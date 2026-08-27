@@ -463,7 +463,11 @@ async fn close_current_window_reports_over_limit_delta() {
         shard_rows: None,
     })
     .await;
-    assert_eq!(task.stats.window.over_limit_new_buckets(), 9, "窗口 1 拒收 9");
+    assert_eq!(
+        task.stats.window.over_limit_new_buckets(),
+        9,
+        "窗口 1 拒收 9"
+    );
 
     task.flush().await; // close 窗口 1 → 上报增量 9
     assert_eq!(
@@ -520,7 +524,11 @@ async fn shard_non_coordinator_reports_own_over_limit() {
         shard_rows: None,
     })
     .await;
-    assert_eq!(task.stats.window.over_limit_new_buckets(), 9, "guard 照常拒收");
+    assert_eq!(
+        task.stats.window.over_limit_new_buckets(),
+        9,
+        "guard 照常拒收"
+    );
 
     task.flush().await; // 发 partial + 上报分片自己的拒收增量
     let partial = rx.try_recv().expect("partial 已发送");

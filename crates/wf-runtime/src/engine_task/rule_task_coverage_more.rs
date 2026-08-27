@@ -365,9 +365,7 @@ async fn emit_metric_sampling_detail_and_append() {
     task.emit(record_with("alerts", 1_700_000_000_000_000_000))
         .await;
     assert!(
-        task.append_nanos
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0,
+        task.append_nanos.load(std::sync::atomic::Ordering::Relaxed) > 0,
         "append timing sampled path must accumulate nanos"
     );
     assert!(

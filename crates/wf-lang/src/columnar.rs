@@ -144,14 +144,10 @@ pub fn columnar_output_expr(expr: &Expr) -> bool {
                 !args.is_empty()
                     && args.len() <= 2
                     && columnar_output_expr(&args[0])
-                    && args
-                        .get(1)
-                        .is_none_or(|a| matches!(a, Expr::StringLit(_)))
+                    && args.get(1).is_none_or(|a| matches!(a, Expr::StringLit(_)))
             }
             Some(ColumnarOutputFunc::CountChar) => {
-                args.len() == 2
-                    && columnar_output_expr(&args[0])
-                    && columnar_output_expr(&args[1])
+                args.len() == 2 && columnar_output_expr(&args[0]) && columnar_output_expr(&args[1])
             }
             Some(ColumnarOutputFunc::Split) => {
                 // split(text, sep)：text 列式可求值（flat 字段/let 内联），sep 字面量。
@@ -180,9 +176,9 @@ pub fn columnar_output_expr(expr: &Expr) -> bool {
                 && columnar_output_expr(then_expr)
                 && columnar_output_expr(else_expr)
         }
-        Expr::InList {
-            expr, list, ..
-        } => columnar_output_expr(expr) && list.iter().all(is_output_literal),
+        Expr::InList { expr, list, .. } => {
+            columnar_output_expr(expr) && list.iter().all(is_output_literal)
+        }
         _ => false,
     }
 }
@@ -668,7 +664,10 @@ mod tests {
             // 字面量 + 字段：首参非字段 → 都不接受。
             assert!(!columnar_func_args_ok(func, &[lit.clone(), flat.clone()]));
             // 字段 + 函数：次参非字面量/字段 → 都不接受。
-            assert!(!columnar_func_args_ok(func, &[flat.clone(), func_call.clone()]));
+            assert!(!columnar_func_args_ok(
+                func,
+                &[flat.clone(), func_call.clone()]
+            ));
             // 字段 + 嵌套路径：次参非 flat → 都不接受。
             assert!(!columnar_func_args_ok(func, &[flat.clone(), nested_path()]));
             // 参数个数：1 个 → 不接受。
@@ -678,7 +677,14 @@ mod tests {
 
     #[test]
     fn columnar_output_func_is_single_authoritative_list() {
-        for name in ["fmt", "strftime", "count_char", "split", "mvindex", "concat"] {
+        for name in [
+            "fmt",
+            "strftime",
+            "count_char",
+            "split",
+            "mvindex",
+            "concat",
+        ] {
             assert!(columnar_output_func(name).is_some(), "{name} 应在输出清单");
         }
         for name in ["lower", "contains", "cidr_match", "bogus"] {
@@ -700,7 +706,10 @@ mod tests {
         let fcall = func("lower");
 
         // fmt(字面量模板, 字面量/字段参数...) → 可列式。
-        assert!(columnar_output_expr(&call("fmt", vec![lit_s.clone(), fld.clone()])));
+        assert!(columnar_output_expr(&call(
+            "fmt",
+            vec![lit_s.clone(), fld.clone()]
+        )));
         assert!(columnar_output_expr(&call(
             "fmt",
             vec![lit_s.clone(), fld.clone(), lit_n.clone()]
@@ -708,7 +717,10 @@ mod tests {
         // fmt 模板非字面量 → 否。
         assert!(!columnar_output_expr(&call("fmt", vec![fld.clone()])));
         // fmt 参数含函数调用 → 否。
-        assert!(!columnar_output_expr(&call("fmt", vec![lit_s.clone(), fcall.clone()])));
+        assert!(!columnar_output_expr(&call(
+            "fmt",
+            vec![lit_s.clone(), fcall.clone()]
+        )));
         // fmt 空参数 → 否。
         assert!(!columnar_output_expr(&call("fmt", vec![])));
 
@@ -718,15 +730,33 @@ mod tests {
             "strftime",
             vec![fld.clone(), lit_s.clone()]
         )));
-        assert!(!columnar_output_expr(&call("strftime", vec![fld.clone(), fld2.clone()])));
-        assert!(!columnar_output_expr(&call("strftime", vec![fld.clone(), lit_s.clone(), lit_n])));
+        assert!(!columnar_output_expr(&call(
+            "strftime",
+            vec![fld.clone(), fld2.clone()]
+        )));
+        assert!(!columnar_output_expr(&call(
+            "strftime",
+            vec![fld.clone(), lit_s.clone(), lit_n]
+        )));
         assert!(!columnar_output_expr(&call("strftime", vec![])));
 
         // count_char(字段, 字段/字面量) → 可列式；个数/形状不符 → 否。
-        assert!(columnar_output_expr(&call("count_char", vec![fld.clone(), lit_s.clone()])));
-        assert!(columnar_output_expr(&call("count_char", vec![fld.clone(), fld2.clone()])));
-        assert!(!columnar_output_expr(&call("count_char", vec![fld.clone()])));
-        assert!(!columnar_output_expr(&call("count_char", vec![fcall.clone(), fld.clone()])));
+        assert!(columnar_output_expr(&call(
+            "count_char",
+            vec![fld.clone(), lit_s.clone()]
+        )));
+        assert!(columnar_output_expr(&call(
+            "count_char",
+            vec![fld.clone(), fld2.clone()]
+        )));
+        assert!(!columnar_output_expr(&call(
+            "count_char",
+            vec![fld.clone()]
+        )));
+        assert!(!columnar_output_expr(&call(
+            "count_char",
+            vec![fcall.clone(), fld.clone()]
+        )));
 
         // 字面量 / flat 字段本身可列式输出；嵌套路径否。
         assert!(columnar_output_expr(&lit_s));
@@ -769,7 +799,10 @@ mod tests {
             args,
         };
         let f = |n: &str| Expr::Field(FieldRef::Simple(n.into()));
-        let hour = call("strftime", vec![f("dateTime"), Expr::StringLit("%H".into())]);
+        let hour = call(
+            "strftime",
+            vec![f("dateTime"), Expr::StringLit("%H".into())],
+        );
         let is_night = Expr::InList {
             expr: Box::new(hour),
             list: vec![
@@ -792,7 +825,10 @@ mod tests {
                 call("count_char", vec![f("extra"), Expr::StringLit("c".into())]),
             ],
         );
-        assert!(columnar_output_expr(&detail), "Q14 detail 应可列式：{detail:?}");
+        assert!(
+            columnar_output_expr(&detail),
+            "Q14 detail 应可列式：{detail:?}"
+        );
 
         // 真实 q14.wfl 形状：嵌套 3 档 CASE（else 分支再嵌 IfThenElse，10/9 项
         // InList）→ 递归放行。
@@ -849,7 +885,10 @@ mod tests {
                 call("count_char", vec![f("extra"), Expr::StringLit("c".into())]),
             ],
         );
-        assert!(!columnar_output_expr(&bad_list), "非字面量列表项应否：{bad_list:?}");
+        assert!(
+            !columnar_output_expr(&bad_list),
+            "非字面量列表项应否：{bad_list:?}"
+        );
     }
 
     #[test]

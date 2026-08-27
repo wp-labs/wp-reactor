@@ -1422,118 +1422,116 @@ fn stats_last_top_keyed_profile() {
 /// 生产 merge_accum 逻辑的内联副本（bench 隔离: 不依赖 executor 内部）。
 /// 与生产 `merge_partial` 一致——借用 `&StatsAccum`（每度量不额外 clone）:
 /// None 时整集 `os.clone()`（协调片首次归并）, 否则逐元素 `iter().cloned()`。
+/// 2026-08-26 对齐度量专用累加器（match 变体, 与 stats_exec::merge_accum 同构）。
 fn merge_accum_cur(t: &mut StatsAccum, o: &StatsAccum) {
-    t.count += o.count;
-    t.sum_i128 += o.sum_i128;
-    t.min = match (t.min, o.min) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-    t.max = match (t.max, o.max) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-    match (&mut t.distinct_set, &o.distinct_set) {
-        (Some(ts), Some(os)) => ts.extend(os.iter().cloned()),
-        (None, Some(os)) => t.distinct_set = Some(os.clone()),
+    match (t, o) {
+        (StatsAccum::Numeric(t), StatsAccum::Numeric(o)) => {
+            t.count += o.count;
+            t.sum += o.sum;
+            t.min = match (t.min, o.min) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            t.max = match (t.max, o.max) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+        }
+        (StatsAccum::Distinct(t), StatsAccum::Distinct(o)) => t.extend_other(o),
         _ => {}
     }
 }
 
 /// 候选: owned move（免克隆; 协调片 None 时直接吞 set）。
 fn merge_accum_move(t: &mut StatsAccum, o: StatsAccum) {
-    t.count += o.count;
-    t.sum_i128 += o.sum_i128;
-    t.min = match (t.min, o.min) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-    t.max = match (t.max, o.max) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-    match (&mut t.distinct_set, o.distinct_set) {
-        (Some(ts), Some(os)) => ts.extend(os),
-        (None, Some(os)) => t.distinct_set = Some(os),
+    match (t, o) {
+        (StatsAccum::Numeric(t), StatsAccum::Numeric(o)) => {
+            t.count += o.count;
+            t.sum += o.sum;
+            t.min = match (t.min, o.min) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            t.max = match (t.max, o.max) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+        }
+        (StatsAccum::Distinct(t), StatsAccum::Distinct(o)) => t.extend(*o),
         _ => {}
     }
 }
 
 /// 候选: owned move + extend 前 reserve 预扩容。
 fn merge_accum_move_reserve(t: &mut StatsAccum, o: StatsAccum) {
-    t.count += o.count;
-    t.sum_i128 += o.sum_i128;
-    t.min = match (t.min, o.min) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-    t.max = match (t.max, o.max) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-    match (&mut t.distinct_set, o.distinct_set) {
-        (Some(ts), Some(os)) => {
-            ts.reserve(os.len());
-            ts.extend(os);
+    match (t, o) {
+        (StatsAccum::Numeric(t), StatsAccum::Numeric(o)) => {
+            t.count += o.count;
+            t.sum += o.sum;
+            t.min = match (t.min, o.min) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            t.max = match (t.max, o.max) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
         }
-        (None, Some(os)) => t.distinct_set = Some(os),
+        (StatsAccum::Distinct(t), StatsAccum::Distinct(o)) => {
+            t.reserve(o.len());
+            t.extend(*o);
+        }
         _ => {}
     }
 }
 
 /// 候选: owned move + 小并大（union by size——小集插大集, 扩容按小集增长）。
 fn merge_accum_move_small_into_big(t: &mut StatsAccum, o: StatsAccum) {
-    t.count += o.count;
-    t.sum_i128 += o.sum_i128;
-    t.min = match (t.min, o.min) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-    t.max = match (t.max, o.max) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-    match (&mut t.distinct_set, o.distinct_set) {
-        (Some(ts), Some(mut os)) => {
-            if ts.len() < os.len() {
-                std::mem::swap(ts, &mut os);
-            }
-            ts.extend(os);
+    match (t, o) {
+        (StatsAccum::Numeric(t), StatsAccum::Numeric(o)) => {
+            t.count += o.count;
+            t.sum += o.sum;
+            t.min = match (t.min, o.min) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            t.max = match (t.max, o.max) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
         }
-        (None, Some(os)) => t.distinct_set = Some(os),
+        (StatsAccum::Distinct(t), StatsAccum::Distinct(mut o)) => {
+            if t.len() < o.len() {
+                std::mem::swap(t, &mut o);
+            }
+            t.extend(*o);
+        }
         _ => {}
     }
 }
 
-/// 构造一个 `StatsAccum`：count + sum + min/max 固定值, distinct_set 填 `n` 个
-/// 确定性 i64 键（LCG, 域 = [0, domain)）。
+/// 构造一个 `StatsAccum`（distinct 度量形状）: distinct_set 填 `n` 个确定性
+/// i64 键（LCG, 域 = [0, domain)）。2026-08-26 对齐度量专用累加器（Distinct 变体）。
 fn shard_accum(n: usize, domain: u64, seed: u64) -> StatsAccum {
-    use crate::match_engine::{DistinctKey, StatsAccum};
-    let mut acc = StatsAccum {
-        count: 1,
-        sum_i128: 7,
-        min: Some(1),
-        max: Some(9),
-        distinct_set: Some(EngineHashSet::default()),
-        last_row: None,
-        top_entries: None,
-    };
+    use crate::match_engine::{DistinctKey, DistinctSet, StatsAccum};
+    let mut set = DistinctSet::default();
+    set.reserve(n);
     let mut rng = seed;
     let mut next = |range: u64| {
         rng = rng
@@ -1541,12 +1539,10 @@ fn shard_accum(n: usize, domain: u64, seed: u64) -> StatsAccum {
             .wrapping_add(1_442_695_040_888_963_407);
         (rng >> 33) % range
     };
-    let set = acc.distinct_set.as_mut().unwrap();
-    set.reserve(n);
     for _ in 0..n {
         set.insert(DistinctKey::Int((next(domain) + 1) as i64));
     }
-    acc
+    StatsAccum::Distinct(Box::new(set))
 }
 
 /// 运行一轮：协调片已含自己 1/N 数据, 依次 merge 其余 partial。

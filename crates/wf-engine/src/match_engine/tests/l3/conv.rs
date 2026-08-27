@@ -27,6 +27,8 @@ fn make_close_output(
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 0,
+        row_fields: None,
+        row_field_names: None,
     }
 }
 

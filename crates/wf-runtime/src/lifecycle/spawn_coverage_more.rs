@@ -187,6 +187,7 @@ async fn run_group(rules: Vec<RunRule>, router: Arc<Router>, shard_count: usize)
         Arc::new(wf_engine::pipe::PipeRegistry::new()),
         SinkFanout::closed(),
         cancel.clone(),
+        cancel.clone(),
         None,
         eos_tx,
         shard_count,

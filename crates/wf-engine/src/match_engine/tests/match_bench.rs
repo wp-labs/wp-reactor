@@ -277,6 +277,7 @@ fn q22_match_pipeline_components() {
             &step_plans,
             Some(&trigger),
             &CloseCtxFields::All,
+            None,
         );
         std::hint::black_box(&ctx);
     }
@@ -296,6 +297,7 @@ fn q22_match_pipeline_components() {
         &step_plans,
         Some(&trigger),
         &CloseCtxFields::All,
+        None,
     );
     let start = Instant::now();
     for _ in 0..N {

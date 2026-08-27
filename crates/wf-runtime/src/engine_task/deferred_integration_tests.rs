@@ -3,8 +3,8 @@
 //! 无 bid 不输出；EOS flush 触发剩余挂起实例。
 use std::sync::Arc;
 
-use std::collections::HashSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use arrow::array::{ArrayRef, Int64Array, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -12,9 +12,7 @@ use arrow::record_batch::RecordBatch;
 use tokio::sync::mpsc;
 
 use wf_engine::match_engine::{RuleExecutor, Value};
-use wf_engine::window::{
-    ProviderWindow, Router, Window, WindowDef, WindowParams, WindowRegistry,
-};
+use wf_engine::window::{ProviderWindow, Router, Window, WindowDef, WindowParams, WindowRegistry};
 use wf_lang::ast::{
     Bound, BoundVal, Expr, FieldRef, JoinMode, PathSegment, ReduceMeasure, TieSpec, WithinSpec,
 };
@@ -74,11 +72,7 @@ fn window_def(name: &str, schema: &Arc<Schema>) -> WindowDef {
 /// `window_def` 的变体：可指定 `over`（时间驱逐窗口）。deferred join 目标窗
 /// 用小 over 可复现生产 q4a/q9（`bid_events over=30m`）的「评估时右行已越过
 /// 时间驱逐线」场景——D4 保留 pin 必须保住它们。
-fn window_def_with_over(
-    name: &str,
-    schema: &Arc<Schema>,
-    over: std::time::Duration,
-) -> WindowDef {
+fn window_def_with_over(name: &str, schema: &Arc<Schema>, over: std::time::Duration) -> WindowDef {
     let mut cfg = super::tests::test_window_config(usize::MAX);
     cfg.name = name.to_string();
     WindowDef {
@@ -221,7 +215,9 @@ fn make_deferred_join_task() -> (
 
 /// `make_deferred_join_task` 的变体：bid 目标窗用小 `over`（复现 q4a/q9 生产
 /// `bid_events over=30m` 的时间驱逐场景）。
-fn make_deferred_join_task_with_over(bid_over: std::time::Duration) -> (
+fn make_deferred_join_task_with_over(
+    bid_over: std::time::Duration,
+) -> (
     rule_task::RuleTask,
     mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<Router>,
@@ -413,9 +409,11 @@ async fn deferred_q9_time_eviction_pin_keeps_in_range_bids() {
 
     // 驱动 watermark + 目标窗都追平 expiry：auction=6 @ T+31s、bid=6 @ T+31s
     auction_window(&router)
-        .append_with_watermark(auction_batch(&[
-            (6, T + 31_000_000_000, T + 61_000_000_000),
-        ]))
+        .append_with_watermark(auction_batch(&[(
+            6,
+            T + 31_000_000_000,
+            T + 61_000_000_000,
+        )]))
         .unwrap();
     bid_window(&router)
         .append_with_watermark(bid_batch(&[(6, 3, 300, T + 31_000_000_000)]))
@@ -454,9 +452,7 @@ async fn deferred_q9_pin_floor_advances_with_pending_drain() {
     task.pull_and_advance().await;
 
     auction_window(&router)
-        .append_with_watermark(auction_batch(&[
-            (6, T + 2_000_000_000, T + 3_000_000_000),
-        ]))
+        .append_with_watermark(auction_batch(&[(6, T + 2_000_000_000, T + 3_000_000_000)]))
         .unwrap();
     bid_window(&router)
         .append_with_watermark(bid_batch(&[(6, 3, 300, T + 2_000_000_000)]))
@@ -466,9 +462,7 @@ async fn deferred_q9_pin_floor_advances_with_pending_drain() {
     assert_eq!(super::tests::field_str(&alert, "__wfu_entity_id"), "5");
 
     auction_window(&router)
-        .append_with_watermark(auction_batch(&[
-            (7, T + 4_000_000_000, T + 5_000_000_000),
-        ]))
+        .append_with_watermark(auction_batch(&[(7, T + 4_000_000_000, T + 5_000_000_000)]))
         .unwrap();
     bid_window(&router)
         .append_with_watermark(bid_batch(&[(7, 7, 7, T + 4_000_000_000)]))
@@ -517,9 +511,11 @@ async fn deferred_q9_flush_unblocks_evaluation_when_frontier_never_advances() {
     // 驱动 wm 追平 expiry（auction 6 @ T+31s）——即使驱动已过 expiry，
     // frontier=i64::MIN → gate=i64::MIN → 不评估（不假 miss）。
     auction_window(&router)
-        .append_with_watermark(auction_batch(&[
-            (6, T + 31_000_000_000, T + 61_000_000_000),
-        ]))
+        .append_with_watermark(auction_batch(&[(
+            6,
+            T + 31_000_000_000,
+            T + 61_000_000_000,
+        )]))
         .unwrap();
     task.pull_and_advance().await;
     assert!(
@@ -587,9 +583,11 @@ async fn deferred_q9_cross_source_reorder_holds_evaluation_until_committed() {
 
     // 驱动 wm 追平 expiry（auction 6 @ T+31s）
     auction_window(&router)
-        .append_with_watermark(auction_batch(&[
-            (6, T + 31_000_000_000, T + 61_000_000_000),
-        ]))
+        .append_with_watermark(auction_batch(&[(
+            6,
+            T + 31_000_000_000,
+            T + 61_000_000_000,
+        )]))
         .unwrap();
     task.pull_and_advance().await;
     assert!(
@@ -623,9 +621,11 @@ async fn deferred_q9_cross_source_reorder_holds_evaluation_until_committed() {
     )
     .unwrap();
     auction_window(&router)
-        .append_with_watermark(auction_batch(&[
-            (7, T + 45_000_000_000, T + 75_000_000_000),
-        ]))
+        .append_with_watermark(auction_batch(&[(
+            7,
+            T + 45_000_000_000,
+            T + 75_000_000_000,
+        )]))
         .unwrap();
     task.pull_and_advance().await;
     let alert = super::tests::take_alert(&mut alert_rx);
@@ -748,7 +748,11 @@ async fn deferred_q9_out_of_order_driver_emits_by_expiry_order() {
 
     // 推进 watermark 到 T+31s：只有 auction 11 到期 → 输出 1 条（id=11）
     auction_window(&router)
-        .append_with_watermark(auction_batch(&[(14, T + 31_000_000_000, T + 91_000_000_000)]))
+        .append_with_watermark(auction_batch(&[(
+            14,
+            T + 31_000_000_000,
+            T + 91_000_000_000,
+        )]))
         .unwrap();
     // 目标窗口追平（bid 14 随 auction 14 到达，max_event_time 推过 T+30s）
     bid_window(&router)
@@ -765,7 +769,11 @@ async fn deferred_q9_out_of_order_driver_emits_by_expiry_order() {
 
     // 推进到 T+61s：auction 12 到期（T+60s），auction 13 未到期（T+90s）
     auction_window(&router)
-        .append_with_watermark(auction_batch(&[(15, T + 61_000_000_000, T + 121_000_000_000)]))
+        .append_with_watermark(auction_batch(&[(
+            15,
+            T + 61_000_000_000,
+            T + 121_000_000_000,
+        )]))
         .unwrap();
     // 目标窗口追平（bid 15 随 auction 15 到达，max_event_time 推过 T+60s）
     bid_window(&router)
@@ -887,7 +895,11 @@ async fn deferred_q9_target_lag_holds_evaluation_until_target_catches_up() {
         .append_with_watermark(bid_batch(&[(6, 2, 200, T + 61_000_000_000)]))
         .unwrap();
     auction_window(&router)
-        .append_with_watermark(auction_batch(&[(7, T + 62_000_000_000, T + 122_000_000_000)]))
+        .append_with_watermark(auction_batch(&[(
+            7,
+            T + 62_000_000_000,
+            T + 122_000_000_000,
+        )]))
         .unwrap();
     task.pull_and_advance().await;
     let alert = super::tests::take_alert(&mut alert_rx);
@@ -1674,9 +1686,15 @@ fn q13c_bid_mod_schema() -> Arc<Schema> {
 fn q13c_bid_batch(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
     // (auction, bidder, price, dateTime)
     let cols: Vec<ArrayRef> = vec![
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+        )),
         Arc::new(TimestampNanosecondArray::from(
             rows.iter().map(|r| r.3).collect::<Vec<_>>(),
         )),
@@ -1687,10 +1705,18 @@ fn q13c_bid_batch(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
 fn q13c_bid_mod_batch(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
     // (id, bidder, auction, price, dateTime, mod_key) — mod_key = auction % 10000
     let cols: Vec<ArrayRef> = vec![
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+        )),
         Arc::new(TimestampNanosecondArray::from(
             rows.iter().map(|r| r.3).collect::<Vec<_>>(),
         )),
@@ -1755,7 +1781,11 @@ async fn q13_dual_chain_intermediate_window_pressure() {
     let schemas = nexmark_schemas();
     let file = wf_lang::parse_wfl(Q13_WFL).expect("parse q13.wfl");
     let plans = wf_lang::compile_wfl(&file, &schemas).expect("compile q13.wfl");
-    assert_eq!(plans.len(), 2, "q13.wfl → 2 个 plan（q13a_bid_mod + q13b_side_input_join）");
+    assert_eq!(
+        plans.len(),
+        2,
+        "q13.wfl → 2 个 plan（q13a_bid_mod + q13b_side_input_join）"
+    );
     let mut plans = plans.into_iter();
     let mut plan_a = plans.next().unwrap();
     let plan_b = plans.next().unwrap();
@@ -1773,11 +1803,7 @@ async fn q13_dual_chain_intermediate_window_pressure() {
     ])
     .unwrap();
     // side_input 静态表：mod_key 1 → "v1"，2 → "v2"
-    let mut pw = ProviderWindow::new(
-        "side_input".into(),
-        "SELECT * FROM side_input".into(),
-        None,
-    );
+    let mut pw = ProviderWindow::new("side_input".into(), "SELECT * FROM side_input".into(), None);
     pw.load(vec![
         {
             let mut m = HashMap::new();
@@ -1989,11 +2015,7 @@ async fn q13_dual_chain_sharded_push_consumption_complete() {
     ])
     .unwrap();
     // side_input 静态表：mod_key 1 → "v1"，2 → "v2"
-    let mut pw = ProviderWindow::new(
-        "side_input".into(),
-        "SELECT * FROM side_input".into(),
-        None,
-    );
+    let mut pw = ProviderWindow::new("side_input".into(), "SELECT * FROM side_input".into(), None);
     pw.load(vec![
         {
             let mut m = HashMap::new();
@@ -2056,8 +2078,7 @@ async fn q13_dual_chain_sharded_push_consumption_complete() {
     let mut shard_tasks = Vec::new();
     let mut shard_rxs: Vec<Option<mpsc::Receiver<wf_engine::window::RulePush>>> = Vec::new();
     for shard_idx in 0..SHARDS {
-        let (push_tx, push_rx) =
-            mpsc::channel::<wf_engine::window::RulePush>(16);
+        let (push_tx, push_rx) = mpsc::channel::<wf_engine::window::RulePush>(16);
         shard_txs.push(push_tx);
         let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
         shard_alert_rxs.push(alert_rx);
@@ -2222,19 +2243,13 @@ async fn q13_dual_chain_sharded_push_high_slope_repro() {
         q13c_window_def("bid_mod", &q13c_bid_mod_schema(), one_batch_bytes * 70 * 2),
     ])
     .unwrap();
-    let mut pw = ProviderWindow::new(
-        "side_input".into(),
-        "SELECT * FROM side_input".into(),
-        None,
-    );
-    pw.load(vec![
-        {
-            let mut m = HashMap::new();
-            m.insert("key".to_string(), Value::Number(1.0));
-            m.insert("value".to_string(), Value::Str("v1".into()));
-            m
-        },
-    ]);
+    let mut pw = ProviderWindow::new("side_input".into(), "SELECT * FROM side_input".into(), None);
+    pw.load(vec![{
+        let mut m = HashMap::new();
+        m.insert("key".to_string(), Value::Number(1.0));
+        m.insert("value".to_string(), Value::Str("v1".into()));
+        m
+    }]);
     registry
         .register_provider("side_input".to_string(), pw)
         .unwrap();
@@ -2417,19 +2432,13 @@ async fn q13_dual_chain_sharded_producer_and_consumer() {
         q13c_window_def("bid_mod", &q13c_bid_mod_schema(), one_batch_bytes * 30),
     ])
     .unwrap();
-    let mut pw = ProviderWindow::new(
-        "side_input".into(),
-        "SELECT * FROM side_input".into(),
-        None,
-    );
-    pw.load(vec![
-        {
-            let mut m = HashMap::new();
-            m.insert("key".to_string(), Value::Number(1.0));
-            m.insert("value".to_string(), Value::Str("v1".into()));
-            m
-        },
-    ]);
+    let mut pw = ProviderWindow::new("side_input".into(), "SELECT * FROM side_input".into(), None);
+    pw.load(vec![{
+        let mut m = HashMap::new();
+        m.insert("key".to_string(), Value::Number(1.0));
+        m.insert("value".to_string(), Value::Str("v1".into()));
+        m
+    }]);
     registry
         .register_provider("side_input".to_string(), pw)
         .unwrap();
@@ -2752,12 +2761,7 @@ async fn q13_dual_chain_intermediate_window_unregistered_consumer_loses() {
     let bid_win = router.registry().get_window("bid_events").unwrap();
     for i in 0..5i64 {
         bid_win
-            .append_with_watermark(q13c_bid_batch(&[(
-                1,
-                i,
-                100 + i,
-                T + i * 1_000_000_000,
-            )]))
+            .append_with_watermark(q13c_bid_batch(&[(1, i, 100 + i, T + i * 1_000_000_000)]))
             .unwrap();
     }
     task_a.pull_and_advance().await;

@@ -268,8 +268,7 @@ pub(crate) async fn push_decoded_batch(
     // EPS 计算）必须活着。普通流被切时直接释放批次, 不占 parse 管线槽位;
     // 同时**绕过限速与帧/行计数**（limiter/parse_item 指标在门控之后）——
     // 诊断档语义: 测的是注入+解码的原始速率（2026-08-25 review 补注）。
-    if crate::perf_diag::perf_cut_append()
-        && stream_name != crate::perf_diag::PERF_SENTINEL_STREAM
+    if crate::perf_diag::perf_cut_append() && stream_name != crate::perf_diag::PERF_SENTINEL_STREAM
     {
         return true;
     }
@@ -659,8 +658,11 @@ mod tests {
         let preread = PrereadBudget::new(1024 * 1024);
         let parse_seq = AtomicU64::new(0);
         let router = Router::new(WindowRegistry::build(vec![]).expect("registry"));
-        let schema =
-            Arc::new(Schema::new(vec![ArrowField::new("v", DataType::Int64, false)]));
+        let schema = Arc::new(Schema::new(vec![ArrowField::new(
+            "v",
+            DataType::Int64,
+            false,
+        )]));
         let batch = |_stream: &str| {
             RecordBatch::try_new(
                 schema.clone(),

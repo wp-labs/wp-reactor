@@ -21,7 +21,7 @@ use crate::match_engine::match_engine::{
 use crate::time::normalize_epoch_timestamp_float_nanos;
 
 use super::RuleExecutor;
-use super::context::{enrich_join_row, eval_interval_bound, in_interval, row_matches_conds};
+use super::context::{enrich_join_row_bare, eval_interval_bound, in_interval, row_matches_conds};
 
 /// 一个挂起的 deferred join 实例：驱动（左）行 + 预计算的区间与触发点。
 ///
@@ -91,6 +91,25 @@ impl RuleExecutor {
         windows: &dyn WindowLookup,
         emit_time_nanos: i64,
     ) -> CoreResult<Option<OutputRecord>> {
+        match self.evaluate_deferred_join(join_idx, pending, windows)? {
+            Some(out_ctx) => {
+                self.build_deferred_output(&out_ctx, pending.expiry_nanos, emit_time_nanos)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 评估 deferred join（2026-08-26 q4a 中间窗轻量化拆分）：查询 + 区间过滤 +
+    /// 条件复核 + 归约/存在 + 富化，返回**输出 ctx**（`Event`）。`None` = 无匹配。
+    /// 输出物化（build）由调用方按目标选择：sink → [`Self::build_deferred_output`]
+    /// （全量告警字段），中间窗 → 轻量 build（`build_each_alert_pipe`，跳过
+    /// wfx_id/fired_at/summary——中间窗消费者按列读不需要）。
+    pub fn evaluate_deferred_join(
+        &self,
+        join_idx: usize,
+        pending: &DeferredPending,
+        windows: &dyn WindowLookup,
+    ) -> CoreResult<Option<Event>> {
         let Some(join) = self.plan.joins.get(join_idx) else {
             return Ok(None);
         };
@@ -99,6 +118,15 @@ impl RuleExecutor {
         else {
             return Ok(None);
         };
+        // 条件复核冗余跳过（2026-08-26 q4a/q9）：`asof_candidates` 已按
+        // `pending.key_field` + `pending.key` 过滤候选（索引/扫描同口径，
+        // 候选行 key 字段值 == key）；`pending.key` 来自 `first_join_key_local`
+        // （ctx[cond.left 字段名]），`pending.key_field` 即 `cond.right` 字段名。
+        // 单条件且右字段 == key_field → 条件复核恒真，跳过 `row_matches_conds`
+        // （每候选一次 Event 字段查找+比较）。多条件（key 只来自第一个 cond，
+        // 其余条件必须复核）/右字段非 key 字段 → 保留复核。
+        let cond_recheck_redundant =
+            join.conds.len() == 1 && pending.key_field == field_ref_name(&join.conds[0].right);
         // 区间过滤 + 全部 join 条件复核（复刻 find_matching_row 语义）
         let matched: Vec<(i64, crate::match_engine::JoinRow)> = rows
             .into_iter()
@@ -109,7 +137,7 @@ impl RuleExecutor {
                     pending.hi_ns,
                     pending.lo_open,
                     pending.hi_open,
-                ) && row_matches_conds(row, &join.conds, &pending.left)
+                ) && (cond_recheck_redundant || row_matches_conds(row, &join.conds, &pending.left))
             })
             .collect();
         if matched.is_empty() {
@@ -126,7 +154,9 @@ impl RuleExecutor {
                 // 胜出行的字段以裸名富化（`winner.bidder` 编译成 Path{alias:"winner",
                 // segments:["bidder"]}，eval_field_value 丢弃 alias、把 segments[0]
                 // 当根字段名读 `fields["bidder"]`）。
-                enrich_join_row(&mut out_ctx, join, &row);
+                // 2026-08-26：bare 注入（省 qualified 死数据）——deferred 表达式
+                // 对 Qualified 引用也读裸名，qualified 键不可达。
+                enrich_join_row_bare(&mut out_ctx, &row);
                 // `as label`：归约整行以裸键 object value 注入（review R2）。
                 // 仅当规则真能读到该 object（裸 `winner` / `field_ref_name` 命中
                 // 标签名，见 plan_reduce_label_reads）时才物化——`label.field`
@@ -147,7 +177,7 @@ impl RuleExecutor {
                 let Some(row) = row else {
                     return Ok(None);
                 };
-                enrich_join_row(&mut out_ctx, join, &row);
+                enrich_join_row_bare(&mut out_ctx, &row);
             }
         }
 
@@ -156,9 +186,19 @@ impl RuleExecutor {
             return Ok(None);
         }
 
+        Ok(Some(out_ctx))
+    }
+
+    /// 全量 build（sink 目标）：评估 ctx → 完整 OutputRecord（告警字段全构建）。
+    pub fn build_deferred_output(
+        &self,
+        out_ctx: &Event,
+        expiry_nanos: i64,
+        emit_time_nanos: i64,
+    ) -> CoreResult<Option<OutputRecord>> {
         self.build_each_alert_with(
-            &out_ctx,
-            pending.expiry_nanos,
+            out_ctx,
+            expiry_nanos,
             AlertOrigin::Deferred,
             &[],
             emit_time_nanos,
@@ -179,7 +219,7 @@ fn first_join_key_local(ctx: &Event, conds: &[JoinCondPlan]) -> Option<(String, 
 /// - `minrow(field)`：field 值最小的行；
 /// - `last(field)`：右窗时间（ts）最新的行（v1 语义；field 参数保留）；
 /// - `top(N, field)`：按 field 降序取前 N，返回首行。
-fn select_reduce_row(
+pub(crate) fn select_reduce_row(
     rows: Vec<(i64, crate::match_engine::JoinRow)>,
     measure: &ReduceMeasure,
 ) -> Option<crate::match_engine::JoinRow> {

@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use arrow::array::Int64Array;
+use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{
@@ -47,10 +47,10 @@ use wf_lang::plan::{
 };
 use wf_lang::{BaseType, FieldType};
 
-use crate::match_engine::executor::StatsExecutor;
+use crate::match_engine::executor::{RowFieldLayout, RowFields, StatsAccum, StatsExecutor};
 use crate::match_engine::match_engine::{
     BindData, CepStateMachine, CloseOutput, CloseReason, EngineHashMap, Event, MatchedContext,
-    StepData, Value, WindowLookup,
+    ScopeKey, StepData, Value, WindowLookup,
 };
 use crate::match_engine::{JoinRow, RuleExecutor, apply_conv};
 
@@ -1091,6 +1091,8 @@ fn close_output(rule: &str, scope_key: Vec<Value>, label: &str, measure: f64) ->
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         last_event_nanos: 0,
+        row_fields: None,
+        row_field_names: None,
     }
 }
 
@@ -1385,6 +1387,7 @@ fn q13_match_snapshot_join() {
             &step_plans,
             matched.trigger_event.as_deref(),
             &needed,
+            None,
         );
         std::hint::black_box(ctx);
     }
@@ -1402,6 +1405,7 @@ fn q13_match_snapshot_join() {
             &step_plans,
             matched.trigger_event.as_deref(),
             &needed,
+            None,
         );
         let ok = crate::match_engine::executor::execute_joins(&rule.joins, &mut ctx, &lookup, NOW);
         std::hint::black_box((ctx, ok));
@@ -1496,6 +1500,7 @@ fn q6_match_emit() {
             &step_plans,
             matched.trigger_event.as_deref(),
             &needed,
+            None,
         );
         std::hint::black_box(ctx);
     }
@@ -1511,6 +1516,7 @@ fn q6_match_emit() {
         &step_plans,
         matched.trigger_event.as_deref(),
         &needed,
+        None,
     );
     let t3 = Instant::now();
     for _ in 0..N {
@@ -1518,6 +1524,54 @@ fn q6_match_emit() {
     }
     let alert_ns = t3.elapsed().as_secs_f64() * 1e9 / N as f64;
     report("q6 build_match_alert", alert_ns, exec_ns);
+}
+/// q6 列式批 emit（2026-08-26 对账）：生产 q6 过 `match_plan_columnar_safe`
+/// gate → `execute_match_direct_batch_columnar`（列式批，零 OutputRecord 物化），
+/// 而 `q6_match_emit` 测的是行式 `execute_match_with_joins`（484ns，非生产形态）。
+/// 本 bench 用生产分段（ALERT_BATCH_SIZE 级 chunk）测列式批成本——对账
+/// diag 实测 1576ns/evt 的构成。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine q6_match_emit_columnar -- --ignored --nocapture"]
+fn q6_match_emit_columnar() {
+    use crate::alert::AlertColumnBuilder;
+
+    let events = bid_events(N);
+    let rule = q6_rule();
+    let exec = RuleExecutor::new(rule.clone());
+    assert!(
+        exec.match_plan_columnar_safe(),
+        "q6 形状必须过列式 gate（生产走 execute_match_direct_batch_columnar）"
+    );
+
+    // 每事件命中 1 个 MatchedContext（q6 avg>=200 高频，近似生产 advance 命中）。
+    let matched: Vec<MatchedContext> = events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| {
+            simple_matched(
+                "q6_bench",
+                vec![num(20.0)],
+                ev,
+                NOW + i as i64 * EVENT_STEP_NS,
+            )
+        })
+        .collect();
+    let refs: Vec<&MatchedContext> = matched.iter().collect();
+
+    // 批级列式装载（生产分段形态）。
+    const SEG: usize = 256;
+    let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_out = Vec::new();
+    let t0 = Instant::now();
+    for _ in 0..4 {
+        for seg in refs.chunks(SEG) {
+            let stats =
+                exec.execute_match_direct_batch_columnar(seg, NOW, &mut builder, &mut appended_out);
+            std::hint::black_box(&stats);
+        }
+    }
+    let col_ns = t0.elapsed().as_secs_f64() * 1e9 / (N as f64 * 4.0);
+    report("q6 match emit(列式批)", col_ns, col_ns);
 }
 
 // ---------------------------------------------------------------------------
@@ -1774,6 +1828,97 @@ fn q19_stats_group_topn() {
     report("q19 stats batch top10", col_ns, row_ns);
 }
 
+/// Q4b：stats `stats<1d:fixed> group by (f.category) { f | avg(f.final) }`——
+/// 消费 q4a 中间窗 auction_finals（id/category/final/dateTime）。group 键域
+/// 极小（category 0..4），avg 累加——测 stats executor 净成本（2026-08-26
+/// q4 归因：q4a staging 列式化后剩余差异主嫌疑）。
+fn q4b_stats_plan() -> StatsPlan {
+    StatsPlan {
+        window_spec: WindowSpec::Fixed(Duration::from_secs(86400)), // 1d
+        keys: vec![Expr::Field(FieldRef::Qualified(
+            "f".into(),
+            "category".into(),
+        ))],
+        output_shape: StatsOutputShapePlan::Rows,
+        measures: vec![StatsMeasurePlan {
+            label: "avg_final".into(),
+            source_alias: "f".into(),
+            where_expr: None,
+            agg: StatsAggPlan::Avg,
+            field: Some(FieldRef::Qualified("f".into(), "final".into())),
+            arg: None,
+        }],
+        tracked_bind_fields: {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "f".to_string(),
+                HashSet::from(["category".to_string(), "final".to_string()]),
+            );
+            m
+        },
+    }
+}
+
+/// Q4b stats 消费成本（2026-08-26 q4 归因）：1.67M auction_finals 行 →
+/// stats group by category avg（键域 5）。行式/列式双路径。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine q4b_stats_group_avg -- --ignored --nocapture"]
+fn q4b_stats_group_avg() {
+    // auction_finals 形状行（id/category/final；category 域 5，final 连续值）。
+    let rows: Vec<HashMap<String, Value>> = (0..N)
+        .map(|i| {
+            let mut m = HashMap::new();
+            m.insert("id".to_string(), num(i as f64));
+            m.insert("category".to_string(), num((i % 5) as f64));
+            m.insert("final".to_string(), num(10.0 + (i % 997) as f64));
+            m
+        })
+        .collect();
+    let batch = {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Int64, false),
+            Field::new("final", DataType::Int64, false),
+        ]);
+        let ids: Vec<i64> = (0..N as i64).collect();
+        let cats: Vec<i64> = (0..N as i64).map(|i| i % 5).collect();
+        let finals: Vec<i64> = (0..N as i64).map(|i| 10 + i % 997).collect();
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(cats)),
+                Arc::new(Int64Array::from(finals)),
+            ],
+        )
+        .expect("batch")
+    };
+
+    // 行式：group by category + avg(final)
+    let mut exec = StatsExecutor::with_row_fields(
+        q4b_stats_plan(),
+        Some(Arc::new(
+            ["category".to_string(), "final".to_string()]
+                .into_iter()
+                .collect(),
+        )),
+    );
+    let t0 = Instant::now();
+    exec.process_rows(&rows, |row, name| row.get(name).cloned());
+    let row_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q4b stats rows avg", row_ns, row_ns);
+
+    // 列式：group by category + avg(final)
+    let mut exec2 = StatsExecutor::with_row_fields(q4b_stats_plan(), None);
+    let t1 = Instant::now();
+    assert!(
+        exec2.process_batch(&batch),
+        "列式前置应满足（Int64 category/final）"
+    );
+    let col_ns = t1.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q4b stats batch avg", col_ns, row_ns);
+}
+
 // ---------------------------------------------------------------------------
 // Bench 10：Q20 on each + snapshot join + where
 // ---------------------------------------------------------------------------
@@ -1975,7 +2120,82 @@ fn q22_each_split() {
     let stats_row =
         exec_col.execute_each_direct_batch(&rows, &NoLookup, &[], NOW, &mut b_row, &mut app_row);
     assert_eq!(stats_row.appended, N, "行式输出行数 = N");
-    assert_eq!(b_col.finish().len(), b_row.finish().len(), "列式/行式输出行数一致");
+    assert_eq!(
+        b_col.finish().len(),
+        b_row.finish().len(),
+        "列式/行式输出行数一致"
+    );
+
+    // ---- split 内部拆解（2026-08-26 q22 内存归因）：全分割 collect vs 惰性 nth ----
+    // 生产 `split_index_vec` 每行 `text.split(sep).collect::<Vec<_>>()` 再索引——
+    // url 3 段目录 + query（split 后 ≥6 段）全分割建 Vec 是纯浪费。量化惰性
+    // `split(sep).nth(k)`（只扫描到第 k 段）的加速空间。
+    let sep = "/";
+    let mut sum = 0usize;
+    let t0 = Instant::now();
+    for _ in 0..N {
+        let parts: Vec<&str> = nexmark_url().split(sep).collect();
+        let k = normalize_idx(3, parts.len());
+        if let Some(k) = k {
+            sum += parts[k].len();
+        }
+    }
+    let collect_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q22 split 全分割 collect", collect_ns, collect_ns);
+
+    let t0 = Instant::now();
+    for _ in 0..N {
+        let picked = nexmark_url().split(sep).nth(3);
+        if let Some(p) = picked {
+            sum += p.len();
+        }
+    }
+    let nth_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q22 split 惰性 nth(3)", nth_ns, collect_ns);
+
+    // ---- concat 内部拆解（2026-08-26 q22 内存归因 2）：String::new 无预分配 +
+    // 逐参 value_to_string 转换 vs 预分配 + 直接 push_str。q22 detail =
+    // concat(3 段 + 2 个 "/")，每行 5 参数。----
+    let segs: Vec<&str> = nexmark_url().split(sep).collect();
+    let mut sum2 = 0usize;
+    let t0 = Instant::now();
+    for _ in 0..N {
+        let mut s = String::new();
+        s.push_str(segs[3]);
+        s.push_str(sep);
+        s.push_str(segs[4]);
+        s.push_str(sep);
+        s.push_str(segs[5]);
+        sum2 += s.len();
+    }
+    let cat_naive_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q22 concat 无预分配", cat_naive_ns, cat_naive_ns);
+
+    let t0 = Instant::now();
+    for _ in 0..N {
+        let cap = segs[3].len() + 1 + segs[4].len() + 1 + segs[5].len();
+        let mut s = String::with_capacity(cap);
+        s.push_str(segs[3]);
+        s.push_str(sep);
+        s.push_str(segs[4]);
+        s.push_str(sep);
+        s.push_str(segs[5]);
+        sum2 += s.len();
+    }
+    let cat_cap_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q22 concat 预分配", cat_cap_ns, cat_naive_ns);
+    assert!(sum > 0 && sum2 > 0);
+}
+
+/// mvindex 负索引/越界归一（与 `normalize_index_simple` 同语义的 bench 内联版）。
+fn normalize_idx(index: i64, len: usize) -> Option<usize> {
+    let len = len as i64;
+    let normalized = if index < 0 { len + index } else { index };
+    if normalized < 0 || normalized >= len {
+        None
+    } else {
+        Some(normalized as usize)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2088,6 +2308,8 @@ fn q19_close_entry(
         window_start_time_nanos: window_start,
         window_end_time_nanos: window_end,
         last_event_nanos: window_end,
+        row_fields: None,
+        row_field_names: None,
     }
 }
 
@@ -2126,7 +2348,10 @@ fn q19_close_output_chain() {
 
     // ② 列式 close 全链（现状基线，detail = fmt）——含 yield 求值 / fmt / wfx_id / 落列
     let exec_full = RuleExecutor::new(q19_close_columnar_rule(true));
-    assert!(exec_full.close_plan_columnar_safe(), "q19 形状必须过列式 close 门控");
+    assert!(
+        exec_full.close_plan_columnar_safe(),
+        "q19 形状必须过列式 close 门控"
+    );
     let mut builder = AlertColumnBuilder::new(Arc::from("nexmark_alerts"));
     let t0 = Instant::now();
     let stats = exec_full.execute_close_direct_batch_columnar(&closes, &mut builder, W_END);
@@ -2174,5 +2399,249 @@ fn q19_close_output_chain() {
         entry_ns / full_ns * 100.0,
         exec_net,
         exec_net / full_ns * 100.0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bench 13：Q18 每键状态分账 —— 「键数 × 每键状态」（2026-08-26）
+// ---------------------------------------------------------------------------
+//
+// 背景：q18 = `stats<1d:fixed> group by (bidder, auction)` + 4×last，30M 数据
+// 键数 ≈ 2300 万（(bidder,auction) 组合几乎每行唯一——数据特征决定，不可减）。
+// 每键状态 = 唯一可压项。本 bench 量化每键构成：
+//   1. size_of 栈上（StatsAccum / RowFields / ScopeKey）
+//   2. 真实每键内存求和（ScopeKey 堆 + 累加器 + 共享 RowFields 堆 + HashMap 槽）
+//   3. `bucket_allowance` 预算口径 vs 真实 → 高估倍数（guard 拒收阈值失真度）
+//
+// 预期发现（2026-08-26 代码审查）：4 个 last 度量各占一个全功能 `StatsAccum`
+// （count/sum/min/max/distinct/top 死字段 ~80% 浪费），真实每键 ≈ 1KB；预算
+// 口径 last 按 160B/度量固定计 → 每桶 1664B，高估 ~1.5×。16GB 预算 → 拒收
+// 阈值 ~1000 万键 < 30M 数据真实键数 2300 万 → **guard 早拒（语义丢失）**。
+
+/// Q18 形态 stats plan：`stats<1d:fixed> group by (b.bidder, b.auction)` +
+/// 4×last（price/channel/url/dateTime），与 q18.wfl 对齐。
+fn q18_stats_last_plan() -> StatsPlan {
+    fn last(label: &str, field: &str) -> StatsMeasurePlan {
+        StatsMeasurePlan {
+            label: label.into(),
+            source_alias: "b".into(),
+            where_expr: None,
+            agg: StatsAggPlan::Last,
+            field: Some(FieldRef::Qualified("b".into(), field.into())),
+            arg: None,
+        }
+    }
+    StatsPlan {
+        window_spec: WindowSpec::Fixed(Duration::from_secs(86400)),
+        keys: vec![
+            Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+            Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        ],
+        output_shape: StatsOutputShapePlan::Rows,
+        measures: vec![
+            last("last_price", "price"),
+            last("last_channel", "channel"),
+            last("last_url", "url"),
+            last("last_dateTime", "dateTime"),
+        ],
+        tracked_bind_fields: {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "b".to_string(),
+                HashSet::from([
+                    "auction".to_string(),
+                    "bidder".to_string(),
+                    "price".to_string(),
+                    "channel".to_string(),
+                    "url".to_string(),
+                    "dateTime".to_string(),
+                ]),
+            );
+            m
+        },
+    }
+}
+
+/// Q18 形态列式 batch（auction/bidder/price/dateTime Int64 + channel/url Utf8）。
+/// 键域：bidder 1010（真实域）；auction 域放大到 2_000_000 → (bidder,auction)
+/// 组合 ≈ 每行唯一（对齐 30M 数据「键数≈行数」的真实形态——域小会严重低估
+/// 键数，测不到每键真实成本）。
+fn q18_last_batch(n: usize) -> RecordBatch {
+    const BIDDER_BASE: i64 = 1000;
+    const BIDDER_DOMAIN: u64 = 1010;
+    const AUCTION_BASE: i64 = 1000;
+    const AUCTION_DOMAIN: u64 = 2_000_000;
+    let schema = Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("bidder", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+        Field::new("channel", DataType::Utf8, false),
+        Field::new("url", DataType::Utf8, false),
+        Field::new("dateTime", DataType::Int64, false),
+    ]);
+    let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+    let auctions: Vec<i64> = (0..n)
+        .map(|_| AUCTION_BASE + (next_u64(&mut rng) % AUCTION_DOMAIN) as i64)
+        .collect();
+    let bidders: Vec<i64> = (0..n)
+        .map(|_| BIDDER_BASE + (next_u64(&mut rng) % BIDDER_DOMAIN) as i64)
+        .collect();
+    let prices: Vec<i64> = (0..n).map(|_| next_price(&mut rng) as i64).collect();
+    let channels: Vec<String> = (0..n).map(|_| "Google".to_string()).collect();
+    let urls: Vec<String> = (0..n).map(|_| nexmark_url().to_string()).collect();
+    let times: Vec<i64> = (0..n).map(|i| NOW + i as i64 * EVENT_STEP_NS).collect();
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int64Array::from(auctions)),
+            Arc::new(Int64Array::from(bidders)),
+            Arc::new(Int64Array::from(prices)),
+            Arc::new(StringArray::from(channels)),
+            Arc::new(StringArray::from(urls)),
+            Arc::new(Int64Array::from(times)),
+        ],
+    )
+    .expect("q18 batch")
+}
+
+/// ScopeKey 堆内存（Box 子节点；Str 长串堆分配忽略——q18 键为数字）。
+fn scope_key_heap_bytes(k: &ScopeKey) -> usize {
+    match k {
+        ScopeKey::Pair(a, b) => {
+            // 每个 Box 子节点 = 1 个 ScopeKey 的栈上大小（enum 24B，含 tag）
+            size_of::<ScopeKey>() * 2 + scope_key_heap_bytes(a) + scope_key_heap_bytes(b)
+        }
+        ScopeKey::Str(s) if s.len() > 22 => s.len(),
+        _ => 0,
+    }
+}
+
+/// RowFields 堆内存（Box 数组元素 + null_mask；layout Arc 全局共享不计）。
+fn row_fields_heap_bytes(rf: &RowFields) -> usize {
+    let l = rf.layout();
+    l.n_numeric() * 8
+        + l.n_strings() * 24 // SmolStr 24B 内联
+        + l.n_others() * size_of::<Option<Value>>()
+        + l.n_fields().div_ceil(64) * 8 // null_mask
+}
+
+/// Q18 每键状态分账（release-only）。
+///
+/// 运行：cargo test --release -p wf-engine q18_stats_last_key_state -- --ignored --nocapture
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine q18_stats_last_key_state -- --ignored --nocapture"]
+fn q18_stats_last_key_state() {
+    eprintln!("[q18-state] === size_of（栈上，不含堆）===");
+    eprintln!(
+        "[q18-state] size_of::<StatsAccum>()     = {} B",
+        size_of::<StatsAccum>()
+    );
+    eprintln!(
+        "[q18-state] size_of::<RowFields>()      = {} B",
+        size_of::<RowFields>()
+    );
+    eprintln!(
+        "[q18-state] size_of::<RowFieldLayout>() = {} B",
+        size_of::<RowFieldLayout>()
+    );
+    eprintln!(
+        "[q18-state] size_of::<ScopeKey>()       = {} B",
+        size_of::<ScopeKey>()
+    );
+
+    let row_fields: Arc<HashSet<String>> = Arc::new(
+        ["auction", "bidder", "price", "channel", "url", "dateTime"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    );
+    let mut exec = StatsExecutor::with_row_fields(q18_stats_last_plan(), Some(row_fields));
+    let batch = q18_last_batch(N);
+    assert!(
+        exec.process_batch(&batch),
+        "列式前置应满足（Int64 键/值 + Utf8 字符串）"
+    );
+    let n_buckets: usize = exec.window.buckets.values().map(|c| c.len()).sum();
+    let n_chains = exec.window.buckets.len();
+    let estimated = exec.window.estimated_bytes();
+    let allowance = if n_chains > 0 {
+        estimated / n_chains as u64
+    } else {
+        0
+    };
+
+    // 真实每键内存求和：ScopeKey 栈+堆 / accs / 共享 RowFields 堆 / HashMap 槽估算
+    let mut real_sum = 0usize;
+    let mut last_shared = 0usize;
+    for chain in exec.window.buckets.values() {
+        for b in chain {
+            real_sum += size_of_val(b); // StatsBucket 栈（scope_key + accs Vec 头）
+            real_sum += scope_key_heap_bytes(&b.scope_key);
+            real_sum += b.accs.len() * size_of::<StatsAccum>();
+            let shared = b.accs.iter().filter(|a| a.last().is_some()).count();
+            if shared > 0 {
+                last_shared += 1;
+                let rf = b
+                    .accs
+                    .iter()
+                    .find_map(|a| a.last().as_ref())
+                    .expect("is_some");
+                real_sum += 16 /* Arc 头 */ + row_fields_heap_bytes(rf);
+            }
+        }
+    }
+    // HashMap<u64, Vec<StatsBucket>> 槽位（foldhash 控制字 + entry + Vec 头）估算
+    let slot_est = n_buckets * 40;
+    let real_per_key = (real_sum + slot_est) as f64 / n_buckets as f64;
+
+    eprintln!(
+        "[q18-state] === 运行形态（N={} 列式，键域 bidder 1010 × auction 2M ≈ 每行唯一）===",
+        N
+    );
+    eprintln!("[q18-state] 键数 n_buckets            = {}", n_buckets);
+    eprintln!("[q18-state] 哈希链数 n_chains          = {}", n_chains);
+    eprintln!(
+        "[q18-state] 状态估算 estimated_bytes   = {} MB",
+        estimated / 1024 / 1024
+    );
+    eprintln!("[q18-state] 预算/键（allowance 口径）  = {} B", allowance);
+    eprintln!(
+        "[q18-state] 真实/键（求和 + 槽估算）    = {:.0} B",
+        real_per_key
+    );
+    eprintln!(
+        "[q18-state] 预算高估倍数              = {:.2}×（guard 拒收阈值被低估）",
+        allowance as f64 / real_per_key
+    );
+    eprintln!(
+        "[q18-state] 共享 last_row 桶数/总桶   = {}/{}（多 last 度量 Arc 共享已生效）",
+        last_shared, n_buckets
+    );
+
+    // 推算 30M 真实数据（键数 ≈ 2300 万）：16GB 预算下的拒收阈值
+    let keys_30m = 23_000_000u64;
+    let cap_by_budget = 16_000_000_000u64 / allowance;
+    let real_30m_gb = keys_30m as f64 * real_per_key / 1e9;
+    eprintln!("[q18-state] === 推算 30M 数据（键数≈{}）===", keys_30m);
+    eprintln!(
+        "[q18-state] 16GB 预算可容纳键数        = {}（{} 万）{}",
+        cap_by_budget,
+        cap_by_budget / 10_000,
+        if cap_by_budget < keys_30m {
+            "⚠ 早于 2300 万拒收 → 新键语义丢失"
+        } else {
+            ""
+        }
+    );
+    eprintln!(
+        "[q18-state] 30M 真实状态内存估算        = {:.1} GB（按当前每键 {:.0}B 求和）",
+        real_30m_gb, real_per_key
+    );
+    eprintln!(
+        "[q18-state] 紧凑化后预期（Last 变体 16B/度量 + 共享行字段）: 每键 ≈ {:.0} B, 30M ≈ {:.1} GB, 预算/键 ≈ {} B → 拒收阈值 {} 万键",
+        256.0 + 4.0 * 16.0 + 104.0,
+        (256.0 + 4.0 * 16.0 + 104.0) * 23_000_000.0 / 1e9,
+        256 + 4 * 16 + 112,
+        16_000_000_000u64 / (256 + 4 * 16 + 112) / 10_000
     );
 }

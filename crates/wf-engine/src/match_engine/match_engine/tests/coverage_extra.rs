@@ -611,6 +611,8 @@ fn close_is_qualified_and_rate_limit_close_qualifying_modes() {
             window_start_time_nanos: 0,
             window_end_time_nanos: 0,
             last_event_nanos: 0,
+            row_fields: None,
+            row_field_names: None,
         };
     // And mode: needs both event_ok and close_ok.
     assert!(close_is_qualified(&mk(true, true, CloseMode::And, vec![])));
@@ -675,6 +677,8 @@ fn apply_conv_filtered_separates_qualifying_and_appends_rest() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         last_event_nanos: 0,
+        row_fields: None,
+        row_field_names: None,
     };
     // Two qualifying outputs (sorted desc by scope key string) + one non-qualifying.
     let outputs = vec![
@@ -748,6 +752,8 @@ fn conv_apply_sorts_mixed_types_and_dedups_none() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         last_event_nanos: 0,
+        row_fields: None,
+        row_field_names: None,
     };
     let keys = vec![simple_key("k")];
     let plan = ConvPlan {

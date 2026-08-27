@@ -140,6 +140,10 @@ pub async fn run_window_actor(
     let mut next_seq: HashMap<Arc<str>, u64> = HashMap::new();
     // Out-of-order arrivals waiting for their source cursor to catch up.
     let mut pending: BTreeMap<(Arc<str>, u64), WindowMsg> = BTreeMap::new();
+    // This window's actor is now live: subsequent commits happen through this
+    // task, so a rule task flushing at shutdown must wait for its drain before
+    // reading the final state (default `true` covers windows with no actor).
+    win.set_actor_drained(false);
 
     loop {
         tokio::select! {
@@ -149,8 +153,14 @@ pub async fn run_window_actor(
                 // the tail is not dropped, then stop. Messages still in
                 // producer hands at this point are torn down with them (same
                 // semantics as the old commit worker on a cancelled pool).
+                // Per-source seq order is preserved (parked gap batches flush
+                // via the post-loop drain below).
                 while let Ok(msg) = rx.try_recv() {
-                    commit_append(&name, &win, &gate, &fanout, &notify, &report, msg).await;
+                    process_mailbox_msg(
+                        &name, &win, &gate, &fanout, &notify, &report, &mut next_seq,
+                        &mut pending, msg,
+                    )
+                    .await;
                 }
                 break;
             }
@@ -162,60 +172,12 @@ pub async fn run_window_actor(
                         log::warn!("window actor {:?}: mailbox closed (all senders dropped), exiting", name);
                         break;
                     }
-                    Some(mut m) => {
-                        let (source, seq) = match &m {
-                            WindowMsg::Append { source, seq, .. } => (Arc::clone(source), *seq),
-                        };
-                        let cursor = next_seq.entry(Arc::clone(&source)).or_insert(0);
-                        if seq == *cursor {
-                            commit_append(&name, &win, &gate, &fanout, &notify, &report, m).await;
-                            *cursor += 1;
-                            // Drain this source's now-consecutive pending tail.
-                            // The gap never blocked the channel — these
-                            // arrived earlier and parked in `pending`.
-                            while let Some(msg) =
-                                pending.remove(&(Arc::clone(&source), *cursor))
-                            {
-                                commit_append(&name, &win, &gate, &fanout, &notify, &report, msg)
-                                    .await;
-                                *cursor += 1;
-                            }
-                        } else {
-                            if seq < *cursor {
-                                // Stale (already-processed) seq: a duplicate
-                                // delivery, reachable only via the hot-add
-                                // fallback seq in `dispatch_parsed`. Parking
-                                // it would strand the message in `pending`
-                                // forever — the cursor has moved past it, so
-                                // no drain path can ever flush it (a pure
-                                // memory leak). Drop it; dropping also
-                                // releases its budget permits.
-                                log::warn!(
-                                    "window actor {:?}: dropping stale seq {} <= cursor {} (source {:?})",
-                                    name, seq, cursor, source
-                                );
-                                drop(m);
-                                continue;
-                            }
-                            // Future seq for this source: park it (gap or
-                            // cross-source interleaving); keep dequeuing.
-                            // Release the parked message's budget permits
-                            // *before* parking: parse workers dispatch
-                            // concurrently, so arrival order is not seq
-                            // order, and the dispatcher holding the missing
-                            // seq may itself be blocked in
-                            // `acquire_window_budget` waiting for this very
-                            // budget — parking with the permits held is a
-                            // deterministic deadlock whenever a batch (or a
-                            // batch sum in flight) exhausts the budget.
-                            // Parked bytes stay bounded by the parse-side
-                            // in-flight budget instead.
-                            // `WindowMsg` has a single variant, so this
-                            // destructures unconditionally.
-                            let WindowMsg::Append { permits, .. } = &mut m;
-                            permits.clear();
-                            pending.insert((Arc::clone(&source), seq), m);
-                        }
+                    Some(m) => {
+                        process_mailbox_msg(
+                            &name, &win, &gate, &fanout, &notify, &report, &mut next_seq,
+                            &mut pending, m,
+                        )
+                        .await;
                     }
                 }
             }
@@ -248,6 +210,73 @@ pub async fn run_window_actor(
         }
         // Anything still pending sits on a real gap (a lost batch); dropping
         // the messages releases their budget permits.
+    }
+    // Full shutdown drain complete (both the cancel branch and the
+    // mailbox-closed branch land here after the loop): every message the
+    // actor received has been committed or dropped on a real gap. Rule tasks
+    // waiting on `actor_drained` may now flush against the complete tail.
+    win.set_actor_drained(true);
+}
+
+/// Process one mailbox message honoring per-source seq order: commit it if it
+/// is the expected next seq (draining the now-consecutive parked tail), park
+/// it if it is ahead of a gap, drop it if it is stale. Shared by the normal
+/// loop and the shutdown cancel-drain so a cancelled actor commits exactly the
+/// same order as steady-state processing (and the post-loop pending flush can
+/// find the consecutive tail).
+#[allow(clippy::too_many_arguments)]
+async fn process_mailbox_msg(
+    name: &Arc<str>,
+    win: &Arc<Window>,
+    gate: &Arc<EvictionGate>,
+    fanout: &Arc<RuleFanout>,
+    notify: &Arc<Notify>,
+    report: &Option<WindowAppendReport>,
+    next_seq: &mut HashMap<Arc<str>, u64>,
+    pending: &mut BTreeMap<(Arc<str>, u64), WindowMsg>,
+    mut m: WindowMsg,
+) {
+    let (source, seq) = match &m {
+        WindowMsg::Append { source, seq, .. } => (Arc::clone(source), *seq),
+    };
+    let cursor = next_seq.entry(Arc::clone(&source)).or_insert(0);
+    if seq == *cursor {
+        commit_append(name, win, gate, fanout, notify, report, m).await;
+        *cursor += 1;
+        // Drain this source's now-consecutive pending tail. The gap never
+        // blocked the channel — these arrived earlier and parked in `pending`.
+        while let Some(msg) = pending.remove(&(Arc::clone(&source), *cursor)) {
+            commit_append(name, win, gate, fanout, notify, report, msg).await;
+            *cursor += 1;
+        }
+    } else if seq < *cursor {
+        // Stale (already-processed) seq: a duplicate delivery, reachable only
+        // via the hot-add fallback seq in `dispatch_parsed`. Parking it would
+        // strand the message in `pending` forever — the cursor has moved past
+        // it, so no drain path can ever flush it (a pure memory leak). Drop it;
+        // dropping also releases its budget permits.
+        log::warn!(
+            "window actor {:?}: dropping stale seq {} <= cursor {} (source {:?})",
+            name,
+            seq,
+            cursor,
+            source
+        );
+        drop(m);
+    } else {
+        // Future seq for this source: park it (gap or cross-source
+        // interleaving); keep dequeuing. Release the parked message's budget
+        // permits *before* parking: parse workers dispatch concurrently, so
+        // arrival order is not seq order, and the dispatcher holding the
+        // missing seq may itself be blocked in `acquire_window_budget` waiting
+        // for this very budget — parking with the permits held is a
+        // deterministic deadlock whenever a batch (or a batch sum in flight)
+        // exhausts the budget. Parked bytes stay bounded by the parse-side
+        // in-flight budget instead. `WindowMsg` has a single variant, so this
+        // destructures unconditionally.
+        let WindowMsg::Append { permits, .. } = &mut m;
+        permits.clear();
+        pending.insert((Arc::clone(&source), seq), m);
     }
 }
 
@@ -849,7 +878,7 @@ mod tests {
     /// 演变成永久冻结（2026-08-25 线上：q19 30m 墙梯 rules 档 CPU 0% 永久冻结 2min+）。
     #[tokio::test]
     async fn over_budget_park_recovers_once_consumer_catches_up() {
-        use crate::window::{Evictor, EvictionGate, WindowDef, WindowParams, WindowRegistry};
+        use crate::window::{EvictionGate, Evictor, WindowDef, WindowParams, WindowRegistry};
         use std::sync::atomic::AtomicU64;
 
         const PER_BATCH: usize = 64;
@@ -1022,5 +1051,121 @@ mod tests {
         // 未置位 → 停车等待（超时 = 正确：它在等 evictor 通知而非直接放行）。
         assert!(park.await.is_err(), "未置位 force_release → 必须停车等待");
         assert_eq!(win2.next_seq(), 0, "停车期间未 append");
+    }
+
+    // -- shutdown drain ------------------------------------------------------
+
+    /// Graceful-shutdown contract: cancelling the actor commits its queued
+    /// mailbox tail (nothing received is dropped) and flips `actor_drained`
+    /// so rule tasks waiting at shutdown can flush against the complete tail.
+    #[tokio::test]
+    async fn cancel_drain_commits_mailbox_tail_and_marks_drained() {
+        let win = make_window("w");
+        let (tx, cancel) = spawn_actor(Arc::clone(&win)).await;
+        // Actor started → the window reports not drained (give the spawned
+        // task a moment to flip the flag).
+        for _ in 0..100 {
+            if !win.actor_drained() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!win.actor_drained(), "live actor must report not drained");
+
+        // Queue a tail in the mailbox without waiting for it to commit.
+        for seq in 0..4u64 {
+            tx.send(msg("s", seq, seq as i64 * 10_000_000_000, seq as i64))
+                .await
+                .unwrap();
+        }
+        cancel.cancel();
+
+        // Wait for the actor to finish its shutdown drain.
+        for _ in 0..200 {
+            if win.actor_drained() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(win.actor_drained(), "actor must mark the window drained");
+        assert_eq!(
+            appended_values(&win),
+            vec![0, 1, 2, 3],
+            "cancel drain must commit the whole queued mailbox tail"
+        );
+    }
+
+    /// The cancel drain must also flush in-order batches parked in the
+    /// reorder map (a gap filled by the tail of the mailbox): the drained
+    /// flag is only truthful once everything the actor received is committed.
+    #[tokio::test]
+    async fn cancel_drain_flushes_parked_pending_in_order() {
+        let win = make_window("w");
+        let (tx, cancel) = spawn_actor(Arc::clone(&win)).await;
+
+        // seq 1..=3 park while seq 0 is missing.
+        for seq in 1..=3u64 {
+            tx.send(msg("s", seq, seq as i64 * 10_000_000_000, seq as i64))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(win.total_rows(), 0, "cursor pinned by the missing seq 0");
+
+        // Close the gap and cancel before the actor's normal loop can commit
+        // seq 0: whichever path wins, the drain must commit 0..=3 in order.
+        tx.send(msg("s", 0, 0, 0)).await.unwrap();
+        cancel.cancel();
+
+        for _ in 0..200 {
+            if win.actor_drained() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(win.actor_drained(), "actor must mark the window drained");
+        assert_eq!(
+            appended_values(&win),
+            vec![0, 1, 2, 3],
+            "cancel drain must flush parked in-order pending after the gap closes"
+        );
+    }
+
+    /// The mailbox-closed exit path (embedded/test mode, all senders dropped)
+    /// must also mark the window drained — it commits the same pending flush.
+    #[tokio::test]
+    async fn mailbox_close_marks_window_drained() {
+        let win = make_window("w");
+        let (tx, rx) = mpsc::channel::<WindowMsg>(WINDOW_CHANNEL_DEPTH);
+        let cancel = CancellationToken::new();
+        let name: Arc<str> = Arc::from("w");
+        let fanout = RuleFanout::new();
+        let notify = Arc::new(Notify::new());
+        let win2 = Arc::clone(&win);
+        let cancel2 = cancel.clone();
+        let handle = tokio::spawn(async move {
+            run_window_actor(
+                name,
+                win2,
+                Arc::new(EvictionGate::new(usize::MAX)),
+                fanout,
+                notify,
+                rx,
+                cancel2,
+                None,
+            )
+            .await;
+        });
+        for _ in 0..100 {
+            if !win.actor_drained() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!win.actor_drained(), "live actor must report not drained");
+
+        drop(tx); // all senders dropped → actor exits via the channel-closed path
+        handle.await.unwrap();
+        assert!(win.actor_drained(), "channel-closed exit must mark drained");
     }
 }

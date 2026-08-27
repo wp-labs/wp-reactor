@@ -161,6 +161,7 @@ impl Reactor {
                 alert_task::SinkFanout::closed()
             }),
             self.rule_cancel.clone(),
+            self.cancel.clone(),
             self.metrics.clone(),
             self.eos_tx.clone(),
             self.current_config.runtime.rule_parallelism,

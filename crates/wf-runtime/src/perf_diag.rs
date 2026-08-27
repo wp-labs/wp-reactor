@@ -78,7 +78,8 @@ const WF_DIAG_DEFAULT_MEM_FRACTION: f64 = 0.6;
 pub fn init_perf_diag(config: &PerfConfig) {
     *PERF_STAGES.write().expect("perf stages lock poisoned") = config.stages.clone();
     PERF_DIAG_ENABLED.store(true, Ordering::Relaxed);
-    let (cut_rules, cut_output, cut_append, cut_recv, cut_sink_write) = match config.stages.first() {
+    let (cut_rules, cut_output, cut_append, cut_recv, cut_sink_write) = match config.stages.first()
+    {
         Some(stage) => (
             stage.cut_rules,
             stage.cut_output,
@@ -190,7 +191,10 @@ fn diag_mem_cap(config_max: usize, phys: Option<usize>, env: Option<&str>) -> (u
             if let (Ok(p), Some(phys)) = (pct.trim().parse::<f64>(), phys) {
                 return (
                     config_max.max((phys as f64 * p / 100.0) as usize),
-                    format!("{WF_DIAG_MAX_TOTAL_BYTES}={v}（物理 {}）", ByteSize::from(phys)),
+                    format!(
+                        "{WF_DIAG_MAX_TOTAL_BYTES}={v}（物理 {}）",
+                        ByteSize::from(phys)
+                    ),
                 );
             }
         } else if let Ok(size) = v.parse::<ByteSize>() {
@@ -520,7 +524,13 @@ impl PerfDiagController {
         }
         let stage = self.stages.get(target)?.clone();
         // 1. 原子门控翻转（先于 reload——新数据即吃新门控）。
-        set_perf_cuts(stage.cut_rules, stage.cut_output, stage.cut_append, stage.cut_recv, stage.cut_sink_write);
+        set_perf_cuts(
+            stage.cut_rules,
+            stage.cut_output,
+            stage.cut_append,
+            stage.cut_recv,
+            stage.cut_sink_write,
+        );
         // 2. 规则子集变化（非空且不同于基线）→ 触发现有 runtime.rules 热 reload。
         let mut reloaded = false;
         let rules = stage.rules.as_deref().unwrap_or("");
@@ -845,10 +855,18 @@ mod tests {
 
     #[test]
     fn mem_cap_env_bytes_overrides() {
-        let (cap, src) = diag_mem_cap(2 * 1024 * 1024 * 1024, Some(32 * 1024 * 1024 * 1024), Some("8GB"));
+        let (cap, src) = diag_mem_cap(
+            2 * 1024 * 1024 * 1024,
+            Some(32 * 1024 * 1024 * 1024),
+            Some("8GB"),
+        );
         assert_eq!(cap, 8 * 1024 * 1024 * 1024);
         assert!(src.contains("8GB"), "source={src}");
-        let (cap, src) = diag_mem_cap(2 * 1024 * 1024 * 1024, Some(32 * 1024 * 1024 * 1024), Some("4096MB"));
+        let (cap, src) = diag_mem_cap(
+            2 * 1024 * 1024 * 1024,
+            Some(32 * 1024 * 1024 * 1024),
+            Some("4096MB"),
+        );
         assert_eq!(cap, 4 * 1024 * 1024 * 1024);
         assert!(src.contains("4096MB"), "source={src}");
         // 字节大小不需要物理内存探测也能生效。
@@ -882,20 +900,40 @@ mod tests {
 
     #[test]
     fn mem_cap_zero_env_disables_override() {
-        let (cap, src) = diag_mem_cap(2 * 1024 * 1024 * 1024, Some(32 * 1024 * 1024 * 1024), Some("0"));
-        assert_eq!(cap, 2 * 1024 * 1024 * 1024, "WF_DIAG_MAX_TOTAL_BYTES=0 关闭覆盖");
+        let (cap, src) = diag_mem_cap(
+            2 * 1024 * 1024 * 1024,
+            Some(32 * 1024 * 1024 * 1024),
+            Some("0"),
+        );
+        assert_eq!(
+            cap,
+            2 * 1024 * 1024 * 1024,
+            "WF_DIAG_MAX_TOTAL_BYTES=0 关闭覆盖"
+        );
         assert!(src.contains("0"), "source={src}");
-        let (cap, _) = diag_mem_cap(2 * 1024 * 1024 * 1024, Some(32 * 1024 * 1024 * 1024), Some(""));
+        let (cap, _) = diag_mem_cap(
+            2 * 1024 * 1024 * 1024,
+            Some(32 * 1024 * 1024 * 1024),
+            Some(""),
+        );
         assert_eq!(cap, 2 * 1024 * 1024 * 1024);
     }
 
     #[test]
     fn mem_cap_never_reduces_below_config() {
         // 显式给更小的值 → 取 max(配置, 计算值)，诊断只放大不缩小。
-        let (cap, _) = diag_mem_cap(8 * 1024 * 1024 * 1024, Some(32 * 1024 * 1024 * 1024), Some("1GB"));
+        let (cap, _) = diag_mem_cap(
+            8 * 1024 * 1024 * 1024,
+            Some(32 * 1024 * 1024 * 1024),
+            Some("1GB"),
+        );
         assert_eq!(cap, 8 * 1024 * 1024 * 1024);
         // 无法解析的值 → 回退 60% 物理内存。
-        let (cap, _) = diag_mem_cap(2 * 1024 * 1024 * 1024, Some(32 * 1024 * 1024 * 1024), Some("garbage"));
+        let (cap, _) = diag_mem_cap(
+            2 * 1024 * 1024 * 1024,
+            Some(32 * 1024 * 1024 * 1024),
+            Some("garbage"),
+        );
         let phys = (32 * 1024 * 1024 * 1024usize) as f64;
         assert_eq!(cap, (phys * 0.6) as usize);
     }

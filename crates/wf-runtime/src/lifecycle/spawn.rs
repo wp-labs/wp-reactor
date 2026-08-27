@@ -35,7 +35,7 @@ use wf_lang::plan::RulePlan;
 /// alive until the (slow) rule task consumes it. 256 (~3.5s of backlog at the
 /// q5 ingest rate) covers transient pauses without the unbounded-channel RSS
 /// blow-up; raise further only if a *sustained* single-shard skew is observed.
-pub(crate) const RULE_CHANNEL_CAPACITY: usize = 256;
+pub(crate) const RULE_CHANNEL_CAPACITY: usize = 64;
 use wf_lang::ast::FieldRef;
 
 use crate::alert_task;
@@ -382,6 +382,7 @@ pub(super) fn spawn_rule_tasks(
     pipe_registry: std::sync::Arc<wf_engine::pipe::PipeRegistry>,
     sink_fanout: Arc<alert_task::SinkFanout>,
     cancel: CancellationToken,
+    root_cancel: CancellationToken,
     metrics: Option<Arc<RuntimeMetrics>>,
     eos_tx: watch::Sender<u64>,
     shard_count: usize,
@@ -557,9 +558,10 @@ pub(super) fn spawn_rule_tasks(
                             merge_rx: None,
                             merge_tx: None,
                         };
-                        group.push(tokio::spawn(
-                            async move { run_stats_task(task_config).await },
-                        ));
+                        let rc = root_cancel.clone();
+                        group.push(tokio::spawn(async move {
+                            run_stats_task(task_config, rc).await
+                        }));
                     }
                     if use_push {
                         for source in &window_sources {
@@ -619,9 +621,10 @@ pub(super) fn spawn_rule_tasks(
                                 Some(merge_tx.clone())
                             },
                         };
-                        group.push(tokio::spawn(
-                            async move { run_stats_task(task_config).await },
-                        ));
+                        let rc = root_cancel.clone();
+                        group.push(tokio::spawn(async move {
+                            run_stats_task(task_config, rc).await
+                        }));
                     }
                 } else {
                     let push_rx = if use_push {
@@ -656,9 +659,10 @@ pub(super) fn spawn_rule_tasks(
                         merge_rx: None,
                         merge_tx: None,
                     };
-                    group.push(tokio::spawn(
-                        async move { run_stats_task(task_config).await },
-                    ));
+                    let rc = root_cancel.clone();
+                    group.push(tokio::spawn(async move {
+                        run_stats_task(task_config, rc).await
+                    }));
                 }
             }
             RunRuleKind::Each { alias, time_field } => {
@@ -764,8 +768,9 @@ pub(super) fn spawn_rule_tasks(
                             progress: progress.clone(),
                             conv_sink: None,
                         };
+                        let rc = root_cancel.clone();
                         group.push(tokio::spawn(
-                            async move { run_rule_task(task_config).await },
+                            async move { run_rule_task(task_config, rc).await },
                         ));
                     }
                     if wants_push {
@@ -828,8 +833,9 @@ pub(super) fn spawn_rule_tasks(
                         progress: progress.clone(),
                         conv_sink: None,
                     };
+                    let rc = root_cancel.clone();
                     group.push(tokio::spawn(
-                        async move { run_rule_task(task_config).await },
+                        async move { run_rule_task(task_config, rc).await },
                     ));
                 }
             }
@@ -964,8 +970,9 @@ pub(super) fn spawn_rule_tasks(
                             progress: progress.clone(),
                             conv_sink,
                         };
+                        let rc = root_cancel.clone();
                         group.push(tokio::spawn(
-                            async move { run_rule_task(task_config).await },
+                            async move { run_rule_task(task_config, rc).await },
                         ));
                     }
                     if use_push {
@@ -1012,8 +1019,9 @@ pub(super) fn spawn_rule_tasks(
                         progress: progress.clone(),
                         conv_sink: None,
                     };
+                    let rc = root_cancel.clone();
                     group.push(tokio::spawn(
-                        async move { run_rule_task(task_config).await },
+                        async move { run_rule_task(task_config, rc).await },
                     ));
                 }
             }

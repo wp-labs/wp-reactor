@@ -305,6 +305,27 @@ async fn dispatch_batch(
     }
 }
 
+/// 哨兵批判定：测量协议（档位切换 + EPS）的落盘豁免唯一依据是**批次目标**
+/// （`AlertColumnBatch::target()` = 窗口名 `__wf_sentinel`），与 sink 名无关。
+///
+/// 历史教训：旧判定按 sink 名（`sentinel_out`）匹配，哨兵记录实际经名不同的
+/// sink 写出 → 匹配失败 → cut_sink_write 档把哨兵切掉 → wfgen 等哨兵超时 →
+/// 7 档墙梯假死。改为按批次目标判定后，哨兵批无论经哪个 sink 都稳定豁免。
+/// 哨兵批判定：测量协议（档位切换 + EPS）的落盘豁免唯一依据是**批次目标**
+/// （`AlertColumnBatch::target()` = 窗口名 `__wf_sentinel`），与 sink 名无关。
+///
+/// 历史教训：旧判定按 sink 名（`sentinel_out`）匹配，哨兵记录实际经名不同的
+/// sink 写出 → 匹配失败 → cut_sink_write 档把哨兵切掉 → wfgen 等哨兵超时 →
+/// 7 档墙梯假死。改为按批次目标判定后，哨兵批无论经哪个 sink 都稳定豁免。
+pub fn is_sentinel_batch(batch: &AlertBatch) -> bool {
+    match batch {
+        AlertBatch::Columns(cols) => {
+            cols.target().as_ref() == crate::perf_diag::PERF_SENTINEL_WINDOW
+        }
+        AlertBatch::Rows(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,7 +339,9 @@ mod tests {
     #[test]
     fn sentinel_columns_batch_is_exempt() {
         // 哨兵批必须豁免 cut_sink_write（驱动档位切换 + EPS 落盘）。
-        assert!(is_sentinel_batch(&columns_batch(crate::perf_diag::PERF_SENTINEL_WINDOW)));
+        assert!(is_sentinel_batch(&columns_batch(
+            crate::perf_diag::PERF_SENTINEL_WINDOW
+        )));
     }
 
     #[test]
@@ -333,20 +356,5 @@ mod tests {
         // 行式批不携带 target：cut_sink_write 下一律切（升级/测试路径，非 emit 主链）。
         let rows = AlertBatch::Rows(Arc::new(Vec::new()));
         assert!(!is_sentinel_batch(&rows));
-    }
-}
-
-/// 哨兵批判定：测量协议（档位切换 + EPS）的落盘豁免唯一依据是**批次目标**
-/// （`AlertColumnBatch::target()` = 窗口名 `__wf_sentinel`），与 sink 名无关。
-///
-/// 历史教训：旧判定按 sink 名（`sentinel_out`）匹配，哨兵记录实际经名不同的
-/// sink 写出 → 匹配失败 → cut_sink_write 档把哨兵切掉 → wfgen 等哨兵超时 →
-/// 7 档墙梯假死。改为按批次目标判定后，哨兵批无论经哪个 sink 都稳定豁免。
-pub fn is_sentinel_batch(batch: &AlertBatch) -> bool {
-    match batch {
-        AlertBatch::Columns(cols) => {
-            cols.target().as_ref() == crate::perf_diag::PERF_SENTINEL_WINDOW
-        }
-        AlertBatch::Rows(_) => false,
     }
 }

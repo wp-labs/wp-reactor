@@ -244,6 +244,7 @@ async fn spawn_rule_tasks_stats_non_field_key_shard_filter() {
         Arc::new(wf_engine::pipe::PipeRegistry::new()),
         SinkFanout::closed(),
         cancel.clone(),
+        cancel.clone(),
         None,
         eos_tx,
         2,
@@ -329,6 +330,7 @@ async fn spawn_rule_tasks_push_mode_all_kinds() {
         &HashSet::new(),
         Arc::new(wf_engine::pipe::PipeRegistry::new()),
         SinkFanout::closed(),
+        cancel.clone(),
         cancel.clone(),
         None,
         eos_tx,
@@ -687,8 +689,8 @@ async fn final_metrics_export_captures_multiple_rules() {
 /// 聚合消费的 intermediate target 都必须命中；可交换 stats 与 each 下游不命中。
 #[test]
 fn collect_order_sensitive_targets_covers_match_and_last_top_stats() {
-    use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan};
     use wf_lang::ast::{Expr, FieldRef};
+    use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan};
 
     let intermediate = HashSet::from(["mid".to_string(), "other_mid".to_string()]);
 

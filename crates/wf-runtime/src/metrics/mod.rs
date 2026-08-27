@@ -352,12 +352,7 @@ impl MetricsSnapshot {
             "",
             self.alert_escalate_failed,
         ));
-        out.push(metric(
-            "alert",
-            "append_nanos",
-            "",
-            self.alert_append_nanos,
-        ));
+        out.push(metric("alert", "append_nanos", "", self.alert_append_nanos));
         for (rule, v) in &self.rule_events {
             out.push(metric("rule", "events_total", rule, *v));
         }
@@ -1344,8 +1339,7 @@ impl RuntimeMetrics {
     /// in the rule workers' emit path（worker 侧输出构建; 与 sink 侧序列化区分,
     /// per-run counter, drained each export interval）。
     pub fn add_alert_append_nanos(&self, nanos: u64) {
-        self.alert_append_nanos
-            .fetch_add(nanos, Ordering::Relaxed);
+        self.alert_append_nanos.fetch_add(nanos, Ordering::Relaxed);
     }
 
     pub fn inc_alert_dispatch(&self) {

@@ -191,7 +191,7 @@ fn build_wfx_id_iter<'a>(
 #[cfg(test)]
 mod split_tests {
     use super::*;
-    use crate::match_engine::match_engine::{CloseReason, StepData, EngineHashMap};
+    use crate::match_engine::match_engine::{CloseReason, EngineHashMap, StepData};
 
     /// `build_wfx_id_split` 必须与「先 combine 再 build_wfx_id」字节一致。
     #[test]
@@ -259,32 +259,42 @@ mod split_tests {
         let steps: Vec<StepData> = (0..10).map(|i| mk(i as f64 * 1.5, 100 + i)).collect();
         let mut cache = None::<WfxPrefixCache>;
         for sd in &steps {
-            let expected = build_wfx_id_split(rule, &scope, fired, &[], std::slice::from_ref(sd), &origin);
+            let expected =
+                build_wfx_id_split(rule, &scope, fired, &[], std::slice::from_ref(sd), &origin);
             let got = match &cache {
-                Some(c)
-                    if c.prefix_matches(
-                        &scope,
-                        fired,
-                        &[],
-                        std::slice::from_ref(sd),
-                    ) =>
-                {
+                Some(c) if c.prefix_matches(&scope, fired, &[], std::slice::from_ref(sd)) => {
                     c.finish(&[], std::slice::from_ref(sd), &origin)
                 }
                 _ => {
-                    let c = WfxPrefixCache::build(rule, &scope, fired, &[], std::slice::from_ref(sd));
+                    let c =
+                        WfxPrefixCache::build(rule, &scope, fired, &[], std::slice::from_ref(sd));
                     let id = c.finish(&[], std::slice::from_ref(sd), &origin);
                     cache = Some(c);
                     id
                 }
             };
-            assert_eq!(got, expected, "前缀缓存 wfx_id 必须与 split 一致 (price={})", sd.measure_value);
+            assert_eq!(
+                got, expected,
+                "前缀缓存 wfx_id 必须与 split 一致 (price={})",
+                sd.measure_value
+            );
         }
         // 换桶（scope_key 不同）→ 前缀不匹配 → 重建。
         let scope2 = vec![Value::Number(99.0)];
         let sd = mk(3.0, 7);
-        let expected = build_wfx_id_split(rule, &scope2, fired, &[], std::slice::from_ref(&sd), &origin);
-        assert!(!cache.unwrap().prefix_matches(&scope2, fired, &[], std::slice::from_ref(&sd)));
+        let expected = build_wfx_id_split(
+            rule,
+            &scope2,
+            fired,
+            &[],
+            std::slice::from_ref(&sd),
+            &origin,
+        );
+        assert!(
+            !cache
+                .unwrap()
+                .prefix_matches(&scope2, fired, &[], std::slice::from_ref(&sd))
+        );
         let c = WfxPrefixCache::build(rule, &scope2, fired, &[], std::slice::from_ref(&sd));
         assert_eq!(c.finish(&[], std::slice::from_ref(&sd), &origin), expected);
     }
@@ -331,26 +341,26 @@ mod split_tests {
             format!("id-{}", n)
         };
         // 首次 → 计算。
-        let a1 = cache.get_or(&key_a, || f());
+        let a1 = cache.get_or(&key_a, f);
         assert_eq!(a1, "id-1");
         assert_eq!(calls.get(), 1);
         // 同 key → 复用（f 不调用）。
-        let a2 = cache.get_or(&key_a, || f());
+        let a2 = cache.get_or(&key_a, f);
         assert_eq!(a2, "id-1");
         assert_eq!(calls.get(), 1, "同 key 不应重新计算");
         // 异 key → 重算。
-        let b1 = cache.get_or(&key_b, || f());
+        let b1 = cache.get_or(&key_b, f);
         assert_eq!(b1, "id-2");
         assert_eq!(calls.get(), 2);
         // 切回 key_a → 重算（缓存只保留最近一个）。
-        let a3 = cache.get_or(&key_a, || f());
+        let a3 = cache.get_or(&key_a, f);
         assert_eq!(a3, "id-3");
         assert_eq!(calls.get(), 3);
         // 空 key。
         let empty: [Value; 0] = [];
-        let e1 = cache.get_or(&empty, || f());
+        let e1 = cache.get_or(&empty, f);
         assert_eq!(e1, "id-4");
-        let e2 = cache.get_or(&empty, || f());
+        let e2 = cache.get_or(&empty, f);
         assert_eq!(e2, "id-4");
         assert_eq!(calls.get(), 4, "空 key 同值也应复用");
     }
@@ -360,11 +370,7 @@ mod split_tests {
     #[test]
     fn origin_arcs_match_as_str() {
         let arcs = OriginArcs::new();
-        for reason in [
-            CloseReason::Timeout,
-            CloseReason::Flush,
-            CloseReason::Eos,
-        ] {
+        for reason in [CloseReason::Timeout, CloseReason::Flush, CloseReason::Eos] {
             let origin = AlertOrigin::Close { reason };
             assert_eq!(&**arcs.origin(reason), origin.as_str(), "origin {reason:?}");
             assert_eq!(
@@ -612,7 +618,6 @@ fn hex_encode_smol(bytes: &[u8]) -> smol_str::SmolStr {
 /// entity_id 连续缓存（P6, 2026-08-26，通用）: 相邻输出（close/match/each）
 /// 同 scope_key 时复用 entity_id 字符串——免每行一次字段 resolve +
 /// value_to_string。q19 每桶 top-10 条 / q6 同 key 多 match 命中率高。
-
 pub(crate) struct EntityIdCache {
     key: Vec<Value>,
     id: String,
@@ -659,9 +664,24 @@ pub(crate) struct OriginArcs {
 impl OriginArcs {
     pub(crate) fn new() -> Self {
         Self {
-            timeout: Arc::from(AlertOrigin::Close { reason: CloseReason::Timeout }.as_str()),
-            flush: Arc::from(AlertOrigin::Close { reason: CloseReason::Flush }.as_str()),
-            eos: Arc::from(AlertOrigin::Close { reason: CloseReason::Eos }.as_str()),
+            timeout: Arc::from(
+                AlertOrigin::Close {
+                    reason: CloseReason::Timeout,
+                }
+                .as_str(),
+            ),
+            flush: Arc::from(
+                AlertOrigin::Close {
+                    reason: CloseReason::Flush,
+                }
+                .as_str(),
+            ),
+            eos: Arc::from(
+                AlertOrigin::Close {
+                    reason: CloseReason::Eos,
+                }
+                .as_str(),
+            ),
             timeout_reason: Arc::from(CloseReason::Timeout.as_str()),
             flush_reason: Arc::from(CloseReason::Flush.as_str()),
             eos_reason: Arc::from(CloseReason::Eos.as_str()),
@@ -719,6 +739,86 @@ pub(super) fn build_summary_split(
         event_step_data.iter().chain(close_step_data.iter()),
         origin,
     )
+}
+
+/// (label, measure_value) 迭代器版 build_wfx_id（2026-08-26 q18 stats 直写）:
+/// 免构造 StepData（每桶 4 个 label String + 结构 ≈ 4G 分配, allocator 保留
+/// 致 RSS 虚高）。字节流 = `build_wfx_id_iter`（测试 `wfx_from_labels_matches`）。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_wfx_id_from_labels<'a>(
+    rule_name: &str,
+    scope_key: &[Value],
+    fired_at: &str,
+    steps: impl Iterator<Item = (Option<&'a str>, f64)>,
+    origin: &AlertOrigin,
+) -> String {
+    let mut hasher = Fnv1a::new();
+    hasher.update(rule_name.as_bytes());
+    hasher.update(b"\x00");
+    for v in scope_key {
+        hash_value_bytes(&mut hasher, v);
+        hasher.update(b"\x1f");
+    }
+    hasher.update(b"\x00");
+    hasher.update(fired_at.as_bytes());
+    hasher.update(b"\x00");
+    for (label, measure) in steps {
+        if let Some(label) = label {
+            hasher.update(label.as_bytes());
+        }
+        hasher.update(b"\x1e");
+        hasher.update(&measure.to_bits().to_le_bytes());
+        hasher.update(b"\x1f");
+    }
+    hasher.update(b"\x00");
+    hasher.update(origin.as_str().as_bytes());
+    hex_encode(&hasher.finalize().to_le_bytes())
+}
+
+/// (label, measure_value) 迭代器版 build_summary（2026-08-26 q18 stats 直写）。
+/// 字节流 = `build_summary_iter`（step 段: 有 label 则 `label=measure; `,
+/// 无 label 则 `step{i}=measure; `——由调用方保证 label 迭代器含 None 槽位,
+/// 顺序与索引一致）。
+pub(super) fn build_summary_from_labels<'a>(
+    rule_name: &str,
+    keys: &[FieldRef],
+    scope_key: &[Value],
+    steps: impl Iterator<Item = (Option<&'a str>, f64)>,
+    origin: &AlertOrigin,
+) -> String {
+    use std::fmt::Write as _;
+    let steps_vec: Vec<(Option<&str>, f64)> = steps.collect();
+    let mut out = String::with_capacity(64 + scope_key.len() * 12 + steps_vec.len() * 16);
+    let _ = write!(out, "rule={}; ", rule_name);
+    if scope_key.is_empty() {
+        out.push_str("scope=global; ");
+    } else {
+        out.push_str("scope=[");
+        for (i, (fr, val)) in keys.iter().zip(scope_key.iter()).enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{}={}", field_ref_name(fr), value_to_string(val));
+        }
+        out.push_str("]; ");
+    }
+    for (i, (label, measure)) in steps_vec.iter().enumerate() {
+        match label {
+            Some(label) => {
+                out.push_str(label);
+                out.push('=');
+                write_fixed1(&mut out, *measure);
+                out.push_str("; ");
+            }
+            None => {
+                let _ = write!(out, "step{}=", i);
+                write_fixed1(&mut out, *measure);
+                out.push_str("; ");
+            }
+        }
+    }
+    let _ = write!(out, "origin={}", origin.as_str());
+    out
 }
 
 fn build_summary_iter<'a>(

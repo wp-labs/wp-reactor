@@ -6,6 +6,10 @@ mod close_exec;
 mod context;
 #[cfg(test)]
 pub(crate) use context::{build_eval_context, execute_joins};
+#[cfg(test)]
+pub(crate) use context::{enrich_join_row, enrich_join_row_bare, in_interval, row_matches_conds};
+#[cfg(test)]
+pub(crate) use deferred_exec::select_reduce_row;
 mod deferred_exec;
 pub use deferred_exec::DeferredPending;
 mod each_exec;
@@ -15,7 +19,10 @@ mod stats_exec;
 
 pub use each_exec::{EachDirectBatchStats, PipeEachRow, PipeRowSink};
 // 供 `match_engine::pub use executor::DistinctKey` 转发（stats distinct 键类型）。
-pub use stats_exec::{DistinctKey, StatsAccum, StatsExecutor, StatsWindowState};
+pub use stats_exec::{
+    DistinctKey, DistinctSet, RowFieldLayout, RowFields, StatsAccum, StatsCloseBucket,
+    StatsExecutor, StatsWindowState,
+};
 
 #[cfg(test)]
 mod close_coverage_more;
@@ -865,6 +872,14 @@ impl RuleExecutor {
         &self.output_static().yield_target
     }
 
+    /// close ctx 是否 All（保守全字段构建——L3 聚合/窗口访问表达式用）。
+    /// stats close 据此决定行字段注入方式（Named 窄化下多 last 度量共享同一
+    /// [`RowFields`] Arc, 只需首个度量注入; All 下每度量独立注入, 保
+    /// `_step_i_field_*` 完整性）。
+    pub fn close_ctx_is_all(&self) -> bool {
+        matches!(self.close_ctx_fields, CloseCtxFields::All)
+    }
+
     pub(crate) fn output_config(&self) -> &OutputConfig {
         &self.output
     }
@@ -1183,9 +1198,7 @@ pub(crate) fn collect_general_plain_fields(expr: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::InList {
-            expr: inner,
-            list,
-            ..
+            expr: inner, list, ..
         } => {
             collect_general_plain_fields(inner, out);
             for item in list {
@@ -1238,9 +1251,7 @@ pub(crate) fn yield_general_columnar_safe(expr: &Expr) -> bool {
         Expr::Neg(inner) | Expr::Not(inner) => yield_general_columnar_safe(inner),
         Expr::Array(items) => items.iter().all(yield_general_columnar_safe),
         Expr::InList {
-            expr: inner,
-            list,
-            ..
+            expr: inner, list, ..
         } => yield_general_columnar_safe(inner) && list.iter().all(yield_general_columnar_safe),
         Expr::IfThenElse {
             cond,
@@ -1251,7 +1262,9 @@ pub(crate) fn yield_general_columnar_safe(expr: &Expr) -> bool {
                 && yield_general_columnar_safe(then_expr)
                 && yield_general_columnar_safe(else_expr)
         }
-        Expr::Object(items) => items.iter().all(|it| yield_general_columnar_safe(&it.value)),
+        Expr::Object(items) => items
+            .iter()
+            .all(|it| yield_general_columnar_safe(&it.value)),
         Expr::FuncCall { args, .. } => args.iter().all(yield_general_columnar_safe),
         // Number/StringLit/Bool/SystemVar/WfuMeta/PresetParam: 读字面量/
         // YieldMeta/参数体, 无 ctx 字段访问。

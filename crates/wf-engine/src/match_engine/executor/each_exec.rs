@@ -25,11 +25,11 @@ use crate::match_engine::match_engine::{
 
 use super::RuleExecutor;
 use super::YieldKind;
-use super::close_exec::CloseBatchVecs;
 use super::alert::{
     EachWfxPrefix, build_each_wfx_id, build_each_wfx_id_reusing, format_nanos_utc, now_nanos,
     write_int64_value,
 };
+use super::close_exec::CloseBatchVecs;
 use super::context::execute_joins;
 use super::eval::{
     YieldMeta, eval_bool_expr, eval_entity_id, eval_expr_with_l3, eval_score,
@@ -706,8 +706,8 @@ impl RuleExecutor {
         // let）；Field yield 引用 let 变量 → 拒绝（列式字段读无 let 视图）。
         let let_names: std::collections::HashSet<&str> =
             self.plan.lets.iter().map(|l| l.name.as_str()).collect();
-        if !self.plan.lets.is_empty() {
-            if !self.live_joins.is_empty()
+        if !self.plan.lets.is_empty()
+            && (!self.live_joins.is_empty()
                 || !self.plan.lets.iter().all(|l| {
                     wf_lang::columnar::expr_is_columnar(&l.expr)
                         || wf_lang::columnar::columnar_output_expr(&l.expr)
@@ -724,11 +724,12 @@ impl RuleExecutor {
                 || expr_refs_let(&self.plan.score_plan.expr, &let_names)
                 || expr_refs_let(&self.plan.entity_plan.entity_id_expr, &let_names)
                 || !self.plan.binds.iter().all(|b| {
-                    b.filter.as_ref().is_none_or(|f| !expr_refs_let(f, &let_names))
-                })
-            {
-                return false;
-            }
+                    b.filter
+                        .as_ref()
+                        .is_none_or(|f| !expr_refs_let(f, &let_names))
+                }))
+        {
+            return false;
         }
         // 无活 join：形状检查走无 join 列式路径（后置 where 列式不执行——bind
         // filter 已下推为事件过滤，plan.r#where 非空 → 回退行式）。单活 join：
@@ -933,9 +934,12 @@ impl RuleExecutor {
             };
         }
         CloseBatchVecs {
-            general_cvecs: self.compile_general_slots(&ref_fields, n, |row, name| {
-                rows[row].0.fields.get(name).cloned()
-            }, &self.plan.lets),
+            general_cvecs: self.compile_general_slots(
+                &ref_fields,
+                n,
+                |row, name| rows[row].0.fields.get(name).cloned(),
+                &self.plan.lets,
+            ),
         }
     }
 
@@ -2145,7 +2149,9 @@ impl RuleExecutor {
                             EntityCol::Generic => match entity_left_idx
                                 .and_then(|eidx| event.value_at(eidx))
                             {
-                                Some(v) => (smol_str::SmolStr::from(value_to_string(&v)), Some(v), None),
+                                Some(v) => {
+                                    (smol_str::SmolStr::from(value_to_string(&v)), Some(v), None)
+                                }
                                 None => (smol_str::SmolStr::new(""), None, None),
                             },
                         }
@@ -2186,7 +2192,8 @@ impl RuleExecutor {
                             // entity 同一左列（q13b：id=m.bidder == entity bidder）
                             // 且目标数字类型 → stage 原始 f64 直接写，跳过每行
                             // `value_at` + Value 构造 + coerce 中转。
-                            if let (Some(FieldSrc::Left(yf)), Some(FieldSrc::Left(ef))) = (&src, &entity_src)
+                            if let (Some(FieldSrc::Left(yf)), Some(FieldSrc::Left(ef))) =
+                                (&src, &entity_src)
                                 && yf == ef
                                 && let Some(n) = entity_f64
                                 && is_numeric_yield_type(field_type.as_ref())
@@ -2449,6 +2456,87 @@ impl RuleExecutor {
         }))
     }
 
+    /// 中间窗轻量 build 就绪（2026-08-26 q4a deferred 轻量化）：yield 表达式
+    /// **不引用任何 `__wfu_*` meta**——light `YieldMeta`（[`Self::each_yield_meta_light`]，
+    /// q13a pipe 路径同款）里 `wfx_id`/`origin`/`fired_at`/`emit_time`/`summary`
+    /// 是空槽，yield 若引用会拿到空值（静默变值）；不引用则空槽不可观测。
+    /// `SystemVar` 全部由 light meta 提供真值（score/event times/emit_time_nanos），
+    /// 无需排除。命中 → [`Self::build_each_alert_pipe`] 跳过告警字段构建。
+    pub fn pipe_light_build_ready(&self) -> bool {
+        self.plan
+            .yield_plan
+            .fields
+            .iter()
+            .all(|f| !expr_references_wfu_meta(&f.value))
+    }
+
+    /// 中间窗轻量 build（2026-08-26 q4a deferred）：跳过 sink 才需要的告警字段
+    /// 构建——`wfx_id` 哈希+hex（`build_each_wfx_id`）、`fired_at` ISO8601 格式化
+    /// （`format_nanos_utc`）、`machine_id` 提取——中间窗消费者（stats/列式 join）
+    /// 按列读，不需要这些。yield 表达式由 [`Self::pipe_light_build_ready`] 保证
+    /// 不引用空槽 meta。产出与全量 build 的 yield_fields/meta/event_time 逐位一致
+    /// （对拍测试锁）。
+    pub fn build_each_alert_pipe(
+        &self,
+        ctx: &Event,
+        event_time_nanos: i64,
+    ) -> CoreResult<Option<OutputRecord>> {
+        debug_assert!(self.pipe_light_build_ready());
+        let statics = self.output_static();
+        let score = eval_score(&self.plan.score_plan.expr, ctx)?;
+        let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
+        let yield_meta = self.each_yield_meta_light(&entity_id, score, event_time_nanos);
+        let yield_fields = with_yield_eval_scope(|| {
+            // 与 build_each_alert_with 完全相同的求值/coerce 矩阵（对拍契约）。
+            self.plan
+                .yield_plan
+                .fields
+                .iter()
+                .zip(statics.yield_specs.iter())
+                .map(|(field, (name, field_type))| {
+                    let Some(value) = eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
+                    else {
+                        return Err(orion_error::StructError::from(CoreReason::RuleExec)
+                            .with_detail(format!(
+                                "on each yield field {:?} expression evaluated to None",
+                                field.name
+                            )));
+                    };
+                    let Some(value) = RuleExecutor::coerce_yield_field_value_with(
+                        name,
+                        field_type.as_ref(),
+                        value,
+                    )?
+                    else {
+                        // Optional input field was missing → omit it from the
+                        // output record (wp-labs/warp-fusion#62).
+                        return Ok(None);
+                    };
+                    Ok(Some((Arc::clone(name), value)))
+                })
+                .filter_map(Result::transpose)
+                .collect::<CoreResult<Vec<_>>>()
+        })?;
+        Ok(Some(OutputRecord {
+            wfx_id: String::new(),
+            rule_name: Arc::clone(&statics.rule_name),
+            score,
+            entity_type: Arc::clone(&statics.entity_type),
+            entity_id,
+            origin: AlertOrigin::Deferred,
+            fired_at: String::new(),
+            emit_time: Arc::from(""),
+            matched_rows: vec![],
+            summary: Arc::from(""),
+            yield_target: Arc::clone(&statics.yield_target),
+            yield_fields,
+            yield_field_types: Arc::clone(&statics.yield_field_types),
+            event_time_nanos,
+            machine_id: Arc::from(""),
+            scope_key: Arc::from(""),
+        }))
+    }
+
     /// The `YieldMeta` for an `on each` output — shared by the record path
     /// ([`Self::build_each_alert`]) and the direct-write path
     /// ([`Self::execute_each_direct`]) so both evaluate yield expressions
@@ -2534,6 +2622,44 @@ fn passes_each_filter(filter: Option<&wf_lang::ast::Expr>, event: &Event) -> boo
     match filter.and_then(|expr| eval_bool_expr(expr, event)) {
         Some(result) => result,
         None => filter.is_none(),
+    }
+}
+
+/// yield 表达式是否引用任何 `__wfu_*` meta（2026-08-26 q4a 中间窗轻量化）：
+/// 引用 → 回退全量 build（light YieldMeta 的空槽不可观测性不成立）。
+/// `SystemVar` 由 light meta 提供真值，不视为引用。
+fn expr_references_wfu_meta(expr: &wf_lang::ast::Expr) -> bool {
+    use wf_lang::ast::Expr;
+    match expr {
+        Expr::WfuMeta(_) => true,
+        Expr::Number(_)
+        | Expr::StringLit(_)
+        | Expr::Bool(_)
+        | Expr::SystemVar(_)
+        | Expr::Field(_)
+        | Expr::PresetParam(_) => false,
+        Expr::Neg(e) | Expr::Not(e) => expr_references_wfu_meta(e),
+        Expr::BinOp { left, right, .. } => {
+            expr_references_wfu_meta(left) || expr_references_wfu_meta(right)
+        }
+        Expr::FuncCall { args, .. } => args.iter().any(expr_references_wfu_meta),
+        Expr::Object(items) => items.iter().any(|i| expr_references_wfu_meta(&i.value)),
+        Expr::Array(items) => items.iter().any(expr_references_wfu_meta),
+        Expr::InList { expr, list, .. } => {
+            expr_references_wfu_meta(expr) || list.iter().any(expr_references_wfu_meta)
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            expr_references_wfu_meta(cond)
+                || expr_references_wfu_meta(then_expr)
+                || expr_references_wfu_meta(else_expr)
+        }
+        // 保守兜底：未知变体（non_exhaustive）→ 回退全量 build。
+        _ => true,
     }
 }
 
@@ -2809,9 +2935,7 @@ fn expr_refs_let(expr: &Expr, let_names: &std::collections::HashSet<&str>) -> bo
         Expr::Neg(inner) | Expr::Not(inner) => expr_refs_let(inner, let_names),
         Expr::Array(items) => items.iter().any(|i| expr_refs_let(i, let_names)),
         Expr::InList {
-            expr: inner,
-            list,
-            ..
+            expr: inner, list, ..
         } => expr_refs_let(inner, let_names) || list.iter().any(|i| expr_refs_let(i, let_names)),
         Expr::IfThenElse {
             cond,

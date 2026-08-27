@@ -643,8 +643,7 @@ mod tests {
         let step_nanos = 2_000_000_000i64;
         let over_nanos = 10_000_000_000i64;
         // Retained span = over + watermark delay (test_config: 5s).
-        let expected_batches_per_window =
-            ((over_nanos + 5_000_000_000i64) / step_nanos) as usize;
+        let expected_batches_per_window = ((over_nanos + 5_000_000_000i64) / step_nanos) as usize;
 
         let total_iterations = 2000;
         let mut memory_samples: Vec<usize> = Vec::new();
@@ -1293,10 +1292,7 @@ mod tests {
         let evictor = Evictor::new(Arc::clone(&gate));
 
         evictor.run_once(&reg, 0);
-        assert!(
-            !gate.force_release(),
-            "pressure 首轮 → 仅开始计时，不放行"
-        );
+        assert!(!gate.force_release(), "pressure 首轮 → 仅开始计时，不放行");
 
         std::thread::sleep(Duration::from_millis(80));
         evictor.run_once(&reg, 0);

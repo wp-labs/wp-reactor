@@ -246,6 +246,8 @@ fn close_output(
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         last_event_nanos: 123,
+        row_fields: None,
+        row_field_names: None,
     }
 }
 
@@ -339,8 +341,25 @@ impl WindowLookup for RowsLookup {
                 .collect(),
         )
     }
-    fn asof_candidates(&self, _w: &str, _kf: &str, _k: &Value) -> Option<Vec<(i64, JoinRow)>> {
-        Some(self.ts_rows.clone())
+    fn asof_candidates(
+        &self,
+        _w: &str,
+        key_field: &str,
+        key: &Value,
+    ) -> Option<Vec<(i64, JoinRow)>> {
+        // 契约（types.rs asof_candidates 文档）：候选 = key_field == key 的行。
+        // 2026-08-26 q4a 条件复核冗余跳过后，测试 lookup 必须遵守该契约
+        //（否则错误 key 的行会绕过复核被 reduce 选中）。
+        Some(
+            self.ts_rows
+                .iter()
+                .filter(|(_, row)| {
+                    row.field_value(key_field)
+                        .is_some_and(|v| crate::match_engine::values_equal(&v, key))
+                })
+                .cloned()
+                .collect(),
+        )
     }
     fn asof_lookup_max(
         &self,
@@ -1218,6 +1237,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
         &step_plans,
         None,
         &all,
+        None,
     );
     assert_eq!(ctx.fields.get("sip"), Some(&str_val("10.0.0.1")));
     assert_eq!(ctx.fields.get("dport"), Some(&num(443.0)));
@@ -1248,6 +1268,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
         &[&StepPlan { branches: vec![] }],
         None,
         &all,
+        None,
     );
     assert_eq!(ctx.fields.get("sip"), Some(&str_val("10.0.0.1")));
     assert_eq!(ctx.fields.get("_step_0_measure"), Some(&num(99.0)));
@@ -1262,6 +1283,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
         &[&StepPlan { branches: vec![] }],
         Some(&trigger),
         &all,
+        None,
     );
     assert_eq!(ctx.fields.get("sip"), Some(&str_val("10.0.0.1")));
     assert_eq!(ctx.fields.get("raw"), Some(&num(7.0)));
@@ -1276,6 +1298,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
         &step_plans,
         None,
         &named,
+        None,
     );
     assert_eq!(ctx.fields.get("price"), Some(&num(3.0)));
     assert!(!ctx.fields.contains_key("login"), "label not requested");
@@ -1301,6 +1324,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
         &[],
         None,
         &all,
+        None,
     );
     assert_eq!(ctx.fields.get("_bind_win_count"), Some(&num(2.0)));
     assert_eq!(
@@ -1309,7 +1333,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
     );
     assert_eq!(ctx.fields.get("amount"), Some(&num(20.0)));
     let named = CloseCtxFields::Named(HashSet::from(["amount".to_string()]));
-    let ctx = build_eval_context(&keys, &scope_key, &[], &[bd], &[], None, &named);
+    let ctx = build_eval_context(&keys, &scope_key, &[], &[bd], &[], None, &named, None);
     assert_eq!(ctx.fields.get("amount"), Some(&num(20.0)));
     assert!(!ctx.fields.contains_key("_bind_win_count"));
 }
@@ -2602,7 +2626,10 @@ fn each_pipe_columnar_safe_gate_branches() {
         name: "mod_key".into(),
         value: Expr::BinOp {
             op: BinOp::Mod,
-            left: Box::new(Expr::Field(FieldRef::Qualified("b".into(), "auction".into()))),
+            left: Box::new(Expr::Field(FieldRef::Qualified(
+                "b".into(),
+                "auction".into(),
+            ))),
             right: Box::new(Expr::Number(10000.0)),
         },
     }];
@@ -3357,14 +3384,18 @@ fn each_columnar_output_funcs_match_row_path() {
             ("dots".into(), FieldType::Base(BaseType::Digit)),
         ]),
     );
-    assert!(exec.each_plan_columnar_safe(), "fmt/strftime/count_char yield 应列式");
+    assert!(
+        exec.each_plan_columnar_safe(),
+        "fmt/strftime/count_char yield 应列式"
+    );
 
     let t = 1_700_000_000_000_000_000i64;
     let events = crate::match_engine::event_bridge::batch_to_events(&batch);
     let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
     let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app_row = Vec::new();
-    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
     assert_eq!(sr.appended, 3);
     let out_row: Vec<_> = b_row
         .finish()
@@ -3410,7 +3441,11 @@ fn each_columnar_output_funcs_match_row_path() {
 /// 越界 → 空串）。
 #[test]
 fn each_columnar_q22_split_mvindex_concat_matches_row_path() {
-    let schema = Arc::new(Schema::new(vec![ArrowField::new("url", DataType::Utf8, true)]));
+    let schema = Arc::new(Schema::new(vec![ArrowField::new(
+        "url",
+        DataType::Utf8,
+        true,
+    )]));
     let batch = RecordBatch::try_new(
         schema,
         vec![Arc::new(StringArray::from(vec![
@@ -3448,7 +3483,10 @@ fn each_columnar_q22_split_mvindex_concat_matches_row_path() {
     let mvindex = |idx: f64| Expr::FuncCall {
         qualifier: None,
         name: "mvindex".into(),
-        args: vec![Expr::Field(FieldRef::Simple("parts".into())), Expr::Number(idx)],
+        args: vec![
+            Expr::Field(FieldRef::Simple("parts".into())),
+            Expr::Number(idx),
+        ],
     };
     plan.yield_plan.fields = vec![YieldField {
         name: "detail".into(),
@@ -3468,14 +3506,18 @@ fn each_columnar_q22_split_mvindex_concat_matches_row_path() {
         plan,
         HashMap::from([("detail".into(), FieldType::Base(BaseType::Chars))]),
     );
-    assert!(exec.each_plan_columnar_safe(), "q22 let+split+mvindex+concat 应列式");
+    assert!(
+        exec.each_plan_columnar_safe(),
+        "q22 let+split+mvindex+concat 应列式"
+    );
 
     let t = 1_700_000_000_000_000_000i64;
     let events = crate::match_engine::event_bridge::batch_to_events(&batch);
     let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
     let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app_row = Vec::new();
-    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
     assert_eq!(sr.appended, 4);
     let out_row: Vec<_> = b_row
         .finish()
@@ -3544,7 +3586,10 @@ fn each_direct_batch_general_yield_matches_per_event() {
     let mvindex = |idx: f64| Expr::FuncCall {
         qualifier: None,
         name: "mvindex".into(),
-        args: vec![Expr::Field(FieldRef::Simple("parts".into())), Expr::Number(idx)],
+        args: vec![
+            Expr::Field(FieldRef::Simple("parts".into())),
+            Expr::Number(idx),
+        ],
     };
     plan.yield_plan.fields = vec![
         YieldField {
@@ -3556,11 +3601,7 @@ fn each_direct_batch_general_yield_matches_per_event() {
             value: Expr::FuncCall {
                 qualifier: None,
                 name: "concat".into(),
-                args: vec![
-                    mvindex(3.0),
-                    Expr::StringLit("/".into()),
-                    mvindex(4.0),
-                ],
+                args: vec![mvindex(3.0), Expr::StringLit("/".into()), mvindex(4.0)],
             },
         },
     ];
@@ -3576,12 +3617,12 @@ fn each_direct_batch_general_yield_matches_per_event() {
     let events = vec![
         event(vec![
             ("auction", num(1001.0)),
-            ("url", str_val("https://www.nexmark.com/aaaaa/bbbbb/ccccc/item.htm")),
+            (
+                "url",
+                str_val("https://www.nexmark.com/aaaaa/bbbbb/ccccc/item.htm"),
+            ),
         ]),
-        event(vec![
-            ("auction", num(1002.0)),
-            ("url", str_val("short")),
-        ]),
+        event(vec![("auction", num(1002.0)), ("url", str_val("short"))]),
         event(vec![("auction", num(1003.0))]), // url 缺失 → mvindex null → 空串
     ];
 
@@ -3619,11 +3660,7 @@ fn each_direct_batch_general_yield_matches_per_event() {
             if fa.get_name() == wf_lang::wfu_meta::WFU_EMIT_TIME {
                 continue;
             }
-            assert_eq!(
-                fa.get_name(),
-                fb.get_name(),
-                "row {row} field name"
-            );
+            assert_eq!(fa.get_name(), fb.get_name(), "row {row} field name");
             assert_eq!(
                 fa.get_value(),
                 fb.get_value(),
@@ -3730,18 +3767,21 @@ fn each_columnar_fmt_structured_arg_falls_back_matches_row_path() {
     use wp_model_core::model::Value as ModelValue;
 
     let schema = Arc::new(Schema::new(vec![
-        ArrowField::new("ext", DataType::Utf8, true).with_metadata(std::collections::HashMap::from(
-            [(
+        ArrowField::new("ext", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
                 WFL_FIELD_TYPE_METADATA_KEY.to_string(),
                 WFL_FIELD_TYPE_OBJECT.to_string(),
-            )],
-        )),
+            )]),
+        ),
         ArrowField::new("sip", DataType::Utf8, true),
     ]));
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(StringArray::from(vec![Some(r#"{"k":1}"#), Some(r#"{"k":2}"#)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some(r#"{"k":1}"#),
+                Some(r#"{"k":2}"#),
+            ])) as ArrayRef,
             Arc::new(StringArray::from(vec![Some("10.0.0.1"), Some("10.0.0.2")])) as ArrayRef,
         ],
     )
@@ -3782,7 +3822,8 @@ fn each_columnar_fmt_structured_arg_falls_back_matches_row_path() {
     let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
     let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app_row = Vec::new();
-    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
     assert_eq!(sr.appended, 2);
     let out_row: Vec<_> = b_row
         .finish()
@@ -3938,7 +3979,10 @@ fn each_columnar_q14_filter_matches_row_path() {
                         else_expr: Box::new(Expr::StringLit("otherTime".into())),
                     }),
                 },
-                call("count_char", vec![b_field("extra"), Expr::StringLit("c".into())]),
+                call(
+                    "count_char",
+                    vec![b_field("extra"), Expr::StringLit("c".into())],
+                ),
             ],
         ),
     }];
@@ -3956,7 +4000,8 @@ fn each_columnar_q14_filter_matches_row_path() {
     let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
     let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app_row = Vec::new();
-    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
     let out_row: Vec<_> = b_row
         .finish()
         .iter_data_records()
@@ -3994,9 +4039,21 @@ fn each_columnar_q14_filter_matches_row_path() {
             })
             .expect("detail field")
     };
-    assert_eq!(label(&out_col[0]), "nightTime c=4", "5M 行：22 时 → nightTime，\"abc c cc\" 含 4 个 c");
-    assert_eq!(label(&out_col[1]), "dayTime c=1", "10M 行：10 时 → dayTime，\"no-c\" 含 1 个 c");
-    assert_eq!(label(&out_col[2]), "otherTime c=0", "20M 行：07 时 → otherTime，\"zz\" 无 c");
+    assert_eq!(
+        label(&out_col[0]),
+        "nightTime c=4",
+        "5M 行：22 时 → nightTime，\"abc c cc\" 含 4 个 c"
+    );
+    assert_eq!(
+        label(&out_col[1]),
+        "dayTime c=1",
+        "10M 行：10 时 → dayTime，\"no-c\" 含 1 个 c"
+    );
+    assert_eq!(
+        label(&out_col[2]),
+        "otherTime c=0",
+        "20M 行：07 时 → otherTime，\"zz\" 无 c"
+    );
 }
 
 /// Q14 变体：fmt 的 IfThenElse 分支 / count_char 参数含 OBJECT 元数据字段。
@@ -4023,7 +4080,11 @@ fn each_columnar_nested_structured_falls_back_matches_row_path() {
         schema,
         vec![
             Arc::new(Int64Array::from(vec![Some(1), Some(2), None])) as ArrayRef,
-            Arc::new(BooleanArray::from(vec![Some(true), Some(false), Some(true)])) as ArrayRef,
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                Some(false),
+                Some(true),
+            ])) as ArrayRef,
             Arc::new(StringArray::from(vec![
                 Some(r#"{"k":1}"#),
                 Some(r#"{"c":2}"#),
@@ -4072,7 +4133,10 @@ fn each_columnar_nested_structured_falls_back_matches_row_path() {
         },
         YieldField {
             name: "cc".into(),
-            value: call("count_char", vec![b_field("ext"), Expr::StringLit("c".into())]),
+            value: call(
+                "count_char",
+                vec![b_field("ext"), Expr::StringLit("c".into())],
+            ),
         },
     ];
     let exec = RuleExecutor::new_with_yield_field_types(
@@ -4090,7 +4154,8 @@ fn each_columnar_nested_structured_falls_back_matches_row_path() {
     let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
     let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app_row = Vec::new();
-    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
     let out_row: Vec<_> = b_row
         .finish()
         .iter_data_records()
@@ -4104,7 +4169,10 @@ fn each_columnar_nested_structured_falls_back_matches_row_path() {
     let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
 
     assert_eq!(sr.appended, 3, "行式 appended");
-    assert_eq!(sc.appended, 3, "列式 appended（结构化回退仍应产出全部 3 行）");
+    assert_eq!(
+        sc.appended, 3,
+        "列式 appended（结构化回退仍应产出全部 3 行）"
+    );
     assert_eq!(sr.rejected, 0);
     assert_eq!(sc.rejected, 0);
     assert_eq!(sc.failed, 0);
@@ -4127,12 +4195,28 @@ fn each_columnar_nested_structured_falls_back_matches_row_path() {
             .expect(name)
     };
     // label：row 0 true 分支 → [object]；row 1 false 分支 → "x"；row 2 null ext → 空串。
-    assert_eq!(get(&out_col[0], "label"), "[object] y", "true 分支渲染 [object]（列式若未回退会渲染原始 JSON）");
+    assert_eq!(
+        get(&out_col[0], "label"),
+        "[object] y",
+        "true 分支渲染 [object]（列式若未回退会渲染原始 JSON）"
+    );
     assert_eq!(get(&out_col[1], "label"), "x y", "false 分支渲染 x");
-    assert_eq!(get(&out_col[2], "label"), "", "null ext → fmt 参数 None → 空串");
+    assert_eq!(
+        get(&out_col[2], "label"),
+        "",
+        "null ext → fmt 参数 None → 空串"
+    );
     // cc：count_char(Object) → None → 空串（列式若未回退会对原始 JSON 文本计数）。
-    assert_eq!(get(&out_col[0], "cc"), "", "count_char(Object) → None → 空串");
-    assert_eq!(get(&out_col[1], "cc"), "", "count_char(Object) → None → 空串");
+    assert_eq!(
+        get(&out_col[0], "cc"),
+        "",
+        "count_char(Object) → None → 空串"
+    );
+    assert_eq!(
+        get(&out_col[1], "cc"),
+        "",
+        "count_char(Object) → None → 空串"
+    );
     assert_eq!(get(&out_col[2], "cc"), "", "count_char(null) → None → 空串");
 }
 
@@ -4172,9 +4256,11 @@ fn each_columnar_empty_rows_is_noop() {
     assert_eq!(builder.finish().len(), 0, "空批不得产出任何行");
 
     // _with（真实 prepared + 空 rows）：debug_assert 不得触发，统计为零。
-    let schema = Arc::new(Schema::new(vec![
-        ArrowField::new("auction", DataType::Int64, true),
-    ]));
+    let schema = Arc::new(Schema::new(vec![ArrowField::new(
+        "auction",
+        DataType::Int64,
+        true,
+    )]));
     let batch = RecordBatch::try_new(
         schema,
         vec![Arc::new(Int64Array::from(vec![Some(1)])) as ArrayRef],
@@ -4183,13 +4269,7 @@ fn each_columnar_empty_rows_is_noop() {
     let prepared = exec.each_batch_prepare(&batch);
     let mut b2 = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app2 = Vec::new();
-    let s2 = exec.execute_each_direct_batch_columnar_with(
-        &[],
-        0,
-        &prepared,
-        &mut b2,
-        &mut app2,
-    );
+    let s2 = exec.execute_each_direct_batch_columnar_with(&[], 0, &prepared, &mut b2, &mut app2);
     assert_eq!(s2.appended, 0);
     assert_eq!(s2.rejected, 0);
     assert_eq!(s2.failed, 0);
@@ -4226,9 +4306,11 @@ fn each_columnar_filter_missing_column_rejects_all_parity() {
     let exec = RuleExecutor::new(plan);
     assert!(exec.each_plan_columnar_safe());
 
-    let schema = Arc::new(Schema::new(vec![
-        ArrowField::new("auction", DataType::Int64, true),
-    ]));
+    let schema = Arc::new(Schema::new(vec![ArrowField::new(
+        "auction",
+        DataType::Int64,
+        true,
+    )]));
     let batch = RecordBatch::try_new(
         schema,
         vec![Arc::new(Int64Array::from(vec![Some(1), Some(2), None])) as ArrayRef],
@@ -4240,7 +4322,8 @@ fn each_columnar_filter_missing_column_rejects_all_parity() {
     let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
     let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app_row = Vec::new();
-    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
     assert_eq!(sr.rejected, 3, "行式：缺字段 → None → 全拒绝");
     assert_eq!(sr.appended, 0);
 
@@ -4313,7 +4396,10 @@ fn each_columnar_general_yield_not_first_matches_row_path() {
                 "fmt",
                 vec![
                     Expr::StringLit("c={} p={}".into()),
-                    call("count_char", vec![b_field("extra"), Expr::StringLit("c".into())]),
+                    call(
+                        "count_char",
+                        vec![b_field("extra"), Expr::StringLit("c".into())],
+                    ),
                     b_field("price"),
                 ],
             ),
@@ -4339,7 +4425,8 @@ fn each_columnar_general_yield_not_first_matches_row_path() {
     let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
     let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app_row = Vec::new();
-    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
     let out_row: Vec<_> = b_row
         .finish()
         .iter_data_records()
@@ -4354,7 +4441,10 @@ fn each_columnar_general_yield_not_first_matches_row_path() {
 
     assert_eq!(sr.appended, 3, "行式 appended");
     assert_eq!(sr.rejected, 0);
-    assert_eq!(sc.appended, 3, "列式 appended（General 不在字段 0 也必须全编译）");
+    assert_eq!(
+        sc.appended, 3,
+        "列式 appended（General 不在字段 0 也必须全编译）"
+    );
     assert_eq!(sc.rejected, 0);
     assert_eq!(sc.failed, 0);
     assert_eq!(app_row, vec![0usize, 1, 2]);
@@ -4378,7 +4468,11 @@ fn each_columnar_general_yield_not_first_matches_row_path() {
     // 列式必须真的命中 fmt 槽位（错位取 None 会误回退成空串/悬空 panic）。
     assert_eq!(detail(&out_col[0]), "c=1 p=7");
     assert_eq!(detail(&out_col[1]), "c=2 p=8");
-    assert_eq!(detail(&out_col[2]), "", "null extra → count_char None → fmt 参数 None → 空串");
+    assert_eq!(
+        detail(&out_col[2]),
+        "",
+        "null extra → count_char None → fmt 参数 None → 空串"
+    );
 }
 
 /// each filter 引用 OBJECT 元数据列：gate 放行（flat FieldRef 形状），但列式
@@ -4429,7 +4523,10 @@ fn each_columnar_filter_structured_field_falls_back_parity() {
         schema,
         vec![
             Arc::new(Int64Array::from(vec![Some(1), Some(2)])) as ArrayRef,
-            Arc::new(StringArray::from(vec![Some(r#"{"k":1}"#), Some(r#"{"k":2}"#)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some(r#"{"k":1}"#),
+                Some(r#"{"k":2}"#),
+            ])) as ArrayRef,
         ],
     )
     .unwrap();
@@ -4439,7 +4536,8 @@ fn each_columnar_filter_structured_field_falls_back_parity() {
     let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
     let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app_row = Vec::new();
-    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
     assert_eq!(sr.rejected, 2, "行式：Object 比较非 Bool → None → 全拒绝");
     assert_eq!(sr.appended, 0);
 
@@ -4448,7 +4546,10 @@ fn each_columnar_filter_structured_field_falls_back_parity() {
     let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app_col = Vec::new();
     let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
-    assert_eq!(sc.rejected, 2, "列式：结构化 filter 槽位不编译 → 解释回退 → 全拒绝");
+    assert_eq!(
+        sc.rejected, 2,
+        "列式：结构化 filter 槽位不编译 → 解释回退 → 全拒绝"
+    );
     assert_eq!(sc.appended, 0);
     assert_eq!(sc.failed, 0);
     assert_eq!(app_row, Vec::<usize>::new());
@@ -4519,7 +4620,10 @@ fn each_columnar_multiple_generals_interspersed_matches_row_path() {
         },
         YieldField {
             name: "dots".into(),
-            value: call("count_char", vec![b_field("extra"), Expr::StringLit("c".into())]),
+            value: call(
+                "count_char",
+                vec![b_field("extra"), Expr::StringLit("c".into())],
+            ),
         },
     ];
     let exec = RuleExecutor::new_with_yield_field_types(
@@ -4538,7 +4642,8 @@ fn each_columnar_multiple_generals_interspersed_matches_row_path() {
     let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
     let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app_row = Vec::new();
-    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
     let out_row: Vec<_> = b_row
         .finish()
         .iter_data_records()
@@ -4577,7 +4682,11 @@ fn each_columnar_multiple_generals_interspersed_matches_row_path() {
     // 两个 General 都得真命中各自槽位（错位会取到 Field/Lit 的 None → 空串）。
     assert_eq!(get(&out_col[0], "day"), "2023", "strftime 槽位 1 命中");
     assert_eq!(get(&out_col[1], "day"), "2023");
-    assert_eq!(get(&out_col[0], "dots"), "1", "count_char 槽位 3 命中（\"ab c\" 含 1 个 c）");
+    assert_eq!(
+        get(&out_col[0], "dots"),
+        "1",
+        "count_char 槽位 3 命中（\"ab c\" 含 1 个 c）"
+    );
     assert_eq!(get(&out_col[1], "dots"), "2", "\"cc\" 含 2 个 c");
     assert_eq!(get(&out_col[2], "dots"), "", "null extra → None → 空串");
 }

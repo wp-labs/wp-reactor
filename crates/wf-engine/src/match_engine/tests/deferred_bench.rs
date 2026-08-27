@@ -294,6 +294,245 @@ fn deferred_join_hot_paths() {
     let eager_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
     report("eager-interval", eager_ns, eager_ns);
 }
+/// Q4a 形状：auction_finals yield 4 字段（id/category/final/dateTime=a.expires），
+/// deferred reduce maxrow(price) tie(dateTime asc) within [a.dateTime, a.expires]
+/// on a.id == bid_events.auction。候选数 = auction 生命周期内的 bid 数（q4a
+/// 30M 全流 ~16.5 bid/auction；生命周期内候选是评估成本主变量）。
+fn q4a_deferred_plan() -> RulePlan {
+    let mut plan = deferred_plan(true);
+    plan.name = "q4a_auction_finals".into();
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Simple("id".into())),
+        },
+        YieldField {
+            name: "category".into(),
+            value: Expr::Field(FieldRef::Simple("category".into())),
+        },
+        YieldField {
+            name: "final".into(),
+            value: Expr::Field(FieldRef::Path {
+                alias: "winner".into(),
+                segments: vec![wf_lang::ast::PathSegment::Field("price".into())],
+            }),
+        },
+        YieldField {
+            name: "dateTime".into(),
+            value: Expr::Field(FieldRef::Qualified("a".into(), "expires".into())),
+        },
+    ];
+    plan
+}
+
+/// q4a 驱动 auction 事件（含 category）。
+fn q4a_auction_event() -> Event {
+    let mut fields = EngineHashMap::default();
+    fields.insert("id".into(), Value::Number(5.0));
+    fields.insert("category".into(), Value::Number(3.0));
+    fields.insert("dateTime".into(), Value::Number(NOW as f64));
+    fields.insert(
+        "expires".into(),
+        Value::Number((NOW + 60_000_000_000) as f64),
+    );
+    Event { fields }
+}
+
+/// q4a 到期评估成本随候选数（auction 生命周期内 bid 数）扫描（2026-08-26
+/// q4 归因：q4a 与 q9 deferred 部分同构，候选数分布是评估成本主变量——
+/// eval-cand8 的 1330ns 是合成形状，q4a 实际候选数待定）。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine q4a_deferred_eval_candidate_scan -- --ignored --nocapture"]
+fn q4a_deferred_eval_candidate_scan() {
+    let exec = RuleExecutor::new(q4a_deferred_plan());
+    let event = q4a_auction_event();
+    let pending = exec.deferred_pending_for(0, &event, NOW).expect("pending");
+    let base_rows: Vec<(i64, JoinRow)> = (0..32usize)
+        .map(|i| {
+            timed_bid(
+                NOW + 1_000_000_000 + (i as i64) * 1_000_000_000,
+                5.0,
+                i as f64,
+                (i as f64) * 10.0,
+            )
+        })
+        .collect();
+    for &n_cand in &[1usize, 4, 8, 16, 32] {
+        let rows = base_rows[..n_cand].to_vec();
+        let lookup = BidLookup(rows);
+        let start = Instant::now();
+        for _ in 0..N {
+            let rec = exec
+                .execute_deferred_join(0, &pending, &lookup, NOW + 100_000_000_000)
+                .unwrap()
+                .expect("eval hits");
+            std::hint::black_box(&rec);
+        }
+        let per = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+        report(&format!("eval-q4a-cand{n_cand}"), per, per);
+    }
+
+    // ---- 中间窗轻量化对比（2026-08-26 q4a）：evaluate + build_each_alert_pipe
+    // （跳过 wfx_id/fired_at/summary 构建）vs 全量 execute_deferred_join ----
+    let rows4 = base_rows[..4].to_vec();
+    let lookup4 = BidLookup(rows4);
+    let start = Instant::now();
+    for _ in 0..N {
+        let out_ctx = exec
+            .evaluate_deferred_join(0, &pending, &lookup4)
+            .unwrap()
+            .expect("eval hits");
+        let rec = exec
+            .build_each_alert_pipe(&out_ctx, pending.expiry_nanos)
+            .unwrap()
+            .expect("light build");
+        std::hint::black_box(&rec);
+    }
+    let light_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("eval-q4a-light-cand4", light_ns, light_ns);
+    eprintln!(
+        "[deferred-bench] 轻量/全量(cand4) = {:.1}x（中间窗跳过告警字段构建）",
+        1702.9 / light_ns.max(1.0)
+    );
+}
+/// q4a 评估成本分解（2026-08-26）：asof/filter/recheck/reduce/enrich 各段独立
+/// 计时（in_interval/row_matches_conds/enrich_join_row/select_reduce_row 可独立
+/// 调用；asof_candidates 用 BidLookup 的 Vec clone 近似——真实引擎是索引查询）。
+/// 结论：定位评估 ~1.2µs 固定成本的大头段，指导下一轮优化。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine q4a_eval_cost_decomposition -- --ignored --nocapture"]
+fn q4a_eval_cost_decomposition() {
+    use crate::match_engine::executor::{
+        enrich_join_row, enrich_join_row_bare, in_interval, row_matches_conds, select_reduce_row,
+    };
+
+    let plan = q4a_deferred_plan();
+    let exec = RuleExecutor::new(plan.clone());
+    let join = &plan.joins[0];
+    let event = q4a_auction_event();
+    let pending = exec.deferred_pending_for(0, &event, NOW).unwrap();
+
+    // 候选：key=5.0 的 4 条（与 eval-q4a-cand4 同构）。
+    let rows: Vec<(i64, JoinRow)> = (0..4)
+        .map(|i| {
+            timed_bid(
+                NOW + 1_000_000_000 + (i as i64) * 1_000_000_000,
+                5.0,
+                i as f64,
+                (i as f64) * 10.0,
+            )
+        })
+        .collect();
+
+    // ① asof_candidates：窗口查询 + 候选物化（BidLookup = Vec clone 近似）。
+    let lookup = BidLookup(rows.clone());
+    let start = Instant::now();
+    for _ in 0..N {
+        let cand = lookup
+            .asof_candidates("bid_events", &pending.key_field, &pending.key)
+            .unwrap();
+        std::hint::black_box(&cand);
+    }
+    let asof_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q4a-①asof(cand4)", asof_ns, asof_ns);
+
+    // ② filter：in_interval × 候选。
+    let start = Instant::now();
+    for _ in 0..N {
+        let mut hit = 0usize;
+        for (ts, _) in &rows {
+            if in_interval(
+                *ts,
+                pending.lo_ns,
+                pending.hi_ns,
+                pending.lo_open,
+                pending.hi_open,
+            ) {
+                hit += 1;
+            }
+        }
+        std::hint::black_box(hit);
+    }
+    let filter_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q4a-②filter×4", filter_ns, filter_ns);
+
+    // ③ 条件复核 row_matches_conds × 候选（2026-08-26 skip 后已省——此段展示原成本）。
+    let start = Instant::now();
+    for _ in 0..N {
+        let mut hit = 0usize;
+        for (_, row) in &rows {
+            if row_matches_conds(row, &join.conds, &pending.left) {
+                hit += 1;
+            }
+        }
+        std::hint::black_box(hit);
+    }
+    let recheck_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q4a-③recheck×4", recheck_ns, recheck_ns);
+
+    // ④ select_reduce_row：maxrow(price) tie(dateTime asc) 扫描 4 候选。
+    let start = Instant::now();
+    for _ in 0..N {
+        let winner = select_reduce_row(rows.clone(), &join.reduce.as_ref().unwrap().measure);
+        std::hint::black_box(&winner);
+    }
+    let reduce_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q4a-④reduce×4", reduce_ns, reduce_ns);
+
+    // ⑤a left clone（evaluate 的 out_ctx = pending.left.clone() 成本；move 可省）。
+    let start = Instant::now();
+    for _ in 0..N {
+        let ctx = pending.left.clone();
+        std::hint::black_box(&ctx);
+    }
+    let clone_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q4a-⑤a-left-clone", clone_ns, clone_ns);
+
+    // ⑤ enrich_join_row（全量：qualified + bare；eager 路径契约）。
+    let winner =
+        select_reduce_row(rows.clone(), &join.reduce.as_ref().unwrap().measure).expect("winner");
+    let start = Instant::now();
+    for _ in 0..N {
+        let mut ctx = pending.left.clone();
+        enrich_join_row(&mut ctx, join, &winner);
+        std::hint::black_box(&ctx);
+    }
+    let enrich_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q4a-⑤enrich", enrich_ns, enrich_ns);
+
+    // ⑤b enrich_join_row_bare（deferred 路径 2026-08-26：只裸名，省 qualified 死数据）。
+    let start = Instant::now();
+    for _ in 0..N {
+        let mut ctx = pending.left.clone();
+        enrich_join_row_bare(&mut ctx, &winner);
+        std::hint::black_box(&ctx);
+    }
+    let enrich_bare_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q4a-⑤b-enrich-bare", enrich_bare_ns, enrich_ns);
+
+    // ⑥ 轻量 build（build_each_alert_pipe，含 evaluate 的 out_ctx 输入）。
+    let start = Instant::now();
+    for _ in 0..N {
+        let rec = exec
+            .build_each_alert_pipe(&pending.left, pending.expiry_nanos)
+            .unwrap()
+            .expect("light build");
+        std::hint::black_box(&rec);
+    }
+    let build_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q4a-⑥build(light)", build_ns, build_ns);
+
+    eprintln!(
+        "[deferred-bench] 分解合计 ≈ {:.0}ns（asof {:.0} + filter {:.0} + recheck {:.0} + reduce {:.0} + enrich {:.0} + build {:.0}）",
+        asof_ns + filter_ns + recheck_ns + reduce_ns + enrich_ns + build_ns,
+        asof_ns,
+        filter_ns,
+        recheck_ns,
+        reduce_ns,
+        enrich_ns,
+        build_ns
+    );
+}
 
 // ---------------------------------------------------------------------------
 // 常规（debug 可跑）宽松回归测试
@@ -437,8 +676,9 @@ fn deferred_scan_strategy_bench() {
         // 到期比例：每 batch 到期一小部分（100M 数据 2740 batch，33M 挂起尾部
         // 到期——每 batch 到期 ~1/挂起总数比例；取 0.1% 模拟）。
         let expiry_step = 100i64;
-        let pending_init: Vec<(i64, i64)> =
-            (0..n_pending).map(|i| (i as i64 * expiry_step, i as i64 * 7)).collect();
+        let pending_init: Vec<(i64, i64)> = (0..n_pending)
+            .map(|i| (i as i64 * expiry_step, i as i64 * 7))
+            .collect();
         let batch_ns = n_pending as i64 * expiry_step / 1000; // wm 推进到 ~0.1% 到期
         let rounds = 100usize;
 
@@ -646,8 +886,7 @@ fn contention_case<I: ContendedIndex + Sync>(
             let stop = Arc::clone(&stop);
             let ops = Arc::clone(&reader_ops);
             scope.spawn(move || {
-                let mut state =
-                    0x9E37_79B9_7F4A_7C15u64 ^ ((r as u64) * 0x9E37_79B9_7F4A_7C15);
+                let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ ((r as u64) * 0x9E37_79B9_7F4A_7C15);
                 while !stop.load(AtomicOrdering::Relaxed) {
                     let key = pick_key(&mut state, n_keys);
                     std::hint::black_box(index.lookup(key));
@@ -714,8 +953,13 @@ fn deferred_index_contention_bench() {
         prefill(&single, n_keys);
         let _ = contention_case("single-noW", &single, n_keys, duration, false);
         // 单锁：有写者（当前生产形态）
-        let (single_mops, _, _) =
-            contention_case(&format!("single+W-{}", n_keys_m), &single, n_keys, duration, true);
+        let (single_mops, _, _) = contention_case(
+            &format!("single+W-{}", n_keys_m),
+            &single,
+            n_keys,
+            duration,
+            true,
+        );
 
         // 分片：有写者（候选修复）
         let sharded = ShardedIndex {
@@ -723,8 +967,13 @@ fn deferred_index_contention_bench() {
             mask: SHARDS - 1,
         };
         prefill(&sharded, n_keys);
-        let (shard_mops, _, _) =
-            contention_case(&format!("shard+W-{}", n_keys_m), &sharded, n_keys, duration, true);
+        let (shard_mops, _, _) = contention_case(
+            &format!("shard+W-{}", n_keys_m),
+            &sharded,
+            n_keys,
+            duration,
+            true,
+        );
         eprintln!(
             "[deferred-bench] 分片/单锁 读者吞吐比 = {:.2}×（keys={}M）",
             shard_mops / single_mops.max(1e-9),
@@ -792,7 +1041,10 @@ fn deferred_remove_batch_strategy_bench() {
                     state = state
                         .wrapping_mul(6_364_136_223_846_793_005)
                         .wrapping_add(1_442_695_040_888_963_407);
-                    (k * 100 + i as i64, (k as u64 * seqs_per_key as u64 + i as u64))
+                    (
+                        k * 100 + i as i64,
+                        (k as u64 * seqs_per_key as u64 + i as u64),
+                    )
                 })
                 .collect();
             map.insert(k, rows);
@@ -822,7 +1074,10 @@ fn deferred_remove_batch_strategy_bench() {
 
         // 一致性：两实现的「移除量」相同（本 seq 无既有行 → 0）。
         assert_eq!(remove_batch_full(&mut map_full.clone(), seq), 0);
-        assert_eq!(remove_batch_incr(&mut map_incr.clone(), &batch_keys, seq), 0);
+        assert_eq!(
+            remove_batch_incr(&mut map_incr.clone(), &batch_keys, seq),
+            0
+        );
 
         eprintln!(
             "[deferred-bench] 驱逐 keys={:>3}万 行={:>5}万: remove-full {:>10.1} µs/批; remove-incr {:>9.1} µs/批 → {:.0}×",
