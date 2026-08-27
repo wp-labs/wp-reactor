@@ -114,3 +114,23 @@ evict_to_spill（热路径，同步）:
 - M6-2：spill 适配（RedbSpillStore 内部 AsyncPersister；evict_to_spill 改 move + submit）
 - M6-3：读回前 flush 语义 + 失败回调接线（spill_failed）
 - M6-4：实测（30M/100M EPS/RSS 对比）+ 本设计文档定论
+
+## 7. 写并发形态 A/B（2026-08-27 实测定论）
+
+| 形态 | 30M EPS | 100M-1GB EPS | 结论 |
+|---|---|---|---|
+| **每分片独立 worker**（= 多 worker 多文件, 分片键 hash 定位） | **10.9M** | **11.6M** | **最优**——驱逐与写每片流水线自洽 |
+| 共享队列 + 4 worker（文件 hash 路由） | 0.59M | 未测 | 4 worker 跟不上 10 片驱逐速率 → 背压 |
+| 全局单写者（串行写所有文件） | 0.57M | 未测 | 小写量浪费并行度 |
+
+**结论**："多 worker + 多文件 + 目标 hash 定位"的最优实现 = **每分片独立写队列**
+（分片键 hash → 分片 executor → 分片 worker；每文件单写者 ✓ 无 redb 事务冲突；
+驱逐与写流水线自洽——片驱逐一批片 worker 消化一批）。共享队列/全局单写者
+都是降级（worker 数 < 文件数时跟不上驱逐速率）。
+
+**追加优化（实测）**：
+1. 驱逐批内按 hash 排序 → redb 随机写变近似顺序写（bench 1.4-2.4x）
+2. 攒批上限（`WF_SPILL_BATCH_BYTES` 默认 64MB）——无上限会合并出超大批
+   （几百 MB）拖死小页缓存后端（实测单批 197s）
+3. `WF_SPILL_CACHE_MB`（页缓存）/ `WF_SPILL_FSYNC_EVERY` / `WF_SPILL_PROFILE`
+   （worker 分段计时）实验开关
