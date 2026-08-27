@@ -27,7 +27,8 @@ pub use stats_exec::{
 // 供 crate 内 SoA 对照 bench（tests/）访问私有热路径函数。
 #[cfg(test)]
 pub(crate) use stats_exec::{
-    accumulate_column_row, accumulate_soa, measure_values_soa, NumericSoALayout,
+    accumulate_column_row, accumulate_soa, comps_hash, measure_values_soa, NumericSoALayout,
+    StatsBucket,
 };
 
 #[cfg(test)]

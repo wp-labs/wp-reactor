@@ -882,7 +882,8 @@ impl StatsWindowState {
     ///
     /// **单次 entry 查找（2026-08-27 q17）**: 命中主流（在航 auction 窗口内
     /// 重复引用 ~100%）, 旧 get + get_mut 双查找纯浪费。
-    fn keyed_bucket_mut(
+    /// pub(crate) 供 rules 段分解 bench（q17_rules_breakdown）。
+    pub(crate) fn keyed_bucket_mut(
         &mut self,
         hash: u64,
         comps: &[ScopeKey],

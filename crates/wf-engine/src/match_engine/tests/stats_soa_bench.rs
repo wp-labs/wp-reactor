@@ -26,9 +26,10 @@ use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{BinOp, Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan, WindowSpec};
 
+use crate::match_engine::ScopeKey;
 use crate::match_engine::executor::{
-    RowFieldLayout, StatsAccum, StatsBucketAccs, accumulate_column_row, accumulate_soa,
-    measure_values_soa, NumericSoALayout,
+    RowFieldLayout, StatsAccum, StatsBucket, StatsBucketAccs, accumulate_column_row,
+    accumulate_soa, comps_hash, measure_values_soa, NumericSoALayout,
 };
 use crate::match_engine::executor::StatsExecutor;
 
@@ -308,4 +309,157 @@ fn q17_stats_accum_soa() {
             None => "空桶（异常）",
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// q17 rules 段逐分量归因（2026-08-27，#2 采样前的组件级量化）
+// ---------------------------------------------------------------------------
+//
+// 目标: 钉死 q17 rules 段每事件 ~0.58µs·核（diag 核·s 17.3/30M）的成本构成——
+// hash（FNV）/ 桶查找（真实规模 180 万桶表的 cache miss）/ SoA 累积 各占多少。
+// 结论方向（#3 radix 分区 / 哈希替换 / 热点缓存）由本数据决定。
+//
+// 关键: 桶查找必须用**真实规模表**（180 万桶 → foldhash 表 ~32MB >> L2）——
+// 小表会低估查找成本（cache miss 是主墙候选）。
+
+/// 大表构造（真实 q17 规模）: 直接插桶（buckets 为 pub 字段）。
+fn build_large_window(plan: &StatsPlan, n_buckets: usize) -> StatsExecutor {
+    let mut exec = StatsExecutor::new(plan.clone());
+    let layout = NumericSoALayout::build(plan);
+    exec.window.buckets.reserve(n_buckets);
+    for i in 0..n_buckets {
+        let h = comps_hash(&[ScopeKey::Int(i as i64)]);
+        exec.window.buckets.entry(h).or_insert_with(|| {
+            vec![StatsBucket {
+                scope_key: ScopeKey::Int(i as i64),
+                accs: StatsBucketAccs::Numeric(layout.zeros()),
+            }]
+        });
+    }
+    exec
+}
+
+#[test]
+#[ignore]
+fn q17_rules_breakdown() {
+    let plan = q17_plan();
+    let layout = NumericSoALayout::build(&plan);
+    let batch = q17_batch(N);
+    let masks = q17_masks(&batch);
+    let price_col = batch.schema().index_of("price").unwrap();
+    let measure_field_cols: Vec<Option<usize>> = plan
+        .measures
+        .iter()
+        .map(|m| m.field.as_ref().map(|_| price_col))
+        .collect();
+    let measure_where: Vec<Option<usize>> =
+        vec![None, Some(0), Some(1), Some(2), None, None, None, None];
+
+    // 访问序列: 热点 100 auction 循环（q17 活跃集 ~100）+ 少量冷键穿插。
+    const N_LOOKUP: usize = 5_000_000;
+    const N_BUCKETS: usize = 1_800_000; // q17 实测 emitted 1,799,180
+    let auction_at = |i: usize| (i as i64) % AUCTIONS;
+
+    // —— 大表（180 万桶）——
+    let mut exec = build_large_window(&plan, N_BUCKETS);
+    // 预热: 访问热点键若干次, 建立 TLB/cache 分布。
+    for i in 0..100_000 {
+        let a = auction_at(i);
+        let _ = exec.window.keyed_bucket_mut(comps_hash(&[ScopeKey::Int(a)]), &[ScopeKey::Int(a)], &plan);
+    }
+
+    // 1. hash only
+    let t0 = Instant::now();
+    for i in 0..N_LOOKUP {
+        let a = auction_at(i);
+        std::hint::black_box(comps_hash(&[ScopeKey::Int(a)]));
+    }
+    let hash_ns = t0.elapsed().as_secs_f64() * 1e9 / N_LOOKUP as f64;
+
+    // 2. 桶查找（大表, 热点命中）
+    let t0 = Instant::now();
+    for i in 0..N_LOOKUP {
+        let a = auction_at(i);
+        let h = comps_hash(&[ScopeKey::Int(a)]);
+        let accs = exec.window.keyed_bucket_mut(h, &[ScopeKey::Int(a)], &plan);
+        std::hint::black_box(accs);
+    }
+    let lookup_large_ns = t0.elapsed().as_secs_f64() * 1e9 / N_LOOKUP as f64;
+
+    // 3. SoA 累积（独立桶）
+    let mut soa = layout.zeros();
+    let t0 = Instant::now();
+    for i in 0..N_LOOKUP {
+        let row = i % N;
+        std::hint::black_box(accumulate_soa(
+            &mut soa, &layout, &measure_where, &measure_field_cols, &batch, &masks, row,
+        ));
+    }
+    let accum_ns = t0.elapsed().as_secs_f64() * 1e9 / N_LOOKUP as f64;
+
+    // 4. 完整行（大表查找 + 累积, 不含 hash——与 2+3 差值对照）
+    let t0 = Instant::now();
+    for i in 0..N_LOOKUP {
+        let a = auction_at(i);
+        let h = comps_hash(&[ScopeKey::Int(a)]);
+        if let Some(StatsBucketAccs::Numeric(soa)) =
+            exec.window.keyed_bucket_mut(h, &[ScopeKey::Int(a)], &plan)
+        {
+            let row = i % N;
+            std::hint::black_box(accumulate_soa(
+                soa, &layout, &measure_where, &measure_field_cols, &batch, &masks, row,
+            ));
+        }
+    }
+    let full_ns = t0.elapsed().as_secs_f64() * 1e9 / N_LOOKUP as f64;
+
+    // —— 小表对照（100 桶, L1/L2 命中）——
+    let mut small = build_large_window(&plan, 100);
+    for i in 0..10_000 {
+        let a = auction_at(i);
+        let _ = small.window.keyed_bucket_mut(comps_hash(&[ScopeKey::Int(a)]), &[ScopeKey::Int(a)], &plan);
+    }
+    let t0 = Instant::now();
+    for i in 0..N_LOOKUP {
+        let a = auction_at(i);
+        let h = comps_hash(&[ScopeKey::Int(a)]);
+        let accs = small.window.keyed_bucket_mut(h, &[ScopeKey::Int(a)], &plan);
+        std::hint::black_box(accs);
+    }
+    let lookup_small_ns = t0.elapsed().as_secs_f64() * 1e9 / N_LOOKUP as f64;
+
+    // —— 冷键全表随机对照（每次不同键, 真实随机 miss）——
+    const N_COLD: usize = 1_000_000;
+    let mut cold_exec = build_large_window(&plan, N_BUCKETS);
+    let mut cold_state = 0x9E37_79B9_7F4A_7C15u64;
+    let t0 = Instant::now();
+    for i in 0..N_COLD {
+        // xorshift——确定性伪随机键（覆盖全表不同位置）
+        cold_state ^= cold_state << 13;
+        cold_state ^= cold_state >> 7;
+        cold_state ^= cold_state << 17;
+        let k = (cold_state % N_BUCKETS as u64) as i64;
+        let h = comps_hash(&[ScopeKey::Int(k)]);
+        let accs = cold_exec.window.keyed_bucket_mut(h, &[ScopeKey::Int(k)], &plan);
+        std::hint::black_box(accs);
+    }
+    let lookup_cold_ns = t0.elapsed().as_secs_f64() * 1e9 / N_COLD as f64;
+
+    // —— 生产入口完整路径（大表 + process_batch_rows, 含批级前置/mask/分派）——
+    let mut prod = build_large_window(&plan, N_BUCKETS);
+    let t0 = Instant::now();
+    let ok = prod.process_batch_rows(&batch, None);
+    let prod_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+
+    eprintln!("== q17 rules 段逐分量（N_LOOKUP={}, 大表 {} 桶, 热点 {} auction）==", N_LOOKUP, N_BUCKETS, AUCTIONS);
+    eprintln!("  hash(comps_hash FNV)      : {:>6.2} ns/事件", hash_ns);
+    eprintln!("  bucket lookup 大表        : {:>6.2} ns/事件（{:.0}%）", lookup_large_ns, lookup_large_ns / (hash_ns + lookup_large_ns + accum_ns) * 100.0);
+    eprintln!("  bucket lookup 小表(对照)  : {:>6.2} ns/事件", lookup_small_ns);
+    eprintln!("  bucket lookup 冷随机(对照): {:>6.2} ns/事件", lookup_cold_ns);
+    eprintln!("  ├ 热点局部性收益(冷-热)   : {:>6.2} ns/事件（q17 活跃 ~100 auction → 热路径 ≈ 大表行）", lookup_cold_ns - lookup_large_ns);
+    eprintln!("  accumulate_soa            : {:>6.2} ns/事件（{:.0}%）", accum_ns, accum_ns / (hash_ns + lookup_large_ns + accum_ns) * 100.0);
+    eprintln!("  三件合计                  : {:>6.2} ns/事件", hash_ns + lookup_large_ns + accum_ns);
+    eprintln!("  完整行(查找+累积,无hash)  : {:>6.2} ns/事件", full_ns);
+    eprintln!("  process_batch_rows 大表   : {:>6.2} ns/事件（列式前置={}）", prod_ns, ok);
+    eprintln!("  → diag 实测 rules 每事件   : ~577 ns·核（核·s 17.3 / 30M）——剩余差距在生产外围（批级/窗口/多核）");
 }
