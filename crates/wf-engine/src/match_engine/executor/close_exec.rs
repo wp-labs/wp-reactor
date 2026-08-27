@@ -17,7 +17,7 @@ use super::RuleExecutor;
 use super::YieldKind;
 use super::alert::{
     EntityIdCache, OriginArcs, WfxPrefixCache, build_summary, build_summary_from_labels,
-    build_summary_split, build_wfx_id, build_wfx_id_from_labels, format_nanos_utc, now_nanos,
+    build_summary_split, build_wfx_id, format_nanos_utc, now_nanos,
 };
 use super::context::{build_eval_context, execute_joins};
 use super::eval::{
@@ -956,10 +956,15 @@ impl RuleExecutor {
                 wp_model_core::model::Value,
             )>,
         > = Vec::with_capacity(total);
-        let mut fired_at_cache: Option<(i64, String)> = None;
-        let _wfx_cache: Option<WfxPrefixCache> = None;
+        // wfx_id 前缀缓存（P6 补齐, 2026-08-27）: 同桶 top-N 条目共享
+        // rule/scope/fired_at/labels 前缀——v4 去 StepData 时误丢（旧 CloseOutput
+        // 路径有缓存）, 逐条目全量重 hash 的回归缺口。labels 迭代器变体零 StepData。
+        let mut wfx_cache: Option<WfxPrefixCache> = None;
         let mut entity_cache = EntityIdCache::new();
         let origin_arcs = OriginArcs::new();
+        // fired_at 每窗一次（window_end_nanos 常量——wfx 前缀/entity 连续缓存依赖;
+        // 单次 flush 内恒同, 无需缓存）。
+        let fired_at = format_nanos_utc(window_end_nanos);
         let mut global_row = 0usize;
 
         for bucket in buckets.iter() {
@@ -976,16 +981,16 @@ impl RuleExecutor {
                         .map_or(0.0, |e| e.measure_value);
                     (Some(label.as_str()), mv)
                 });
+                // measures 单独迭代（finish_from_labels 与缓存的 labels 交错）。
+                let measures = labels.iter().enumerate().map(|(i, _)| {
+                    bucket
+                        .measures
+                        .get(i)
+                        .and_then(|m| m.get(usize::min(k, m.len().saturating_sub(1))))
+                        .map_or(0.0, |e| e.measure_value)
+                });
                 let origin = AlertOrigin::Close {
                     reason: CloseReason::Timeout,
-                };
-                let fired_at = match &fired_at_cache {
-                    Some((w, s)) if *w == window_end_nanos => s.clone(),
-                    _ => {
-                        let s = format_nanos_utc(window_end_nanos);
-                        fired_at_cache = Some((window_end_nanos, s.clone()));
-                        s
-                    }
                 };
                 let entity_id: String = if let Some(s) = entity_const {
                     s.to_string()
@@ -1004,13 +1009,26 @@ impl RuleExecutor {
                         .unwrap_or_default()
                     })
                 };
-                let wfx_id = build_wfx_id_from_labels(
-                    &self.plan.name,
-                    &scope_values,
-                    &fired_at,
-                    step_iter.clone(),
-                    &origin,
-                );
+                // wfx_id: 前缀命中则只 hash 变化的 measure + origin（与
+                // `wfx_prefix_cache_matches_split` 同款判定; 换桶/窗自动重建）。
+                let wfx_id = match &wfx_cache {
+                    Some(c) if c.prefix_matches_labels(
+                        &scope_values,
+                        &fired_at,
+                        labels.iter().map(|l| Some(l.as_str())),
+                    ) => c.finish_from_labels(measures, &origin),
+                    _ => {
+                        let c = WfxPrefixCache::build_from_labels(
+                            &self.plan.name,
+                            &scope_values,
+                            &fired_at,
+                            labels.iter().map(|l| Some(l.as_str())),
+                        );
+                        let id = c.finish_from_labels(measures, &origin);
+                        wfx_cache = Some(c);
+                        id
+                    }
+                };
                 let summary = build_summary_from_labels(
                     &self.plan.name,
                     keys,
@@ -1088,7 +1106,7 @@ impl RuleExecutor {
                 wfx_ids.push(SmolStr::from(wfx_id));
                 scores.push(score_const);
                 entity_ids.push(SmolStr::from(entity_id));
-                fired_ats.push(fired_at);
+                fired_ats.push(fired_at.clone());
                 origins.push(Arc::clone(origin_arcs.origin(CloseReason::Timeout)));
                 close_reasons.push(Arc::clone(origin_arcs.close_reason(CloseReason::Timeout)));
                 summaries.push(Arc::from(summary));

@@ -299,6 +299,66 @@ mod split_tests {
         assert_eq!(c.finish(&[], std::slice::from_ref(&sd), &origin), expected);
     }
 
+    /// labels 迭代器版前缀缓存必须与 `build_wfx_id_from_labels` 字节一致
+    /// （同桶 top-N: 前缀命中只续 hash measure + origin）。
+    #[test]
+    fn wfx_prefix_cache_from_labels_matches_reference() {
+        let rule = "q19_auction_top10_stats";
+        let fired = "2026-08-25T00:00:00.000Z";
+        let origin = AlertOrigin::Close {
+            reason: CloseReason::Timeout,
+        };
+        let labels = ["top_price", "count"];
+        // 同桶（scope_key 相同）多条：只有 measure 变化。
+        let scope = vec![Value::Number(42.0)];
+        let rows: Vec<Vec<f64>> = (0..10).map(|i| vec![i as f64 * 1.5, i as f64 * 2.0]).collect();
+        let mut cache = None::<WfxPrefixCache>;
+        for measures in &rows {
+            let steps = labels.iter().zip(measures.iter()).map(|(l, m)| (Some(*l), *m));
+            let expected = build_wfx_id_from_labels(rule, &scope, fired, steps, &origin);
+            let got = match &cache {
+                Some(c)
+                    if c.prefix_matches_labels(
+                        &scope,
+                        fired,
+                        labels.iter().map(|l| Some(*l)),
+                    ) =>
+                {
+                    c.finish_from_labels(measures.iter().copied(), &origin)
+                }
+                _ => {
+                    let c = WfxPrefixCache::build_from_labels(
+                        rule,
+                        &scope,
+                        fired,
+                        labels.iter().map(|l| Some(*l)),
+                    );
+                    let id = c.finish_from_labels(measures.iter().copied(), &origin);
+                    cache = Some(c);
+                    id
+                }
+            };
+            assert_eq!(got, expected, "前缀缓存 wfx_id 必须与 from_labels 一致 (measures={measures:?})");
+        }
+        // 换桶（scope_key 不同）→ 前缀不匹配 → 重建。
+        let scope2 = vec![Value::Number(99.0)];
+        let measures = [3.0, 7.0];
+        let steps = labels.iter().zip(measures.iter()).map(|(l, m)| (Some(*l), *m));
+        let expected = build_wfx_id_from_labels(rule, &scope2, fired, steps, &origin);
+        assert!(!cache.unwrap().prefix_matches_labels(
+            &scope2,
+            fired,
+            labels.iter().map(|l| Some(*l))
+        ));
+        let c = WfxPrefixCache::build_from_labels(
+            rule,
+            &scope2,
+            fired,
+            labels.iter().map(|l| Some(*l)),
+        );
+        assert_eq!(c.finish_from_labels(measures.iter().copied(), &origin), expected);
+    }
+
     /// 同 scope+fired_at、labels 不同（内容 / 数量）→ 前缀必须不匹配：
     /// `prefix_matches` 是逐 label 精确比较（review 2026-08-26 废弃 FNV-64
     /// 近似后补的负例——hash 方案在碰撞时会静默产出与全量 build 不一致的
@@ -488,6 +548,85 @@ impl WfxPrefixCache {
             }
             hasher.update(b"\x1e");
             hasher.update(&sd.measure_value.to_bits().to_le_bytes());
+            hasher.update(b"\x1f");
+        }
+        hasher.update(b"\x00");
+        hasher.update(origin.as_str().as_bytes());
+        hex_encode(&hasher.finalize().to_le_bytes())
+    }
+
+    // -- labels/measure 迭代器变体（2026-08-27 stats 列式直写）-------------
+    // stats 直写路径（execute_stats_close_batch_columnar）无 StepData（v4 为省
+    // 每桶 4 个 StepData ≈ 4G 分配），但同桶 top-N 条目仍共享 rule/scope/fired_at/
+    // labels 前缀——逐条目全量重 hash 是 P6 前缀缓存的回归缺口（旧 CloseOutput
+    // 路径有缓存）。本变体以 labels 迭代器替代 StepData 切片，字节流与
+    // [`build_wfx_id_from_labels`] 完全一致（测试对拍锁定）。
+
+    /// 构建前缀 state（labels 段仅缓存不 hash；finish 时逐条与 measure 交错）。
+    pub(crate) fn build_from_labels<'a>(
+        rule_name: &str,
+        scope_key: &[Value],
+        fired_at: &str,
+        labels: impl Iterator<Item = Option<&'a str>>,
+    ) -> Self {
+        let mut hasher = Fnv1a::new();
+        hasher.update(rule_name.as_bytes());
+        hasher.update(b"\x00");
+        for v in scope_key {
+            hash_value_bytes(&mut hasher, v);
+            hasher.update(b"\x1f");
+        }
+        hasher.update(b"\x00");
+        hasher.update(fired_at.as_bytes());
+        hasher.update(b"\x00");
+        let labels: Vec<Option<String>> =
+            labels.map(|l| l.map(|s| s.to_string())).collect();
+        Self {
+            state: hasher.state,
+            scope_key: scope_key.to_vec(),
+            fired_at: fired_at.to_string(),
+            labels,
+        }
+    }
+
+    /// labels 迭代器版前缀匹配（scope/fired_at/labels 全同）。
+    pub(crate) fn prefix_matches_labels<'a>(
+        &self,
+        scope_key: &[Value],
+        fired_at: &str,
+        labels: impl Iterator<Item = Option<&'a str>>,
+    ) -> bool {
+        if self.scope_key.as_slice() != scope_key || self.fired_at != fired_at {
+            return false;
+        }
+        let mut cached = self.labels.iter();
+        for cur in labels {
+            match cached.next() {
+                Some(a) => {
+                    if a.as_deref() != cur {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        cached.next().is_none()
+    }
+
+    /// 从缓存前缀续算 wfx_id：measures（与缓存的 labels 同序交错）是变化部分。
+    pub(crate) fn finish_from_labels(
+        &self,
+        measures: impl Iterator<Item = f64>,
+        origin: &AlertOrigin,
+    ) -> String {
+        let mut hasher = Fnv1a { state: self.state };
+        let mut labels = self.labels.iter();
+        for mv in measures {
+            if let Some(label) = labels.next().and_then(|l| l.as_deref()) {
+                hasher.update(label.as_bytes());
+            }
+            hasher.update(b"\x1e");
+            hasher.update(&mv.to_bits().to_le_bytes());
             hasher.update(b"\x1f");
         }
         hasher.update(b"\x00");
@@ -741,10 +880,12 @@ pub(super) fn build_summary_split(
     )
 }
 
-/// (label, measure_value) 迭代器版 build_wfx_id（2026-08-26 q18 stats 直写）:
-/// 免构造 StepData（每桶 4 个 label String + 结构 ≈ 4G 分配, allocator 保留
-/// 致 RSS 虚高）。字节流 = `build_wfx_id_iter`（测试 `wfx_from_labels_matches`）。
-#[allow(clippy::too_many_arguments)]
+/// (label, measure_value) 迭代器版 build_wfx_id（2026-08-26 q18 stats 直写）。
+/// 字节流 = `build_wfx_id_iter`（rule \x00 scope \x1f* \x00 fired_at \x00
+/// {label \x1e measure \x1f}* \x00 origin）。
+/// 注：生产 stats 直写路径已改用 [`WfxPrefixCache::build_from_labels`]（P6 补齐,
+/// 2026-08-27）——本函数保留为测试对拍参考（`wfx_prefix_cache_from_labels_matches_reference`）。
+#[cfg(test)]
 pub(super) fn build_wfx_id_from_labels<'a>(
     rule_name: &str,
     scope_key: &[Value],
