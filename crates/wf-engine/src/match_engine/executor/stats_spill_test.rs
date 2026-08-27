@@ -60,6 +60,28 @@ fn last_measure(label: &str, field: &str) -> StatsMeasurePlan {
     }
 }
 
+fn distinct_measure(label: &str, field: &str) -> StatsMeasurePlan {
+    StatsMeasurePlan {
+        label: label.into(),
+        source_alias: "b".into(),
+        where_expr: None,
+        agg: StatsAggPlan::DistinctCount,
+        field: Some(FieldRef::Qualified("b".into(), field.into())),
+        arg: None,
+    }
+}
+
+fn top_measure(label: &str, field: &str, n: u64) -> StatsMeasurePlan {
+    StatsMeasurePlan {
+        label: label.into(),
+        source_alias: "b".into(),
+        where_expr: None,
+        agg: StatsAggPlan::Top,
+        field: Some(FieldRef::Qualified("b".into(), field.into())),
+        arg: Some(n),
+    }
+}
+
 fn keyed_plan(keys: Vec<Expr>, measures: Vec<StatsMeasurePlan>) -> StatsPlan {
     StatsPlan {
         window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(1800)),
@@ -733,4 +755,156 @@ fn mem_shared_counter_rule_budget() {
     let b_out = b.close_window_by_bucket_rows();
     assert_eq!(b_out.len(), 1, "B 输出 1 键");
     assert_eq!(shared.load(Ordering::SeqCst), 0, "B close 后共享归零");
+}
+
+// ---------------------------------------------------------------------------
+// 9. distinct / top 度量驱逐-读回全链路（对拍契约, 2026-08-27 review 补）
+// ---------------------------------------------------------------------------
+
+/// distinct 度量全链路：驱逐落盘 → 回访读回 → DistinctSet 合并——集合不丢。
+/// 序列化往返单测在 spill.rs 已覆盖, 这里补「驱逐-读回-合并」的机制层验证。
+#[test]
+fn spill_distinct_readback_merges() {
+    let subset = None;
+    let plan = keyed_plan(
+        vec![field_key("b", "bidder")],
+        vec![distinct_measure("d", "price")],
+    );
+
+    let make_rows = || {
+        let mut rows = Vec::new();
+        // 30 键 × 各 2 个 price 值（预算 4 桶 → 大量驱逐/读回）; 键 5 第三次
+        // 行触发读回（spill 后回访, DistinctSet 需合并旧集合 + 新值）。
+        for k in 1..=30 {
+            rows.push(row(&[
+                ("bidder", num(k as f64)),
+                ("price", num(100.0 + k as f64)),
+            ]));
+            rows.push(row(&[
+                ("bidder", num(k as f64)),
+                ("price", num(200.0 + k as f64)),
+            ]));
+        }
+        rows.push(row(&[("bidder", num(5.0)), ("price", num(999.0))]));
+        rows
+    };
+
+    // A: 不 spill（参照）
+    let mut a = StatsExecutor::new(plan.clone());
+    a.process_rows(&make_rows(), extract);
+    let a_out = a.close_window_by_bucket_rows();
+
+    // B: spill（预算 4 桶）
+    let mut b = exec_with_spill(plan, 4, subset, Some(Box::new(MemSpillStore::new())), None);
+    b.process_rows(&make_rows(), extract);
+    assert_eq!(b.window.over_limit_new_buckets(), 0, "spill 不拒收");
+    let b_out = b.close_window_by_bucket_rows();
+
+    assert_eq!(a_out.len(), b_out.len(), "输出行数一致");
+    assert_eq!(a_out.len(), 30, "30 键");
+    for (x, y) in a_out.iter().zip(b_out.iter()) {
+        assert_eq!(x.key, y.key, "键一致");
+        // distinct count: 每键 2 个值（键 5 有第 3 个）
+        let expect = if x.key == ScopeKey::Int(5) { 3.0 } else { 2.0 };
+        assert_eq!(
+            x.measures[0][0].measure_value, expect,
+            "参照 键 {:?} distinct count",
+            x.key
+        );
+        assert_eq!(
+            y.measures[0][0].measure_value, expect,
+            "spill 键 {:?} distinct count（驱逐读回后集合完整）",
+            y.key
+        );
+    }
+}
+
+/// top 度量全链路：驱逐落盘 → 读回 → TopEntry（含行字段）完整、rank 序正确。
+/// top 是行序敏感度量（spawn 门控不分片）——spill 读回后条目与不 spill 一致。
+#[test]
+fn spill_top_readback_roundtrip() {
+    let subset = Arc::new(HashSet::from(["price".to_string(), "channel".to_string()]));
+    let plan = keyed_plan(
+        vec![field_key("b", "bidder")],
+        vec![top_measure("t", "price", 3)],
+    );
+
+    let make_rows = || {
+        let mut rows = Vec::new();
+        // 30 键 × 3 行（top 3 全满）; 键 5 第 4 行触发读回后 top 更新。
+        for k in 1..=30 {
+            for v in 1..=3 {
+                rows.push(row(&[
+                    ("bidder", num(k as f64)),
+                    ("price", num(k as f64 * 10.0 + v as f64)),
+                    ("channel", Value::Str(format!("ch{k}").into())),
+                ]));
+            }
+        }
+        rows.push(row(&[
+            ("bidder", num(5.0)),
+            ("price", num(999.0)),
+            ("channel", Value::Str("ch5b".into())),
+        ]));
+        rows
+    };
+
+    // A: 不 spill（参照）
+    let mut a = StatsExecutor::with_row_fields(plan.clone(), Some(subset.clone()));
+    a.process_rows(&make_rows(), extract);
+    let a_out = a.close_window_by_bucket_rows();
+
+    // B: spill（预算 4 桶）
+    let mut b = exec_with_spill(
+        plan,
+        4,
+        Some(subset.clone()),
+        Some(Box::new(MemSpillStore::new())),
+        None,
+    );
+    b.process_rows(&make_rows(), extract);
+    assert_eq!(b.window.over_limit_new_buckets(), 0, "spill 不拒收");
+    let b_out = b.close_window_by_bucket_rows();
+
+    assert_eq!(a_out.len(), b_out.len(), "输出行数一致");
+    assert_eq!(a_out.len(), 30, "30 键");
+    for (x, y) in a_out.iter().zip(b_out.iter()) {
+        assert_eq!(x.key, y.key, "键一致");
+        // top 条目: 键 5 = [999, 53, 52]（第 4 行插入后 51 被挤出）; 其余 = 3 条
+        let expect_top = if x.key == ScopeKey::Int(5) {
+            vec![999.0, 53.0, 52.0]
+        } else {
+            let k = match x.key {
+                ScopeKey::Int(k) => k,
+                _ => panic!("Int 键"),
+            };
+            vec![
+                k as f64 * 10.0 + 3.0,
+                k as f64 * 10.0 + 2.0,
+                k as f64 * 10.0 + 1.0,
+            ]
+        };
+        let vals_a: Vec<f64> = x.measures[0].iter().map(|e| e.measure_value).collect();
+        let vals_b: Vec<f64> = y.measures[0].iter().map(|e| e.measure_value).collect();
+        assert_eq!(vals_a, expect_top, "参照 键 {:?} top", x.key);
+        assert_eq!(
+            vals_b, expect_top,
+            "spill 键 {:?} top（读回后 rank 序一致）",
+            y.key
+        );
+        // 行字段逐值对拍（TopEntry 的 row 序列化往返不丢）
+        for (ex, ey) in x.measures[0].iter().zip(y.measures[0].iter()) {
+            let nx: Vec<Option<Value>> = ex
+                .row_fields
+                .as_ref()
+                .map(|r| r.iter_values().collect())
+                .unwrap_or_default();
+            let ny: Vec<Option<Value>> = ey
+                .row_fields
+                .as_ref()
+                .map(|r| r.iter_values().collect())
+                .unwrap_or_default();
+            assert_eq!(nx, ny, "键 {:?} top 行字段一致", x.key);
+        }
+    }
 }

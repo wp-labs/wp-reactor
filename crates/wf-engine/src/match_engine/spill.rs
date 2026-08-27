@@ -1298,6 +1298,60 @@ mod tests {
         assert_eq!(back[3].top()[0].key, 100.0);
     }
 
+    /// 同桶多 last 共享同一 Arc<RowFields>（row_cache 保证）→ 序列化只写 1 份,
+    /// 读回后**仍共享同一 Arc**（ptr_eq）——与内存语义一致（2026-08-27 去重）。
+    #[test]
+    fn last_shared_rowfields_dedup_roundtrip_shares_arc() {
+        let layout = sample_layout();
+        let rf = std::sync::Arc::new({
+            let mut r = RowFields::empty(std::sync::Arc::clone(&layout));
+            r.set(0, Some(crate::match_engine::Value::Number(7.0)));
+            r
+        });
+        // 3 个 last 指向同一 Arc（同桶多 last 共享的场景）
+        let accs = vec![
+            StatsAccum::Last(Some(std::sync::Arc::clone(&rf))),
+            StatsAccum::Last(Some(std::sync::Arc::clone(&rf))),
+            StatsAccum::Last(Some(std::sync::Arc::clone(&rf))),
+        ];
+        let bytes = serialize_accs(&accs).expect("serialize");
+        let back = deserialize_accs(&bytes, &layout).expect("deserialize");
+        // 读回共享同一 Arc（去重引用索引生效, 与写侧 ptr_eq 对应）
+        let a0 = back[0].last().as_ref().expect("last0");
+        let a1 = back[1].last().as_ref().expect("last1");
+        let a2 = back[2].last().as_ref().expect("last2");
+        assert!(std::sync::Arc::ptr_eq(a0, a1), "读回 last0/last1 共享 Arc");
+        assert!(std::sync::Arc::ptr_eq(a0, a2), "读回 last0/last2 共享 Arc");
+        assert_eq!(
+            a0.value_at(0),
+            Some(crate::match_engine::Value::Number(7.0)),
+            "去重读回值不丢"
+        );
+        // 不同 Arc 的 last 不被误合并（引用索引必须精确匹配）
+        let rf2 = std::sync::Arc::new({
+            let mut r = RowFields::empty(std::sync::Arc::clone(&layout));
+            r.set(0, Some(crate::match_engine::Value::Number(8.0)));
+            r
+        });
+        let accs2 = vec![
+            StatsAccum::Last(Some(std::sync::Arc::clone(&rf))),
+            StatsAccum::Last(Some(std::sync::Arc::clone(&rf2))),
+        ];
+        let bytes2 = serialize_accs(&accs2).expect("serialize");
+        let back2 = deserialize_accs(&bytes2, &layout).expect("deserialize");
+        assert!(
+            !std::sync::Arc::ptr_eq(
+                back2[0].last().as_ref().expect("a"),
+                back2[1].last().as_ref().expect("b")
+            ),
+            "不同内容不共享 Arc"
+        );
+        assert_eq!(
+            back2[1].last().as_ref().expect("b").value_at(0),
+            Some(crate::match_engine::Value::Number(8.0))
+        );
+    }
+
     #[test]
     fn spill_value_roundtrip_with_layout_mismatch_rejected() {
         let layout = sample_layout();

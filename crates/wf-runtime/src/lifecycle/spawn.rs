@@ -519,8 +519,9 @@ pub(super) fn spawn_rule_tasks(
                 );
                 // 状态外溢（M4, `docs/design/stats-state-spill-redb.md`）:
                 // `limits { spill = "redb" }` → redb 落盘、内存只留活跃子集。
-                // 仅**单实例**可用（分片组合暂不支持, 见设计 §10）——分片/输入分片
-                // 分支下配置了 spill 则告警并忽略。
+                // 支持单实例 + key 分片（每片独立文件 + 独立写 worker, M6）;
+                // **输入分片**（空键按行号切分）暂不支持——配置了 spill 则告警
+                // 并忽略（见下方 input_shardable 分支）。
                 let spill_cfg = rule
                     .executor
                     .plan()
