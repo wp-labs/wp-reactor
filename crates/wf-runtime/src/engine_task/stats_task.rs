@@ -1220,3 +1220,6 @@ mod stats_task_coverage_more;
 #[cfg(test)]
 #[path = "stats_task_r4.rs"]
 mod stats_task_r4;
+#[cfg(test)]
+#[path = "stats_task_bench.rs"]
+mod stats_task_bench;
