@@ -39,9 +39,16 @@ use crate::window::scope_key_from_column;
 // （列数据 Arc 共享, 防释放不复制）; 超限整体清空（旧批已处理完, 安全）。
 
 /// 分片共享的批级 where mask 缓存（`Arc<RecordBatch>` 强持有防指针复用）。
+///
+/// key = (首列 Arc 指针, 行数); value = (批 Arc 防释放, mask 结果)。
+type MaskCacheMap = std::collections::HashMap<
+    (usize, usize),
+    (Arc<RecordBatch>, Arc<Vec<BooleanArray>>),
+>;
+
 #[derive(Debug)]
 pub struct StatsMaskCache {
-    inner: std::sync::Mutex<std::collections::HashMap<(usize, usize), (Arc<RecordBatch>, Arc<Vec<BooleanArray>>)>>,
+    inner: std::sync::Mutex<MaskCacheMap>,
     /// 容量上限（总行数; 超限整体清空——流式批下旧批已消费完）。
     /// pub(crate) 供测试缩容验证清理。
     pub(crate) max_rows: usize,

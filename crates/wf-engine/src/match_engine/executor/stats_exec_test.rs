@@ -2991,3 +2991,125 @@ fn stats_mask_cache_cached_path_agrees_with_plain() {
         plain.final_measure_values_by_bucket()
     );
 }
+
+/// 并发正确性（第 2 轮 review 补）: 多线程（模拟 S 片）同时 get_or_compute 同批——
+/// compute 只执行 1 次, 所有线程拿到同一 mask Arc（结果一致）。
+#[test]
+fn stats_mask_cache_concurrent_shards() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let cache = std::sync::Arc::new(StatsMaskCache::new());
+    let batch = std::sync::Arc::new(rows_to_batch(&auction_price_rows(&[
+        (1.0, 100.0),
+        (1.0, 2_000_000.0),
+        (2.0, 50_000.0),
+        (3.0, 15_000.0),
+        (1.0, 7.0),
+    ])));
+    let compute_calls = AtomicUsize::new(0);
+
+    const THREADS: usize = 10;
+    std::thread::scope(|s| {
+        for _ in 0..THREADS {
+            let cache = std::sync::Arc::clone(&cache);
+            let batch = std::sync::Arc::clone(&batch);
+            let calls = &compute_calls;
+            s.spawn(move || {
+                let m = cache.get_or_compute(&batch, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    vec![BooleanArray::from(vec![true, true, false, false, true])]
+                });
+                assert_eq!(m.len(), 1, "所有线程拿到同一结果");
+                assert!(m[0].value(0), "mask 值正确");
+                assert!(!m[0].value(2));
+            });
+        }
+    });
+    assert_eq!(compute_calls.load(Ordering::SeqCst), 1, "10 片并发只算 1 次");
+    assert_eq!(cache.len(), 1);
+}
+
+/// 清空后重算一致性（第 3 轮 review 补）: 容量超限整体清空后, 同批再次
+/// get_or_compute 重算——结果与首次一致（清理不破坏正确性）。
+#[test]
+fn stats_mask_cache_recompute_after_clear_matches() {
+    let cache = StatsMaskCache::new();
+    let mut cache = cache;
+    cache.max_rows = 4;
+    let b1 = rows_to_batch(&auction_price_rows(&[(1.0, 100.0), (1.0, 200.0)])); // 2 行
+    let b2 = rows_to_batch(&auction_price_rows(&[(1.0, 300.0), (1.0, 400.0)])); // 2 行
+    let b3 = rows_to_batch(&auction_price_rows(&[(1.0, 500.0), (1.0, 600.0)])); // 2 行 → 触发清空
+
+    let m1 = cache.get_or_compute(&b1, || vec![BooleanArray::from(vec![true, true])]);
+    let m2 = cache.get_or_compute(&b2, || vec![BooleanArray::from(vec![false, false])]);
+    let m3 = cache.get_or_compute(&b3, || vec![BooleanArray::from(vec![true, false])]);
+    // 第 3 批: total 4+2=6 > 4 → 清空（b1/b2 被清）; 缓存只留 b3
+    assert_eq!(cache.len(), 1, "清空后只留当前批");
+
+    // b1 再次访问 → 重算（同一表达式 → 同一结果; 缓存设计下 compute 是纯函数）
+    let m1b = cache.get_or_compute(&b1, || vec![BooleanArray::from(vec![true, true])]);
+    assert!(m1b[0].value(0) && m1b[0].value(1), "重算结果与首次一致");
+    assert_eq!(m1[0].value(0), m1b[0].value(0));
+    assert_eq!(m1[0].value(1), m1b[0].value(1));
+    // b3 仍在缓存（未被重算影响）
+    let m3b = cache.get_or_compute(&b3, || vec![]);
+    assert_eq!(m3b.len(), 1);
+    assert!(m3b[0].value(0) && !m3b[0].value(1));
+}
+
+/// 空批不缓存（第 6 轮 review 补）: rows==0 直接 compute, 不写入缓存（避免
+/// key=(0,0) 与后续真实批碰撞）。
+#[test]
+fn stats_mask_cache_empty_batch_not_cached() {
+    let cache = StatsMaskCache::new();
+    let empty = rows_to_batch(&[]);
+    assert_eq!(empty.num_rows(), 0);
+    let m = cache.get_or_compute(&empty, || vec![BooleanArray::from(Vec::<bool>::new())]);
+    assert_eq!(m.len(), 1);
+    assert_eq!(cache.len(), 0, "空批不缓存");
+
+    // 空批后再来真实批: 正常缓存（key 不冲突）
+    let real = rows_to_batch(&auction_price_rows(&[(1.0, 100.0)]));
+    let m2 = cache.get_or_compute(&real, || vec![BooleanArray::from(vec![true])]);
+    assert_eq!(m2.len(), 1);
+    assert_eq!(cache.len(), 1);
+}
+
+/// 分片语义集成（第 5 轮 review 补）: 两片共享 cache, 各处理自己的行域子集,
+/// 合并后与单实例全批结果一致——缓存路径在真实分片语义下不破坏正确性。
+#[test]
+fn stats_mask_cache_two_shards_match_single() {
+    let plan = q17_shape_plan();
+    let rows = auction_price_rows(&[
+        (1.0, 100.0),
+        (1.0, 2_000_000.0),
+        (2.0, 50_000.0),
+        (3.0, 15_000.0),
+        (1.0, 7.0),
+    ]);
+    let batch = rows_to_batch(&rows);
+    let n = batch.num_rows() as u32;
+    // 行号 % 2 分区（与 fanout 的 shard_rows 口径一致）
+    let shard0: Vec<u32> = (0..n).filter(|i| i % 2 == 0).collect();
+    let shard1: Vec<u32> = (0..n).filter(|i| i % 2 == 1).collect();
+
+    let cache = StatsMaskCache::new();
+    let mut s0 = StatsExecutor::new(plan.clone());
+    let mut s1 = StatsExecutor::new(plan.clone());
+    assert!(s0.process_batch_rows_cached(&batch, Some(&shard0), &cache));
+    assert!(s1.process_batch_rows_cached(&batch, Some(&shard1), &cache));
+
+    // 两片桶值合并（键 1 的 count/sum 等相加——分片归并语义）
+    let mut merged = StatsExecutor::new(plan);
+    let (b0, c0) = s0.take_partial();
+    let (b1, c1) = s1.take_partial();
+    merged.merge_partial(b0, c0);
+    merged.merge_partial(b1, c1);
+
+    let mut single = StatsExecutor::new(q17_shape_plan());
+    assert!(single.process_batch_rows(&batch, None));
+    assert_eq!(
+        merged.final_measure_values_by_bucket(),
+        single.final_measure_values_by_bucket(),
+        "两片共享缓存 + 分片行域归并 = 单实例全批"
+    );
+}
