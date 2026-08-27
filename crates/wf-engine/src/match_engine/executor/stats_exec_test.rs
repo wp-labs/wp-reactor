@@ -3086,6 +3086,93 @@ fn stats_mask_cache_time_shares_same_batch() {
     assert_ne!(t1, t3);
 }
 
+/// time 并发正确性（第 2 轮 review 补）: 多线程并发 get_or_compute_time 同批——
+/// compute 只执行 1 次, 所有线程拿到同一 max_time。
+#[test]
+fn stats_mask_cache_time_concurrent_shards() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let cache = std::sync::Arc::new(StatsMaskCache::new());
+    let batch = std::sync::Arc::new(rows_to_batch(&auction_price_rows(&[
+        (1.0, 100.0),
+        (1.0, 200.0),
+    ])));
+    let compute_calls = AtomicUsize::new(0);
+
+    const THREADS: usize = 10;
+    std::thread::scope(|s| {
+        for _ in 0..THREADS {
+            let cache = std::sync::Arc::clone(&cache);
+            let batch = std::sync::Arc::clone(&batch);
+            let calls = &compute_calls;
+            s.spawn(move || {
+                let t = cache.get_or_compute_time(&batch, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    42_000_000_000i64
+                });
+                assert_eq!(t, 42_000_000_000);
+            });
+        }
+    });
+    assert_eq!(compute_calls.load(Ordering::SeqCst), 1, "10 片并发只扫 1 次");
+}
+
+/// time 表容量清理（第 3 轮 review 补）: 超限整体清空, 与 mask 表独立记账。
+#[test]
+fn stats_mask_cache_time_capacity_clears() {
+    let cache = StatsMaskCache::new();
+    let mut cache = cache;
+    cache.max_rows = 3;
+    let b1 = rows_to_batch(&auction_price_rows(&[(1.0, 100.0)]));
+    let b2 = rows_to_batch(&auction_price_rows(&[(1.0, 200.0)]));
+    let b3 = rows_to_batch(&auction_price_rows(&[(1.0, 300.0)]));
+
+    cache.get_or_compute_time(&b1, || 1);
+    cache.get_or_compute_time(&b2, || 2);
+    assert_eq!(cache.time_len(), 2);
+    // 第 3 批: total 3 > 3? —— 3 批各 1 行: 第 3 批 total=3 不超; 第 4 批才触发。
+    cache.get_or_compute_time(&b3, || 3);
+    assert_eq!(cache.time_len(), 3, "3 批各 1 行 ≤ 上限 3");
+    let b4 = rows_to_batch(&auction_price_rows(&[(1.0, 400.0)]));
+    cache.get_or_compute_time(&b4, || 4);
+    assert_eq!(cache.time_len(), 1, "超限清空后只留当前批");
+    // 清空后旧批重算（与 mask 表互不影响）
+    assert_eq!(cache.get_or_compute_time(&b1, || 1), 1);
+}
+
+/// 两表同批共享一致性（第 5 轮 review 补）: 同一批 mask 与 max_time 都在缓存中
+/// 命中（同 key 批身份, 两表独立但一致工作）。
+#[test]
+fn stats_mask_cache_mask_and_time_share_batch() {
+    let cache = StatsMaskCache::new();
+    let batch = rows_to_batch(&auction_price_rows(&[(1.0, 100.0), (1.0, 200.0)]));
+
+    let mut calls = 0usize;
+    // mask 首算
+    let m1 = cache.get_or_compute(&batch, || {
+        calls += 1;
+        vec![BooleanArray::from(vec![true, false])]
+    });
+    // time 首算（独立表）
+    let t1 = cache.get_or_compute_time(&batch, || {
+        calls += 1;
+        5_000_000_000i64
+    });
+    assert_eq!(calls, 2, "mask 与 time 各算 1 次");
+    // 第二片同批: 两表都命中
+    let batch2 = batch.clone();
+    let m2 = cache.get_or_compute(&batch2, || {
+        calls += 1;
+        vec![]
+    });
+    let t2 = cache.get_or_compute_time(&batch2, || {
+        calls += 1;
+        -1
+    });
+    assert_eq!(calls, 2, "第二片两表均命中");
+    assert!(std::sync::Arc::ptr_eq(&m1, &m2));
+    assert_eq!(t1, t2);
+}
+
 /// 空批不缓存（第 6 轮 review 补）: rows==0 直接 compute, 不写入缓存（避免
 /// key=(0,0) 与后续真实批碰撞）。
 #[test]

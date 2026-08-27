@@ -145,6 +145,11 @@ impl StatsMaskCache {
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().expect("poisoned").len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn time_len(&self) -> usize {
+        self.time_inner.lock().expect("poisoned").len()
+    }
 }
 
 // ---------------------------------------------------------------------------

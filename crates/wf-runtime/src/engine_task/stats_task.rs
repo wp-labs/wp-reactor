@@ -118,7 +118,8 @@ pub(super) struct StatsTask {
     merge_rx: Option<mpsc::Receiver<StatsPartial>>,
     merge_tx: Option<mpsc::Sender<StatsPartial>>,
     /// 分片共享批级 where mask 缓存（2026-08-27 q17 分片去重）; None = 不缓存。
-    mask_cache: Option<Arc<wf_engine::match_engine::StatsMaskCache>>,
+    /// pub(crate) 供测试注入共享缓存验证。
+    pub(crate) mask_cache: Option<Arc<wf_engine::match_engine::StatsMaskCache>>,
     /// 当前窗口（fixed 桶, bucket 对齐首个事件; `None` = 尚未见事件）。
     window_start: Option<i64>,
     /// 当前窗口结束（= window_start + dur; close 判定 watermark >= window_end）。
