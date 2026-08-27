@@ -1278,6 +1278,19 @@ impl StatsExecutor {
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
         });
+        // 度量字段列索引（2026-08-27 q17 修复）: 每批预解析一次, 免逐行逐度量
+        // `schema().index_of` 线性扫描——q17 4 个数值度量 min/max/avg/sum 全命中
+        // 旧缺陷（column_i128 每行 index_of + downcast）。count 无字段 → None。
+        let measure_field_cols: Vec<Option<usize>> = self
+            .plan
+            .measures
+            .iter()
+            .map(|m| {
+                m.field
+                    .as_ref()
+                    .and_then(|f| batch.schema().index_of(field_name(f)).ok())
+            })
+            .collect();
         // 带 key（P2）: 逐行按桶归并（mask 列式 + 桶键列式, 无解释器 eval）。
         // 空键保持整列归并快路径（P1.5）。
         if !self.plan.keys.is_empty() {
@@ -1292,6 +1305,7 @@ impl StatsExecutor {
                 rows,
                 row_names.as_deref(),
                 row_field_cols.as_deref(),
+                &measure_field_cols,
             );
         }
         // 段 1d: 纯归并度量整列累加（**行域驱动**——2026-08-24 分片裁剪: 只遍历
@@ -1400,6 +1414,7 @@ impl StatsExecutor {
         rows: Option<&[u32]>,
         row_names: Option<&[String]>,
         row_field_cols: Option<&[Option<usize>]>,
+        measure_field_cols: &[Option<usize>],
     ) -> bool {
         // 局部寄存器计数（F1 修复的 event_count 口径 + 零热路径开销）: 归并成功
         // 才计, 批末一次性写回——避免每行一次 `self.window.event_count += 1` 的
@@ -1419,6 +1434,7 @@ impl StatsExecutor {
                         r as usize,
                         row_names,
                         row_field_cols,
+                        measure_field_cols,
                     ) {
                         counted += 1;
                     }
@@ -1434,6 +1450,7 @@ impl StatsExecutor {
                         row,
                         row_names,
                         row_field_cols,
+                        measure_field_cols,
                     ) {
                         counted += 1;
                     }
@@ -1448,9 +1465,9 @@ impl StatsExecutor {
     /// 返回 `true` = 归并成功（行计入 event_count）; `false` = 键 null/超限拒收
     /// （行跳过, 不计入——F1 行式/列式对拍口径）。
     ///
-    /// 字段读取走**原生列值**（`column_i128`/`column_distinct_key`）——与空键
-    /// 列式段同精度（D7/D8: ≥2^53 的 Int64 不得经 `Value::Number(f64)` 舍入;
-    /// Timestamp 列 distinct 也走原生 i64, 不得静默跳过）。
+    /// 字段读取走**原生列值**（`column_i128_at`/`column_distinct_key_at`, 列索引
+    /// 批级预解析——与空键列式段同精度（D7/D8: ≥2^53 的 Int64 不得经
+    /// `Value::Number(f64)` 舍入; Timestamp 列 distinct 也走原生 i64, 不得静默跳过）。
     ///
     /// **复合键优化（P5+）**: 键数 ≤ 4 走扁平键路径——栈上叶数组（`key_column_comp`
     /// 预解析列, 无 Box 分配/无逐行 downcast）→ `comps_hash` → `keyed_bucket_mut`
@@ -1466,6 +1483,7 @@ impl StatsExecutor {
         row: usize,
         row_names: Option<&[String]>,
         row_field_cols: Option<&[Option<usize>]>,
+        measure_field_cols: &[Option<usize>],
     ) -> bool {
         const MAX_STACK_KEYS: usize = 4;
         // 2026-08-26 q18/q19：行字段 layout（首次从 schema 构建并缓存）；
@@ -1496,6 +1514,7 @@ impl StatsExecutor {
                 masks,
                 row,
                 &row_layout,
+                measure_field_cols,
             );
             return true;
         }
@@ -1517,6 +1536,7 @@ impl StatsExecutor {
             masks,
             row,
             &row_layout,
+            measure_field_cols,
         );
         true
     }
@@ -1539,6 +1559,7 @@ fn accumulate_column_row(
     masks: &[BooleanArray],
     row: usize,
     row_layout: &std::sync::Arc<RowFieldLayout>,
+    measure_field_cols: &[Option<usize>],
 ) {
     let mut row_cache: Option<std::sync::Arc<RowFields>> = None;
     for (idx, measure) in plan.measures.iter().enumerate() {
@@ -1558,18 +1579,20 @@ fn accumulate_column_row(
             | StatsAggPlan::Max => {
                 let nacc = acc.numeric_mut();
                 nacc.count += 1;
-                let Some(field) = &measure.field else {
+                // 度量字段列索引（批级预解析, 免每行 schema.index_of——q17 修复）;
+                // count 无字段 → None → 只计数。
+                let Some(ci) = measure_field_cols[idx] else {
                     continue;
                 };
                 match measure.agg {
                     StatsAggPlan::Count => {}
                     StatsAggPlan::Sum | StatsAggPlan::Avg => {
-                        if let Some(nn) = column_i128(batch, field_name(field), row) {
+                        if let Some(nn) = column_i128_at(batch, ci, row) {
                             nacc.sum += nn;
                         }
                     }
                     StatsAggPlan::Min => {
-                        if let Some(nn) = column_i128(batch, field_name(field), row) {
+                        if let Some(nn) = column_i128_at(batch, ci, row) {
                             nacc.min = Some(match nacc.min {
                                 Some(m) if m <= nn => m,
                                 _ => nn,
@@ -1577,7 +1600,7 @@ fn accumulate_column_row(
                         }
                     }
                     StatsAggPlan::Max => {
-                        if let Some(nn) = column_i128(batch, field_name(field), row) {
+                        if let Some(nn) = column_i128_at(batch, ci, row) {
                             nacc.max = Some(match nacc.max {
                                 Some(m) if m >= nn => m,
                                 _ => nn,
@@ -1588,8 +1611,8 @@ fn accumulate_column_row(
                 }
             }
             StatsAggPlan::DistinctCount => {
-                if let Some(field) = &measure.field
-                    && let Some(k) = column_distinct_key(batch, field_name(field), row)
+                if let Some(ci) = measure_field_cols[idx]
+                    && let Some(k) = column_distinct_key_at(batch, ci, row)
                 {
                     acc.distinct_mut().insert(k);
                 }
@@ -2316,9 +2339,8 @@ fn row_fields_from_batch(
 /// 从 batch 列读单行原生数值（Int64 原生 i64 → i128, 不走 f64——D8: ≥2^53 的
 /// Int64 经 `Value::Number(f64)` 会丢精度; Float64 按 `sum_masked` 同口径截断）。
 /// null / 非数值列 → None（与行式 `value_to_i128` 的 None 一致）。
-fn column_i128(batch: &RecordBatch, name: &str, row: usize) -> Option<i128> {
-    let idx = batch.schema().index_of(name).ok()?;
-    let col = batch.column(idx);
+fn column_i128_at(batch: &RecordBatch, ci: usize, row: usize) -> Option<i128> {
+    let col = batch.column(ci);
     if col.is_null(row) {
         return None;
     }
@@ -2349,13 +2371,16 @@ fn column_f64_at(batch: &RecordBatch, ci: usize, row: usize) -> Option<f64> {
     None
 }
 
-/// 从 batch 列读单行原生 distinct 键（与列式段 `insert_distinct_column` 同类型
-/// 分派, 原生值构造——D7: 禁止 `Value::Number(f64)` 化 ≥2^53 的 Int64）。
-/// null / 类型不在支持集 → None（与行式 extract None 一致）。
-fn column_distinct_key(batch: &RecordBatch, name: &str, row: usize) -> Option<DistinctKey> {
+/// 索引版 distinct 键读取（列索引批级预解析, 免每行 schema.index_of——q17 同款修复）。
+/// 与列式段 `insert_distinct_column` 同类型分派, 原生值构造（D7: 禁止
+/// `Value::Number(f64)` 化 ≥2^53 的 Int64）。null / 类型不在支持集 → None。
+fn column_distinct_key_at(
+    batch: &RecordBatch,
+    ci: usize,
+    row: usize,
+) -> Option<DistinctKey> {
     use arrow::array::TimestampNanosecondArray;
-    let idx = batch.schema().index_of(name).ok()?;
-    let col = batch.column(idx);
+    let col = batch.column(ci);
     if col.is_null(row) {
         return None;
     }
