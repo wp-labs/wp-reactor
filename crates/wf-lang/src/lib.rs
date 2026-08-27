@@ -2,7 +2,7 @@ pub mod ast;
 mod checker;
 pub mod cidr;
 pub mod columnar;
-mod compiler;
+pub mod compiler;
 pub mod diagnostics;
 pub mod error;
 pub mod explain;

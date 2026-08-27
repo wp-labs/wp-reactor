@@ -35,6 +35,8 @@ pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
             _ => scope.resolve_field_ref(fref).ok().flatten(),
         },
         Expr::PresetParam(_) => None,
+        // 编译期已展开（resolve_shared_list_refs 在 checker 前）。
+        Expr::ListRef(_) => None,
         Expr::Object(_) => Some(ValType::Object),
         Expr::Array(items) => infer_array_type(items, scope),
         Expr::BinOp { op, left, right } => infer_binop(*op, left, right, scope),

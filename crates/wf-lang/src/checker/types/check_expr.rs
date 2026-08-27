@@ -392,7 +392,9 @@ fn check_expr_type_inner(
         | Expr::StringLit(_)
         | Expr::Bool(_)
         | Expr::SystemVar(_)
-        | Expr::WfuMeta(_) => {}
+        | Expr::WfuMeta(_)
+        // 编译期已展开（resolve_shared_list_refs 在 checker 前）。
+        | Expr::ListRef(_) => {}
         Expr::IfThenElse {
             cond,
             then_expr,

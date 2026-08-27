@@ -223,6 +223,7 @@ pub fn expr_is_columnar(expr: &Expr) -> bool {
         Expr::SystemVar(_)
         | Expr::WfuMeta(_)
         | Expr::PresetParam(_)
+        | Expr::ListRef(_)
         | Expr::FuncCall { .. }
         | Expr::Object(_)
         | Expr::Array(_)

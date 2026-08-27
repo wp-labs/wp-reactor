@@ -537,7 +537,37 @@ yield scan_alerts : base_alerts, ioc_fields (
 - 必填参数不能排在带默认值参数之后；缺少必填参数、实参数量过多、未知 `$param` 都是编译错误
 - preset 中引用的事件 alias 在使用点解析；推荐 preset 优先放常量、`@score`、`@__wfu_*` 和时间系统变量
 
-项目级公共 preset 可集中放入规则根目录下的 `_global.wfl`。规则根目录由 `runtime.rules` glob 的非通配前缀推导，例如 `rules/**/*.wfl` 对应 `rules/_global.wfl`，`rules/current/*.wfl` 对应 `rules/current/_global.wfl`。运行时会自动把它作为 project prelude 加载，并从普通规则文件列表中排除；`_global.wfl` 只允许 `yield preset` 声明，不会自动启用普通 `rule`。
+项目级公共 preset 可集中放入规则根目录下的 `_global.wfl`。规则根目录由 `runtime.rules` glob 的非通配前缀推导，例如 `rules/**/*.wfl` 对应 `rules/_global.wfl`，`rules/current/*.wfl` 对应 `rules/current/_global.wfl`。运行时会自动把它作为 project prelude 加载，并从普通规则文件列表中排除；`_global.wfl` 只允许 `yield preset` 与 `shared` 声明，不会自动启用普通 `rule`。
+
+#### `shared` 公共允许列表
+
+`shared` 用于声明跨规则复用的公共允许列表（issue #73）——一组 `in (...)` 右值只定义一次，多条规则以 `expr in <name>`（或 `expr not in <name>`）引用：
+
+```wfl
+shared security_log_types = (
+    "360_active_defense_log",
+    "edr_alert_log",
+    "fw_ips_protect_log"
+)
+
+rule alert_rule {
+    events { s : sdm_event && s.log_type in security_log_types }
+    ...
+}
+
+rule alert_entity_rule {
+    events { s : sdm_event && s.log_type in security_log_types }
+    ...
+}
+```
+
+语义：
+
+- 声明必须在规则之前（与 `yield preset` / `pattern` 同文法位置）；声明中的元素与手写 `in (...)` 列表同文法
+- 编译期把引用展开为字面列表——元素类型检查、运行时求值与手写列表**逐字节等价**，不引入新语义
+- 引用未声明的列表 → 编译错误（带规则名与列表名）；同名重复声明 → 编译错误
+- 支持 `not in <name>`；`shared` 列表元素不支持嵌套引用其他 `shared` 列表
+- 项目级共享：放入规则根目录的 `_global.wfl` 后自动并入每个规则文件（prelude 合并，规则文件内不允许重名覆盖）
 
 #### 时间系统变量
 

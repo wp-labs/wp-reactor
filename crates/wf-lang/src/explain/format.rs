@@ -22,6 +22,7 @@ pub fn format_expr(expr: &Expr) -> String {
         Expr::WfuMeta(field) => format!("@{}", field.name()),
         Expr::Field(fref) => format_field_ref(fref),
         Expr::PresetParam(name) => format!("${name}"),
+        Expr::ListRef(name) => format!("in {name}"),
         Expr::BinOp { op, left, right } => {
             format!(
                 "{} {} {}",
