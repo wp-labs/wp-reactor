@@ -566,6 +566,12 @@ pub struct StatsWindowState {
     spill_evictions: u64,
     /// 累计读回次数（跨窗口，指标/抖动观测用）。
     spill_readbacks: u64,
+    /// 驱逐分段耗时（ns，跨窗口累计；性能定位用——扫描/clone/redb 写三段的占比）。
+    spill_scan_ns: u64,
+    spill_clone_ns: u64,
+    spill_write_ns: u64,
+    /// 驱逐调用次数（分段耗时的分母）。
+    spill_evict_calls: u64,
 }
 
 impl StatsWindowState {
@@ -591,6 +597,10 @@ impl StatsWindowState {
             readback: HashSet::new(),
             spill_evictions: 0,
             spill_readbacks: 0,
+            spill_scan_ns: 0,
+            spill_clone_ns: 0,
+            spill_write_ns: 0,
+            spill_evict_calls: 0,
         }
     }
 
@@ -702,7 +712,11 @@ impl StatsWindowState {
                     self.rule_name,
                     self.estimated_bytes,
                     limit,
-                    if self.spill.is_some() { "已满/失败" } else { "未启用" },
+                    if self.spill.is_some() {
+                        "已满/失败"
+                    } else {
+                        "未启用"
+                    },
                     self.spill_limit_bytes
                         .map(|b| format!(" 落盘 {}/{}B", self.spilled_bytes, b))
                         .unwrap_or_default(),
@@ -717,7 +731,11 @@ impl StatsWindowState {
 
     /// 注入状态外溢存储（窗口开始时由 spawn 层调用）。
     /// `store = None` 关闭 spill（Noop 语义）。`max_spill_bytes = None` 不限落盘。
-    pub fn set_spill(&mut self, store: Option<Box<dyn SpillStore + Send + Sync>>, max_spill_bytes: Option<usize>) {
+    pub fn set_spill(
+        &mut self,
+        store: Option<Box<dyn SpillStore + Send + Sync>>,
+        max_spill_bytes: Option<usize>,
+    ) {
         self.spill = store;
         self.spill_limit_bytes = max_spill_bytes.map(|b| b as u64);
         self.spill_index.clear();
@@ -738,13 +756,25 @@ impl StatsWindowState {
         self.spill_readbacks
     }
 
+    /// 驱逐分段耗时（跨窗口累计；性能定位）：(扫描 ns, clone ns, 写 ns, 调用次数)。
+    pub fn spill_profile_ns(&self) -> (u64, u64, u64, u64) {
+        (
+            self.spill_scan_ns,
+            self.spill_clone_ns,
+            self.spill_write_ns,
+            self.spill_evict_calls,
+        )
+    }
+
     /// 驱逐最老未更新键到 spill（clock 二次机会近似 LRU），直到内存预算降到
     /// `min(上限-单桶, 上限 90%)`（滞后带：既要放得下新桶，又避免每新键都驱逐）。
     ///
     /// 落盘上限已满/写失败 → 置 `spill_failed`, 由 `account_new_bucket` 落到
     /// 拒收兜底（不丢内存键）。
     fn evict_to_spill(&mut self, plan: &StatsPlan) {
-        let Some(limit) = self.limit_bytes else { return };
+        let Some(limit) = self.limit_bytes else {
+            return;
+        };
         // 落盘上限已到 → 停止驱逐（拒收兜底）。
         if let Some(sl) = self.spill_limit_bytes
             && self.spilled_bytes >= sl
@@ -754,7 +784,9 @@ impl StatsWindowState {
         }
         let allowance = Self::bucket_allowance(plan);
         // 驱逐目标: 上限-单桶 与 上限 90% 取小（前者保证新桶放得下）。
-        let target = limit.saturating_sub(allowance).min(limit.saturating_mul(9) / 10);
+        let target = limit
+            .saturating_sub(allowance)
+            .min(limit.saturating_mul(9) / 10);
         let mut batch: Vec<(u64, ScopeKey, Vec<StatsAccum>)> = Vec::new();
         let mut batch_hashes: Vec<u64> = Vec::new();
         // 扫描期待驱逐字节（est 只在落盘后扣——循环条件用 est - pending）。
@@ -762,8 +794,13 @@ impl StatsWindowState {
         // 防活锁: 最多扫 (TOUCH_MAX+2)× 时钟长度（全活跃时停止——拒收兜底正确）。
         let max_scan = self.clock.len().saturating_mul(TOUCH_MAX as usize + 2);
         let mut scanned = 0usize;
+        let mut scan_ns = 0u64;
+        let mut clone_ns = 0u64;
         while self.estimated_bytes.saturating_sub(pending) > target && scanned < max_scan {
-            let Some(h) = self.clock.pop_front() else { break };
+            let s0 = std::time::Instant::now();
+            let Some(h) = self.clock.pop_front() else {
+                break;
+            };
             scanned += 1;
             let Some(chain) = self.buckets.get_mut(&h) else {
                 continue; // 链已不在（close 分批取走）
@@ -775,15 +812,19 @@ impl StatsWindowState {
                     b.touch = b.touch.saturating_sub(1);
                 }
                 self.clock.push_back(h);
+                scan_ns += s0.elapsed().as_nanos() as u64;
                 continue;
             }
             // 驱逐整链（先 clone 进 batch；落盘成功后才从桶表移除——写失败
             // 不丢内存键）。
+            let c0 = std::time::Instant::now();
             pending += allowance * chain.len() as u64;
             for b in chain.iter() {
                 batch.push((h, b.scope_key.clone(), b.accs.clone()));
             }
             batch_hashes.push(h);
+            scan_ns += s0.elapsed().as_nanos() as u64;
+            clone_ns += c0.elapsed().as_nanos() as u64;
         }
         if batch.is_empty() {
             return;
@@ -797,18 +838,20 @@ impl StatsWindowState {
             return;
         }
         // 单事务批量写。
+        let w0 = std::time::Instant::now();
         let result = self
             .spill
             .as_mut()
             .expect("调用方已确认 spill 启用")
             .put_batch(batch);
+        self.spill_write_ns += w0.elapsed().as_nanos() as u64;
+        self.spill_scan_ns += scan_ns;
+        self.spill_clone_ns += clone_ns;
+        self.spill_evict_calls += 1;
         if let Err(e) = result {
             // 写失败（磁盘满/IO）→ 回退拒收（§5 三层阶梯兜底），不丢内存键。
             self.spill_failed = true;
-            log::error!(
-                "spill 写失败(规则 {}): {e}——回退拒收新键",
-                self.rule_name
-            );
+            log::error!("spill 写失败(规则 {}): {e}——回退拒收新键", self.rule_name);
             return;
         }
         // 落盘成功 → 从桶表移除 + 记账（内存/spill 不相交不变量成立）。
@@ -1578,6 +1621,10 @@ impl StatsExecutor {
         let over_limit = self.window.over_limit_new_buckets;
         let spill_evictions = self.window.spill_evictions;
         let spill_readbacks = self.window.spill_readbacks;
+        let spill_scan_ns = self.window.spill_scan_ns;
+        let spill_clone_ns = self.window.spill_clone_ns;
+        let spill_write_ns = self.window.spill_write_ns;
+        let spill_evict_calls = self.window.spill_evict_calls;
         self.window = StatsWindowState::new(buckets);
         // 保留限额配置 + 拒收/抖动计数跨窗口（guard 持续生效; 计数供指标/告警）。
         // spill 不跨窗口（store 已 cleanup 丢弃, 文件删除）。
@@ -1586,6 +1633,10 @@ impl StatsExecutor {
         self.window.over_limit_new_buckets = over_limit;
         self.window.spill_evictions = spill_evictions;
         self.window.spill_readbacks = spill_readbacks;
+        self.window.spill_scan_ns = spill_scan_ns;
+        self.window.spill_clone_ns = spill_clone_ns;
+        self.window.spill_write_ns = spill_write_ns;
+        self.window.spill_evict_calls = spill_evict_calls;
     }
 
     /// 注入状态内存上限（字节; None = 不设防）——超限拒收新键桶, 已有桶继续。
@@ -1595,7 +1646,11 @@ impl StatsExecutor {
 
     /// 注入状态外溢存储（M3; 窗口开始时调用; None = 关闭 spill）。
     /// `max_spill_bytes` = 落盘上限（None = 不限; 三层预算阶梯第二层）。
-    pub fn set_spill(&mut self, store: Option<Box<dyn SpillStore + Send + Sync>>, max_spill_bytes: Option<usize>) {
+    pub fn set_spill(
+        &mut self,
+        store: Option<Box<dyn SpillStore + Send + Sync>>,
+        max_spill_bytes: Option<usize>,
+    ) {
         self.spill_redb = None;
         self.window.set_spill(store, max_spill_bytes);
     }
@@ -1636,7 +1691,8 @@ impl StatsExecutor {
         };
         let store = crate::match_engine::spill::RedbSpillStore::create(&path, layout)
             .unwrap_or_else(|e| panic!("spill redb 创建失败(致命) {}: {e}", path.display()));
-        self.window.set_spill(Some(Box::new(store)), max_spill_bytes);
+        self.window
+            .set_spill(Some(Box::new(store)), max_spill_bytes);
     }
 
     /// 提取本片已关闭窗口的**原始累加状态**（输入分区分片归并用）并重置窗口。

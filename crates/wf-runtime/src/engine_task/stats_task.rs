@@ -133,6 +133,11 @@ pub(super) struct StatsTask {
     /// 已上报的 spill 驱逐/读回累计值（delta 记账；抖动观测, M5-2）。
     last_reported_spill_evictions: u64,
     last_reported_spill_readbacks: u64,
+    /// 已上报的驱逐分段耗时（ns 累计值；delta 记账, 性能定位用）。
+    last_reported_spill_scan_ns: u64,
+    last_reported_spill_clone_ns: u64,
+    last_reported_spill_write_ns: u64,
+    last_reported_spill_calls: u64,
 }
 
 impl StatsTask {
@@ -187,6 +192,10 @@ impl StatsTask {
             last_reported_over_limit: 0,
             last_reported_spill_evictions: 0,
             last_reported_spill_readbacks: 0,
+            last_reported_spill_scan_ns: 0,
+            last_reported_spill_clone_ns: 0,
+            last_reported_spill_write_ns: 0,
+            last_reported_spill_calls: 0,
         };
         (task, cancel)
     }
@@ -697,13 +706,40 @@ impl StatsTask {
         if ev_delta > 0 || rb_delta > 0 {
             // 用 log 而非 wf_warn（tracing）：daemon 日志过滤器未开
             // wf_runtime::engine_task 目标——executor 的 log::warn 已验证可输出。
+            let (scan_ns, clone_ns, write_ns, calls) = self.stats.window.spill_profile_ns();
+            let scan_d = scan_ns.saturating_sub(self.last_reported_spill_scan_ns);
+            let clone_d = clone_ns.saturating_sub(self.last_reported_spill_clone_ns);
+            let write_d = write_ns.saturating_sub(self.last_reported_spill_write_ns);
+            let calls_d = calls.saturating_sub(self.last_reported_spill_calls);
+            self.last_reported_spill_scan_ns = scan_ns;
+            self.last_reported_spill_clone_ns = clone_ns;
+            self.last_reported_spill_write_ns = write_ns;
+            self.last_reported_spill_calls = calls;
+            let profile = if calls_d > 0 {
+                format!(
+                    " · 驱逐耗时(calls={}): scan={:.0}ms clone={:.0}ms write={:.0}ms (每批 scan+clone/write {:.2}ms/{:.2}ms)",
+                    calls_d,
+                    scan_d as f64 / 1e6,
+                    clone_d as f64 / 1e6,
+                    write_d as f64 / 1e6,
+                    (scan_d + clone_d) as f64 / 1e6 / calls_d as f64,
+                    write_d as f64 / 1e6 / calls_d as f64,
+                )
+            } else {
+                String::new()
+            };
             log::warn!(
-                "spill 抖动(规则 {}, task {}): 本窗驱逐 {} 键 / 读回 {} 次（读回率 {:.1}%; 预算不足时升高 = 抖动）",
+                "spill 抖动(规则 {}, task {}): 本窗驱逐 {} 键 / 读回 {} 次（读回率 {:.1}%; 预算不足时升高 = 抖动）{}",
                 self.rule_name(),
                 self.task_id,
                 ev_delta,
                 rb_delta,
-                if ev_delta > 0 { rb_delta as f64 * 100.0 / ev_delta as f64 } else { 0.0 }
+                if ev_delta > 0 {
+                    rb_delta as f64 * 100.0 / ev_delta as f64
+                } else {
+                    0.0
+                },
+                profile
             );
         }
     }
