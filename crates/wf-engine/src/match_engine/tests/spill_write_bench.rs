@@ -77,6 +77,69 @@ fn time_insert(entries: &[(u64, Vec<u8>)], cache_mb: usize) -> f64 {
 
 #[test]
 #[ignore]
+fn redb_concurrent_multi_db_64mb_cache() {
+    // 生产形态：10 片并行（每片独立 redb 库），64MB 页缓存（默认），
+    // 每库持续写入驱逐批。验证并发是否放大单批耗时（100M 256MB 预算
+    // 实测 worker 39MB/批 7-8s ≈ 5MB/s，而单库 bench 170MB/s——差 35 倍）。
+    eprintln!("[spill-bench] 并发 10 库 × 64MB 页缓存（生产 q18 形态）:");
+    eprintln!("[spill-bench] 并发库  批大小  单批耗时(中位)  吞吐/库  总吞吐");
+    for n in [62_000usize, 248_000] {
+        // 每库预生成自己的批（避免共享 entries 的排序干扰）。
+        let mut per_db: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
+        for _ in 0..10 {
+            let mut e = gen_entries(n, 633);
+            e.sort_by_key(|x| x.0);
+            per_db.push(e);
+        }
+        let t0 = Instant::now();
+        let handles: Vec<_> = per_db
+            .into_iter()
+            .enumerate()
+            .map(|(i, entries)| {
+                std::thread::spawn(move || {
+                    let path = temp_db_path(&format!("conc_{i}"));
+                    let db = Database::builder()
+                        .set_cache_size(64 * 1024 * 1024)
+                        .create(&path)
+                        .expect("create");
+                    {
+                        let txn = db.begin_write().expect("begin_write");
+                        let _ = txn.open_table(TABLE).expect("open");
+                        txn.commit().expect("commit init");
+                    }
+                    let tb = Instant::now();
+                    let txn = db.begin_write().expect("begin_write");
+                    {
+                        let mut table = txn.open_table(TABLE).expect("open");
+                        for (h, v) in &entries {
+                            table.insert(*h, v.as_slice()).expect("insert");
+                        }
+                    }
+                    txn.commit().expect("commit");
+                    let batch_ms = tb.elapsed().as_secs_f64() * 1e3;
+                    let _ = std::fs::remove_file(&path);
+                    batch_ms
+                })
+            })
+            .collect();
+        let mut per_batch: Vec<f64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        per_batch.sort_by(|a, b| a.total_cmp(b));
+        let median = per_batch[per_batch.len() / 2];
+        let wall = t0.elapsed().as_secs_f64();
+        let mb_per_db = n as f64 * 633.0 / 1e6;
+        eprintln!(
+            "[spill-bench]    {:>3}库  {:>6}  {:>8.1}ms  {:>6.0}MB/s  {:>6.0}MB/s",
+            10,
+            n,
+            median,
+            mb_per_db / (median / 1e3),
+            mb_per_db * 10.0 / wall,
+        );
+    }
+}
+
+#[test]
+#[ignore]
 fn redb_write_random_vs_sorted() {
     eprintln!("[spill-bench] redb 批量 insert: 随机(当前) vs 批内排序 vs 顺序key(理论上限)");
     eprintln!("[spill-bench] 值大小 = q18 每键状态 ~633B");

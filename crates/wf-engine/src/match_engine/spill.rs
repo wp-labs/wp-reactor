@@ -208,7 +208,7 @@ const REDB_TABLE: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new
 /// - 读失败 = 致命：redb 错误在无 Result 通道的 trait 方法里直接 panic
 ///   （绝不静默丢键）；`put_batch` 保留 Result 供 M3 三层预算回退拒收。
 pub struct RedbSpillStore {
-    /// 读侧数据库句柄（worker 线程持有 Arc clone 做写事务——redb 并发读/单写）。
+    /// 读侧数据库句柄（写侧 RedbBatchWriter 持 Arc clone 共用同一库）。
     db: Option<std::sync::Arc<redb::Database>>,
     /// 库文件路径（`cleanup` 删除用；含 redb 可能的 `.rbr` 侧车文件）。
     path: std::path::PathBuf,
@@ -216,22 +216,23 @@ pub struct RedbSpillStore {
     layout: std::sync::Arc<RowFieldLayout>,
     /// drain_up_to 游标：下一批从 `Excluded(cursor)` 续读（None = 从头）。
     drain_cursor: Option<u64>,
-    /// 异步写队列（后台 worker 消化）。None = 已 cleanup。
+    /// 异步写队列（M6）：本分片独立写 worker（每分片 = 每文件 = 单写者，驱逐
+    /// 与写流水线自洽——实测最优；共享队列/全局单写者均负优化）。
     writer: Option<AsyncPersister<SpillItem, RedbBatchWriter>>,
-    /// 后台写失败标记（error_cb 置位 → 后续 put_batch 拒收，防继续丢键）。
+    /// 写失败标记（writer error_cb 置位 → put_batch 拒收）。
     write_failed: std::sync::Arc<AtomicBool>,
 }
 
 impl RedbSpillStore {
     /// 打开/新建库（`Database::create` 语义：文件不存在则初始化，存在则打开）。
     /// 初始化时确保 `state` 表存在（读事务 `open_table` 要求表已存在）。
+    /// 内部创建本分片的独立异步写队列（M6：每分片 = 每文件 = 单写者）。
     ///
     /// **页缓存设界**（2026-08-26 M5 实测）：redb 默认缓存 1GiB/库——q18 10 片
     /// 潜在 10GB 无谓 RSS。取 `WF_SPILL_CACHE_MB`（默认 64MB）。
     ///
     /// **无持久化语义**（设计 §8）：spill 是内存换磁盘的临时缓冲，崩溃即重
-    /// ingest——正确性不依赖落盘；`put_batch` 用 `Immediate` 仅为了把脏页
-    /// 刷出页缓存（批量低频, fsync 成本可忽略）。
+    /// ingest——正确性不依赖落盘。
     pub fn create(
         path: impl AsRef<std::path::Path>,
         layout: std::sync::Arc<RowFieldLayout>,
@@ -252,11 +253,19 @@ impl RedbSpillStore {
                 .map_err(|e| SpillError::Redb(e.into()))?;
         }
         write_txn.commit().map_err(|e| SpillError::Redb(e.into()))?;
-        // 异步写队列（M6）：驱逐写移出热路径。
+        // 异步写队列（M6）：驱逐写移出热路径。每分片独立（单 worker）。
         let queue_bytes: usize = std::env::var("WF_SPILL_QUEUE_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(512 * 1024 * 1024);
+        let batch_bytes: usize = std::env::var("WF_SPILL_BATCH_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64 * 1024 * 1024);
+        let fsync_every: u64 = std::env::var("WF_SPILL_FSYNC_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
         let write_failed = std::sync::Arc::new(AtomicBool::new(false));
         let error_cb: std::sync::Arc<dyn Fn(&str) + Send + Sync> = {
             let flag = std::sync::Arc::clone(&write_failed);
@@ -266,12 +275,10 @@ impl RedbSpillStore {
             })
         };
         let writer = AsyncPersister::new(
-            RedbBatchWriter {
-                db: db.clone(),
-                put_batches: 0,
-            },
+            vec![RedbBatchWriter::new(db.clone(), fsync_every)],
             queue_bytes,
             32,
+            batch_bytes,
             Some(error_cb),
         );
         Ok(Self {
@@ -300,24 +307,38 @@ impl RedbSpillStore {
 
 impl Drop for RedbSpillStore {
     fn drop(&mut self) {
-        // 停写队列（join worker，排空剩余批）——Drop 时不留后台线程。
+        // 停本分片写队列（join worker，排空剩余批）——Drop 时不留后台线程。
         if let Some(w) = self.writer.take() {
             w.shutdown();
         }
     }
 }
 
-/// 单个 spill 条目（异步写队列的数据单元）。
-pub(crate) type SpillItem = (u64, ScopeKey, Vec<StatsAccum>);
+/// 单个 spill 条目（异步写队列的数据单元）——本分片独立 worker，无需目标标识。
+pub type SpillItem = (u64, ScopeKey, Vec<StatsAccum>);
 
 /// 写侧后端：redb 单事务批量 insert（M6——由 AsyncPersister 后台 worker 调用）。
+/// 每分片一个实例（每分片 = 每文件 = 单写者）。
 ///
 /// durability 策略与 M5-1 一致：默认 `None`（无 fsync，close 期 drain 读内存页
-/// 更快），每 8 批一次 `Immediate` 周期 flush（redb 连带持久化之前所有 None
-/// 提交——脏页有界）。
-struct RedbBatchWriter {
+/// 更快），每 `fsync_every` 批一次 `Immediate` 周期 flush（redb 连带持久化之前
+/// 所有 None 提交——脏页有界）。
+pub struct RedbBatchWriter {
     db: std::sync::Arc<redb::Database>,
     put_batches: u64,
+    /// 每 N 批一次 `Immediate`（fsync）周期 flush（M5-1：限脏页有界）。
+    /// `WF_SPILL_FSYNC_EVERY` 可调（A/B 实验已排除 fsync 频率为主瓶颈）。
+    fsync_every: u64,
+}
+
+impl RedbBatchWriter {
+    pub fn new(db: std::sync::Arc<redb::Database>, fsync_every: u64) -> Self {
+        Self {
+            db,
+            put_batches: 0,
+            fsync_every,
+        }
+    }
 }
 
 impl BatchWriter<SpillItem> for RedbBatchWriter {
@@ -325,36 +346,56 @@ impl BatchWriter<SpillItem> for RedbBatchWriter {
         if items.is_empty() {
             return Ok(());
         }
-        self.put_batches += 1;
-        let durability = if self.put_batches.is_multiple_of(8) {
-            redb::Durability::Immediate
-        } else {
-            redb::Durability::None
-        };
+        let t0 = std::time::Instant::now();
         // 批内按 hash 排序（2026-08-27 bench 实测 1.4-2.4x）：B+树随机插入
         // 页分裂多/缓存命中差；排序后近似顺序写，逼近连续 key 理论上限
         // （见 tests/spill_write_bench.rs）。排序成本 ~50ms/24.8 万键，远小于
         // 写耗时。
         let mut items = items;
         items.sort_by_key(|(h, _, _)| *h);
+        let t1 = std::time::Instant::now();
+        self.put_batches += 1;
+        let durability = if self.put_batches.is_multiple_of(self.fsync_every) {
+            redb::Durability::Immediate
+        } else {
+            redb::Durability::None
+        };
         let mut txn = self
             .db
             .begin_write()
             .map_err(|e| format!("begin_write: {e}"))?;
         txn.set_durability(durability)
             .map_err(|e| format!("set_durability: {e}"))?;
+        let mut serialize_ns = 0u64;
+        let mut insert_ns = 0u64;
         {
             let mut table = txn
                 .open_table(REDB_TABLE)
                 .map_err(|e| format!("open_table: {e}"))?;
             for (hash, key, accs) in items {
+                let s0 = std::time::Instant::now();
                 let bytes = serialize_spill_value(&key, &accs).map_err(|e| e.to_string())?;
+                serialize_ns += s0.elapsed().as_nanos() as u64;
+                let i0 = std::time::Instant::now();
                 table
                     .insert(hash, bytes.as_slice())
                     .map_err(|e| format!("insert: {e}"))?;
+                insert_ns += i0.elapsed().as_nanos() as u64;
             }
         }
+        let c0 = std::time::Instant::now();
         txn.commit().map_err(|e| format!("commit: {e}"))?;
+        let commit_ns = c0.elapsed().as_nanos() as u64;
+        if std::env::var("WF_SPILL_PROFILE").is_ok() {
+            log::info!(
+                "spill worker 批: 总 {:>8.1}ms | sort {:>6.1}ms | 序列化 {:>6.1}ms | insert {:>6.1}ms | commit {:>6.1}ms",
+                t0.elapsed().as_secs_f64() * 1e3,
+                t1.duration_since(t0).as_secs_f64() * 1e3,
+                serialize_ns as f64 / 1e6,
+                insert_ns as f64 / 1e6,
+                commit_ns as f64 / 1e6,
+            );
+        }
         Ok(())
     }
 }
@@ -384,7 +425,7 @@ impl SpillStore for RedbSpillStore {
         if entries.is_empty() {
             return Ok(());
         }
-        // 后台写失败标记 → 拒收（防继续丢键）。
+        // 写失败标记 → 拒收（防继续丢键）。
         if self.write_failed.load(AtomicOrdering::SeqCst) {
             return Err(SpillError::Closed);
         }
@@ -392,10 +433,11 @@ impl SpillStore for RedbSpillStore {
             return Err(SpillError::Closed);
         };
         // 入队（M6 异步写）：热路径不阻塞 redb 事务；队列满/超预算时阻塞
-        // （背压 = 内存有界的代价）。est 按每项保守 1KB 估算。
+        // （背压 = 内存有界的代价）。est 按每项保守 1KB 估算；单 worker 队列
+        // route 恒 0。
         let est = entries.len().saturating_mul(1024);
         writer
-            .submit_batch(entries, est)
+            .submit_batch(0, entries, est)
             .map_err(|_| SpillError::Closed)
     }
 
@@ -466,8 +508,8 @@ impl SpillStore for RedbSpillStore {
     }
 
     fn cleanup(&mut self) {
-        // 停写队列（排空剩余批）→ 关闭数据库（释放文件句柄）→ 删除库文件
-        // 与可能的侧车 WAL。
+        // 停本分片写队列（排空剩余批）→ 关闭数据库（释放文件句柄）→ 删除库
+        // 文件与可能的侧车 WAL。
         if let Some(w) = self.writer.take() {
             w.shutdown();
         }
@@ -1375,7 +1417,9 @@ mod tests {
                 RedbSpillStore::create(&path, std::sync::Arc::clone(&layout)).expect("create");
             s.put_batch(vec![(h, k.clone(), vec![StatsAccum::Last(None)])])
                 .expect("put");
-            // 不 cleanup（模拟崩溃残留/跨窗口复用前重开）
+            // 触发 flush（写队列排空——worker 的 db Arc 释放后文件才可重开）;
+            // 不 cleanup（模拟崩溃残留/跨窗口复用前重开）。
+            assert!(s.contains(h), "put 后已落盘可见");
         }
         // 重开（create 对已存在文件 = open）：数据仍在
         let mut s2 = RedbSpillStore::create(&path, std::sync::Arc::clone(&layout)).expect("reopen");

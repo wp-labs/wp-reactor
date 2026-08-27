@@ -247,7 +247,13 @@ fn spill_file_path(rule_name: &str, shard: Option<usize>) -> PathBuf {
     }
     let safe: String = rule_name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     match shard {
         Some(s) => dir_path.join(format!("spill_{safe}_{}_{s}.rb", std::process::id())),
@@ -508,9 +514,12 @@ pub(super) fn spawn_rule_tasks(
                 // `limits { spill = "redb" }` → redb 落盘、内存只留活跃子集。
                 // 仅**单实例**可用（分片组合暂不支持, 见设计 §10）——分片/输入分片
                 // 分支下配置了 spill 则告警并忽略。
-                let spill_cfg = rule.executor.plan().limits_plan.as_ref().and_then(|l| {
-                    l.spill.as_ref().map(|_| l.max_spill_bytes)
-                });
+                let spill_cfg = rule
+                    .executor
+                    .plan()
+                    .limits_plan
+                    .as_ref()
+                    .and_then(|l| l.spill.as_ref().map(|_| l.max_spill_bytes));
                 if let Some(max_spill_bytes) = spill_cfg {
                     stats.set_spill_redb(
                         spill_file_path(&rule.executor.plan().name, None),
@@ -571,7 +580,7 @@ pub(super) fn spawn_rule_tasks(
                             );
                         shard_stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
                         // key 分片: 每片独立 executor（无跨片 merge）——spill 按片独立
-                        // 启用（每片独立文件）。
+                        // 启用（每片独立文件 + 每片独立写 worker = 多 worker 多文件）。
                         if let Some(max_spill_bytes) = spill_cfg {
                             shard_stats.set_spill_redb(
                                 spill_file_path(&rule.executor.plan().name, Some(shard_idx)),
