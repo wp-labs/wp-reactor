@@ -679,20 +679,12 @@ impl StatsWindowState {
         if has_row_fields {
             bytes += 112; // 共享 1 份 RowFields 堆（q18 6 字段 ≈ 104B + 余量）
         }
-        // 校准系数（2026-08-27 q18 实测）：估算 432B/键 vs 实际 960B/键
-        // （2.22x）——低估来源 = StatsAccum enum 实际 24B（估 16）+ RowFields
-        // 实测 168B（估 112）+ hashbrown 桶数组/容量 + mimalloc 16B 对齐×
-        // 每分配 + Vec 容量。估算低估 → 驱逐水位失真（实际 2.2× 预算才驱逐）。
-        // `WF_ALLOWANCE_MULT` 可调（A/B：1.0 = 原行为；2.2 = q18 实测校准）。
-        // OnceLock 缓存（热路径每新键调用, 不重复读 env）。
-        static MULT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-        let mult: f64 = *MULT.get_or_init(|| {
-            std::env::var("WF_ALLOWANCE_MULT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2.2)
-        });
-        (bytes as f64 * mult).round() as u64
+        // 校准系数 2.2（2026-08-27 q18 实测）：估算 432B/键 vs 实际 960B/键
+        // ——低估来源 = StatsAccum enum 实际 24B（估 16）+ RowFields 实测 168B
+        // （估 112）+ hashbrown 桶数组/容量 + mimalloc 16B 对齐×每分配 + Vec
+        // 容量。估算低估 → 驱逐水位失真（实际 2.2× 预算才驱逐）。
+        // 常量（非 env）：热路径每新键调用, 且避免测试 env 竞态。
+        (bytes as f64 * 2.2).round() as u64
     }
 
     /// 新建桶前的限额检查: 超限 → 先尝试 spill 腾空间（M3 三层预算阶梯第二层）

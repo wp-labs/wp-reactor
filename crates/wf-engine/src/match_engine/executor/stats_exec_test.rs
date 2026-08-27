@@ -2141,7 +2141,7 @@ fn stats_memory_guard_rejects_new_buckets_over_limit() {
     // top(3) 桶预算 = 512 + 1×128 + 3×160 = 1120B。限额 1200 → 只放行 1 桶。
     let plan = q19_like_plan();
     let mut exec = StatsExecutor::new(plan);
-    exec.set_memory_limit("guard_test", Some(1200));
+    exec.set_memory_limit("guard_test", Some(2640));
 
     // 10 个不同 auction 键, 每键 1 行（先到者进桶）。
     let rows = auction_price_rows(&[
@@ -2164,7 +2164,7 @@ fn stats_memory_guard_rejects_new_buckets_over_limit() {
         "10 个新键, 限额只放 1 个 → 拒收 9"
     );
     assert!(
-        exec.window.estimated_bytes() <= 1200,
+        exec.window.estimated_bytes() <= 2640,
         "估算必须在限额内（有界）: {}",
         exec.window.estimated_bytes()
     );
@@ -2179,7 +2179,7 @@ fn stats_memory_guard_existing_bucket_keeps_accumulating() {
     // 已存在的桶不受拒收影响（同键后续行继续累积）。
     let plan = q19_like_plan();
     let mut exec = StatsExecutor::new(plan);
-    exec.set_memory_limit("guard_test", Some(1200));
+    exec.set_memory_limit("guard_test", Some(2640));
 
     exec.process_rows(&auction_price_rows(&[(1.0, 100.0), (2.0, 200.0)]), extract);
     assert_eq!(exec.window.over_limit_new_buckets(), 1, "键 2 被拒");
@@ -2213,7 +2213,7 @@ fn stats_memory_guard_no_limit_accepts_all() {
 fn stats_memory_guard_resets_on_close() {
     let plan = q19_like_plan();
     let mut exec = StatsExecutor::new(plan);
-    exec.set_memory_limit("guard_test", Some(1200));
+    exec.set_memory_limit("guard_test", Some(2640));
     exec.process_rows(&auction_price_rows(&[(1.0, 100.0), (2.0, 200.0)]), extract);
     assert!(exec.window.estimated_bytes() > 0);
     assert_eq!(exec.window.over_limit_new_buckets(), 1);
@@ -2255,7 +2255,7 @@ fn stats_memory_guard_columnar_path_rejects_too() {
     // 列式路径（process_batch）与行式同受 guard 约束。
     let plan = q19_like_plan();
     let mut exec = StatsExecutor::new(plan);
-    exec.set_memory_limit("guard_test", Some(1200));
+    exec.set_memory_limit("guard_test", Some(2640));
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("auction", DataType::Int64, false),
@@ -2271,7 +2271,7 @@ fn stats_memory_guard_columnar_path_rejects_too() {
     .unwrap();
     assert!(exec.process_batch(&batch), "列式前置满足");
     assert_eq!(exec.window.over_limit_new_buckets(), 4, "5 键限 1 → 拒 4");
-    assert!(exec.window.estimated_bytes() <= 1200);
+    assert!(exec.window.estimated_bytes() <= 2640);
 }
 
 #[test]
@@ -2294,7 +2294,7 @@ fn stats_memory_guard_event_count_counts_only_accumulated_rows() {
 
     // 列式: 5 键限 1 → 只归并 1 行, event_count == 1（不是 5）。
     let mut col_exec = StatsExecutor::new(plan.clone());
-    col_exec.set_memory_limit("guard_test", Some(1200));
+    col_exec.set_memory_limit("guard_test", Some(2640));
     assert!(col_exec.process_batch(&batch), "列式前置满足");
     assert_eq!(col_exec.window.over_limit_new_buckets(), 4);
     assert_eq!(
@@ -2304,7 +2304,7 @@ fn stats_memory_guard_event_count_counts_only_accumulated_rows() {
 
     // 行式对拍: 同一输入 → 同样只归并 1 行。
     let mut row_exec = StatsExecutor::new(plan);
-    row_exec.set_memory_limit("guard_test", Some(1200));
+    row_exec.set_memory_limit("guard_test", Some(2640));
     let rows = auction_price_rows(&[
         (1.0, 100.0),
         (2.0, 200.0),
@@ -2323,7 +2323,7 @@ fn stats_memory_guard_over_limit_counts_rows_not_keys() {
     // 仍尝试建桶 → 每次 +1。这是有意取舍（每键记账需无界集合, 违背有界承诺）。
     let plan = q19_like_plan();
     let mut exec = StatsExecutor::new(plan);
-    exec.set_memory_limit("guard_test", Some(1200)); // 只放 1 桶
+    exec.set_memory_limit("guard_test", Some(2640)); // 只放 1 桶
 
     // 键 1 放行; 键 2 首次被拒; 键 2 再来 2 行仍被拒; 键 3 被拒。
     exec.process_rows(
@@ -2350,7 +2350,7 @@ fn stats_memory_guard_merge_partial_rejects_over_limit() {
     // 内放行的键, 合并到协调片后可能超限被拒（协调片 own 预算）。
     let plan = q19_like_plan();
     let mut exec = StatsExecutor::new(plan);
-    exec.set_memory_limit("guard_test", Some(1200)); // 只放 1 桶
+    exec.set_memory_limit("guard_test", Some(2640)); // 只放 1 桶
 
     // 协调片已有键 1（占满预算 1120B）。
     exec.process_rows(&auction_price_rows(&[(1.0, 100.0)]), extract);
@@ -2399,7 +2399,7 @@ fn stats_memory_guard_q18_shape_budget_not_overcounted() {
     );
     let mut exec = StatsExecutor::new(plan);
     // 43.2MB: 新口径 432B → 阈值 10 万键; 旧口径 1664B → 阈值 2.6 万键。
-    exec.set_memory_limit("guard_q18_shape", Some(43_200_000));
+    exec.set_memory_limit("guard_q18_shape", Some(95_000_000));
     const N: usize = 50_000;
     let rows: Vec<HashMap<String, Value>> = (0..N)
         .map(|i| {

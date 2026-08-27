@@ -830,6 +830,10 @@ fn read_distinct_key(r: &mut Reader<'_>) -> Result<DistinctKey, SpillError> {
 pub fn serialize_accs(accs: &[StatsAccum]) -> Result<Vec<u8>, SpillError> {
     let mut w = Writer::new();
     w.u64(accs.len() as u64);
+    // 已写 RowFields 的指针表（Last 去重引用, 2026-08-27 q18 落盘 2.9x 压缩）：
+    // 同桶多 last 内存共享 1 份 RowFields（row_cache 保证）——序列化只写 1
+    // 份完整 + 后续引用索引, 读回共享同一 Arc（与内存语义一致）。
+    let mut written_rf: Vec<std::ptr::NonNull<RowFields>> = Vec::new();
     for acc in accs {
         match acc {
             StatsAccum::Numeric(n) => {
@@ -871,8 +875,18 @@ pub fn serialize_accs(accs: &[StatsAccum]) -> Result<Vec<u8>, SpillError> {
                 w.u8(TAG_LAST);
                 match rf {
                     Some(rf) => {
-                        w.u8(1);
-                        write_row_fields(&mut w, rf)?;
+                        let ptr =
+                            std::ptr::NonNull::new(std::sync::Arc::as_ptr(rf) as *mut RowFields)
+                                .expect("Arc 指针非空");
+                        if let Some(idx) = written_rf.iter().position(|p| *p == ptr) {
+                            // 已写过 → 引用索引（复用读回时的同一 Arc）。
+                            w.u8(2);
+                            w.u64(idx as u64);
+                        } else {
+                            w.u8(1);
+                            write_row_fields(&mut w, rf)?;
+                            written_rf.push(ptr);
+                        }
                     }
                     None => w.u8(0),
                 }
@@ -908,6 +922,8 @@ pub fn deserialize_accs(
         return Err(SpillError::Corrupt(format!("accs 数量 {n} 超上限")));
     }
     let mut out = Vec::with_capacity(n);
+    // 已读 RowFields（Last 去重引用读回——写侧 ptr_eq 去重对应）。
+    let mut written_rf: Vec<std::sync::Arc<RowFields>> = Vec::new();
     for _ in 0..n {
         let acc = match r.u8()? {
             TAG_NUMERIC => {
@@ -942,12 +958,31 @@ pub fn deserialize_accs(
                 StatsAccum::Distinct(Box::new(DistinctSet::from_parts(ints, others)))
             }
             TAG_LAST => {
-                let rf = if r.u8()? == 1 {
-                    Some(read_row_fields_with_layout(&mut r, layout)?)
-                } else {
-                    None
+                let flag = r.u8()?;
+                let rf = match flag {
+                    0 => None,
+                    1 => {
+                        let rf = read_row_fields_with_layout(&mut r, layout)?;
+                        let arc = std::sync::Arc::new(rf);
+                        written_rf.push(std::sync::Arc::clone(&arc));
+                        Some(arc)
+                    }
+                    2 => {
+                        // 引用之前已读的 RowFields（共享同一 Arc, 与写侧去重对应）。
+                        let idx = r.u64()? as usize;
+                        if idx >= written_rf.len() {
+                            return Err(SpillError::Corrupt(format!(
+                                "RowFields 引用索引 {idx} 越界 ({} 已读)",
+                                written_rf.len()
+                            )));
+                        }
+                        Some(std::sync::Arc::clone(&written_rf[idx]))
+                    }
+                    other => {
+                        return Err(SpillError::Corrupt(format!("Last flag 未知 {other}")));
+                    }
                 };
-                StatsAccum::Last(rf.map(std::sync::Arc::new))
+                StatsAccum::Last(rf)
             }
             TAG_TOP => {
                 let n = r.u64()? as usize;

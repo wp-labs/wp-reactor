@@ -14,10 +14,10 @@ use std::sync::Arc;
 use wf_lang::ast::{Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan, WindowSpec};
 
+use crate::match_engine::Value;
 use crate::match_engine::executor::stats_exec::{RowFieldLayout, StatsExecutor};
 use crate::match_engine::match_engine::ScopeKey;
 use crate::match_engine::spill::{MemSpillStore, RedbSpillStore};
-use crate::match_engine::Value;
 
 // ---------------------------------------------------------------------------
 // helpers（与 stats_exec_test 同款）
@@ -85,8 +85,9 @@ fn extract(row: &HashMap<String, Value>, name: &str) -> Option<Value> {
     row.get(name).cloned()
 }
 
-/// count 单度量桶预算（StatsWindowState::bucket_allowance 口径: 256 + 80）。
-const COUNT_ALLOWANCE: u64 = 336;
+/// count 单度量桶预算（StatsWindowState::bucket_allowance 口径: (256 + 80) ×
+/// 2.2 校准系数——2026-08-27 q18 实测估算低估 2.2x, 与 bucket_allowance 同步）。
+const COUNT_ALLOWANCE: u64 = 739;
 
 /// 开启 spill 的 executor（row 路径）：
 /// `budget_buckets` = 内存可驻留桶数上限；`store` = 存储实现；
@@ -124,13 +125,7 @@ fn spill_evicts_over_budget_and_reads_back() {
         vec![count_measure("n"), sum_measure("total", "price")],
     );
     // count+sum 桶预算 = 256+80+80 = 416; 预算 4 桶 → limit 1344（内存驻留 3 桶）
-    let mut exec = exec_with_spill(
-        plan,
-        4,
-        None,
-        Some(Box::new(MemSpillStore::new())),
-        None,
-    );
+    let mut exec = exec_with_spill(plan, 4, None, Some(Box::new(MemSpillStore::new())), None);
 
     // 10 个键各 2 行（键 1..=10 创建后都再命中一次——第二次命中已 spill 的键走读回）
     for k in 1..=10 {
@@ -141,21 +136,17 @@ fn spill_evicts_over_budget_and_reads_back() {
     }
 
     // 拒收必须为 0（spill 替代拒收，不丢键）
-    assert_eq!(exec.window.over_limit_new_buckets(), 0, "spill 生效不应拒收");
+    assert_eq!(
+        exec.window.over_limit_new_buckets(),
+        0,
+        "spill 生效不应拒收"
+    );
     // 内存有界: 估算 ≤ 预算上限（读回也驱逐，严格有界）
     let est = exec.window.estimated_bytes();
     let limit = COUNT_ALLOWANCE * 4;
-    assert!(
-        est <= limit,
-        "内存估算应 ≤ 预算上限 {limit}: {est}"
-    );
+    assert!(est <= limit, "内存估算应 ≤ 预算上限 {limit}: {est}");
     // 总数守恒: 内存桶 + spill 键 = 全部 10 键（不相交不变量）
-    let in_memory = exec
-        .window
-        .buckets
-        .values()
-        .map(Vec::len)
-        .sum::<usize>();
+    let in_memory = exec.window.buckets.values().map(Vec::len).sum::<usize>();
     let spilled = exec.window.spill_index.len();
     let readback = exec.window.readback.len();
     assert_eq!(
@@ -302,12 +293,7 @@ fn spill_budget_ladder_falls_back_to_reject() {
         "落盘满应回退拒收（计数>0）"
     );
     // 已建桶不丢: 内存 2 桶 + spill 2 键 = 4 键全在（其余拒收）
-    let in_memory = exec
-        .window
-        .buckets
-        .values()
-        .map(Vec::len)
-        .sum::<usize>();
+    let in_memory = exec.window.buckets.values().map(Vec::len).sum::<usize>();
     assert_eq!(in_memory, 2);
     assert_eq!(exec.window.spill_index.len(), 2);
     // close 输出 = 已接收的 4 键（每个 count=1）——无重复无半吊子
@@ -361,7 +347,10 @@ fn spill_redb_full_pipeline_and_file_lifecycle() {
         .iter()
         .find(|b| b.key == ScopeKey::Int(3))
         .expect("键 3");
-    assert_eq!(k3.measures[0][0].measure_value, 333.0, "键3 读回后 last=333");
+    assert_eq!(
+        k3.measures[0][0].measure_value, 333.0,
+        "键3 读回后 last=333"
+    );
 
     // close（reset_window）→ cleanup → 文件删除
     assert!(!path.exists(), "close 后 redb 文件应删除");
@@ -374,13 +363,7 @@ fn spill_redb_full_pipeline_and_file_lifecycle() {
 #[test]
 fn spill_estimated_bytes_bounded_by_budget() {
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
-    let mut exec = exec_with_spill(
-        plan,
-        5,
-        None,
-        Some(Box::new(MemSpillStore::new())),
-        None,
-    );
+    let mut exec = exec_with_spill(plan, 5, None, Some(Box::new(MemSpillStore::new())), None);
     // 大量键（每次 process_rows 批末 refresh 重新核算——与增量账本对账）
     for batch in 0..50 {
         let rows: Vec<HashMap<String, Value>> = (1..=100)
@@ -408,13 +391,7 @@ fn spill_touch_counter_protects_recently_hit_key() {
     // 预算 2 桶（limit 672, 驱逐目标 336）: 键 1 创建后回访一次（touch=3）——
     // 应存活 3 轮驱逐扫描（每轮 -1），未回访键立即被驱逐。
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
-    let mut exec = exec_with_spill(
-        plan,
-        2,
-        None,
-        Some(Box::new(MemSpillStore::new())),
-        None,
-    );
+    let mut exec = exec_with_spill(plan, 2, None, Some(Box::new(MemSpillStore::new())), None);
     exec.process_rows(&[bid_row(1, 1.0)], extract);
     exec.process_rows(&[bid_row(1, 2.0)], extract); // 回访 → touch=TOUCH_MAX
     for k in 2..=5 {
@@ -432,12 +409,22 @@ fn spill_touch_counter_protects_recently_hit_key() {
         exec.window.find_bucket(&ScopeKey::Int(1)).is_none(),
         "计数耗尽后键 1 应被驱逐"
     );
-    assert_eq!(exec.window.spill_index.len(), 4, "键 1/2/3/4 已 spill（键 5 未扫描仍驻留）");
+    assert_eq!(
+        exec.window.spill_index.len(),
+        4,
+        "键 1/2/3/4 已 spill（键 5 未扫描仍驻留）"
+    );
     // close: 全部 6 键恰好一次（含读回去重过滤）
     let closed = exec.close_window_by_bucket_rows();
     assert_eq!(closed.len(), 6);
-    let k1 = closed.iter().find(|b| b.key == ScopeKey::Int(1)).expect("键1");
-    assert_eq!(k1.measures[0][0].measure_value, 2.0, "键1 count=2（两次回访）");
+    let k1 = closed
+        .iter()
+        .find(|b| b.key == ScopeKey::Int(1))
+        .expect("键1");
+    assert_eq!(
+        k1.measures[0][0].measure_value, 2.0,
+        "键1 count=2（两次回访）"
+    );
 }
 
 #[test]
@@ -483,7 +470,10 @@ fn spill_redb_deferred_create_via_executor() {
         .iter()
         .find(|b| b.key == ScopeKey::Int(3))
         .expect("键 3");
-    assert_eq!(k3.measures[0][0].measure_value, 333.0, "键3 读回后 last=333");
+    assert_eq!(
+        k3.measures[0][0].measure_value, 333.0,
+        "键3 读回后 last=333"
+    );
     // close（reset_window → cleanup）→ 文件删除
     assert!(!path.exists(), "close 后 redb 文件应删除");
     // 下一窗口沿用同一路径（create 语义重建）——再 process 应重建 store
@@ -564,7 +554,10 @@ fn spill_streaming_close_matches_batch_close() {
     assert_eq!(b_sorted, a_keys, "流式 vs 非流式键集合一致");
     assert_eq!(b_keys.len(), 30);
     assert_eq!(
-        b_sorted.iter().collect::<std::collections::HashSet<_>>().len(),
+        b_sorted
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
         30,
         "每键恰好一次（无重复）"
     );
@@ -577,13 +570,7 @@ fn spill_streaming_close_memory_bounded() {
     // 流式 close 内存有界：spill 分批进来, buckets 不膨胀（每次取走后再
     // 读下一批）——close 峰值 = 批大小, 不是全量。
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
-    let mut exec = exec_with_spill(
-        plan,
-        2,
-        None,
-        Some(Box::new(MemSpillStore::new())),
-        None,
-    );
+    let mut exec = exec_with_spill(plan, 2, None, Some(Box::new(MemSpillStore::new())), None);
     for k in 1..=20 {
         exec.process_rows(&[bid_row(k, 1.0)], extract);
     }
@@ -598,10 +585,7 @@ fn spill_streaming_close_memory_bounded() {
         }
         total += batch.len();
         let in_mem = exec.window.buckets.values().map(Vec::len).sum::<usize>();
-        assert!(
-            in_mem <= 4,
-            "close 中 buckets 应 ≤ 批大小, 实测 {in_mem}"
-        );
+        assert!(in_mem <= 4, "close 中 buckets 应 ≤ 批大小, 实测 {in_mem}");
     }
     assert_eq!(total, 20, "全部键输出");
 }
