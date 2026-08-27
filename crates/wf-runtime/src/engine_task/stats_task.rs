@@ -81,7 +81,7 @@ pub(crate) type StatsPartial = (
     i64,
     Vec<(
         wf_engine::match_engine::ScopeKey,
-        Vec<wf_engine::match_engine::StatsAccum>,
+        wf_engine::match_engine::StatsBucketAccs,
     )>,
     u64,
 );
@@ -720,7 +720,7 @@ impl StatsTask {
         &self,
         buckets: Vec<(
             wf_engine::match_engine::ScopeKey,
-            Vec<wf_engine::match_engine::StatsAccum>,
+            wf_engine::match_engine::StatsBucketAccs,
         )>,
         labels: &[String],
         row_names: Option<std::sync::Arc<Vec<String>>>,

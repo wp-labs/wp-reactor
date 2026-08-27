@@ -47,7 +47,7 @@ use wf_lang::plan::{
 };
 use wf_lang::{BaseType, FieldType};
 
-use crate::match_engine::executor::{RowFieldLayout, RowFields, StatsAccum, StatsExecutor};
+use crate::match_engine::executor::{RowFieldLayout, RowFields, StatsAccum, StatsBucketAccs, StatsExecutor};
 use crate::match_engine::match_engine::{
     BindData, CepStateMachine, CloseOutput, CloseReason, EngineHashMap, Event, MatchedContext,
     ScopeKey, StepData, Value, WindowLookup,
@@ -2575,14 +2575,17 @@ fn q18_stats_last_key_state() {
     let mut last_shared = 0usize;
     for chain in exec.window.buckets.values() {
         for b in chain {
-            real_sum += size_of_val(b); // StatsBucket 栈（scope_key + accs Vec 头）
+            real_sum += size_of_val(b); // StatsBucket 栈（scope_key + accs 载体头）
             real_sum += scope_key_heap_bytes(&b.scope_key);
-            real_sum += b.accs.len() * size_of::<StatsAccum>();
-            let shared = b.accs.iter().filter(|a| a.last().is_some()).count();
+            // q18 计划（last/top）恒 Classic；SoA 桶不在此路径。
+            let StatsBucketAccs::Classic(accs) = &b.accs else {
+                unreachable!("q18 last 计划不走 SoA");
+            };
+            real_sum += accs.len() * size_of::<StatsAccum>();
+            let shared = accs.iter().filter(|a| a.last().is_some()).count();
             if shared > 0 {
                 last_shared += 1;
-                let rf = b
-                    .accs
+                let rf = accs
                     .iter()
                     .find_map(|a| a.last().as_ref())
                     .expect("is_some");

@@ -24,6 +24,7 @@ mod perf;
 mod q13b_join_bench;
 mod seq_examples;
 mod seq_l2;
+mod stats_soa_bench;
 
 mod cep_core;
 mod close;

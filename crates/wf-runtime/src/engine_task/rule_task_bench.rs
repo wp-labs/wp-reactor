@@ -27,7 +27,7 @@ use wf_lang::plan::{
 };
 
 use wf_engine::match_engine::event_bridge::batch_to_events;
-use wf_engine::match_engine::{RuleExecutor, WindowLookup};
+use wf_engine::match_engine::{RuleExecutor, StatsBucketAccs, WindowLookup};
 
 use super::{OutputRecord, PipeBatchStager};
 use crate::engine_task::tests::empty_tracked_bind_fields;
@@ -1703,11 +1703,14 @@ fn q18_close_alloc_footprint() {
                 for b in chain {
                     sum_bucket_stack += size_of_val(b);
                     sum_scopes += size_of_val(&b.scope_key) + scope_key_heap_bytes(&b.scope_key);
-                    sum_accs_cap += b.accs.capacity() * size_of_val(&b.accs[0]);
-                    sum_accs_len += b.accs.len() * size_of_val(&b.accs[0]);
-                    if b.accs.iter().any(|a| a.last().is_some()) {
-                        let rf = b
-                            .accs
+                    // q18 计划（last 度量）恒 Classic; SoA 桶不在此分析路径。
+                    let StatsBucketAccs::Classic(accs) = &b.accs else {
+                        unreachable!("q18 last 计划不走 SoA");
+                    };
+                    sum_accs_cap += accs.capacity() * size_of_val(&accs[0]);
+                    sum_accs_len += accs.len() * size_of_val(&accs[0]);
+                    if accs.iter().any(|a| a.last().is_some()) {
+                        let rf = accs
                             .iter()
                             .find_map(|a| a.last().as_ref())
                             .expect("is_some");

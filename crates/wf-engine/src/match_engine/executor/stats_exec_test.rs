@@ -11,7 +11,7 @@ use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsP
 
 use crate::match_engine::Value;
 use crate::match_engine::executor::stats_exec::{
-    RowFieldLayout, RowFields, StatsAccum, StatsExecutor, TopEntry,
+    RowFieldLayout, RowFields, StatsAccum, StatsBucketAccs, StatsExecutor, TopEntry,
 };
 
 fn num(n: f64) -> Value {
@@ -1421,6 +1421,9 @@ fn stats_columnar_keyed_precision_matches_empty_key_native() {
     assert_eq!(buckets[0].1[0], 2.0, "≥2^53 的 distinct 不得 f64 化");
     // sum 精确断言（i128 累加器域）: 2^53 + (2^53+1) = 2^54+1
     let accs = keyed.window.find_bucket(&ScopeKey::Int(1)).unwrap();
+    let StatsBucketAccs::Classic(accs) = accs else {
+        panic!("distinct+sum 计划恒 Classic");
+    };
     assert_eq!(
         accs[1].numeric().sum,
         9_007_199_254_740_992i128 + 9_007_199_254_740_993i128,
@@ -2357,9 +2360,9 @@ fn stats_memory_guard_merge_partial_rejects_over_limit() {
     assert_eq!(exec.window.over_limit_new_buckets(), 0);
 
     // 分片 partial 带来键 2（分片侧限额内放行）——协调片合并时超限被拒。
-    let partial: Vec<(ScopeKey, Vec<StatsAccum>)> = vec![(
+    let partial: Vec<(ScopeKey, StatsBucketAccs)> = vec![(
         ScopeKey::Int(2),
-        vec![StatsAccum::Top(vec![TopEntry {
+        StatsBucketAccs::Classic(vec![StatsAccum::Top(vec![TopEntry {
             key: 200.0,
             row: {
                 let layout = std::sync::Arc::new(RowFieldLayout::all_other(&["price".to_string()]));
@@ -2367,7 +2370,7 @@ fn stats_memory_guard_merge_partial_rejects_over_limit() {
                 rf.set(0, Some(Value::Number(200.0)));
                 rf
             },
-        }])],
+        }])]),
     )];
     exec.merge_partial(partial, 1);
     assert_eq!(
