@@ -641,3 +641,25 @@ rule r {
     assert_eq!(name, "sip");
     assert_eq!(origin, "auth_events.sip (via s)");
 }
+
+/// stats 规则的 `disk_provider`/`max_disk` 在 explain limits 节显示
+/// （2026-08-27 改名: 旧名 spill 不再出现）。
+#[test]
+fn explain_limits_disk_provider_shown_for_stats_rule() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    stats<10s:fixed> group by (e.sip) { e | count as n; }
+    entity(digit, e.sip)
+    yield security_alerts (sip = e.sip, fail_count = 2, message = "m")
+    limits { disk_provider = "redb"; max_disk = "8GB"; }
+}
+"#;
+    let schemas = &[auth_events_window(), security_alerts_window()];
+    let file = parse_wfl(input).unwrap();
+    let plans = compile_wfl(&file, schemas).unwrap();
+    let expl = &explain_rules(&plans, schemas)[0];
+    let limits = expl.limits.as_ref().expect("limits");
+    assert!(limits.contains("disk_provider=Redb"), "got: {limits}");
+    assert!(limits.contains("max_disk=8589934592B"), "got: {limits}");
+}

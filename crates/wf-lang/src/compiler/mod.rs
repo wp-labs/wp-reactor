@@ -1329,7 +1329,7 @@ fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan
     let mut max_instances = None;
     let mut max_throttle = None;
     let mut on_exceed = ExceedAction::Throttle; // default
-    let mut spill = None;
+    let mut disk_provider = None;
     let mut max_disk_bytes = None;
 
     for item in &limits.items {
@@ -1351,8 +1351,9 @@ fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan
                     _ => ExceedAction::Throttle,
                 };
             }
-            "spill" => {
-                spill = match item.value.as_str() {
+            "disk_provider" | "spill" => {
+                // `spill` 为兼容别名（2026-08-27 改名 disk_provider）: 旧键仍生效。
+                disk_provider = match item.value.as_str() {
                     "redb" => Some(SpillMode::Redb),
                     _ => None,
                 };
@@ -1373,7 +1374,7 @@ fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan
         max_instances,
         max_throttle,
         on_exceed,
-        spill,
+        disk_provider,
         max_disk_bytes,
     })
 }

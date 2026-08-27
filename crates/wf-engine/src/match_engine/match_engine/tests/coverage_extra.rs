@@ -854,7 +854,7 @@ fn rate_limit_close_raw_conv_mode_skips_inline_throttle() {
             per: Duration::from_secs(60),
         }),
         on_exceed: ExceedAction::Throttle,
-        spill: None,
+        disk_provider: None,
         max_disk_bytes: None,
     };
     let mut sm = CepStateMachine::with_limits("r".into(), plan, None, Some(limits));
@@ -891,7 +891,7 @@ fn rate_limit_close_fail_rule_latches_and_rejects() {
             per: Duration::from_secs(60),
         }),
         on_exceed: ExceedAction::FailRule,
-        spill: None,
+        disk_provider: None,
         max_disk_bytes: None,
     };
     let mut sm = CepStateMachine::with_limits("r".into(), plan, None, Some(limits));

@@ -115,7 +115,7 @@ enum ColumnData<T> { Const(T), Rows(Vec<T>) }  // at(row): Const→唯一值, Ro
 分片数是引擎内部细节——同规则全部分片共享一个 `Arc<AtomicU64>` 占用计数。
 
 ```
-配置（wfl）:  limits { max_memory = "15GB"; spill = "redb"; max_disk = "20GB" }
+配置（wfl）:  limits { max_memory = "15GB"; disk_provider = "redb"; max_disk = "20GB" }
 注入（spawn）: 规则级创建 Arc<AtomicU64> → 单实例/分片 clone 注入
 记账（executor）: 建桶 fetch_add(allowance) / 驱逐 fetch_sub / close 统一 mem_sub(本片净占用)
 检查: 全部走共享计数读值（未注入共享 → 退化本地账本, 测试/单片兼容）
@@ -123,7 +123,7 @@ enum ColumnData<T> { Const(T), Rows(Vec<T>) }  // at(row): Const→唯一值, Ro
 
 - **预算阶梯**（三层）：内存 `max_memory` → 磁盘 `max_disk` → 拒收兜底（不丢已建桶）
 - **铁律**：内存+磁盘预算之和必须 ≥ 状态总量, 否则拒收丢键（`[clean]` 不报, 需对拍 EMIT）
-- **键改名兼容**：`max_spill_bytes → max_disk` 保留旧键为别名（解析接受 + lint 迁移 Warning）
+- **键改名兼容**：`max_spill_bytes → max_disk`、`spill → disk_provider` 保留旧键为别名（解析接受 + lint 迁移 Warning）
 - 实现：`stats_exec.rs`（记账/检查）、`spawn.rs`（注入）、`wf-lang`（解析）;
   设计 `docs/design/stats-state-spill-redb.md` §19/§20
 
@@ -131,7 +131,8 @@ enum ColumnData<T> { Const(T), Rows(Vec<T>) }  // at(row): Const→唯一值, Ro
 
 改名用户可见键/字段时, 旧名保留为**兼容别名**：解析器同时接受, 旧名产生
 **迁移 Warning**（不破坏已有配置）, 新文档/示例用新名——避免硬切破坏存量规则。
-实现：`wf-lang/src/checker/rules/limits.rs`（`max_disk`/`max_spill_bytes` 双分支）。
+实现：`wf-lang/src/checker/rules/limits.rs`（`disk_provider`/`spill`、
+`max_disk`/`max_spill_bytes` 双分支）。
 
 `commit_each_rows_batch_moved`（owned Vec move-extend）**实测无效**（CPU/内存均不变）：
 分配**总量**不变 → 内存水位不变。教训：**列装载的内存 ∝ 值进列的总量（∝行数×列值），
@@ -200,7 +201,8 @@ bench 的 `RSS_peak` 单次不可信（运行间波动），对比用 `MEMORY=1 
    且 bench `[clean]` 不覆盖 `over_limit_new_buckets`——**必须对拍 EMIT**
    （q18 100M: 15+12=27 < 28.2GB 丢 451 万键仍报 clean, 15+20=35 ✓ 才对）
 8. **配置语义要直觉化**：`max_spill_bytes`(每分片×10=80GB 陷阱) 改名 `max_disk`
-   (规则总量)——用户配置的应是总量, 分片数是内部细节（§3.6/§3.7）
+   (规则总量)、`spill` 改名 `disk_provider`——用户配置的应是总量/直白语义,
+   分片数是内部细节（§3.6/§3.7）
 
 
 ---
@@ -271,7 +273,7 @@ bench 的 `RSS_peak` 单次不可信（运行间波动），对比用 `MEMORY=1 
 | 机制 | 成熟度 | 位置 | 能力 | 验证/局限 |
 |---|---|---|---|---|
 | **规则级共享预算**（`max_memory`/`max_disk` 共享计数） | ★4 | `stats_exec.rs` + `spawn.rs` + `wf-lang` | 用户配规则总量, 分片共享一个 `Arc<AtomicU64>` 占用计数（建桶/驱逐/close 记账, 检查走共享读值, 未共享退化本地） | q18 30M/100M 实测（EMIT 对拍 29,370,378 ✓, RSS 35-40→24GB）; 守护测试 `mem_shared_counter_rule_budget`/`spill_shared_counter_rule_budget`; ⚠ 仅 stats 规则（CEP/join 无 SpillStore） |
-| **键改名兼容别名** | ★4 | `wf-lang/src/checker/rules/limits.rs` | 旧键保留 + lint 迁移 Warning, 新名优先 | `max_spill_bytes→max_disk`; 测试: 新键解析/旧键编译生效/迁移警告 |
-| **spill 状态外溢**（redb 三层预算阶梯） | ★4 | `stats_exec.rs` + `spill.rs` | 内存→磁盘→拒收; 窗口级文件 + 流式 close 分批读回 + 异步写 worker（每分片单写者） | q18 100M 正确性达标; 守护测试: 全链路对拍（count/sum/last/distinct/top/流式 close/多窗口）+ 序列化往返全变体 + RowFields 去重 |
+| **键改名兼容别名** | ★4 | `wf-lang/src/checker/rules/limits.rs` | 旧键保留 + lint 迁移 Warning, 新名优先 | `max_spill_bytes→max_disk`、`spill→disk_provider`; 测试: 新键解析/旧键编译生效/迁移警告 |
+| **spill 状态外溢**（redb 三层预算阶梯, 键 `disk_provider`） | ★4 | `stats_exec.rs` + `spill.rs` | 内存→磁盘→拒收; 窗口级文件 + 流式 close 分批读回 + 异步写 worker（每分片单写者）; store 惰性创建（零驱逐窗口零开销） | q18 100M 正确性达标; 守护测试: 全链路对拍（count/sum/last/distinct/top/流式 close/多窗口）+ 序列化往返全变体 + RowFields 去重 + 惰性创建 |
 
 ---

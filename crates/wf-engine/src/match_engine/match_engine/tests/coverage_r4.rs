@@ -124,7 +124,7 @@ fn limits(
         max_instances,
         max_throttle: None,
         on_exceed,
-        spill: None,
+        disk_provider: None,
         max_disk_bytes: None,
     })
 }
@@ -397,7 +397,7 @@ fn rate_limit_suppresses_match_reset_and_fail_rule() {
             max_instances: None,
             max_throttle: Some(rate.clone()),
             on_exceed: ExceedAction::Throttle,
-            spill: None,
+            disk_provider: None,
             max_disk_bytes: None,
         }),
     );
@@ -413,7 +413,7 @@ fn rate_limit_suppresses_match_reset_and_fail_rule() {
             max_instances: None,
             max_throttle: Some(rate.clone()),
             on_exceed: ExceedAction::DropOldest,
-            spill: None,
+            disk_provider: None,
             max_disk_bytes: None,
         }),
     );
@@ -428,7 +428,7 @@ fn rate_limit_suppresses_match_reset_and_fail_rule() {
             max_instances: None,
             max_throttle: Some(rate.clone()),
             on_exceed: ExceedAction::FailRule,
-            spill: None,
+            disk_provider: None,
             max_disk_bytes: None,
         }),
     );
@@ -456,7 +456,7 @@ fn rate_limit_accu_rearm_keeps_accumulating() {
             max_instances: None,
             max_throttle: Some(rate),
             on_exceed: ExceedAction::Throttle,
-            spill: None,
+            disk_provider: None,
             max_disk_bytes: None,
         }),
     );
@@ -491,7 +491,7 @@ fn raw_conv_mode_skips_inline_close_throttle() {
             max_instances: None,
             max_throttle: Some(rate),
             on_exceed: ExceedAction::Throttle,
-            spill: None,
+            disk_provider: None,
             max_disk_bytes: None,
         }),
     );
