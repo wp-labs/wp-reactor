@@ -41,18 +41,24 @@ use crate::window::scope_key_from_column;
 /// 分片共享的批级 where mask 缓存（`Arc<RecordBatch>` 强持有防指针复用）。
 ///
 /// key = (首列 Arc 指针, 行数); value = (批 Arc 防释放, mask 结果)。
+/// 2026-08-27 扩展: 同批的 [`batch_max_time`] 也是 10× 分片重复——并入本缓存
+/// （同 key 批身份, 复用同一 config 字段, 见 [`StatsMaskCache::get_or_compute_time`]）。
 type MaskCacheMap = std::collections::HashMap<
     (usize, usize),
     (Arc<RecordBatch>, Arc<Vec<BooleanArray>>),
 >;
+/// 批级时间信息缓存表: key = (首列 Arc 指针, 行数), value = (批 Arc, max_time)。
+type TimeCacheMap = std::collections::HashMap<(usize, usize), (Arc<RecordBatch>, i64)>;
 
 #[derive(Debug)]
 pub struct StatsMaskCache {
     inner: std::sync::Mutex<MaskCacheMap>,
+    time_inner: std::sync::Mutex<TimeCacheMap>,
     /// 容量上限（总行数; 超限整体清空——流式批下旧批已消费完）。
     /// pub(crate) 供测试缩容验证清理。
     pub(crate) max_rows: usize,
     total_rows: std::sync::atomic::AtomicUsize,
+    time_total_rows: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for StatsMaskCache {
@@ -65,8 +71,10 @@ impl StatsMaskCache {
     pub fn new() -> Self {
         Self {
             inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            time_inner: std::sync::Mutex::new(std::collections::HashMap::new()),
             max_rows: 4_000_000,
             total_rows: std::sync::atomic::AtomicUsize::new(0),
+            time_total_rows: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -101,6 +109,36 @@ impl StatsMaskCache {
         }
         guard.insert(key, (Arc::new(batch.clone()), Arc::clone(&masks)));
         masks
+    }
+
+    /// 批级时间信息（batch_max_time）共享缓存（2026-08-27 q17）: 与 mask 同
+    /// key（批身份——首列 Arc 指针 + 行数）; 首片扫时间列 max 写缓存, 其余片
+    /// 命中（免 10× 全批时间扫描重复）。`compute` = 全批时间 max 求值。
+    pub fn get_or_compute_time(&self, batch: &RecordBatch, compute: impl FnOnce() -> i64) -> i64 {
+        let rows = batch.num_rows();
+        if rows == 0 {
+            return compute(); // 空批不缓存
+        }
+        let key = (
+            std::sync::Arc::as_ptr(batch.column(0)) as *const () as usize,
+            rows,
+        );
+        let mut guard = self.time_inner.lock().expect("mask cache poisoned");
+        if let Some((_, v)) = guard.get(&key) {
+            return *v;
+        }
+        let v = compute();
+        let new_total = self
+            .time_total_rows
+            .fetch_add(rows, std::sync::atomic::Ordering::Relaxed)
+            + rows;
+        if new_total > self.max_rows {
+            guard.clear();
+            self.time_total_rows
+                .store(rows, std::sync::atomic::Ordering::Relaxed);
+        }
+        guard.insert(key, (Arc::new(batch.clone()), v));
+        v
     }
 
     #[cfg(test)]

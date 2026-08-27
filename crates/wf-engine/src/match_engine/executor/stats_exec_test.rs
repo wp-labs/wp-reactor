@@ -3056,6 +3056,36 @@ fn stats_mask_cache_recompute_after_clear_matches() {
     assert!(m3b[0].value(0) && !m3b[0].value(1));
 }
 
+/// 批级时间信息共享（2026-08-27 q17 扩展 A）: 同批 get_or_compute_time 命中
+/// （compute 只调 1 次, 模拟 10 片共享 batch_max_time 扫描）; 不同批各自算。
+#[test]
+fn stats_mask_cache_time_shares_same_batch() {
+    let cache = StatsMaskCache::new();
+    let batch = Arc::new(rows_to_batch(&auction_price_rows(&[(1.0, 100.0), (1.0, 200.0)])));
+    let batch2 = batch.clone(); // 模拟另一片（值副本, 列 Arc 同源）
+
+    let mut calls = 0usize;
+    let t1 = cache.get_or_compute_time(&batch, || {
+        calls += 1;
+        1_750_000_000_000_000_000i64
+    });
+    let t2 = cache.get_or_compute_time(&batch2, || {
+        calls += 1;
+        -1
+    });
+    assert_eq!(calls, 1, "同批第二次命中（不重扫）");
+    assert_eq!(t1, t2);
+
+    // 不同批各自算
+    let b_other = Arc::new(rows_to_batch(&auction_price_rows(&[(2.0, 300.0)])));
+    let t3 = cache.get_or_compute_time(&b_other, || {
+        calls += 1;
+        2_000_000_000_000_000_000i64
+    });
+    assert_eq!(calls, 2);
+    assert_ne!(t1, t3);
+}
+
 /// 空批不缓存（第 6 轮 review 补）: rows==0 直接 compute, 不写入缓存（避免
 /// key=(0,0) 与后续真实批碰撞）。
 #[test]

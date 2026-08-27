@@ -309,7 +309,14 @@ impl StatsTask {
         shard_rows: Option<&[u32]>,
     ) {
         self.last_activity_wall = std::time::Instant::now();
-        let max_time = batch_max_time(batch, self.time_field.as_deref());
+        // 分片共享批级时间缓存: 首片扫全批时间 max, 其余片命中（q17 10 片原
+        // 各扫全批 10×——batch_max_time 是时间列读取的主要来源, sample 热点）。
+        let max_time = match &self.mask_cache {
+            Some(cache) => cache.get_or_compute_time(batch, || {
+                batch_max_time(batch, self.time_field.as_deref())
+            }),
+            None => batch_max_time(batch, self.time_field.as_deref()),
+        };
         if max_time > self.last_watermark {
             self.last_watermark = max_time; // 单调; scan_timeouts 兜底推进用
         }
@@ -322,6 +329,18 @@ impl StatsTask {
             let _ = window_name;
             return;
         };
+        // 单段快路径（2026-08-27 q17）: 窗口已建立且整批最大时间仍在窗内——
+        // 批内行全部同属当前窗口, 整批一段直接归并（跳过逐行段扫 + domain 构造）。
+        // 1d 窗口 + 批内跨度 << 窗长时恒命中（q17 批内 ~0.5s << 86400s）。
+        // 正确性: max_time < window_end ⇒ 首行（≤ max_time）也在窗内, 无需
+        // advance; 时间列单调保证段连续性（原逐行段扫的同窗口判定）。
+        if let Some(end) = self.window_end
+            && max_time < end
+        {
+            self.accumulate_segment(batch, shard_rows).await;
+            let _ = window_name;
+            return;
+        }
         // 行域（升序; 分片子集由 fanout 分区保序, 全批即 0..n）。
         let domain: Vec<u32> = match shard_rows {
             Some(rows) => rows.to_vec(),
