@@ -426,8 +426,8 @@ fn over_limit_reported(metrics: &crate::metrics::RuntimeMetrics, rule: &str) -> 
         .unwrap_or(0)
 }
 
-/// 带键 count 计划 + 极小限额（count 桶预算 = 512 + 1×128 = 640B, 限额 640
-/// → 只放行 1 桶, 其余键全拒收）。
+/// 带键 count 计划 + 极小限额（count 桶预算 = (256+80)×2.2 校准 = 739B,
+/// 2026-08-27 q18 实测估算低估 2.2×; 限额 739 → 只放行 1 桶, 其余键全拒收）。
 fn guard_plan_and_limit(task: &mut StatsTask) {
     let mut plan = stats_plan();
     plan.keys = vec![Expr::Field(wf_lang::ast::FieldRef::Qualified(
@@ -435,7 +435,7 @@ fn guard_plan_and_limit(task: &mut StatsTask) {
         "auction".into(),
     ))];
     task.stats = StatsExecutor::with_row_fields(plan, None);
-    task.stats.set_memory_limit("stats_r4_rule", Some(640));
+    task.stats.set_memory_limit("stats_r4_rule", Some(739));
 }
 
 /// 状态内存 guard 告警: close 时按窗口增量上报 metrics（delta 记账, 不重复）。
@@ -555,7 +555,7 @@ async fn close_current_window_all_rejected_window_still_reports() {
     let (config, _cancel) = make_config(vec![], None, &eos_tx, Some(Arc::clone(&metrics)));
     let (mut task, _cancel) = StatsTask::new(config);
     guard_plan_and_limit(&mut task);
-    // 限额 < 桶预算 640B → 全部新键被拒（每键 allowance 640 > 100）。
+    // 限额 < 桶预算（校准后 count 桶 739B）→ 全部新键被拒（每键 allowance > 100）。
     task.stats.set_memory_limit("stats_r4_rule", Some(100));
 
     task.process_push(RulePush {

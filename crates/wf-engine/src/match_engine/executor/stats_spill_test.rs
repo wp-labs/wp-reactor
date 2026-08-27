@@ -105,7 +105,7 @@ fn exec_with_spill(
     };
     let budget = COUNT_ALLOWANCE as usize * budget_buckets;
     exec.set_memory_limit("spill_test", Some(budget));
-    exec.set_spill(store, max_spill_bytes);
+    exec.set_spill(store, max_spill_bytes, None);
     exec
 }
 
@@ -449,7 +449,7 @@ fn spill_redb_deferred_create_via_executor() {
 
     let mut exec = StatsExecutor::with_row_fields(plan, Some(subset));
     exec.set_memory_limit("spill_test", Some(COUNT_ALLOWANCE as usize * 2));
-    exec.set_spill_redb(&path, None);
+    exec.set_spill_redb(&path, None, None);
     // 未处理任何数据前不建 store（延迟创建）
     assert!(exec.window.spill.is_none(), "首次 process 前不创建 store");
     assert!(!path.exists(), "首次 process 前不落文件");
@@ -477,7 +477,7 @@ fn spill_redb_deferred_create_via_executor() {
     // close（reset_window → cleanup）→ 文件删除
     assert!(!path.exists(), "close 后 redb 文件应删除");
     // 下一窗口沿用同一路径（create 语义重建）——再 process 应重建 store
-    exec.set_spill_redb(&path, None);
+    exec.set_spill_redb(&path, None, None);
     exec.process_rows(&[bid_row(1, 1.0)], extract);
     assert!(exec.window.spill.is_some(), "下一窗口重建 store");
     assert!(path.exists());
@@ -588,4 +588,87 @@ fn spill_streaming_close_memory_bounded() {
         assert!(in_mem <= 4, "close 中 buckets 应 ≤ 批大小, 实测 {in_mem}");
     }
     assert_eq!(total, 20, "全部键输出");
+}
+
+// ---------------------------------------------------------------------------
+// 8. max_spill_bytes 规则级共享预算（2026-08-27）
+// ---------------------------------------------------------------------------
+
+/// 开启 spill + 规则级共享落盘计数（模拟 spawn 层为同规则分片注入的同一个
+/// `Arc<AtomicU64>`）：预算仍按桶数给定, 计数跨 executor 共享。
+fn exec_with_shared_spill(
+    plan: StatsPlan,
+    budget_buckets: usize,
+    max_spill_bytes: Option<usize>,
+    shared: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> StatsExecutor {
+    let mut exec = StatsExecutor::new(plan);
+    let budget = COUNT_ALLOWANCE as usize * budget_buckets;
+    exec.set_memory_limit("spill_shared", Some(budget));
+    exec.set_spill(
+        Some(Box::new(MemSpillStore::new())),
+        max_spill_bytes,
+        Some(std::sync::Arc::clone(shared)),
+    );
+    exec
+}
+
+/// 规则级共享预算语义（两个 executor 模拟同规则两个分片）：
+/// 1. 各自驱逐 → 落盘计数跨分片累计（a{1,2,3} + b{7,8} = 5×COUNT_ALLOWANCE）
+/// 2. 共享预算耗尽 → 另一分片驱逐回退拒收（规则总上限, 与分片数无关）
+/// 3. 各自 close → 只扣减自己的份额（预算随窗口释放可复用）
+#[test]
+fn spill_shared_counter_rule_budget() {
+    use std::sync::atomic::Ordering;
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    // 规则总上限 = 5 桶（a 驱逐 3 + b 驱逐 2）, 与「每分片 3 桶内存预算」无关。
+    let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let limit = (COUNT_ALLOWANCE * 5) as usize;
+    let mut a = exec_with_shared_spill(plan.clone(), 3, Some(limit), &shared);
+    let mut b = exec_with_shared_spill(plan.clone(), 3, Some(limit), &shared);
+
+    // a: 6 键 → 内存 3 + spill {1,2,3}（第 6 键的驱逐仍在共享预算内）
+    for k in 1..=6 {
+        a.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+    assert_eq!(a.window.over_limit_new_buckets(), 0, "a 不应拒收");
+    assert_eq!(
+        shared.load(Ordering::SeqCst),
+        COUNT_ALLOWANCE * 3,
+        "a 落盘 3 键"
+    );
+
+    // b: 12 键 → 内存 3 + spill {7,8}; 第 12 键驱逐时共享预算耗尽 → 拒收。
+    //   （b 自身 store 还有余量——拒收源于**规则总上限**, 即共享语义生效）
+    for k in 7..=12 {
+        b.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+    assert_eq!(
+        shared.load(Ordering::SeqCst),
+        COUNT_ALLOWANCE * 5,
+        "a{{1,2,3}}+b{{7,8}} 跨分片累计"
+    );
+    assert_eq!(
+        b.window.over_limit_new_buckets(),
+        1,
+        "b 第 12 键被共享上限拒收"
+    );
+
+    // a close → 只扣 a 的份额（3 键）, 共享计数剩 b 的 2 键
+    let a_out = a.close_window_by_bucket_rows();
+    assert_eq!(a_out.len(), 6, "a 输出 6 键（内存 3 + spill 3）");
+    assert_eq!(
+        shared.load(Ordering::SeqCst),
+        COUNT_ALLOWANCE * 2,
+        "close 后只剩 b 的落盘份额"
+    );
+
+    // b close → 扣 b 的份额（2 键）→ 归零（预算释放, 下一窗口可复用）
+    let b_out = b.close_window_by_bucket_rows();
+    assert_eq!(b_out.len(), 5, "b 输出 5 键（内存 3 + spill 2, 拒收 1）");
+    assert_eq!(
+        shared.load(Ordering::SeqCst),
+        0,
+        "全部 close 后共享计数归零"
+    );
 }

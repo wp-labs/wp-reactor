@@ -548,9 +548,12 @@ pub struct StatsWindowState {
     /// 已 spill 键的存在性索引（hot path 未命中时 O(1) 查，不碰持久层）。
     pub(crate) spill_index: HashSet<u64>,
     /// 落盘字节上限（None = 不限）。三层预算阶梯第二层（内存→磁盘→拒收兜底）。
+    /// **规则级全局语义**（2026-08-27）：同规则全部分片共享一个 `spill_used`
+    /// 计数器——`max_spill_bytes` 是用户配置的规则总落盘上限（分片数是引擎
+    /// 内部细节，用户不可见）。
     spill_limit_bytes: Option<u64>,
-    /// 估算的已落盘字节（按桶预算计，与 `estimated_bytes` 同口径）。
-    spilled_bytes: u64,
+    /// 共享已落盘字节计数器（跨分片；None = 未配置 spill）。
+    spill_used: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// spill 写失败/满后的拒收回退标记（避免反复尝试写）。
     spill_failed: bool,
     /// 落盘满/写失败的告警标记（每窗口一次，防刷屏）。
@@ -590,7 +593,7 @@ impl StatsWindowState {
             spill: None,
             spill_index: HashSet::new(),
             spill_limit_bytes: None,
-            spilled_bytes: 0,
+            spill_used: None,
             spill_failed: false,
             spill_warned: false,
             clock: VecDeque::new(),
@@ -723,7 +726,7 @@ impl StatsWindowState {
                         "未启用"
                     },
                     self.spill_limit_bytes
-                        .map(|b| format!(" 落盘 {}/{}B", self.spilled_bytes, b))
+                        .map(|b| format!(" 落盘 {}/{}B", self.spill_used_bytes(), b))
                         .unwrap_or_default(),
                     self.over_limit_new_buckets
                 );
@@ -734,17 +737,34 @@ impl StatsWindowState {
         true
     }
 
+    /// 已落盘字节（共享计数器读值；诊断/告警）。
+    fn spill_used_bytes(&self) -> u64 {
+        self.spill_used
+            .as_ref()
+            .map(|u| u.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
     /// 注入状态外溢存储（窗口开始时由 spawn 层调用）。
     /// `store = None` 关闭 spill（Noop 语义）。`max_spill_bytes = None` 不限落盘。
+    /// `spill_used` = 规则级共享落盘计数器（同规则全部分片共用一个——
+    /// `max_spill_bytes` 是规则总上限, 分片数是引擎内部细节）。
     pub fn set_spill(
         &mut self,
         store: Option<Box<dyn SpillStore + Send + Sync>>,
         max_spill_bytes: Option<usize>,
+        spill_used: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     ) {
         self.spill = store;
         self.spill_limit_bytes = max_spill_bytes.map(|b| b as u64);
+        // 未注入规则级共享计数（测试/直接调用）但启用了 store → 自建本片独立
+        // 计数：预算检查/记账口径不变（共享语义退化为单片, 与旧行为一致）。
+        if self.spill.is_some() && spill_used.is_none() {
+            self.spill_used = Some(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        } else {
+            self.spill_used = spill_used;
+        }
         self.spill_index.clear();
-        self.spilled_bytes = 0;
         self.spill_failed = false;
         self.spill_warned = false;
         self.clock.clear();
@@ -825,9 +845,9 @@ impl StatsWindowState {
         let Some(limit) = self.limit_bytes else {
             return;
         };
-        // 落盘上限已到 → 停止驱逐（拒收兜底）。
+        // 落盘上限已到（规则级共享计数）→ 停止驱逐（拒收兜底）。
         if let Some(sl) = self.spill_limit_bytes
-            && self.spilled_bytes >= sl
+            && self.spill_used_bytes() >= sl
         {
             self.warn_spill_full();
             return;
@@ -879,10 +899,10 @@ impl StatsWindowState {
         if batch.is_empty() {
             return;
         }
-        // 落盘预算检查（写入前）：超出则拒收兜底。
+        // 落盘预算检查（写入前）：超出则拒收兜底（规则级共享计数）。
         let add_bytes = batch_hashes.len() as u64 * allowance;
         if let Some(sl) = self.spill_limit_bytes
-            && self.spilled_bytes + add_bytes > sl
+            && self.spill_used_bytes() + add_bytes > sl
         {
             self.warn_spill_full();
             return;
@@ -904,12 +924,15 @@ impl StatsWindowState {
             log::error!("spill 写失败(规则 {}): {e}——回退拒收新键", self.rule_name);
             return;
         }
-        // 落盘成功 → 从桶表移除 + 记账（内存/spill 不相交不变量成立）。
+        // 落盘成功 → 从桶表移除 + 记账（内存/spill 不相交不变量成立；落盘字节
+        // 记入规则级共享计数）。
         for h in &batch_hashes {
             if let Some(chain) = self.buckets.remove(h) {
                 let n = chain.len() as u64;
                 self.estimated_bytes = self.estimated_bytes.saturating_sub(allowance * n);
-                self.spilled_bytes += allowance * n;
+                if let Some(u) = &self.spill_used {
+                    u.fetch_add(allowance * n, std::sync::atomic::Ordering::SeqCst);
+                }
             }
             self.spill_index.insert(*h);
             self.readback.remove(h); // 键已回 redb（覆盖旧条目）——close 不再过滤它
@@ -926,7 +949,7 @@ impl StatsWindowState {
         log::warn!(
             "spill 落盘上限/写失败（规则 {}, 已落盘 {}B / 上限 {:?}）——停止驱逐, 回退拒收新键",
             self.rule_name,
-            self.spilled_bytes,
+            self.spill_used_bytes(),
             self.spill_limit_bytes
         );
     }
@@ -934,20 +957,24 @@ impl StatsWindowState {
     /// close 前把 spill 全部并入内存桶。**take 只读化（M5-2）后**：redb 中
     /// 仍有已读回键的旧条目——drain 后按 `readback` 集合过滤（内存副本更新，
     /// 每个键恰好一次）。并入后走原有 `take_buckets` / `take_buckets_up_to` 路径。
-    fn merge_spill_into_buckets(&mut self) {
+    fn merge_spill_into_buckets(&mut self, plan: &StatsPlan) {
         let Some(spill) = &mut self.spill else { return };
         if spill.is_empty() {
             return;
         }
         let drained = spill.drain();
         self.spill_index.clear();
-        self.spilled_bytes = 0;
         self.clock.clear();
+        // 规则级共享计数（2026-08-27）：本窗落盘的键随 close 并入内存 → 从共享
+        // 计数扣减（每键 allowance 与驱逐记账同口径）。readback 键在读回时已扣过
+        // （redb 残留旧条目, 此处跳过）——只扣实际并入的键。
+        let mut merged_n = 0u64;
         for (key, accs) in drained {
             let hash = scope_key_hash(&key);
             if self.readback.contains(&hash) {
                 continue; // 已读回且在内存（副本更新）——跳过 redb 旧条目
             }
+            merged_n += 1;
             let chain = self
                 .buckets
                 .entry(hash)
@@ -966,12 +993,22 @@ impl StatsWindowState {
                 }),
             }
         }
+        if let Some(u) = &self.spill_used {
+            u.fetch_sub(
+                merged_n * Self::bucket_allowance(plan),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
         self.readback.clear();
     }
     /// 分批读回 spill 键（流式 close, M5-3）：store 游标续读 + readback 过滤
     /// （take 只读后 redb 残留旧条目, 内存副本更新——跳过）。批内顺序无要求
     /// （调用方排序）。
-    fn spill_drain_up_to(&mut self, n: usize) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+    fn spill_drain_up_to(
+        &mut self,
+        n: usize,
+        plan: &StatsPlan,
+    ) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
         let Some(spill) = &mut self.spill else {
             return Vec::new();
         };
@@ -983,6 +1020,13 @@ impl StatsWindowState {
                 continue; // 已读回且在内存（副本更新）——跳过 redb 旧条目
             }
             out.push((key, accs));
+        }
+        // 共享计数扣减：只扣实际读回的键（readback 键已在读回时扣过）。
+        if let Some(u) = &self.spill_used {
+            u.fetch_sub(
+                out.len() as u64 * Self::bucket_allowance(plan),
+                std::sync::atomic::Ordering::SeqCst,
+            );
         }
         out
     }
@@ -1085,9 +1129,12 @@ impl StatsWindowState {
         self.spill_index.remove(&hash);
         self.readback.insert(hash);
         self.spill_readbacks += 1;
-        self.spilled_bytes = self
-            .spilled_bytes
-            .saturating_sub(Self::bucket_allowance(plan));
+        if let Some(u) = &self.spill_used {
+            u.fetch_sub(
+                Self::bucket_allowance(plan),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
         self.estimated_bytes += Self::bucket_allowance(plan);
         if let Some(limit) = self.limit_bytes
             && self.estimated_bytes > limit
@@ -1170,8 +1217,8 @@ impl StatsWindowState {
     /// 清空并拍平全部桶（close 用）: `(ScopeKey, accs)` 按 ScopeKey 升序。
     /// 同时清零内存账本（新窗口重新累积; 拒收计数保留——指标用）。
     /// spill 启用时先并入 spill 键（每个键恰好一次, 见 [`Self::merge_spill_into_buckets`]）。
-    fn take_buckets(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
-        self.merge_spill_into_buckets();
+    fn take_buckets(&mut self, plan: &StatsPlan) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+        self.merge_spill_into_buckets(plan);
         let mut out: Vec<(ScopeKey, Vec<StatsAccum>)> = std::mem::take(&mut self.buckets)
             .into_values()
             .flat_map(|chain| chain.into_iter().map(|b| (b.scope_key, b.accs)))
@@ -1204,10 +1251,14 @@ pub struct StatsExecutor {
     /// 行字段类型分派（2026-08-26 q18/q19 紧凑化）：列式路径首次 `process_batch`
     /// 从 batch schema 构建；行式路径（无静态类型）退化全 Other（不紧凑但正确）。
     row_field_layout: Option<std::sync::Arc<RowFieldLayout>>,
-    /// 待创建 redb spill store（M4）：路径 + 落盘上限。延迟到首次 `process_*`
-    /// （行字段 layout 解析后）创建——store 的 layout 必须与 executor 一致。
-    /// 窗口 reset 后保留（下一窗口沿用同路径, create 语义重建文件）。
-    spill_redb: Option<(std::path::PathBuf, Option<usize>)>,
+    /// 待创建 redb spill store（M4）：路径 + 落盘上限 + 规则级共享计数。延迟到
+    /// 首次 `process_*`（行字段 layout 解析后）创建——store 的 layout 必须与
+    /// executor 一致。窗口 reset 后保留（下一窗口沿用同路径, create 语义重建文件）。
+    spill_redb: Option<(
+        std::path::PathBuf,
+        Option<usize>,
+        Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    )>,
 }
 
 impl StatsExecutor {
@@ -1522,7 +1573,7 @@ impl StatsExecutor {
     /// 条目携带行字段（last/top 的整行）, 供 yield 经 field_values 读 `b.*`。
     /// 桶序 = ScopeKey 升序; 同时清空窗口状态。
     pub fn close_window_by_bucket_rows(&mut self) -> Vec<StatsCloseBucket> {
-        let buckets = self.window.take_buckets();
+        let buckets = self.window.take_buckets(&self.plan);
         let out = self.close_buckets_to_rows(buckets);
         self.reset_window();
         out
@@ -1621,7 +1672,7 @@ impl StatsExecutor {
         let mem = self.take_buckets_up_to(n);
         // spill 批补足配额（两源之和 ≤ n）; 批内排序后与内存批归并。
         let spill_n = n.saturating_sub(mem.len()).max(1);
-        let mut spill = self.window.spill_drain_up_to(spill_n);
+        let mut spill = self.window.spill_drain_up_to(spill_n, &self.plan);
         spill.sort_by(|a, b| a.0.cmp(&b.0));
         // 归并两个有序序列（peek 比较 + next 取走, 无 clone）。
         let mut mem_iter = mem.into_iter().peekable();
@@ -1710,31 +1761,36 @@ impl StatsExecutor {
 
     /// 注入状态外溢存储（M3; 窗口开始时调用; None = 关闭 spill）。
     /// `max_spill_bytes` = 落盘上限（None = 不限; 三层预算阶梯第二层）。
+    /// `spill_used` = 规则级共享落盘计数（同规则全部分片共用一个——
+    /// `max_spill_bytes` 是规则总上限, 分片数是引擎内部细节; None = 未配置）。
     pub fn set_spill(
         &mut self,
         store: Option<Box<dyn SpillStore + Send + Sync>>,
         max_spill_bytes: Option<usize>,
+        spill_used: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     ) {
         self.spill_redb = None;
-        self.window.set_spill(store, max_spill_bytes);
+        self.window.set_spill(store, max_spill_bytes, spill_used);
     }
 
     /// 便捷：redb spill（M4, `limits { spill = "redb" }`）——记录待创建配置,
     /// **延迟到首次 `process_*`**（行字段 layout 解析后）创建 store：
     /// store 的 layout 必须与 executor 一致（列式 from_schema / 行式 all_other）。
     /// `max_spill_bytes` = 落盘上限（None = 不限）。
+    /// `spill_used` = 规则级共享落盘计数（见 [`Self::set_spill`]）。
     pub fn set_spill_redb(
         &mut self,
         path: impl AsRef<std::path::Path>,
         max_spill_bytes: Option<usize>,
+        spill_used: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     ) {
-        self.spill_redb = Some((path.as_ref().to_path_buf(), max_spill_bytes));
+        self.spill_redb = Some((path.as_ref().to_path_buf(), max_spill_bytes, spill_used));
     }
 
     /// 延迟创建 redb store（首次 process 时调用; layout 已解析）。
     /// 创建失败 = 致命（panic——配置/磁盘错误, 绝不静默降级为拒收）。
     fn ensure_spill_store(&mut self) {
-        let Some((path, max_spill_bytes)) = self.spill_redb.clone() else {
+        let Some((path, max_spill_bytes, spill_used)) = self.spill_redb.clone() else {
             return;
         };
         if self.window.spill.is_some() {
@@ -1756,7 +1812,7 @@ impl StatsExecutor {
         let store = crate::match_engine::spill::RedbSpillStore::create(&path, layout)
             .unwrap_or_else(|e| panic!("spill redb 创建失败(致命) {}: {e}", path.display()));
         self.window
-            .set_spill(Some(Box::new(store)), max_spill_bytes);
+            .set_spill(Some(Box::new(store)), max_spill_bytes, spill_used);
     }
 
     /// 提取本片已关闭窗口的**原始累加状态**（输入分区分片归并用）并重置窗口。
@@ -1764,7 +1820,7 @@ impl StatsExecutor {
     /// 仅空键/可交换度量（count/sum/min/max/distinct）分片使用（last/top 被
     /// spawn 门控排除——行序敏感不可归并）。
     pub fn take_partial(&mut self) -> (Vec<(ScopeKey, Vec<StatsAccum>)>, u64) {
-        let buckets = self.window.take_buckets();
+        let buckets = self.window.take_buckets(&self.plan);
         let count = self.window.event_count;
         self.reset_window();
         (buckets, count)

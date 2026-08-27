@@ -98,20 +98,20 @@ key insight：q18 的数据特征是**滑动窗口引用**——大多数键（�
 ```
 wfl：
     limits {
-        max_memory = "2GB"
+        max_memory = "2GB"      // 状态内存上限（每分片, 2026-08-27 起）
         spill = "redb"          // 启用状态外溢（默认 off）
-        max_spill_bytes = "8GB" // 落盘上限（默认 off 时无意义；启用后默认磁盘可用量的一半）
+        max_spill_bytes = "8GB" // 规则总落盘上限（2026-08-27 起为规则级共享）
     }
 ```
 
 **三层预算阶梯**（内存 → 磁盘 → 兜底拒收）：
 
 ```
-内存 estimated_bytes ≤ max_memory          → 全内存，不 spill
-内存超 max_memory 且 spill_bytes ≤ max_spill → spill 最老键（LRU）腾空间
-spill_bytes ≥ max_spill_bytes              → 停止 spill，回退拒收
-                                             （over_limit_new_buckets 计数 + 告警，与现状一致）
-redb 写失败（磁盘满/IO 错）               → 同拒收（计数 + 致命告警，不静默丢）
+内存 estimated_bytes ≤ max_memory（每分片）          → 全内存，不 spill
+内存超 max_memory 且 共享 spill_bytes ≤ max_spill（规则）→ spill 最老键（LRU）腾空间
+共享 spill_bytes ≥ max_spill_bytes                    → 停止 spill，回退拒收
+                                                     （over_limit_new_buckets 计数 + 告警）
+redb 写失败（磁盘满/IO 错）                         → 同拒收（计数 + 致命告警，不静默丢）
 ```
 
 - `over_limit_new_buckets` 保留为**兜底**（spill 满/写失败才触发）
@@ -385,6 +385,45 @@ rule q18_last_bid_stats {
 4. **时间预算链完整性**：sink drain ≥ rules flush（GROUP_JOIN_TIMEOUT）≥ bench
    kill 宽限——三者必须同步调大, 否则各自成为丢数据的截断点（本轮教训: 只改
    GROUP_JOIN_TIMEOUT 不改 sink budget, 丢 98.6% 输出）
+
+## 19. `max_spill_bytes` 规则级共享预算（2026-08-27）
+
+**语义变更**：`max_spill_bytes` 从「每分片上限」改为「规则总上限」——同规则全部分
+片共享一个 `Arc<AtomicU64>` 落盘字节计数（`spawn.rs` 规则级创建, 分片 clone 注入）。
+分片数是引擎内部细节（用户不可见）, 旧语义 8GB/片 × 10 = 80GB 磁盘峰值违背用户
+直觉——用户配置的就是规则总量。
+
+**记账口径**（`stats_exec.rs` `StatsWindowState`）：
+
+```
+驱逐成功（evict_to_spill）   → fetch_add(allowance × 链长)   // 落盘占用
+读回（readback_bucket_mut）  → fetch_sub(allowance)          // 键回内存, 占用释放
+close 并入/流式 drain        → fetch_sub(并入键数 × allowance) // 窗口结束, 预算回收
+```
+
+- 预算检查（`spill_used_bytes() >= sl` / `+add_bytes > sl`）全部走共享计数 →
+  某分片用满预算后, 其余分片驱逐回退拒收（规则级兜底生效）
+- 窗口 close 后共享计数归零（预算跨窗口可复用）
+- 未注入共享计数但启用 store（测试/直接调用）→ 自建本片独立计数, 语义退化为单片
+
+**q18 100M 实测**（max_memory 2GB/片 + max_spill_bytes 规则 8GB）：
+
+| 配置 | EPS | RSS_peak | EMIT | 说明 |
+|---|---|---|---|---|
+| 无 spill 基线 | 12.6M | 35-40GB | 29,370,378 | 全内存 |
+| max_spill=2GB 规则 | 9.59M | 25.9GB | **24,865,600** | **共享预算耗尽 → 拒收丢 451 万键**（bench `[clean]` 不覆盖 over_limit!） |
+| **max_spill=8GB 规则** | 5.19M | 28.3GB | **29,370,378** | 稳态 spill ~2.1GB（10 片 × 2GB 内存的边缘失衡）, 8GB 留 ~4× 余量 |
+
+**教训**：
+1. **预算必须覆盖实际 spill 需求**：稳态 spill 量 = Σ(分片状态 − 分片内存上限),
+   不是「序列化后文件体积」（瞬时的 645MB 是假象, 稳态 2.1GB）——2GB 配置
+   直接触发拒收兜底, 静默丢键
+2. **bench `[clean]` 盲区**：`over_limit_new_buckets`（内存/spill 双拒收）不在
+   bench 正确性计数内——100M 丢 451 万键仍报 `[clean]`。EMIT 数需与无 spill
+   基线对拍才能发现; 后续应把 over_limit 纳入 bench 硬性检查
+3. **RSS 28.3GB 仍高于 20GB 目标**：剩余 = 分片内存状态 19.5GB（2GB×10 上限
+   几乎全占）+ 开销。压 20GB 需降 max_memory（如 1GB/片 → 状态 10GB）+ spill
+   补足（~10GB 落盘）——即 §A「1GB 预算」方向, EPS 与 RSS 的权衡另行实测
 
 ## 14. 风险与缓解
 
