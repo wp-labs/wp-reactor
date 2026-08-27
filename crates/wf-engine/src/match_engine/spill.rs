@@ -331,6 +331,12 @@ impl BatchWriter<SpillItem> for RedbBatchWriter {
         } else {
             redb::Durability::None
         };
+        // 批内按 hash 排序（2026-08-27 bench 实测 1.4-2.4x）：B+树随机插入
+        // 页分裂多/缓存命中差；排序后近似顺序写，逼近连续 key 理论上限
+        // （见 tests/spill_write_bench.rs）。排序成本 ~50ms/24.8 万键，远小于
+        // 写耗时。
+        let mut items = items;
+        items.sort_by_key(|(h, _, _)| *h);
         let mut txn = self
             .db
             .begin_write()
