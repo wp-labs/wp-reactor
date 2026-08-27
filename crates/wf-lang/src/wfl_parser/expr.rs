@@ -99,13 +99,18 @@ fn cmp_expr(input: &mut &str) -> ModalResult<Expr> {
         ws_skip.parse_next(input)?;
         // `not in <ident>` = 公共允许列表引用（issue #73）; 先试裸名（非 cut,
         // 失败回退到括号列表）, 再试 `(...)` 字面列表。
-        if let Ok(name) = ident.parse_next(input) {
+        let saved = *input;
+        if let Ok(name) = ident.parse_next(input)
+            && !input.trim_start().starts_with('.')
+        {
+            // 限定名（`foo.bar`）不是列表引用——回退, 让 in_list 报 "expected ("。
             return Ok(Expr::InList {
                 expr: Box::new(left),
                 list: vec![Expr::ListRef(name.to_string())],
                 negated: true,
             });
         }
+        *input = saved;
         let list = in_list.parse_next(input)?;
         return Ok(Expr::InList {
             expr: Box::new(left),
@@ -119,13 +124,18 @@ fn cmp_expr(input: &mut &str) -> ModalResult<Expr> {
         ws_skip.parse_next(input)?;
         // `in <ident>` = 公共允许列表引用（issue #73）; 先试裸名（非 cut,
         // 失败回退到括号列表）, 再试 `(...)` 字面列表。
-        if let Ok(name) = ident.parse_next(input) {
+        let saved = *input;
+        if let Ok(name) = ident.parse_next(input)
+            && !input.trim_start().starts_with('.')
+        {
+            // 限定名（`foo.bar`）不是列表引用——回退, 让 in_list 报 "expected ("。
             return Ok(Expr::InList {
                 expr: Box::new(left),
                 list: vec![Expr::ListRef(name.to_string())],
                 negated: false,
             });
         }
+        *input = saved;
         let list = in_list.parse_next(input)?;
         return Ok(Expr::InList {
             expr: Box::new(left),

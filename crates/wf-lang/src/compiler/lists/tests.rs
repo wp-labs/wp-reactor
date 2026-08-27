@@ -588,4 +588,168 @@ empty = ("placeholder")
     assert!(compile_wfl(&file, &schemas()).is_ok());
 }
 
+// ---- review 修复回归（2026-08-27 六轮评审） ----
+
+/// 菱形导入幂等: A use B、A use C、B use D、C use D → D 只导入一次, 不误报重名。
+#[test]
+fn use_diamond_import_is_idempotent() {
+    let mut files = HashMap::new();
+    files.insert("d.wfl", "d_list = (\"d1\")\n");
+    files.insert("b.wfl", "use \"d.wfl\"\nb_list = (\"b1\")\n");
+    files.insert("c.wfl", "use \"d.wfl\"\nc_list = (\"c1\")\n");
+    files.insert("a.wfl", "use \"b.wfl\"\nuse \"c.wfl\"\na_list = (\"a1\")\n");
+    let file = parse_wfl("use \"a.wfl\"\n").unwrap();
+    let mut loader = mem_loader(&files);
+    let merged = crate::compiler::lists::resolve_imports(
+        &file,
+        std::path::Path::new("main.wfl"),
+        &mut loader,
+    )
+    .unwrap();
+    let mut names: Vec<&str> = merged.lists.iter().map(|l| l.name.as_str()).collect();
+    names.sort_unstable();
+    // include 语义不承诺合并顺序; 断言集合 + 无重名（D 只出现一次）。
+    assert_eq!(
+        names,
+        ["a_list", "b_list", "c_list", "d_list"],
+        "菱形导入 D 只合并一次"
+    );
+}
+
+/// 同一文件不同写法（`b.wfl` vs `./b.wfl`）多次 use → 幂等（路径规范化）。
+#[test]
+fn use_same_file_variant_writing_is_idempotent() {
+    let mut files = HashMap::new();
+    files.insert("b.wfl", "b_list = (\"b1\")\n");
+    let file = parse_wfl("use \"b.wfl\"\nuse \"./b.wfl\"\n").unwrap();
+    let mut loader = mem_loader(&files);
+    let merged = crate::compiler::lists::resolve_imports(
+        &file,
+        std::path::Path::new("main.wfl"),
+        &mut loader,
+    )
+    .unwrap();
+    assert_eq!(merged.lists.len(), 1, "同文件变体写法只导入一次");
+}
+
+/// `./` 前缀不得绕过循环检测（路径规范化）。
+#[test]
+fn use_circular_detection_survives_dot_slash() {
+    let mut files = HashMap::new();
+    files.insert("a.wfl", "use \"./b.wfl\"\n");
+    files.insert("b.wfl", "use \"./a.wfl\"\n");
+    let file = parse_wfl("use \"a.wfl\"\n").unwrap();
+    let mut loader = mem_loader(&files);
+    let err = crate::compiler::lists::resolve_imports(
+        &file,
+        std::path::Path::new("main.wfl"),
+        &mut loader,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("circular use"), "{err}");
+}
+
+/// 自循环（文件 use 自己, 含 `./` 前缀）→ 循环报错而非无限递归。
+#[test]
+fn use_self_import_with_dot_slash_errors() {
+    let mut files = HashMap::new();
+    files.insert("a.wfl", "use \"./a.wfl\"\n");
+    let file = parse_wfl("use \"a.wfl\"\n").unwrap();
+    let mut loader = mem_loader(&files);
+    let err = crate::compiler::lists::resolve_imports(
+        &file,
+        std::path::Path::new("main.wfl"),
+        &mut loader,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("circular use"), "{err}");
+}
+
+/// yield preset 声明体（字段值 + 参数默认值）里的列表引用也须展开（评审缺口）。
+#[test]
+fn resolve_list_refs_expands_preset_bodies() {
+    // 字段值引用列表: 展开为字面 InList。
+    let file = parse_wfl(
+        r#"
+allowed_types = ("a", "b")
+
+ yield preset base_alerts <severity = "high"> (
+    detail = "x" in allowed_types
+)
+"#,
+    )
+    .unwrap();
+    let resolved = crate::compiler::lists::resolve_list_refs(&file).unwrap();
+    match &resolved.yield_presets[0].args[0].value {
+        Expr::InList { list, .. } => {
+            assert_eq!(list.len(), 2, "preset 字段值里的 ListRef 应展开");
+            assert!(list.iter().all(|i| matches!(i, Expr::StringLit(_))));
+        }
+        other => panic!("preset 字段值应展开为字面 InList, got {other:?}"),
+    }
+
+    // 参数默认值引用列表: 同样展开。
+    let file = parse_wfl(
+        r#"
+allowed_types = ("a", "b")
+
+ yield preset base_alerts <severity = "x" in allowed_types> (
+    detail = $severity
+)
+"#,
+    )
+    .unwrap();
+    let resolved = crate::compiler::lists::resolve_list_refs(&file).unwrap();
+    match &resolved.yield_presets[0].params[0].default {
+        Some(Expr::InList { list, .. }) => {
+            assert_eq!(list.len(), 2, "preset 参数默认值里的 ListRef 应展开");
+        }
+        other => panic!("preset 参数默认值应展开为字面 InList, got {other:?}"),
+    }
+}
+
+/// 混类型列表: 只报一条（混类型）, 不再叠加左值不兼容双报。
+#[test]
+fn mixed_type_list_reports_single_error() {
+    let file = parse_wfl(
+        r#"
+rule r {
+    events { s : sdm_event && s.log_type in (1, "a") }
+    match<:5m> { on event { s | count >= 1; } } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#,
+    )
+    .unwrap();
+    let err = compile_wfl(&file, &schemas()).unwrap_err();
+    let text = err.to_string();
+    // 混类型报错后不得再叠加左值不兼容（同列表双报）。
+    assert!(text.contains("mixes incompatible"), "混类型应报错: {text}");
+    assert!(
+        !text.contains("left-hand value type"),
+        "混类型后不应再报左值不兼容, got: {text}"
+    );
+}
+
+/// 限定名右值（`in foo.bar`）不是列表引用——解析报错（而非误吞 ident 残留）。
+#[test]
+fn qualified_name_after_in_is_parse_error() {
+    let err = parse_wfl(
+        r#"
+rule r {
+    events { s : sdm_event && s.log_type in a.b }
+    match<:5m> { on event { s | count >= 1; } } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("parse"),
+        "限定名右值应解析报错: {err}"
+    );
+}
+
 fn _unused(_: PathBuf) {}

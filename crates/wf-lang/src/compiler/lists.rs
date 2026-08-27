@@ -14,8 +14,8 @@
 //! - use 目标缺失 / 循环引用（A↔B）/ 重名（文件内与导入、导入与导入）→ 报错。
 //! - 列表元素自身引用 列表（嵌套）→ 编译错误（不支持嵌套）。
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 
 use crate::ast::{
     BoundVal, CloseBlock, ConvClause, ConvStep, Expr, ListDecl, MatchClause, MatchStep, PipeChain,
@@ -41,9 +41,18 @@ pub fn resolve_imports(
     file_path: &Path,
     load_source: &mut dyn FnMut(&Path) -> LangResult<String>,
 ) -> LangResult<WflFile> {
-    let mut stack: Vec<PathBuf> = vec![file_path.to_path_buf()];
+    let mut stack: Vec<PathBuf> = vec![normalize_path(file_path)];
+    // 全局已导入集合（规范化路径）: 幂等——同一文件无论从哪条路径（含菱形
+    // 导入 A→B、A→C、B→D、C→D）到达只导入一次, 不误报重名。
+    let mut imported_files: HashSet<PathBuf> = HashSet::new();
     let mut out = file.clone();
-    resolve_imports_into(&mut out, file_path, &mut stack, load_source)?;
+    resolve_imports_into(
+        &mut out,
+        file_path,
+        &mut stack,
+        &mut imported_files,
+        load_source,
+    )?;
     Ok(out)
 }
 
@@ -51,11 +60,10 @@ fn resolve_imports_into(
     out: &mut WflFile,
     file_path: &Path,
     stack: &mut Vec<PathBuf>,
+    imported_files: &mut HashSet<PathBuf>,
     load_source: &mut dyn FnMut(&Path) -> LangResult<String>,
 ) -> LangResult<()> {
-    // 逐个处理 use（.wfs 目标跳过——schema 由各加载层另行加载）;
-    // 同一文件多处 use 只导入一次。
-    let mut seen: Vec<PathBuf> = Vec::new();
+    // 逐个处理 use（.wfs 目标跳过——schema 由各加载层另行加载）。
     let targets: Vec<String> = out
         .uses
         .iter()
@@ -63,11 +71,7 @@ fn resolve_imports_into(
         .filter(|p| !p.ends_with(".wfs"))
         .collect();
     for target in targets {
-        let path = resolve_use_path(file_path, &target);
-        if seen.contains(&path) {
-            continue;
-        }
-        seen.push(path.clone());
+        let path = normalize_path(&resolve_use_path(file_path, &target));
         if stack.contains(&path) {
             let chain = stack
                 .iter()
@@ -78,6 +82,10 @@ fn resolve_imports_into(
                 LangReason::Compile,
                 format!("circular use: {} (chain: {})", path.display(), chain),
             );
+        }
+        // 幂等: 该文件已在本导入闭包内导入过（菱形/重复 use 同一文件）→ 跳过。
+        if !imported_files.insert(path.clone()) {
+            continue;
         }
         let source = load_source(&path).map_err(|e| {
             crate::error::error(
@@ -103,7 +111,7 @@ fn resolve_imports_into(
         })?;
         // 递归导入目标的 use, 再合并其列表（include 递归传播）。
         stack.push(path.clone());
-        resolve_imports_into(&mut imported, &path, stack, load_source)?;
+        resolve_imports_into(&mut imported, &path, stack, imported_files, load_source)?;
         stack.pop();
         merge_lists(out, &imported, &path)?;
     }
@@ -118,6 +126,24 @@ fn resolve_use_path(file_path: &Path, target: &str) -> PathBuf {
     } else {
         file_path.parent().unwrap_or_else(|| Path::new(".")).join(t)
     }
+}
+
+/// 词法规范化: 折叠 `./` 与空组件（保留 `..` 语义）。循环检测与幂等去重以
+/// 规范化为基准——`./b.wfl` 与 `b.wfl` 视为同一文件, 不绕过检测/不重复导入。
+fn normalize_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(comp.as_os_str());
+                }
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
 }
 
 /// 把导入文件的列表并入 out; 重名（文件内已定义或此前已导入）→ 报错。
@@ -153,6 +179,32 @@ pub fn resolve_list_refs(file: &WflFile) -> LangResult<WflFile> {
     let mut out = file.clone();
     for rule in &mut out.rules {
         *rule = resolve_rule(rule, &lists)?;
+    }
+    // yield preset 声明体（字段值 + 参数默认值）里的 ListRef（issue #73 评审
+    // 缺口）: preset 展开时代入 yield 字段/参数, 残留 ListRef 会到运行时求值
+    // 失败——同样展开。
+    for preset in &mut out.yield_presets {
+        for arg in &mut preset.args {
+            arg.value = resolve_expr(&arg.value, &lists).map_err(|e| {
+                crate::error::error(
+                    LangReason::Compile,
+                    format!("yield preset `{}`: {}", preset.name, e),
+                )
+            })?;
+        }
+        for param in &mut preset.params {
+            if let Some(d) = &param.default {
+                param.default = Some(resolve_expr(d, &lists).map_err(|e| {
+                    crate::error::error(
+                        LangReason::Compile,
+                        format!(
+                            "yield preset `{}` param `{}`: {}",
+                            preset.name, param.name, e
+                        ),
+                    )
+                })?);
+            }
+        }
     }
     Ok(out)
 }

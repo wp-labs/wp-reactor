@@ -357,6 +357,7 @@ fn check_expr_type_inner(
                     elem_types.push(t);
                 }
             }
+            let mut mixed = false;
             for i in 1..elem_types.len() {
                 if !compatible(&elem_types[0], &elem_types[i]) {
                     errors.push(CheckError {
@@ -369,10 +370,14 @@ fn check_expr_type_inner(
                             format_type(&elem_types[i])
                         ),
                     });
+                    mixed = true;
                     break;
                 }
             }
-            if let Some(lv) = infer_type(inner, scope)
+            // 混类型已报错则跳过左值比对（避免同列表双报）; 列表元素无代表类型
+            // （全推断不出）时同样跳过。
+            if !mixed
+                && let Some(lv) = infer_type(inner, scope)
                 && let Some(first) = elem_types.first()
                 && !compatible(&lv, first)
             {
