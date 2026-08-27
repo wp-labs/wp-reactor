@@ -8,7 +8,8 @@ const VALID_LIMIT_KEYS: &[&str] = &[
     "max_throttle",
     "on_exceed",
     "spill",
-    "max_spill_bytes",
+    "max_disk",
+    "max_spill_bytes", // 兼容别名（2026-08-27 改名 max_disk）
 ];
 
 const VALID_ON_EXCEED: &[&str] = &["throttle", "drop_oldest", "fail_rule"];
@@ -71,16 +72,37 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                 });
             }
             "spill" => {}
-            "max_spill_bytes" => {
+            "max_disk" => {
                 if crate::compiler::parse_byte_size(&item.value).is_none() {
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
                         test: None,
                         message: format!(
-                            "max_spill_bytes value `{}` must be a byte size (e.g. \"8GB\")",
+                            "max_disk value `{}` must be a byte size (e.g. \"20GB\")",
                             item.value
                         ),
+                    });
+                }
+            }
+            "max_spill_bytes" => {
+                // 兼容别名: 已重命名为 max_disk（语义同, 规则级磁盘总上限）。
+                if crate::compiler::parse_byte_size(&item.value).is_none() {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "max_spill_bytes value `{}` must be a byte size (e.g. \"20GB\")",
+                            item.value
+                        ),
+                    });
+                } else {
+                    errors.push(CheckError {
+                        severity: Severity::Warning,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: "`max_spill_bytes` 已重命名为 `max_disk`（2026-08-27）——请迁移配置; 旧键仍生效但将废弃".to_string(),
                     });
                 }
             }

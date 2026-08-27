@@ -556,7 +556,7 @@ pub struct StatsWindowState {
     pub(crate) spill_index: HashSet<u64>,
     /// 落盘字节上限（None = 不限）。三层预算阶梯第二层（内存→磁盘→拒收兜底）。
     /// **规则级全局语义**（2026-08-27）：同规则全部分片共享一个 `spill_used`
-    /// 计数器——`max_spill_bytes` 是用户配置的规则总落盘上限（分片数是引擎
+    /// 计数器——`max_disk` 是用户配置的规则总落盘上限（分片数是引擎
     /// 内部细节，用户不可见）。
     spill_limit_bytes: Option<u64>,
     /// 共享已落盘字节计数器（跨分片；None = 未配置 spill）。
@@ -802,7 +802,7 @@ impl StatsWindowState {
     /// 注入状态外溢存储（窗口开始时由 spawn 层调用）。
     /// `store = None` 关闭 spill（Noop 语义）。`max_spill_bytes = None` 不限落盘。
     /// `spill_used` = 规则级共享落盘计数器（同规则全部分片共用一个——
-    /// `max_spill_bytes` 是规则总上限, 分片数是引擎内部细节）。
+    /// `max_disk` 是规则总上限, 分片数是引擎内部细节）。
     pub fn set_spill(
         &mut self,
         store: Option<Box<dyn SpillStore + Send + Sync>>,
@@ -1847,7 +1847,7 @@ impl StatsExecutor {
     /// 注入状态外溢存储（M3; 窗口开始时调用; None = 关闭 spill）。
     /// `max_spill_bytes` = 落盘上限（None = 不限; 三层预算阶梯第二层）。
     /// `spill_used` = 规则级共享落盘计数（同规则全部分片共用一个——
-    /// `max_spill_bytes` 是规则总上限, 分片数是引擎内部细节; None = 未配置）。
+    /// `max_disk` 是规则总上限, 分片数是引擎内部细节; None = 未配置）。
     pub fn set_spill(
         &mut self,
         store: Option<Box<dyn SpillStore + Send + Sync>>,

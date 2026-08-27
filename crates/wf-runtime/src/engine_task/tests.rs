@@ -4563,7 +4563,7 @@ async fn conv_stage_throttle_failrule_latches_shared() {
         }),
         on_exceed: wf_lang::plan::ExceedAction::FailRule,
         spill: None,
-        max_spill_bytes: None,
+        max_disk_bytes: None,
     };
     let barrier: Arc<Vec<std::sync::atomic::AtomicI64>> =
         Arc::new(vec![std::sync::atomic::AtomicI64::new(i64::MIN)]);
@@ -4616,7 +4616,7 @@ async fn conv_stage_failrule_latch_suppresses_rest_of_bucket() {
         }),
         on_exceed: wf_lang::plan::ExceedAction::FailRule,
         spill: None,
-        max_spill_bytes: None,
+        max_disk_bytes: None,
     };
     let barrier: Arc<Vec<std::sync::atomic::AtomicI64>> =
         Arc::new(vec![std::sync::atomic::AtomicI64::new(i64::MIN)]);

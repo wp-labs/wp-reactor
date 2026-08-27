@@ -111,7 +111,7 @@ fn throttle_limits(count: u64, on_exceed: ExceedAction) -> LimitsPlan {
         }),
         on_exceed,
         spill: None,
-        max_spill_bytes: None,
+        max_disk_bytes: None,
     }
 }
 

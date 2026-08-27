@@ -98,20 +98,20 @@ key insight：q18 的数据特征是**滑动窗口引用**——大多数键（�
 ```
 wfl：
     limits {
-        max_memory = "10GB"     // 状态内存上限（2026-08-27 起为规则级共享总量）
+        max_memory = "15GB"     // 状态内存上限（2026-08-27 起为规则级共享总量）
         spill = "redb"          // 启用状态外溢（默认 off）
-        max_spill_bytes = "20GB" // 规则总落盘上限（2026-08-27 起为规则级共享）
+        max_disk = "20GB"       // 规则总磁盘上限（2026-08-27 改名自 max_spill_bytes）
     }
 ```
 
 **三层预算阶梯**（内存 → 磁盘 → 兜底拒收）：
 
 ```
-内存 mem_used ≤ max_memory（规则共享）             → 全内存，不 spill
-内存超 max_memory 且 共享 spill_bytes ≤ max_spill → spill 最老键（LRU）腾空间
-共享 spill_bytes ≥ max_spill_bytes               → 停止 spill，回退拒收
-                                                 （over_limit_new_buckets 计数 + 告警）
-redb 写失败（磁盘满/IO 错）                     → 同拒收（计数 + 致命告警，不静默丢）
+内存 mem_used ≤ max_memory（规则共享）            → 全内存，不 spill
+内存超 max_memory 且 共享 disk_used ≤ max_disk  → spill 最老键（LRU）腾空间
+共享 disk_used ≥ max_disk                       → 停止 spill，回退拒收
+                                                （over_limit_new_buckets 计数 + 告警）
+redb 写失败（磁盘满/IO 错）                    → 同拒收（计数 + 致命告警，不静默丢）
 ```
 
 - `over_limit_new_buckets` 保留为**兜底**（spill 满/写失败才触发）
@@ -386,12 +386,15 @@ rule q18_last_bid_stats {
    kill 宽限——三者必须同步调大, 否则各自成为丢数据的截断点（本轮教训: 只改
    GROUP_JOIN_TIMEOUT 不改 sink budget, 丢 98.6% 输出）
 
-## 19. `max_spill_bytes` 规则级共享预算（2026-08-27）
+## 19. `max_disk` 规则级共享预算（2026-08-27, 改名自 `max_spill_bytes`）
 
-**语义变更**：`max_spill_bytes` 从「每分片上限」改为「规则总上限」——同规则全部分
-片共享一个 `Arc<AtomicU64>` 落盘字节计数（`spawn.rs` 规则级创建, 分片 clone 注入）。
+**语义变更**：`max_disk` 从「每分片上限」改为「规则总上限」——同规则全部分片共
+享一个 `Arc<AtomicU64>` 落盘字节计数（`spawn.rs` 规则级创建, 分片 clone 注入）。
 分片数是引擎内部细节（用户不可见）, 旧语义 8GB/片 × 10 = 80GB 磁盘峰值违背用户
 直觉——用户配置的就是规则总量。
+
+**兼容**：旧键 `max_spill_bytes` 保留为别名（解析接受 + lint 迁移 Warning）,
+新配置一律用 `max_disk`。
 
 **记账口径**（`stats_exec.rs` `StatsWindowState`）：
 
@@ -406,7 +409,7 @@ close 并入/流式 drain        → fetch_sub(并入键数 × allowance) // 窗
 - 窗口 close 后共享计数归零（预算跨窗口可复用）
 - 未注入共享计数但启用 store（测试/直接调用）→ 自建本片独立计数, 语义退化为单片
 
-**q18 100M 实测**（max_memory 2GB/片 + max_spill_bytes 规则 8GB）：
+**q18 100M 实测**（max_memory 2GB/片 + max_disk 规则 8GB）：
 
 | 配置 | EPS | RSS_peak | EMIT | 说明 |
 |---|---|---|---|---|
@@ -477,6 +480,6 @@ close（take_buckets / reset） → mem_sub(本片净占用)  // 预算跨窗口
 | close 读回 18.6G I/O 耗时 | 顺序扫描（B+树叶子链），分钟级跑批可接受；对拍验证耗时 |
 | 序列化 bug 丢数据 | 读回失败 → `SpillError::Corrupt` → panic（致命，不静默丢键） |
 | 与分片组合 | 初始禁用（§10），后续按需扩展 |
-| redb 文件膨胀 | 窗口级文件 + 4 个清除时机（§8）；`max_spill_bytes` 上限（§5） |
-| 磁盘满 | `max_spill_bytes` 预算 + 写失败回退拒收（§5 三层阶梯） |
+| redb 文件膨胀 | 窗口级文件 + 4 个清除时机（§8）；`max_disk` 上限（§5） |
+| 磁盘满 | `max_disk` 预算 + 写失败回退拒收（§5 三层阶梯） |
 | 崩溃残留 `.rbr` | 启动时清理 spill 目录（§8 时机④）；残留无正确性影响 |

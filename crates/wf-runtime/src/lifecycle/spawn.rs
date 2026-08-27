@@ -526,8 +526,8 @@ pub(super) fn spawn_rule_tasks(
                     .plan()
                     .limits_plan
                     .as_ref()
-                    .and_then(|l| l.spill.as_ref().map(|_| l.max_spill_bytes));
-                // `max_spill_bytes` = 规则级共享预算（2026-08-27）：同规则全部
+                    .and_then(|l| l.spill.as_ref().map(|_| l.max_disk_bytes));
+                // `max_disk` = 规则级共享磁盘预算（2026-08-27）：同规则全部
                 // 分片共用一个落盘字节计数器——用户配置的是规则总上限, 分片数是
                 // 引擎内部细节（单实例 = 1 个分片, 共享语义自然退化为单片）。
                 let spill_used = spill_cfg.map(|_| Arc::new(AtomicU64::new(0)));
@@ -597,7 +597,7 @@ pub(super) fn spawn_rule_tasks(
                         );
                         // key 分片: 每片独立 executor（无跨片 merge）——spill 按片独立
                         // 启用（每片独立文件 + 每片独立写 worker = 多 worker 多文件）,
-                        // 落盘字节记账共享规则级计数（max_spill_bytes = 规则总上限）。
+                        // 落盘字节记账共享规则级计数（max_disk = 规则总上限）。
                         if let Some(max_spill_bytes) = spill_cfg {
                             shard_stats.set_spill_redb(
                                 spill_file_path(&rule.executor.plan().name, Some(shard_idx)),

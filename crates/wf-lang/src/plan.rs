@@ -386,8 +386,9 @@ pub struct LimitsPlan {
     /// 状态外溢模式（M4，`docs/design/stats-state-spill-redb.md`）:
     /// None = 关闭（默认，零开销）; Redb = 状态落盘、内存只留活跃子集。
     pub spill: Option<SpillMode>,
-    /// 落盘字节上限（spill 启用时有效；None = 不限）。三层预算阶梯第二层。
-    pub max_spill_bytes: Option<usize>,
+    /// 规则级磁盘占用上限（2026-08-27 改名自 `max_spill_bytes`, 键 `max_disk`;
+    /// 旧键保留为兼容别名）。用户配的是规则总量（分片数是引擎内部细节）。
+    pub max_disk_bytes: Option<usize>,
 }
 
 /// 状态外溢存储模式。

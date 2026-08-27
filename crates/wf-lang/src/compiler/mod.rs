@@ -1330,7 +1330,7 @@ fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan
     let mut max_throttle = None;
     let mut on_exceed = ExceedAction::Throttle; // default
     let mut spill = None;
-    let mut max_spill_bytes = None;
+    let mut max_disk_bytes = None;
 
     for item in &limits.items {
         match item.key.as_str() {
@@ -1357,8 +1357,12 @@ fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan
                     _ => None,
                 };
             }
+            "max_disk" => {
+                max_disk_bytes = parse_byte_size(&item.value);
+            }
             "max_spill_bytes" => {
-                max_spill_bytes = parse_byte_size(&item.value);
+                // 兼容别名（2026-08-27 改名 max_disk）: 旧键仍生效。
+                max_disk_bytes = parse_byte_size(&item.value);
             }
             _ => {}
         }
@@ -1370,7 +1374,7 @@ fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan
         max_throttle,
         on_exceed,
         spill,
-        max_spill_bytes,
+        max_disk_bytes,
     })
 }
 

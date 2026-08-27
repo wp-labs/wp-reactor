@@ -252,7 +252,7 @@ fn accu_throttle_suppresses_alert_but_keeps_accumulation() {
         }),
         on_exceed: ExceedAction::Throttle,
         spill: None,
-        max_spill_bytes: None,
+        max_disk_bytes: None,
     };
     let mut sm = CepStateMachine::with_limits("accu".into(), plan, None, Some(limits));
 

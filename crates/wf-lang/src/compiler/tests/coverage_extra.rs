@@ -278,14 +278,31 @@ rule r {
     limits {
         max_memory = "1GB";
         spill = "redb";
-        max_spill_bytes = "8GB";
+        max_disk = "8GB";
     }
 }
 "#;
     let plans = compile_with(src, &[auth_events_window(), output_window()]);
     let lp = plans[0].limits_plan.as_ref().expect("limits plan");
     assert_eq!(lp.spill, Some(SpillMode::Redb));
-    assert_eq!(lp.max_spill_bytes, Some(8 * 1024 * 1024 * 1024));
+    assert_eq!(lp.max_disk_bytes, Some(8 * 1024 * 1024 * 1024));
+}
+
+/// 旧键 `max_spill_bytes` 兼容别名: 编译仍解析到同一个字段（2026-08-27 改名）。
+#[test]
+fn compile_limits_plan_spill_old_alias_still_parsed() {
+    let src = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+    limits { spill = "redb"; max_spill_bytes = "20GB"; }
+}
+"#;
+    let plans = compile_with(src, &[auth_events_window(), output_window()]);
+    let lp = plans[0].limits_plan.as_ref().expect("limits plan");
+    assert_eq!(lp.max_disk_bytes, Some(20 * 1024 * 1024 * 1024));
 }
 
 #[test]
@@ -302,7 +319,7 @@ rule r {
     let plans = compile_with(src, &[auth_events_window(), output_window()]);
     let lp = plans[0].limits_plan.as_ref().expect("limits plan");
     assert_eq!(lp.spill, None);
-    assert_eq!(lp.max_spill_bytes, None);
+    assert_eq!(lp.max_disk_bytes, None);
 }
 
 #[test]

@@ -102,10 +102,35 @@ rule r {
     match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
     entity(ip, e.sip)
     yield out (x = e.sip)
-    limits { max_memory = "1GB"; spill = "redb"; max_spill_bytes = "8GB"; }
+    limits { max_memory = "1GB"; spill = "redb"; max_disk = "8GB"; }
 }
 "#;
     assert_no_errors(input, &[auth_events_window(), output_window()]);
+}
+
+/// 旧键 `max_spill_bytes` 保留为兼容别名（2026-08-27 改名 max_disk）:
+/// 无 Error（仍生效）, 但产生迁移 Warning。
+#[test]
+fn check_limits_spill_old_alias_warns_migration() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+    limits { spill = "redb"; max_spill_bytes = "8GB"; }
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
+    // 别名产生迁移 Warning（check_errors 只收 Error, 这里直接收全量）。
+    let file = parse_wfl(input).expect("parse");
+    let warns = check_wfl(&file, &[auth_events_window(), output_window()])
+        .into_iter()
+        .filter(|e| {
+            e.severity == crate::checker::Severity::Warning && e.message.contains("max_disk")
+        })
+        .count();
+    assert!(warns >= 1, "旧键 max_spill_bytes 应产生 max_disk 迁移警告");
 }
 
 #[test]
