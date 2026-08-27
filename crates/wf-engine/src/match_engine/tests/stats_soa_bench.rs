@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{ArrayRef, BooleanArray, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{BinOp, Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan, WindowSpec};
@@ -127,6 +127,34 @@ fn q17_batch(n: usize) -> RecordBatch {
         vec![
             Arc::new(Int64Array::from(auction)) as ArrayRef,
             Arc::new(Int64Array::from(price)) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+/// q17 真实形状批（stats_task 层归因用）: auction + price + dateTime 时间列
+/// （单调递增 65.2µs/事件, 对齐 q17 数据步长; 1d 窗口下批内单段）。
+fn q17_batch_with_time(n: usize) -> RecordBatch {
+    use arrow::array::TimestampNanosecondArray;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+        Field::new("dateTime", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+    ]));
+    let auction: Vec<i64> = (0..n).map(|i| (i as i64) % AUCTIONS).collect();
+    let price: Vec<i64> = (0..n)
+        .map(|i| {
+            let t = i as f64 / n as f64;
+            (100.0 * 1e6f64.powf(t)).round() as i64
+        })
+        .collect();
+    let time: Vec<i64> = (0..n).map(|i| 1_750_000_000_000_000_000i64 + i as i64 * 65_200).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(auction)) as ArrayRef,
+            Arc::new(Int64Array::from(price)) as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(time)) as ArrayRef,
         ],
     )
     .unwrap()
@@ -462,4 +490,74 @@ fn q17_rules_breakdown() {
     eprintln!("  完整行(查找+累积,无hash)  : {:>6.2} ns/事件", full_ns);
     eprintln!("  process_batch_rows 大表   : {:>6.2} ns/事件（列式前置={}）", prod_ns, ok);
     eprintln!("  → diag 实测 rules 每事件   : ~577 ns·核（核·s 17.3 / 30M）——剩余差距在生产外围（批级/窗口/多核）");
+}
+
+/// stats_task 层归因（2026-08-27）: 量化 `process_batch_from` 在
+/// `process_batch_rows` 之外的开销组件——max_time 全批扫描 / domain 构造 /
+/// 段扫（时间列逐行读取）/ 行域分支。基准 = process_batch_rows 单核 68ns。
+#[test]
+#[ignore]
+fn q17_stats_task_layer() {
+    use crate::match_engine::event_bridge::{batch_event_time_nanos_at, batch_time_col_index};
+
+    let plan = q17_plan();
+    let batch = q17_batch_with_time(N);
+    let time_col = batch_time_col_index(&batch, Some("dateTime")).unwrap();
+    let n = batch.num_rows();
+
+    // 1. batch_max_time 等价（全批时间扫描取 max）
+    let t0 = Instant::now();
+    let mut max_t = i64::MIN;
+    for r in 0..n {
+        let t = batch_event_time_nanos_at(&batch, time_col, r);
+        if t > max_t {
+            max_t = t;
+        }
+    }
+    std::hint::black_box(max_t);
+    let max_time_ns = t0.elapsed().as_secs_f64() * 1e9 / n as f64;
+
+    // 2. domain 构造（全批路径: Vec<u32> 0..n）
+    let t0 = Instant::now();
+    let domain: Vec<u32> = (0..n as u32).collect();
+    std::hint::black_box(&domain);
+    let domain_ns = t0.elapsed().as_secs_f64() * 1e9 / n as f64;
+
+    // 3. 段扫（1d 窗口批内单段: 逐行时间读取直到越界; black_box 防循环消除）
+    let t0 = Instant::now();
+    let mut j = 0usize;
+    while j < n {
+        let t = std::hint::black_box(batch_event_time_nanos_at(
+            &batch,
+            time_col,
+            domain[j] as usize,
+        ));
+        if t >= max_t {
+            break;
+        }
+        j += 1;
+    }
+    let seg_ns = t0.elapsed().as_secs_f64() * 1e9 / n as f64;
+
+    // 4. process_batch_rows 行域分支 vs None
+    let mut exec = StatsExecutor::new(q17_plan());
+    let t0 = Instant::now();
+    let ok = exec.process_batch_rows(&batch, Some(&domain));
+    let with_rows_ns = t0.elapsed().as_secs_f64() * 1e9 / n as f64;
+
+    let mut exec2 = StatsExecutor::new(q17_plan());
+    let t0 = Instant::now();
+    let ok2 = exec2.process_batch_rows(&batch, None);
+    let none_ns = t0.elapsed().as_secs_f64() * 1e9 / n as f64;
+
+    eprintln!("== q17 stats_task 层归因（N={}, 批内单段 1d 窗）==", N);
+    eprintln!("  process_batch_rows None 基线 : {:>6.2} ns/事件（列式前置={}）", none_ns, ok2);
+    eprintln!("  process_batch_rows Some(rows): {:>6.2} ns/事件（列式前置={}）", with_rows_ns, ok);
+    eprintln!("  ├ 行域分支增量             : {:>6.2} ns/事件", with_rows_ns - none_ns);
+    eprintln!("  max_time 全批扫描          : {:>6.2} ns/事件", max_time_ns);
+    eprintln!("  domain Vec<u32> 构造       : {:>6.2} ns/事件", domain_ns);
+    eprintln!("  段扫（时间列逐行）         : {:>6.2} ns/事件", seg_ns);
+    let task_extra = (with_rows_ns - none_ns) + max_time_ns + domain_ns + seg_ns;
+    eprintln!("  stats_task 层合计附加       : {:>6.2} ns/事件（None 基线 + 附加 = {:.1}）", task_extra, none_ns + task_extra);
+    eprintln!("  → diag 577 ns·核 剩余差距   : 投递/多核/窗口 close/ack 等 wf-runtime 外围");
 }
