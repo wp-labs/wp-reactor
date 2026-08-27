@@ -834,7 +834,8 @@ pub struct StatsWindowState {
     spill_create: Option<SpillCreateSpec>,
     /// 时钟队列（近似 LRU）：桶**创建序**的 hash 环。驱逐扫描队首：
     /// 二次机会（touch > 0）→ 递减回队尾；否则驱逐。每在内存键至多一个条目。
-    clock: VecDeque<u64>,
+    /// pub(crate) 供 spill 测试断言快速路径不维护（无 spill 时恒空）。
+    pub(crate) clock: VecDeque<u64>,
     /// 已读回（take）的键 hash（M5-2）：take 只读不删——redb 中旧条目在 close
     /// 时按此集合过滤（内存副本更新，避免重复输出）。与 spill_index 互补：
     /// 读回 → 出 spill_index 入 readback；再驱逐 → 入 spill_index 出 readback。

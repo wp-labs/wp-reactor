@@ -1567,3 +1567,147 @@ fn spill_disk_full_returns_reserved_and_rejects() {
     let closed = exec.close_window_by_bucket_rows();
     assert_eq!(closed.len(), 4, "只输出被接收的 4 键");
 }
+
+// ---------------------------------------------------------------------------
+// 15. 无 spill 快速路径（2026-08-27 合并取舍恢复 entry 单查）
+// ---------------------------------------------------------------------------
+
+/// 无 spill（快速路径 entry 单查）vs 有 spill 但不驱逐（spill 路径双查）——
+/// 输出逐键一致（对拍契约: 快速路径与 spill 路径的建桶/累计/close 等价）。
+/// 另断言无 spill 时 clock 空（快速路径不维护——零开销确认）。
+#[test]
+fn spill_fast_path_matches_spill_path_without_eviction() {
+    let plan = keyed_plan(
+        vec![field_key("b", "bidder")],
+        vec![count_measure("n"), sum_measure("total", "price")],
+    );
+    let limit = (allowance_for(&plan) * 50) as usize; // 预算 50 桶, 20 键不驱逐
+
+    // A: 无 spill（快速路径）
+    let mut a = StatsExecutor::new(plan.clone());
+    a.set_memory_limit("fast", Some(limit));
+    for k in 1..=20i64 {
+        a.process_rows(&[bid_row(k, k as f64)], extract);
+    }
+    // B: 有 spill 但不驱逐（spill 路径）
+    let mut b = StatsExecutor::new(plan.clone());
+    b.set_memory_limit("spill_path", Some(limit));
+    b.set_spill(Some(Box::new(MemSpillStore::new())), None, None);
+    for k in 1..=20i64 {
+        b.process_rows(&[bid_row(k, k as f64)], extract);
+    }
+
+    // 快速路径不维护 clock（零开销）; 两路径均零驱逐零拒收
+    assert!(a.window.clock.is_empty(), "无 spill 快速路径不维护 clock");
+    assert_eq!(b.window.clock.len(), 20, "spill 路径维护 clock");
+    assert_eq!(a.window.over_limit_new_buckets(), 0);
+    assert_eq!(b.window.over_limit_new_buckets(), 0);
+    assert_eq!(a.window.spill_evictions(), 0);
+    assert_eq!(b.window.spill_evictions(), 0);
+
+    // 输出对拍: 键集合 + 每度量 measure_value + 条目数一致
+    let a_out = a.close_window_by_bucket_rows();
+    let b_out = b.close_window_by_bucket_rows();
+    assert_eq!(a_out.len(), 20, "A 20 键");
+    assert_eq!(a_out.len(), b_out.len(), "两路径输出键数一致");
+    for (x, y) in a_out.iter().zip(b_out.iter()) {
+        assert_eq!(x.key, y.key, "键一致");
+        assert_eq!(x.measures.len(), y.measures.len(), "度量数一致");
+        for (mx, my) in x.measures.iter().zip(y.measures.iter()) {
+            assert_eq!(mx.len(), my.len(), "条目数一致");
+            for (ex, ey) in mx.iter().zip(my.iter()) {
+                assert_eq!(
+                    ex.measure_value, ey.measure_value,
+                    "键 {:?} 度量值一致",
+                    x.key
+                );
+            }
+        }
+    }
+}
+
+/// 无 spill 快速路径限额拒收（`account_bucket_allowed` 本片口径）:
+/// 预算 3 桶注入 8 键 → 拒收 5, 只输出 3（不建桶不丢已建）。
+#[test]
+fn spill_fast_path_no_spill_rejects_over_limit() {
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let limit = (allowance_for(&plan) * 3) as usize;
+    let mut exec = StatsExecutor::new(plan.clone());
+    exec.set_memory_limit("fast_reject", Some(limit));
+    for k in 1..=8i64 {
+        exec.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+    assert!(exec.window.over_limit_new_buckets() > 0, "快速路径超限拒收");
+    assert_eq!(exec.window.buckets.len(), 3, "只建 3 桶");
+    let closed = exec.close_window_by_bucket_rows();
+    assert_eq!(closed.len(), 3, "只输出 3 键");
+}
+
+/// 两片都无 spill（纯快速路径）+ 规则级共享计数: A 占满 3 桶 → B 首键被共享
+/// 总量拒收（`account_bucket_allowed` 共享口径——本次合并修复的核心语义）。
+#[test]
+fn spill_fast_path_shared_budget_two_no_spill() {
+    use std::sync::atomic::Ordering;
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let shared = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let limit = (allowance_for(&plan) * 3) as usize; // 规则总内存 3 桶
+    let mk = |tag: &str| -> StatsExecutor {
+        let mut exec = StatsExecutor::new(plan.clone());
+        exec.set_memory_limit_shared(tag, Some(limit), Some(Arc::clone(&shared)));
+        exec
+    };
+    let mut a = mk("fast_a");
+    let mut b = mk("fast_b");
+    for k in 1..=3i64 {
+        a.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+    b.process_rows(&[bid_row(7, 1.0)], extract);
+    assert_eq!(
+        b.window.over_limit_new_buckets(),
+        1,
+        "B 首键被共享总量拒收（快速路径共享口径）"
+    );
+    assert_eq!(
+        shared.load(Ordering::SeqCst),
+        allowance_for(&plan) * 3,
+        "A 3 桶进共享计数, B 拒收不建"
+    );
+    assert_eq!(a.close_window_by_bucket_rows().len(), 3, "A 3 键");
+    assert_eq!(b.close_window_by_bucket_rows().len(), 0, "B 0 键");
+    assert_eq!(shared.load(Ordering::SeqCst), 0, "close 后共享归零");
+}
+
+/// 惰性创建前快速路径不误判: `set_spill_redb` 已注册（`spill_create` Some）但
+/// 零驱逐未建 store → bucket 仍维护 touch/clock（spill 路径）——首次驱逐时
+/// store 才建。断言 clock 非空（快速路径条件 `spill_create.is_none()` 生效）。
+#[test]
+fn spill_lazy_registered_keeps_clock() {
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let path = {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "wf_spill_lazy_clock_{}_{}.rb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    };
+    let mut exec = StatsExecutor::new(plan.clone());
+    exec.set_memory_limit("lazy_clock", Some((allowance_for(&plan) * 100) as usize));
+    exec.set_spill_redb(&path, None, None);
+    exec.process_rows(&[bid_row(1, 1.0), bid_row(2, 2.0)], extract);
+    // 零驱逐（预算充足）→ store 未建, 但 spill_create 已注册 → 走 spill 路径
+    assert!(exec.window.spill.is_none(), "零驱逐不建 store");
+    assert_eq!(
+        exec.window.clock.len(),
+        2,
+        "spill 路径维护 clock（快速路径不误判）"
+    );
+    // close → reset_window → clock 清空（新窗口）
+    exec.close_window_by_bucket_rows();
+    assert!(exec.window.clock.is_empty(), "close 后 clock 清空");
+    std::fs::remove_file(&path).ok();
+}
