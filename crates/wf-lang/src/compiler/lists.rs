@@ -221,10 +221,10 @@ fn resolve_rule(rule: &RuleDecl, lists: &HashMap<&str, &ListDecl>) -> LangResult
         l.expr = ok(resolve_expr(&l.expr, lists), &rule.name)?;
     }
     out.match_clause = ok(resolve_match(&out.match_clause, lists), &rule.name)?;
-    if let Some(each) = &mut out.each_clause {
-        if let Some(f) = &each.filter {
-            each.filter = Some(ok(resolve_expr(f, lists), &rule.name)?);
-        }
+    if let Some(each) = &mut out.each_clause
+        && let Some(f) = &each.filter
+    {
+        each.filter = Some(ok(resolve_expr(f, lists), &rule.name)?);
     }
     if let Some(stats) = &mut out.stats_clause {
         for key in &mut stats.keys {
@@ -250,10 +250,10 @@ fn resolve_rule(rule: &RuleDecl, lists: &HashMap<&str, &ListDecl>) -> LangResult
     }
     for stage in &mut out.pipeline_stages {
         stage.match_clause = ok(resolve_match(&stage.match_clause, lists), &rule.name)?;
-        if let Some(each) = &mut stage.each_clause {
-            if let Some(f) = &each.filter {
-                each.filter = Some(ok(resolve_expr(f, lists), &rule.name)?);
-            }
+        if let Some(each) = &mut stage.each_clause
+            && let Some(f) = &each.filter
+        {
+            each.filter = Some(ok(resolve_expr(f, lists), &rule.name)?);
         }
         for join in &mut stage.joins {
             if let Some(w) = &join.within {
