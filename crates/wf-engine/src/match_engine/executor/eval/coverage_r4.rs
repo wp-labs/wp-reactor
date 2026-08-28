@@ -561,3 +561,97 @@ fn time_to_ms_rejects_bad_args() {
         None
     );
 }
+
+#[test]
+fn time_to_s_and_ms_cover_unit_matrix_and_edges() {
+    let ctx = ctx_with(vec![]);
+    let none = YieldMeta::default();
+    // 单位矩阵：秒/毫秒/微秒/纳秒 → 秒与毫秒。
+    for (input, expected_s, expected_ms) in [
+        (1_786_501_399.0, 1_786_501_399.0, 1_786_501_399_000.0), // 秒
+        (1_786_501_399_000.0, 1_786_501_399.0, 1_786_501_399_000.0), // 毫秒
+        (
+            1_786_501_399_000_000.0,
+            1_786_501_399.0,
+            1_786_501_399_000.0,
+        ), // 微秒
+        (
+            1_786_501_399_000_000_000.0,
+            1_786_501_399.0,
+            1_786_501_399_000.0,
+        ), // 纳秒
+    ] {
+        assert_eq!(
+            l3(&call("time_to_s", vec![Expr::Number(input)]), &ctx, none),
+            Some(num(expected_s)),
+            "time_to_s({input})"
+        );
+        assert_eq!(
+            l3(&call("time_to_ms", vec![Expr::Number(input)]), &ctx, none),
+            Some(num(expected_ms)),
+            "time_to_ms({input})"
+        );
+    }
+    // 零：归一化幂等。
+    assert_eq!(
+        l3(&call("time_to_ms", vec![Expr::Number(0.0)]), &ctx, none),
+        Some(num(0.0))
+    );
+    // 分数毫秒：纳秒 round 后截断到毫秒。
+    assert_eq!(
+        l3(
+            &call("time_to_ms", vec![Expr::Number(1_786_501_399_000.5)]),
+            &ctx,
+            none,
+        ),
+        Some(num(1_786_501_399_000.0)),
+        "分数毫秒 → round 截断"
+    );
+    // NaN / 非有限 → None。
+    assert_eq!(
+        l3(
+            &call("time_to_ms", vec![Expr::Number(f64::NAN)]),
+            &ctx,
+            none,
+        ),
+        None
+    );
+}
+
+#[test]
+fn time_to_ms_routes_through_nested_l3_and_strptime() {
+    let ctx = ctx_with(vec![]);
+    let none = YieldMeta::default();
+    // 嵌套：外层 fmt 含 time_to_ms → contains_eval_time_func 路由到 L3。
+    assert_eq!(
+        l3(
+            &call(
+                "fmt",
+                vec![
+                    lit("{}"),
+                    call("time_to_ms", vec![Expr::Number(1_786_501_399_000.0)]),
+                ],
+            ),
+            &ctx,
+            none,
+        ),
+        Some(str_val("1786501399000")),
+        "fmt 包装 time_to_ms（嵌套路由）"
+    );
+    // 组合：strptime 字符串 → time（毫秒）→ time_to_ms 幂等。
+    assert_eq!(
+        l3(
+            &call(
+                "time_to_ms",
+                vec![call(
+                    "strptime",
+                    vec![lit("2026-08-12 02:23:19"), lit("%Y-%m-%d %H:%M:%S")],
+                )],
+            ),
+            &ctx,
+            none,
+        ),
+        Some(num(1_786_501_399_000.0)),
+        "time_to_ms(strptime(...)) → 毫秒"
+    );
+}

@@ -6,6 +6,12 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Added
 
+- **wf-lang / wf-engine: 时间值转 epoch 秒/毫秒 `time_to_s` / `time_to_ms`（issue #69）**——time/数值 → `digit`；运行时按数量级归一化到纳秒再转目标单位，系统变量（毫秒）与输入时间字段（纳秒）两种来源结果一致，业务规则无需感知引擎内部纳秒表示。
+  - 类型检查：返回 `digit`；参数须 time/数值、个数为 1（否则编译报错）。
+  - L3 路由：并入 `is_eval_time_func`，嵌套参数（如 `fmt("{}", time_to_ms(x))`）自动路由；列式 yield 未收录函数自动回落解释路径。
+  - 示例：`time_to_ms(@event_first_time)` / `time_to_ms(s.parse_time)` / `time_to_s(@emit_time)`。
+  - 测试：wf-engine eval 6 例（秒/毫秒/微秒/纳秒单位矩阵、零、分数截断、NaN、系统变量包装、嵌套路由、strptime 组合）+ wf-lang 类型检查 6 例。
+
 - **wf-lang: 顶层列表 + `use` 导入（issue #73）**——顶层裸绑定 `name = ("a", "b", ...)` 声明列表，规则内 `expr in <name>` / `expr not in <name>` 引用，`use "file.wfl"` include 导入目标文件全部顶层列表（一处定义、多处引用；无可见性控制）。
   - 解析：`Expr::ListRef` 占位（仅 `in <ident>` 右值产出）；列表声明须在规则之前（与 `yield preset`/`pattern` 同文法位置）。
   - use 导入：`lists::resolve_imports` 递归解析（相对被导入文件目录；`.wfs` 目标跳过；循环引用/缺失/重名报错）；加载层接线（wfgen `load_wfl_files`、wf-runtime `lifecycle/compile.rs`、wfl crate 四命令共用 `load_wfl_with_imports`）。

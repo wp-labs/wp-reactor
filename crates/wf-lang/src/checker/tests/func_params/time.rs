@@ -189,3 +189,33 @@ rule r {
         "time_to_ms() requires exactly 1 argument",
     );
 }
+
+#[test]
+fn time_to_ms_accepts_aggregate_time_result() {
+    // 聚合 min/max 的时间字段推断为 Time——time_to_ms 参数放行。
+    let out = make_output_window("out", vec![("ms", bt(BaseType::Digit))]);
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (ms = time_to_ms(min(e.event_time)))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn time_to_s_returns_digit_for_system_var() {
+    // @event_first_time 推断为 Time——time_to_s 参数放行，返回 digit 字段。
+    let out = make_output_window("out", vec![("s", bt(BaseType::Digit))]);
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (s = time_to_s(@event_first_time))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}

@@ -1019,7 +1019,7 @@ yield security_alerts (
 ```wfl
 yield security_alerts (
     first_alert_time = time_to_ms(@event_first_time),
-    first_insert_time = time_to_ms(min(s.parse_time)),
+    first_insert_time = time_to_ms(s.parse_time),
     update_time = time_to_ms(@emit_time)
 )
 ```
@@ -1028,6 +1028,7 @@ yield security_alerts (
 
 - 引擎内部时间表示对业务不可见——系统变量（`@event_*_time` 等）为毫秒，输入时间字段为纳秒；`time_to_*` 按数量级归一化后统一输出目标单位，两种来源结果一致。
 - `time_to_ms(@event_first_time)` 等价于把该时间直接写入 `digit` 字段并输出毫秒；`strftime` 仍用于格式化为字符串。
+- 注意：`yield` 表达式里的 `min(f)` / `max(f)` 是**匹配步骤序列聚合**（如 `min(match_event(e).x)`），对普通字段返回空；窗口内聚合请在 `match` 内用聚合语法，再在 `yield` 引用其结果。
 
 #### 时间格式化与解析
 
