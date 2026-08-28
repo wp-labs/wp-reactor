@@ -120,3 +120,72 @@ rule r {
         "now() requires no arguments",
     );
 }
+
+#[test]
+fn time_to_ms_and_time_to_s_accept_time_values() {
+    let out = make_output_window(
+        "out",
+        vec![("ms", bt(BaseType::Digit)), ("s", bt(BaseType::Digit))],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        ms = time_to_ms(e.event_time),
+        s = time_to_s(e.event_time)
+    )
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn time_to_ms_accepts_numeric_literal() {
+    let out = make_output_window("out", vec![("ms", bt(BaseType::Digit))]);
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (ms = time_to_ms(1786501210000))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn time_to_ms_rejects_non_time_argument() {
+    let out = output_window();
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (n = time_to_ms("not-a-time"))
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), out],
+        "time_to_ms() argument must be time or numeric",
+    );
+}
+
+#[test]
+fn time_to_ms_requires_exactly_one_argument() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (n = time_to_ms())
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "time_to_ms() requires exactly 1 argument",
+    );
+}

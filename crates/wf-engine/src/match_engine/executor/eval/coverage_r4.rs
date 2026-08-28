@@ -437,3 +437,127 @@ fn eval_bool_and_yield_entries() {
         Some(num(42.0))
     );
 }
+
+// ---------------------------------------------------------------------------
+// time_to_s / time_to_ms（issue #69）——time 值转 epoch 秒/毫秒
+// ---------------------------------------------------------------------------
+
+#[test]
+fn time_to_ms_handles_nanos_and_millis_inputs() {
+    let ctx = ctx_with(vec![]);
+    // 输入字段（event_bridge 转纳秒）: 纳秒 → 毫秒。
+    assert_eq!(
+        l3(
+            &call(
+                "time_to_ms",
+                vec![Expr::Number(1_786_501_399_000_000_000.0)]
+            ),
+            &ctx,
+            YieldMeta::default()
+        ),
+        Some(num(1_786_501_399_000.0)),
+        "纳秒输入 → 毫秒"
+    );
+    // 系统变量（已是毫秒）: 幂等。
+    assert_eq!(
+        l3(
+            &call("time_to_ms", vec![Expr::Number(1_786_501_399_000.0)]),
+            &ctx,
+            YieldMeta::default()
+        ),
+        Some(num(1_786_501_399_000.0)),
+        "毫秒输入幂等"
+    );
+    // 秒输入 → 毫秒。
+    assert_eq!(
+        l3(
+            &call("time_to_ms", vec![Expr::Number(1_786_501_399.0)]),
+            &ctx,
+            YieldMeta::default()
+        ),
+        Some(num(1_786_501_399_000.0)),
+        "秒输入 → 毫秒"
+    );
+}
+
+#[test]
+fn time_to_s_handles_nanos_and_millis_inputs() {
+    let ctx = ctx_with(vec![]);
+    // 纳秒 → 秒。
+    assert_eq!(
+        l3(
+            &call("time_to_s", vec![Expr::Number(1_786_501_399_000_000_000.0)]),
+            &ctx,
+            YieldMeta::default()
+        ),
+        Some(num(1_786_501_399.0)),
+        "纳秒输入 → 秒"
+    );
+    // 毫秒 → 秒。
+    assert_eq!(
+        l3(
+            &call("time_to_s", vec![Expr::Number(1_786_501_399_000.0)]),
+            &ctx,
+            YieldMeta::default()
+        ),
+        Some(num(1_786_501_399.0)),
+        "毫秒输入 → 秒"
+    );
+}
+
+#[test]
+fn time_to_ms_wraps_system_vars() {
+    let ctx = ctx_with(vec![]);
+    let meta = full_meta();
+    // @event_first_time（纳秒源 1.7e18）→ time_to_ms → 毫秒。
+    assert_eq!(
+        l3(
+            &call(
+                "time_to_ms",
+                vec![Expr::SystemVar(SystemVar::EventFirstTime)]
+            ),
+            &ctx,
+            meta,
+        ),
+        Some(num(1_700_000_000_000.0)),
+        "@event_first_time → 毫秒"
+    );
+    // @emit_time → time_to_s → 秒。
+    assert_eq!(
+        l3(
+            &call("time_to_s", vec![Expr::SystemVar(SystemVar::EmitTime)]),
+            &ctx,
+            meta,
+        ),
+        Some(num(1_700_000_000.0)),
+        "@emit_time → 秒"
+    );
+}
+
+#[test]
+fn time_to_ms_rejects_bad_args() {
+    let ctx = ctx_with(vec![("s", str_val("2026-01-01"))]);
+    // 非数值参数 → None。
+    assert_eq!(
+        l3(
+            &call("time_to_ms", vec![field("s")]),
+            &ctx,
+            YieldMeta::default()
+        ),
+        None,
+        "字符串参数 → None"
+    );
+    // 参数个数 != 1 → None。
+    assert_eq!(
+        l3(&call("time_to_ms", vec![]), &ctx, YieldMeta::default()),
+        None
+    );
+    assert_eq!(
+        l3(
+            &call("time_to_ms", vec![Expr::Number(1.0), Expr::Number(2.0)]),
+            &ctx,
+            YieldMeta::default(),
+        ),
+        None
+    );
+}

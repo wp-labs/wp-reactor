@@ -785,6 +785,27 @@ pub fn check_func_call(
                 }
             }
         }
+        "time_to_s" | "time_to_ms" => {
+            // time 值 → 秒/毫秒 epoch（issue #69）：接受 time 或数值参数，返回 digit。
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() requires exactly 1 argument: (time)", name),
+                });
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !compatible(&t, &ValType::Base(BaseType::Time))
+                && !is_numeric(&t)
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() argument must be time or numeric, got {:?}", name, t),
+                });
+            }
+        }
         "strftime" => {
             if args.len() != 1 && args.len() != 2 {
                 errors.push(CheckError {

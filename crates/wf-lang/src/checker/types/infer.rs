@@ -169,6 +169,7 @@ fn infer_func_call(
         "baseline" | "time_diff" => Some(ValType::Base(BaseType::Float)),
         "now" => Some(ValType::Base(BaseType::Time)),
         "now_s" | "now_ms" | "now_us" | "now_ns" => Some(ValType::Base(BaseType::Digit)),
+        "time_to_s" | "time_to_ms" => Some(ValType::Base(BaseType::Digit)),
         "strftime" => Some(ValType::Base(BaseType::Chars)),
         "strptime" => Some(ValType::Base(BaseType::Time)),
         "lower" | "upper" | "replace" | "trim" | "ltrim" | "rtrim" | "concat" | "join"

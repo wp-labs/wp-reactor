@@ -893,6 +893,23 @@ pub(super) fn eval_builtin_func_with_l3(
             }
             Some(Value::Number(utils::current_time_nanos()? as f64))
         }
+        "time_to_s" | "time_to_ms" => {
+            // time 值（系统变量毫秒 / 输入字段纳秒 / 聚合保持原单位）统一按
+            // 数量级归一化到纳秒后转目标单位——两种来源都正确（issue #69）。
+            if args.len() != 1 {
+                return None;
+            }
+            let ts_nanos = match eval_expr_with_l3(&args[0], ctx, score)? {
+                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+                _ => return None,
+            };
+            let divisor = if name == "time_to_s" {
+                1_000_000_000
+            } else {
+                1_000_000
+            };
+            Some(Value::Number((ts_nanos / divisor) as f64))
+        }
         "strftime" => {
             if args.len() != 1 && args.len() != 2 {
                 return None;

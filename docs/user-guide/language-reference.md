@@ -935,7 +935,7 @@ fmt("{} failed {} times from {}", fail.username, count(fail), fail.sip)
 - 结构化对象：`merge`
 - 时间：`time_diff`、`time_bucket`
 - 网络：`cidr_match(ip, subnet)`（IP 是否落在子网内，subnet 为 `"addr/prefix"`，兼容 IPv4/IPv6，Sigma `|cidr` 等效）
-- 当前引擎时间：`now`、`now_s`、`now_ms`、`now_us`、`now_ns`
+- 当前引擎时间：`now`、`now_s`、`now_ms`、`now_us`、`now_ns`；时间值转换：`time_to_s`、`time_to_ms`
 - 哈希 / 编码：`md5`、`sha1`、`sha1_n`、`sha256`、`hex`、`stable_id`
 - 窗口集合：`collect_set`、`collect_list`、`first`、`last`
 - 画像 / 回看：`baseline`
@@ -1006,6 +1006,28 @@ yield security_alerts (
 - 同一条输出记录的多个 `yield` 字段里调用 `now_*`，会复用同一个内部时间戳。
 - 默认 `time` 数值使用 epoch milliseconds；显式单位函数 `now_s()` / `now_us()` / `now_ns()` 按函数名返回对应单位。
 - 当前运行时数值统一使用 `f64` 表示；需要可精确持久化的业务时间，优先写入 `time` 字段。
+
+#### 时间值转换（epoch 单位）
+
+| 函数 | 返回类型 | 说明 |
+|------|----------|------|
+| `time_to_ms(ts)` | `digit` | time/数值 → epoch 毫秒（13 位）；参数可为系统变量、时间字段或聚合结果，自动识别秒/毫秒/微秒/纳秒输入 |
+| `time_to_s(ts)` | `digit` | time/数值 → epoch 秒（10 位） |
+
+示例（告警表统一毫秒时间戳）：
+
+```wfl
+yield security_alerts (
+    first_alert_time = time_to_ms(@event_first_time),
+    first_insert_time = time_to_ms(min(s.parse_time)),
+    update_time = time_to_ms(@emit_time)
+)
+```
+
+说明：
+
+- 引擎内部时间表示对业务不可见——系统变量（`@event_*_time` 等）为毫秒，输入时间字段为纳秒；`time_to_*` 按数量级归一化后统一输出目标单位，两种来源结果一致。
+- `time_to_ms(@event_first_time)` 等价于把该时间直接写入 `digit` 字段并输出毫秒；`strftime` 仍用于格式化为字符串。
 
 #### 时间格式化与解析
 
