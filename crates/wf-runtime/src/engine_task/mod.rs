@@ -102,16 +102,23 @@ async fn run_push_loop(
             // an ingest burst, `rx.recv()` would otherwise starve the cancel
             // branch and extend shutdown by the whole backlog.
             _ = cancel.cancelled() => {
-                // 2026-08-23 q13：shutdown 竞态——中间管道生产者（上游规则
-                // flush_pipes 广播）可能晚于本任务 cancel；单次 drain 会漏掉
-                // 生产者稍后投递的剩余批次（q13b 只收到部分广播）。drain 后
-                // 短暂重试（每轮 50ms，最多 ~1s）直到通道排空，再 flush 收口。
-                for _ in 0..20 {
-                    task.drain_push_channel(&mut rx).await;
-                    if rx.is_empty() {
-                        break;
+                // 2026-08-28 q13：中间管道消费者关机竞态——生产者（上游规则
+                // flush_pipes 广播）与消费者同时被 cancel，生产者的剩余批次可能
+                // 在消费者**第一次 drain 后通道为空**的时刻之后才投递；旧实现
+                // `if rx.is_empty() { break }` 在此提前退出 → 尾部批次被丢
+                // （q13b 1M 丢 0~7%，rule_parallelism=1 时丢 ~96%）。改为截止
+                // 时间驱动的持续消费：通道关闭（recv None）或 1s 宽限耗尽才结束，
+                // 生产者在自身 cancel 路径的 flush_pipes 必然落入该窗口。
+                let deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(1000);
+                loop {
+                    match tokio::time::timeout_at(deadline, rx.recv()).await {
+                        Ok(Some(push)) => task.process_push(push).await,
+                        // 通道关闭：所有生产者已 drop → 真正结束。
+                        Ok(None) => break,
+                        // 宽限预算耗尽（防拖长关机）。
+                        Err(_) => break,
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 task.flush().await;
                 wf_debug!(pipe, task_id = %task_id, "rule task shutdown complete");

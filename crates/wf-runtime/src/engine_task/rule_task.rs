@@ -2616,6 +2616,14 @@ impl RuleTask {
             return;
         }
         let Some(_) = &self.machine else {
+            // on-each（无 match 状态机、无 deferred）：运行期 emit 按
+            // ALERT_BATCH_SIZE 满批 flush，但**最后一个未满批**（<4096）留在
+            // pending builder / pipe staging——关机 flush 必须补一次收口，否则
+            // 该批被静默丢弃（q1 920000→917469 尾批丢失根因，2026-08-28
+            // verify_file.sh 定位；metrics 在 emit 时已计数，只有文件/EMIT
+            // 对拍才暴露）。
+            self.flush_alerts().await;
+            self.flush_pipes().await;
             return;
         };
         self.cached_wall_nanos
@@ -2769,9 +2777,8 @@ impl RuleTask {
         }
         // Drain the batched alert delivery after close emissions.
         self.flush_alerts().await;
-        // Drain staged intermediate rows after close emissions (each rules
-        // early-return above — their rows are covered by the per-batch
-        // flush in `process_batch`).
+        // Drain staged intermediate rows after close emissions（on-each 规则已
+        // 在上面分支补收口，这里只覆盖 match 规则 close 发射装载的中间行）。
         self.flush_pipes().await;
     }
 
