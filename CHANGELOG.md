@@ -2,7 +2,7 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [Unreleased]
+## [2.0.9] -- latest
 
 ### Added
 
