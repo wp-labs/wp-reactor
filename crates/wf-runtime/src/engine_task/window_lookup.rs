@@ -262,7 +262,7 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
     fn asof_lookup_max(
         &self,
         window: &str,
-        _key_field: &str,
+        key_field: &str,
         key: &Value,
         event_time_nanos: i64,
         within: Option<&Duration>,
@@ -279,7 +279,7 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
         });
         // 索引 key 字段校验（2026-08-29 q8 多规则 7565→1 根因，见 join_lookup）：
         // key_field 与索引 key 不匹配 → Fallback（调用方走 asof_candidates 扫描）。
-        if win.join_key_field().as_deref() != Some(_key_field) {
+        if win.join_key_field().as_deref() != Some(key_field) {
             return AsofLookup::Fallback;
         }
         // 索引 asof 快路径（seq-cut: max_seq 过滤后取最新行; 2026-08 前 pull
@@ -435,6 +435,59 @@ mod tests {
             .join_lookup("threat_intel", "ip", &Value::Str("9.9.9.9".into()))
             .expect("indexed window exists");
         assert!(none.is_empty(), "unknown key → empty rows");
+    }
+
+    /// 回归（2026-08-29 q8 多规则 7565→1 根因）：窗口 join 索引只按首个注册的
+    /// 右字段建（set_join_key 幂等），请求 key_field 与索引 key 不同时，索引查询
+    /// 返回「索引命中但空」的假空（不回退扫描）→ 静默全 miss。修复后 key_field
+    /// 不匹配必须回退扫描（按请求字段过滤），命中正确行。
+    #[tokio::test]
+    async fn join_lookup_key_field_mismatch_falls_back_to_scan() {
+        let schema = ts_schema();
+        let reg = WindowRegistry::build(vec![make_def("threat_intel", vec!["feed"])]).unwrap();
+        let router = Router::new(reg);
+        // 另一规则（q20 形态，join 键 id）先注册 ip 索引——本测试模拟 q8
+        // （请求 score 字段）的查询：索引被占用后必须扫描回退而非假空 miss。
+        router
+            .registry()
+            .get_window("threat_intel")
+            .unwrap()
+            .set_join_key("ip".into());
+        assert_eq!(
+            router
+                .registry()
+                .get_window("threat_intel")
+                .unwrap()
+                .join_key_field()
+                .as_deref(),
+            Some("ip"),
+            "先注册的 ip 键生效（set_join_key 幂等）"
+        );
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_000_000_000,
+                    2_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["10.0.0.1", "10.0.0.2"])),
+                Arc::new(Int64Array::from(vec![80, 95])),
+            ],
+        )
+        .unwrap();
+        router.route("feed", batch).await.unwrap();
+
+        let lookup = RegistryLookup::new(&router);
+        // 请求 key_field=score（≠ 索引 ip）→ 必须扫描回退，按 score 过滤。
+        let rows = lookup
+            .join_lookup("threat_intel", "score", &Value::Number(95.0))
+            .expect("field mismatch must fall back to scan, not return empty");
+        assert_eq!(rows.len(), 1, "score=95 的行经扫描回退命中");
+        assert_eq!(
+            rows[0].field_value("ip"),
+            Some(Value::Str("10.0.0.2".into()))
+        );
     }
 
     /// P4 side input：provider 窗口 join_lookup——无 buffer 窗口/索引，按精确
