@@ -601,12 +601,20 @@ pub(super) fn spawn_rule_tasks(
                     .collect();
                 let shardable = !field_keys.is_empty()
                     && field_keys.len() == stats.plan.keys.len()
-                    && shard_count > 1;
+                    && shard_count > 1
+                    // 2026-08-29 q11/q6：窗口分片是单一 (keys) 配置，不同 keys
+                    // 分片同一窗口互相覆盖 → 后注册者回退单 worker 保正确。
+                    && !window_sources.iter().any(|s| {
+                        router
+                            .fanout()
+                            .window_sharding_conflicts(&s.window_name, &field_keys)
+                    });
                 // 输入行索引分区（空键 stats, 2026-08-24 q15）: 空键 + 度量全部
                 // 可交换（count/sum/min/max/distinct——last/top 行序敏感不可归并）
                 // + pull 模式 → 按行号均匀切分多任务, close 时协调片（shard 0）
                 // 收齐各片 raw 状态归并后统一 emit（`StatsExecutor::merge_partial`）。
                 // push 模式暂不输入分片（broadcast 按 key 分区, 无 index 分区路径）。
+                // 2026-08-29：空 keys 分片与已有 key 分片同样冲突（覆盖式注册）→ 回退。
                 let input_shardable = field_keys.is_empty()
                     && !use_push
                     && shard_count > 1
@@ -615,6 +623,11 @@ pub(super) fn spawn_rule_tasks(
                             m.agg,
                             wf_lang::plan::StatsAggPlan::Last | wf_lang::plan::StatsAggPlan::Top
                         )
+                    })
+                    && !window_sources.iter().any(|s| {
+                        router
+                            .fanout()
+                            .window_sharding_conflicts(&s.window_name, &[])
                     });
                 if shardable {
                     let keys: Arc<[FieldRef]> = field_keys.into();
@@ -1000,7 +1013,15 @@ pub(super) fn spawn_rule_tasks(
                 let shardable = !match_plan.keys.is_empty()
                     && !has_inline_conv
                     && !conv_to_pipe
-                    && shard_count > 1;
+                    && shard_count > 1
+                    // 2026-08-29 q11/q6：窗口分片是单一 (keys) 配置，多规则不同
+                    // key 分片同一窗口互相覆盖（bidder/auction/seller 三组注册
+                    // bid_events）→ 后注册者回退单 worker 保正确（先注册者用分片）。
+                    && !window_sources.iter().any(|s| {
+                        router
+                            .fanout()
+                            .window_sharding_conflicts(&s.window_name, &match_plan.keys)
+                    });
 
                 if shardable {
                     let keys: Arc<[FieldRef]> = match_plan.keys.clone().into();
@@ -1125,8 +1146,47 @@ pub(super) fn spawn_rule_tasks(
                         }
                     }
                 } else {
-                    let machine =
+                    // 2026-08-29 q7：单 worker + conv 规则同样走 conv stage——
+                    // 内联 apply_conv 按「close 批次」聚合而非窗口桶（批次 ≠ 桶
+                    // → 每批 top1，q7 单 worker 54 条 vs oracle 10）。conv stage
+                    // 按窗口/watermark 收口聚合，与 sharded 分支同机制（单 shard）。
+                    let keys: Arc<[FieldRef]> = match_plan.keys.clone().into();
+                    let conv_ctx = match &conv_window {
+                        Some(cw) => {
+                            let (tx, rx) = mpsc::channel::<ConvCloseBatch>(RULE_CHANNEL_CAPACITY);
+                            let barrier: Arc<Vec<AtomicI64>> =
+                                Arc::new(vec![AtomicI64::new(i64::MIN)]);
+                            let stage_config = ConvStageConfig {
+                                executor: rule.executor.clone(),
+                                conv_plan: conv_plan.clone(),
+                                keys: Arc::clone(&keys),
+                                over: cw.over,
+                                // hop：桶对齐 = slide（封口长度仍 = over = size）。
+                                bucket_align: cw.slide.unwrap_or(cw.over),
+                                limits: limits.clone(),
+                                shared_limits: None,
+                                barrier: Arc::clone(&barrier),
+                                sink_fanout: Arc::clone(&sink_fanout),
+                                router: Arc::clone(router),
+                                metrics: metrics.clone(),
+                                rx,
+                                cancel: cancel.child_token(),
+                                eos: eos_tx.subscribe(),
+                                timeout_scan_interval,
+                            };
+                            group.push(tokio::spawn(async move {
+                                run_conv_stage_task(stage_config).await
+                            }));
+                            Some((tx, barrier))
+                        }
+                        None => None,
+                    };
+                    let mut machine =
                         CepStateMachine::with_limits(name, match_plan, time_field, limits);
+                    if conv_ctx.is_some() {
+                        // Emit raw closes to the conv stage (aggregation window).
+                        machine.set_raw_conv_mode();
+                    }
                     let push_rx = if use_push {
                         let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
                         for source in &window_sources {
@@ -1139,6 +1199,10 @@ pub(super) fn spawn_rule_tasks(
                         None
                     };
                     let progress = register_progress(router, &window_sources);
+                    let conv_sink = conv_ctx.as_ref().map(|(tx, _barrier)| ConvShardSink {
+                        tx: tx.clone(),
+                        barrier_index: 0,
+                    });
                     let task_config = RuleTaskConfig {
                         machine: Some(machine),
                         each_alias: None,
@@ -1157,7 +1221,7 @@ pub(super) fn spawn_rule_tasks(
                         shard_index: None,
                         shard_count: 1,
                         progress: progress.clone(),
-                        conv_sink: None,
+                        conv_sink,
                     };
                     let rc = root_cancel.clone();
                     group.push(tokio::spawn(

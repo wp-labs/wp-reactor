@@ -1097,6 +1097,51 @@ async fn deferred_q8_hit_outputs_when_watermark_passes_bucket_end() {
     );
 }
 
+/// 回归（2026-08-29 q8 多规则 7565→1 根因）：窗口 join 索引只按**首个注册**
+/// 的右字段建（set_join_key 幂等）。另一规则先用不同 key（id）注册 auction_events
+/// 索引后，q8（join 键 seller）的索引查询会得到「索引命中但空」的假空（不触发
+/// 扫描回退）→ 静默全 miss。修复：RegistryLookup 校验请求 key_field == 索引
+/// key_field，不匹配回退扫描——本测试断言此场景 q8 仍正确输出。
+#[tokio::test]
+async fn deferred_q8_join_key_conflict_falls_back_to_scan() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_q8_task();
+
+    // 模拟 q20（join auction_events on b.auction == auction_events.id）先注册
+    // id 索引——q8 的 join 键是 seller，索引被占用后必须扫描回退而非假空 miss。
+    q8_auction_window(&router).set_join_key("id".into());
+    assert_eq!(
+        q8_auction_window(&router).join_key_field().as_deref(),
+        Some("id"),
+        "先注册的 id 键生效（set_join_key 幂等）"
+    );
+
+    // 与 deferred_q8_hit_outputs_when_watermark_passes_bucket_end 相同的场景。
+    q8_person_window(&router)
+        .append_with_watermark(person_batch(&[(5, T)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    assert!(alert_rx.try_recv().is_err(), "未到期 — 不输出");
+
+    q8_auction_window(&router)
+        .append_with_watermark(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .unwrap();
+    q8_auction_window(&router)
+        .append_with_watermark(q8_auction_batch(&[(99, T + 11_000_000_000)]))
+        .unwrap();
+    q8_person_window(&router)
+        .append_with_watermark(person_batch(&[(6, T + 11_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "5",
+        "索引键冲突（id vs seller）时 q8 走扫描回退仍命中"
+    );
+}
+
 /// 恰在桶边界（T+10s）的 auction → 上开排除（归下桶，权威 TUMBLE [B, B+10s)）。
 #[tokio::test]
 async fn deferred_q8_boundary_auction_excluded() {

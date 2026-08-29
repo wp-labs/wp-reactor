@@ -646,6 +646,22 @@ impl Window {
         *self.join_index.write() = Some(index);
     }
 
+    /// Join index 的 key 字段（无索引 → None）。调用方（RegistryLookup）用它
+    /// 校验「请求的 key_field == 索引 key_field」：索引只按**首个注册** join 的
+    /// 右字段建（`set_join_key` 幂等），多个规则以不同 key join 同一窗口时
+    /// （q8 按 seller / q20·q6 按 id），错字段的索引查询返回「索引命中但空」的
+    /// 假空（`join_lookup` 返回 Some(空)，调用方不会回退扫描）→ 静默全 miss
+    /// （q8 多规则 7565→1 根因，2026-08-29）。
+    pub fn join_key_field(&self) -> Option<SmolStr> {
+        if !self.join_enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        self.join_index
+            .read()
+            .as_ref()
+            .map(|index| index.key_field.clone())
+    }
+
     /// O(1) lookup of rows whose `key_field` equals `key`, as columnar
     /// [`JoinRow`]s. `Some(empty)` if this window is indexed but the key has no
     /// matching rows; `None` if it has no join index (not a join target — the

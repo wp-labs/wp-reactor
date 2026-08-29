@@ -290,6 +290,24 @@ impl RuleFanout {
             .contains_key(window_name)
     }
 
+    /// 窗口分片冲突检测（2026-08-29 q11/q6 多规则根因）：`window_sharding` 是
+    /// **每窗口单一 (keys, shard_count) 配置**（覆盖式 insert），多个规则以
+    /// **不同 keys** 分片同一窗口时互相覆盖——后注册规则的 shard 拉取按被覆盖的
+    /// key 分片，同 key 事件分散到不同 shard → 有状态规则状态被切碎（q11
+    /// bidder session 单规则 17081 → all 118234、q6 872913 → 787704）。
+    /// 注册方（spawn）用它判定：窗口已被不同 keys 注册 → 本规则回退单 worker
+    /// （整批处理，正确性优先）。同 keys（如 q11/q12 都按 bidder）不算冲突。
+    pub fn window_sharding_conflicts(&self, window_name: &str, keys: &[FieldRef]) -> bool {
+        let reg = self
+            .window_sharding
+            .read()
+            .expect("fanout sharding lock poisoned");
+        match reg.get(window_name) {
+            Some((existing, _)) => existing.as_ref() != keys,
+            None => false,
+        }
+    }
+
     /// 输入行索引分区注册（空键 stats 输入分片, 2026-08-24 q15）:
     /// `shard_rows[i] = 行号 % shard_count == i` 的行。空键 = index 分区标记。
     pub fn register_window_index_sharding(&self, window_name: &str, shard_count: usize) {

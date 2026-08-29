@@ -199,11 +199,14 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
         }
         let win = self.router.registry().get_window(window)?;
         let join_key = JoinKey::from_value(key)?;
-        // Indexed lookup with seq-cut（M2 pull 一致性）: 索引行带 batch seq，
-        // `max_seq` 过滤后只返回读者已拉取的 batch 的行（2026-08：索引此前无
-        // seq 感知，pull 模式被迫全量扫描 → q13 等 join 查询 CPU/积压瓶颈）。
-        // `None`（窗口无索引）→ 回退 snapshot 扫描。
-        if let Some(rows) = win.join_lookup(&join_key, self.eff_max_seq(window)) {
+        // 索引 key 字段校验（2026-08-29 q8 多规则 7565→1 根因）：窗口 join 索引
+        // 只按首个注册 join 的右字段建（set_join_key 幂等），其它规则用不同字段
+        // join 同一窗口时，错字段的索引查询返回「索引命中但空」的假空（不回退
+        // 扫描）→ 静默全 miss。key_field 不匹配 → 跳过索引直接扫描（正确性优先；
+        // 扫描只影响多 key 场景）。
+        if win.join_key_field().as_deref() == Some(key_field)
+            && let Some(rows) = win.join_lookup(&join_key, self.eff_max_seq(window))
+        {
             return Some(rows);
         }
         // Scan fallback (no index): filter the seq-bounded snapshot by key
@@ -233,10 +236,11 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
     ) -> Option<Vec<(i64, JoinRow)>> {
         let win = self.router.registry().get_window(window)?;
         let join_key = JoinKey::from_value(key)?;
-        // Indexed asof lookup（seq-cut）: 索引行带 batch seq + 原始时间戳,
-        // `max_seq` 过滤后 O(1)（2026-08 前 pull 模式回退全量扫描）。
-        // `None`（无索引）→ 回退 timestamped 扫描。
-        if let Some(rows) = win.join_lookup_timestamped(&join_key, self.eff_max_seq(window)) {
+        // 索引 key 字段校验（2026-08-29 q8 多规则 7565→1 根因，见 join_lookup）：
+        // key_field 与索引 key 不匹配 → 跳过索引走 timestamped 扫描。
+        if win.join_key_field().as_deref() == Some(key_field)
+            && let Some(rows) = win.join_lookup_timestamped(&join_key, self.eff_max_seq(window))
+        {
             return Some(rows);
         }
         // Scan fallback: filter the seq-bounded timestamped snapshot by key. The
@@ -273,6 +277,11 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
             let nanos = i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
             event_time_nanos.saturating_sub(nanos)
         });
+        // 索引 key 字段校验（2026-08-29 q8 多规则 7565→1 根因，见 join_lookup）：
+        // key_field 与索引 key 不匹配 → Fallback（调用方走 asof_candidates 扫描）。
+        if win.join_key_field().as_deref() != Some(_key_field) {
+            return AsofLookup::Fallback;
+        }
         // 索引 asof 快路径（seq-cut: max_seq 过滤后取最新行; 2026-08 前 pull
         // 模式回退 `asof_candidates` 全量扫描）。`Fallback`（无索引）由调用方
         // 走 asof_candidates。
