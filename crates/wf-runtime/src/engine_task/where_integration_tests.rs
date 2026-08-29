@@ -352,7 +352,12 @@ async fn match_join_waits_for_target_commit_frontier() {
         .expect("task must finish promptly")
         .expect("pull_and_advance ok");
 
-    let alert = super::tests::take_alert(&mut alert_rx);
+    let alert = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        super::tests::take_alert_recv(&mut alert_rx),
+    )
+    .await
+    .expect("alert must be delivered");
     assert_eq!(
         super::tests::field_str(&alert, "__wfu_entity_id"),
         "10.0.0.1",
@@ -389,7 +394,12 @@ async fn each_join_waits_for_target_commit_frontier() {
         .expect("task must finish promptly")
         .expect("pull_and_advance ok");
 
-    let alert = super::tests::take_alert(&mut alert_rx);
+    let alert = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        super::tests::take_alert_recv(&mut alert_rx),
+    )
+    .await
+    .expect("alert must be delivered");
     assert_eq!(
         super::tests::field_str(&alert, "__wfu_entity_id"),
         "10.0.0.1",
@@ -418,26 +428,9 @@ fn make_key_join_task() -> (
 ) {
     let driver = "bid_events";
     let target = "auction_events";
-    let bid_schema = Arc::new(Schema::new(vec![
-        Field::new("auction", DataType::Int64, true),
-        Field::new(
-            "event_time",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            true,
-        ),
-    ]));
-    let auction_schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, true),
-        Field::new("category", DataType::Int64, true),
-        Field::new(
-            "event_time",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            true,
-        ),
-    ]));
     let registry = WindowRegistry::build(vec![
-        window_def(driver, &bid_schema),
-        window_def(target, &auction_schema),
+        window_def(driver, &key_join_bid_schema()),
+        window_def(target, &key_join_auction_schema()),
     ])
     .unwrap();
     let router = Arc::new(Router::new(registry));
@@ -571,18 +564,7 @@ fn bid_batch(auctions: &[i64], ts: i64) -> RecordBatch {
         Arc::new(Int64Array::from(auctions.to_vec())),
         Arc::new(TimestampNanosecondArray::from(vec![ts; auctions.len()])),
     ];
-    RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("auction", DataType::Int64, true),
-            Field::new(
-                "event_time",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                true,
-            ),
-        ])),
-        cols,
-    )
-    .unwrap()
+    RecordBatch::try_new(key_join_bid_schema(), cols).unwrap()
 }
 
 fn auction_batch(ids: &[i64], categories: &[i64], ts: i64) -> RecordBatch {
@@ -591,19 +573,32 @@ fn auction_batch(ids: &[i64], categories: &[i64], ts: i64) -> RecordBatch {
         Arc::new(Int64Array::from(categories.to_vec())),
         Arc::new(TimestampNanosecondArray::from(vec![ts; ids.len()])),
     ];
-    RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("category", DataType::Int64, true),
-            Field::new(
-                "event_time",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                true,
-            ),
-        ])),
-        cols,
-    )
-    .unwrap()
+    RecordBatch::try_new(key_join_auction_schema(), cols).unwrap()
+}
+
+/// key_join 测试的驱动窗 schema：auction + event_time。
+fn key_join_bid_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, true),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]))
+}
+
+/// key_join 测试的 join 目标窗 schema：id + category + event_time。
+fn key_join_auction_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("category", DataType::Int64, true),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]))
 }
 
 /// key_join（join-then-key，q6 形态）端到端回归：join 被 dead-elimination 剔除出

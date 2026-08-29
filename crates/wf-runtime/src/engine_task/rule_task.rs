@@ -398,6 +398,9 @@ pub(super) struct RuleTask {
     /// （仅 sharded match 规则为 true；见 `RuleTaskConfig::key_partitioned`）。
     /// `pull_and_advance` 用它替代全局 `window_is_sharded` 决定拉取行子集。
     key_partitioned: bool,
+    /// 2026-08-29 q6/q20 snapshot join 竞态 gate 的等待目标右窗（去重，构造时
+    /// 解析）：live_joins 的即时 join + key_join（join-then-key）的右窗。
+    eager_join_targets: Vec<String>,
     /// Profiling accumulators (nanos) for locating the rule-task bottleneck.
     advance_nanos: u64,
     scan_nanos: u64,
@@ -595,6 +598,26 @@ impl RuleTask {
             })
             .collect();
 
+        // 2026-08-29 q6/q20 snapshot join 竞态 gate 的等待目标（编译期固定，
+        // 构造时解析一次，免每批 clone live_joins/key_join）：本规则**实际执行**
+        // 的即时 join 右窗（去重）。key_join 必需：q6 形态的 join 只喂 match 键、
+        // 输出不读右窗字段 → 被 dead-join 消除剔除出 live_joins，但 join 在
+        // advance 仍执行——漏掉它则 gate 不触发、竞态照旧（实测从未触发）。
+        let eager_join_targets = {
+            let mut targets: Vec<String> = Vec::new();
+            for join in executor.live_joins() {
+                if join.emit_at.is_none() && !targets.contains(&join.right_window) {
+                    targets.push(join.right_window.clone());
+                }
+            }
+            if let Some(kjp) = machine.as_ref().and_then(|m| m.plan().key_join.clone())
+                && !targets.contains(&kjp.right_window)
+            {
+                targets.push(kjp.right_window);
+            }
+            targets
+        };
+
         let task = Self {
             task_id,
             machine,
@@ -620,6 +643,7 @@ impl RuleTask {
             shard_index,
             shard_count,
             key_partitioned,
+            eager_join_targets,
             progress,
             advance_nanos: 0,
             scan_nanos: 0,
@@ -818,30 +842,6 @@ impl RuleTask {
         self.update_rule_instances_metric();
     }
 
-    /// 本规则**实际执行**的即时 join 目标窗（去重）：live_joins 的即时 join
-    /// （非 deferred）+ join-then-key（key_join）的右窗。后者必需：q6 形态
-    /// 的 join 只喂 match 键（`match<seller:10m>`，seller 来自 auction join）、
-    /// 输出不读右窗字段 → 被 dead-join 消除（compute_live_joins）剔除出
-    /// live_joins，但 join 在 advance 仍执行——gate 漏掉它则竞态照旧（all
-    /// 模式 q6 872913→802k~848k，实测 gate 从未触发）。
-    fn eager_join_target_windows(&self) -> Vec<String> {
-        let mut targets: Vec<String> = Vec::new();
-        for join in self.executor.live_joins() {
-            if join.emit_at.is_none() && !targets.contains(&join.right_window) {
-                targets.push(join.right_window.clone());
-            }
-        }
-        if let Some(kjp) = self
-            .machine
-            .as_ref()
-            .and_then(|m| m.plan().key_join.clone())
-            && !targets.contains(&kjp.right_window)
-        {
-            targets.push(kjp.right_window);
-        }
-        targets
-    }
-
     /// Process a single parsed batch (shared `Arc`) against the state machine.
     ///
     /// This is the per-batch body shared by the legacy pull path
@@ -945,7 +945,7 @@ impl RuleTask {
                     Some(w.schema().field(idx).name().clone())
                 }),
         };
-        let targets = self.eager_join_target_windows();
+        let targets = &self.eager_join_targets;
         if !targets.is_empty()
             && let Some(batch) = batch
             && let Some(time_col) = batch_time_field.as_deref()
@@ -955,8 +955,7 @@ impl RuleTask {
             for row in 0..batch.num_rows() {
                 batch_max_ts = batch_max_ts.max(batch_event_time_nanos_at(batch, col_idx, row));
             }
-            self.wait_eager_joins_caught_up(&targets, batch_max_ts)
-                .await;
+            self.wait_eager_joins_caught_up(targets, batch_max_ts).await;
         }
         // L2 deferred materialization: when the producer broadcast only the raw
         // batch, materialize only the rows the bind filter accepts. The time
