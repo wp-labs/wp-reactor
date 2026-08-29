@@ -394,6 +394,10 @@ pub(super) struct RuleTask {
     /// Total shard count this rule is split across (1 when unsharded). Used by
     /// the on-each round-robin gate (`seq % shard_count == shard_index`).
     shard_count: usize,
+    /// 2026-08-29 q1/q20 all 模式分片误拉修复：本规则是否**自己** key 分片消费
+    /// （仅 sharded match 规则为 true；见 `RuleTaskConfig::key_partitioned`）。
+    /// `pull_and_advance` 用它替代全局 `window_is_sharded` 决定拉取行子集。
+    key_partitioned: bool,
     /// Profiling accumulators (nanos) for locating the rule-task bottleneck.
     advance_nanos: u64,
     scan_nanos: u64,
@@ -498,6 +502,7 @@ impl RuleTask {
             conv_sink,
             shard_index,
             shard_count,
+            key_partitioned,
         } = config;
         let aliases: HashMap<String, Vec<String>> = window_sources
             .iter()
@@ -614,6 +619,7 @@ impl RuleTask {
             pushed_seq: 0,
             shard_index,
             shard_count,
+            key_partitioned,
             progress,
             advance_nanos: 0,
             scan_nanos: 0,
@@ -675,7 +681,7 @@ impl RuleTask {
             // Key-partitioned (match) windows yield per-shard row subsets;
             // everything else (on-each round-robin, unsharded) pulls whole
             // batches and is gated below.
-            let key_partitioned = self.router.fanout().window_is_sharded(&source.window_name);
+            let key_partitioned = self.key_partitioned;
             let pull_shard = if key_partitioned {
                 self.shard_index
             } else {
@@ -812,11 +818,87 @@ impl RuleTask {
         self.update_rule_instances_metric();
     }
 
+    /// 本规则**实际执行**的即时 join 目标窗（去重）：live_joins 的即时 join
+    /// （非 deferred）+ join-then-key（key_join）的右窗。后者必需：q6 形态
+    /// 的 join 只喂 match 键（`match<seller:10m>`，seller 来自 auction join）、
+    /// 输出不读右窗字段 → 被 dead-join 消除（compute_live_joins）剔除出
+    /// live_joins，但 join 在 advance 仍执行——gate 漏掉它则竞态照旧（all
+    /// 模式 q6 872913→802k~848k，实测 gate 从未触发）。
+    fn eager_join_target_windows(&self) -> Vec<String> {
+        let mut targets: Vec<String> = Vec::new();
+        for join in self.executor.live_joins() {
+            if join.emit_at.is_none() && !targets.contains(&join.right_window) {
+                targets.push(join.right_window.clone());
+            }
+        }
+        if let Some(kjp) = self
+            .machine
+            .as_ref()
+            .and_then(|m| m.plan().key_join.clone())
+            && !targets.contains(&kjp.right_window)
+        {
+            targets.push(kjp.right_window);
+        }
+        targets
+    }
+
     /// Process a single parsed batch (shared `Arc`) against the state machine.
     ///
     /// This is the per-batch body shared by the legacy pull path
     /// ([`Self::pull_and_advance`]) and the push path (channel recv). `batch_seq`
     /// is used only for debug event references.
+    /// 等所有即时 join 目标窗的 committed frontier 追平 `batch_max_ts + 余量`（本批
+    /// 驱动事件的最大事件时间 + 跨批引用前视余量）。数据生成保证 bid 引用的 auction
+    /// 事件时间早于 bid（同一 source 批内交错），故目标窗 commit 覆盖该上界即所有
+    /// 引用行可见。余量覆盖「未来 lead 引用」（NEXMark AUCTION_ID_LEAD=10 →
+    /// 引用行事件时间可晚于驱动行最多 ~50ms，且行在**下一 source 批**才产出——
+    /// 只等 batch_max_ts 会漏掉它们：all 模式实测 q20 196517→193k、q6
+    /// 872913→848k 的残余 miss 即此）。放弃等待的安全条件：目标窗提交前沿**停止
+    /// 增长**（~60ms 无新提交 = 目标流已排空/终止，或数据尾部 bid/auction 流 max
+    /// 天然差几秒——此时引用行早已提交，join 本就命中）；30s 硬截止为防御兜底
+    /// （理论上到不了）。
+    /// 注：与 deferred 评估 gate（scan_deferred）同一 `committed_frontier_ns`
+    /// 健全判据、同一 60ms 停滞模式（flush 先例），只是把「等目标窗追平本批
+    /// 事件时间」从评估阶段前移到处理阶段。
+    async fn wait_eager_joins_caught_up(&self, targets: &[String], batch_max_ts: i64) {
+        for right_window in targets {
+            let Some(target) = self.router.registry().get_window(right_window) else {
+                continue; // provider 等无 buffer 窗口的 join 目标：无 actor/frontier
+            };
+            if target.time_col_index().is_none() {
+                continue; // 无时间列 → frontier 无意义（防御：不等待）
+            }
+            // 目标上界 = 驱动批 max 事件时间 + 跨批引用前视余量（见函数注释）：
+            // 引用行可在**下一 source 批**才产出，事件时间晚于驱动批 max 最多
+            // 一个 lead 窗口（NEXMark ≤50ms）。250ms = 5× 实测前视（19ms），
+            // 且小于单批跨度（~200ms）——等待被目标 actor 的连续提交快速满足。
+            const EAGER_JOIN_LEAD_MARGIN_NS: i64 = 250_000_000;
+            let target_ts = batch_max_ts.saturating_add(EAGER_JOIN_LEAD_MARGIN_NS);
+            let mut stalled = 0u32;
+            let mut last = target.committed_frontier_ns();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let cur = target.committed_frontier_ns();
+                if cur >= target_ts {
+                    break; // 所有引用行（含跨批前视）已提交
+                }
+                if cur == last {
+                    stalled += 1;
+                    if stalled >= 3 {
+                        break; // 连续 ~60ms 无新提交 → 目标流已排空/终止，引用行已落地
+                    }
+                } else {
+                    stalled = 0;
+                }
+                last = cur;
+                if std::time::Instant::now() >= deadline {
+                    break; // 限时兜底（防御；actor 必然推进，到不了）
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn process_batch(
         &mut self,
@@ -840,6 +922,42 @@ impl RuleTask {
         let Some(ordered_aliases) = self.ordered_aliases.get(window_name) else {
             return;
         };
+        // 2026-08-29 q6/q20 snapshot join 竞态 gate：处理驱动批前，等即时
+        // （snapshot/asof/inner，非 deferred）join 目标窗 commit 追平本批 max
+        // 事件时间。并行 parse + 跨窗口 actor 独立 commit 使 auction_events
+        // 的提交可能滞后于 bid_events 消费——即时 join 读目标窗时，已 append
+        // 但未 commit 的行不可见 → 静默 miss（q20 p=10 196517→189430、q6
+        // 872913→788k~845k、q3 6060→4795，oracle 对拍定位；单规则隔离全对，
+        // 多规则同跑竞争放大）。deferred join 已有评估 gate（scan_deferred 的
+        // committed frontier），不需要本 gate；无即时 join / 无时间列的规则
+        // 零开销。
+        // 触发条件的时间列：on-each 规则用 `each_time_field`；match 规则
+        // （each_time_field = None，q6/q3 形态）回退到驱动窗的时间列名——
+        // match 的 join 也在本批行循环内求值，需要同样的 frontier 保证。
+        let batch_time_field = match self.each_time_field.as_deref() {
+            Some(tf) => Some(tf.to_string()),
+            None => self
+                .router
+                .registry()
+                .get_window(window_name)
+                .and_then(|w| {
+                    let idx = w.time_col_index()?;
+                    Some(w.schema().field(idx).name().clone())
+                }),
+        };
+        let targets = self.eager_join_target_windows();
+        if !targets.is_empty()
+            && let Some(batch) = batch
+            && let Some(time_col) = batch_time_field.as_deref()
+            && let Ok(col_idx) = batch.schema().index_of(time_col)
+        {
+            let mut batch_max_ts = i64::MIN;
+            for row in 0..batch.num_rows() {
+                batch_max_ts = batch_max_ts.max(batch_event_time_nanos_at(batch, col_idx, row));
+            }
+            self.wait_eager_joins_caught_up(&targets, batch_max_ts)
+                .await;
+        }
         // L2 deferred materialization: when the producer broadcast only the raw
         // batch, materialize only the rows the bind filter accepts. The time
         // column is still scanned over every row (watermark/expiry), but the

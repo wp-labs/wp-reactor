@@ -223,6 +223,7 @@ fn make_provider_join_task(
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -419,6 +420,7 @@ fn snapshot_join_buffer_target_gets_retention_pin() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
 
     let task = rule_task::RuleTask::new(config);

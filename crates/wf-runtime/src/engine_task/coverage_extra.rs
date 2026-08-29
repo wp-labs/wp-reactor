@@ -161,6 +161,7 @@ fn bare_config(push_rx: mpsc::Receiver<RulePush>) -> RuleTaskConfig {
         push_rx: Some(push_rx),
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
         progress: std::collections::HashMap::new(),
         conv_sink: None,
     }

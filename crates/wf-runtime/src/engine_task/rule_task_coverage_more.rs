@@ -117,6 +117,7 @@ struct Spec {
     push_rx: Option<mpsc::Receiver<RulePush>>,
     shard_index: Option<usize>,
     shard_count: usize,
+    key_partitioned: bool,
     progress: HashMap<String, Arc<AtomicU64>>,
     conv_sink: Option<ConvShardSink>,
 }
@@ -137,6 +138,7 @@ impl Default for Spec {
             push_rx: None,
             shard_index: None,
             shard_count: 1,
+            key_partitioned: false,
             progress: HashMap::new(),
             conv_sink: None,
         }
@@ -158,6 +160,7 @@ fn make_task(spec: Spec) -> RuleTask {
         push_rx,
         shard_index,
         shard_count,
+        key_partitioned,
         progress,
         conv_sink,
     } = spec;
@@ -178,6 +181,7 @@ fn make_task(spec: Spec) -> RuleTask {
         push_rx,
         shard_index,
         shard_count,
+        key_partitioned,
         progress,
         conv_sink,
     };

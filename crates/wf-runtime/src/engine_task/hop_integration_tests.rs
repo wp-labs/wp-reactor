@@ -234,6 +234,7 @@ fn make_hop_task(
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
 
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);

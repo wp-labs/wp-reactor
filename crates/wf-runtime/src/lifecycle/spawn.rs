@@ -918,6 +918,7 @@ pub(super) fn spawn_rule_tasks(
                             push_rx,
                             shard_index: Some(shard_idx),
                             shard_count,
+                            key_partitioned: false,
                             progress: progress.clone(),
                             conv_sink: None,
                         };
@@ -983,6 +984,7 @@ pub(super) fn spawn_rule_tasks(
                         push_rx,
                         shard_index: None,
                         shard_count: 1,
+                        key_partitioned: false,
                         progress: progress.clone(),
                         conv_sink: None,
                     };
@@ -1128,6 +1130,7 @@ pub(super) fn spawn_rule_tasks(
                             push_rx,
                             shard_index: Some(shard_idx),
                             shard_count,
+                            key_partitioned: true,
                             progress: progress.clone(),
                             conv_sink,
                         };
@@ -1220,6 +1223,7 @@ pub(super) fn spawn_rule_tasks(
                         push_rx,
                         shard_index: None,
                         shard_count: 1,
+                        key_partitioned: false,
                         progress: progress.clone(),
                         conv_sink,
                     };

@@ -438,6 +438,7 @@ fn make_task_inner(
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
 
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
@@ -620,6 +621,7 @@ fn make_pipeline_stage_task_opts(
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -718,6 +720,7 @@ fn make_each_task() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -831,6 +834,7 @@ fn make_filtered_match_task() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -957,6 +961,7 @@ fn make_filtered_close_config() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     (config, alert_rx, win_arc, notify_arc)
 }
@@ -1062,6 +1067,7 @@ fn make_filtered_each_task() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -1189,6 +1195,7 @@ fn make_intermediate_each_task() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -1298,6 +1305,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -1415,6 +1423,7 @@ fn make_intermediate_score_tasks() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (upstream_task, _cancel, _interval) = rule_task::RuleTask::new(upstream_config);
 
@@ -1562,6 +1571,7 @@ fn make_intermediate_score_tasks() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (downstream_task, _cancel, _interval) = rule_task::RuleTask::new(downstream_config);
 
@@ -1680,6 +1690,7 @@ fn make_intermediate_score_band_tasks() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (upstream_task, _cancel, _interval) = rule_task::RuleTask::new(upstream_config);
 
@@ -1880,6 +1891,7 @@ fn make_intermediate_score_band_tasks() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (downstream_task, _cancel, _interval) = rule_task::RuleTask::new(downstream_config);
 
@@ -2061,6 +2073,7 @@ fn make_filtered_bind_alias_match_task() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, window, notify)
@@ -2181,6 +2194,7 @@ fn make_window_has_match_task() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -3245,6 +3259,7 @@ fn make_sharded_match_tasks(
             push_rx: None,
             shard_index: Some(shard_index),
             shard_count,
+            key_partitioned: true,
         };
         let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
         tasks.push(task);
@@ -3297,6 +3312,153 @@ async fn pull_sharded_match_zero_repartition() {
     assert!(
         union.iter().all(|s| sips.contains(&s.as_str())),
         "only real keys should fire"
+    );
+}
+
+/// 2026-08-29 q1/q20 all 模式分片误拉回归：bid_events 被其它 match 规则注册 key
+/// 分片后，on-each round-robin 任务（q20 形态）若用全局 `window_is_sharded` 判定
+/// 拉取模式，会误把**别的规则**的 key 划分（`shard_rows`）当自己的行子集拉取——
+/// 每 shard 处理被划分走的部分行（`columnar_each` 因 `shard_rows.is_some()` 失效
+/// → 行式路径）→ 偶发丢行（all 模式 q20 196517→189k~193k、q1 重复处理 10×）。
+/// 修复：任务携带**自己**的 `key_partitioned` 标志，round-robin 规则恒拉全批
+/// （`shard_rows=None`）→ 走列式路径。
+///
+/// 本用例：窗口已注册 key 分片（模拟其它 match 规则），round-robin 任务
+/// `key_partitioned=false` → 必须拉全批（shard 0 处理 batch_seq=0 的整批 6 行），
+/// 而不是 `shard_rows[0]`（3 行）。
+#[tokio::test]
+async fn round_robin_pulls_whole_batch_despite_foreign_window_sharding() {
+    init_tracing();
+    let schema = test_schema();
+    let ts = 1_700_000_000_000_000_000i64;
+    let sips = ["s0", "s1", "s2", "s3", "s4", "s5"];
+    let batch = make_batch(&schema, &sips, ts);
+    // 模拟「别的 match 规则」注册的分片划分（6 行 → shard 0/1 各 3 行，按行号奇偶）。
+    let shard_rows: Vec<Vec<u32>> = (0..2)
+        .map(|sh| {
+            (0..sips.len() as u32)
+                .filter(|&r| r as usize % 2 == sh)
+                .collect()
+        })
+        .collect();
+
+    let registry = WindowRegistry::build(vec![make_window_def(
+        "auth_events",
+        &schema,
+        &["syslog"],
+        Some(1),
+    )])
+    .unwrap();
+    let router = Arc::new(Router::new(registry));
+    let window = router.registry().get_window("auth_events").unwrap();
+    let notify = router.registry().get_notifier("auth_events").unwrap();
+    // 全局注册 key 分片（模拟其它 match 规则）——旧代码 `window_is_sharded` 会因此
+    // 把 round-robin 任务误判为 key-partitioned。
+    router.fanout().register_window_sharding(
+        "auth_events",
+        Arc::from(vec![FieldRef::Simple("sip".into())].into_boxed_slice()),
+        2,
+    );
+
+    // q1 形态 on-each 直通任务：每行一条输出（entity = sip）。
+    let rule_plan = RulePlan {
+        conv_window: None,
+        name: "rr_whole_batch".into(),
+        binds: vec![BindPlan {
+            alias: "x".into(),
+            window: "auth_events".into(),
+            filter: None,
+        }],
+        lets: Vec::new(),
+        match_plan: MatchPlan {
+            keys: vec![],
+            key_map: None,
+            key_join: None,
+            window_spec: WindowSpec::Fixed(std::time::Duration::ZERO),
+            event_steps: vec![],
+            close_steps: vec![],
+            close_mode: CloseMode::Or,
+            tracked_bind_aliases: HashSet::new(),
+            tracked_bind_fields: empty_tracked_bind_fields(),
+            tracked_plain_fields: empty_tracked_plain_fields(),
+            seq: None,
+            match_mode: wf_lang::ast::MatchMode::Seq,
+            accu: false,
+            needs_field_history: false,
+            trigger_event_needed: false,
+        },
+        each_plan: Some(EachPlan {
+            alias: "x".into(),
+            filter: None,
+        }),
+        stats_plan: None,
+        joins: vec![],
+        r#where: None,
+        entity_plan: EntityPlan {
+            entity_type: "ip".into(),
+            entity_id_expr: Expr::Field(FieldRef::Qualified("x".into(), "sip".into())),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".into(),
+            version: None,
+            fields: vec![],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(1.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+    let executor = RuleExecutor::new(rule_plan);
+    let (alert_tx, mut alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
+        conv_sink: None,
+        machine: None,
+        each_alias: Some("x".into()),
+        each_time_field: Some("event_time".into()),
+        executor,
+        window_sources: vec![task_types::WindowSource {
+            window_name: "auth_events".into(),
+            window: Arc::clone(&window),
+            notify: Arc::clone(&notify),
+            aliases: vec!["x".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        timeout_scan_interval: Duration::from_secs(60),
+        router: Arc::clone(&router),
+        metrics: None,
+        intermediate_targets: HashSet::new(),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        // round-robin shard 0/2：batch_seq=0 归本 shard。key_partitioned=false →
+        // 拉全批（shard_rows=None），不被上面的全局分片注册影响。
+        shard_index: Some(0),
+        shard_count: 2,
+        key_partitioned: false,
+    };
+    let (mut task, _cancel, _interval) = rule_task::RuleTask::new(config);
+
+    let size = content_bytes(&batch);
+    window
+        .append_with_watermark_sized(batch, size, Some(Arc::new(shard_rows)))
+        .unwrap();
+    task.pull_and_advance().await;
+
+    // round-robin：batch_seq=0 → shard 0 处理整批 6 行 → 6 条输出。
+    // 若误用全局分片（shard_rows[0] = 3 行）→ 只输出 3 条（回归锚点）。
+    let ids: HashSet<String> = drain_alert_entity_ids(&mut alert_rx).into_iter().collect();
+    assert_eq!(
+        ids.len(),
+        sips.len(),
+        "round-robin shard must process the WHOLE batch (not the foreign key partition)"
+    );
+    assert!(
+        ids.iter().all(|s| sips.contains(&s.as_str())),
+        "all batch rows must be emitted"
     );
 }
 
@@ -3904,6 +4066,7 @@ async fn port_scan_rule_triggers_close_alert() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
 
     let (mut task, _cancel, _interval) = rule_task::RuleTask::new(config);
@@ -4228,6 +4391,7 @@ fn make_conv_sink_task() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, conv_rx)

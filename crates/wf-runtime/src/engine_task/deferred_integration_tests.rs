@@ -359,6 +359,7 @@ fn make_deferred_join_task_with_over(
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -1046,6 +1047,7 @@ fn make_q8_task() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -1899,6 +1901,7 @@ async fn q13_dual_chain_intermediate_window_pressure() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (mut task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
 
@@ -1937,6 +1940,7 @@ async fn q13_dual_chain_intermediate_window_pressure() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (mut task_b, _cancel_b, _interval_b) = rule_task::RuleTask::new(config_b);
 
@@ -2111,6 +2115,7 @@ async fn q13_dual_chain_sharded_push_consumption_complete() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (mut task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
 
@@ -2157,6 +2162,7 @@ async fn q13_dual_chain_sharded_push_consumption_complete() {
             push_rx: Some(push_rx),
             shard_index: Some(shard_idx),
             shard_count: SHARDS,
+            key_partitioned: false,
         };
         let (mut task_b, _cancel_b, _interval_b) = rule_task::RuleTask::new(config_b);
         // RuleTask 持有 push_rx（run_rule_task 里 take）；测试自己保留接收端
@@ -2331,6 +2337,7 @@ async fn q13_dual_chain_sharded_push_high_slope_repro() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
 
@@ -2376,6 +2383,7 @@ async fn q13_dual_chain_sharded_push_high_slope_repro() {
             push_rx: Some(push_rx),
             shard_index: Some(shard_idx),
             shard_count: SHARDS,
+            key_partitioned: false,
         };
         let (mut task_b, _cancel_b, _interval_b) = rule_task::RuleTask::new(config_b);
         shard_rxs.push(Some(task_b.push_rx.take().unwrap()));
@@ -2523,6 +2531,7 @@ async fn q13_dual_chain_sharded_producer_and_consumer() {
             push_rx: None,
             shard_index: Some(shard_idx),
             shard_count: PRODUCER_SHARDS,
+            key_partitioned: false,
         };
         let (task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
         producer_tasks.push(task_a);
@@ -2570,6 +2579,7 @@ async fn q13_dual_chain_sharded_producer_and_consumer() {
             push_rx: Some(push_rx),
             shard_index: Some(shard_idx),
             shard_count: SHARDS,
+            key_partitioned: false,
         };
         let (mut task_b, _cancel_b, _interval_b) = rule_task::RuleTask::new(config_b);
         shard_rxs.push(Some(task_b.push_rx.take().unwrap()));
@@ -2682,6 +2692,7 @@ async fn q13_sharded_pull_acks_processed_not_read_position() {
             push_rx: None,
             shard_index: Some(shard_idx),
             shard_count: SHARDS,
+            key_partitioned: false,
         };
         let (task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
         tasks.push(task_a);
@@ -2799,6 +2810,7 @@ async fn q13_dual_chain_intermediate_window_unregistered_consumer_loses() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (mut task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
 
@@ -2879,6 +2891,7 @@ async fn deferred_q9_real_wfl_compiled_plan_runs() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (mut task, _cancel, _interval) = rule_task::RuleTask::new(config);
     let mut alert_rx = alert_rx;

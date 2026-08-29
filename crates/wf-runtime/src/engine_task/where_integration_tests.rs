@@ -15,8 +15,8 @@ use wf_lang::ast::{
     Bound, BoundVal, CloseMode, CmpOp, Expr, FieldRef, JoinMode, MatchMode, Measure, WithinSpec,
 };
 use wf_lang::plan::{
-    AggPlan, BindPlan, BranchPlan, EntityPlan, JoinCondPlan, JoinPlan, MatchPlan, RulePlan,
-    ScorePlan, StepPlan, WindowSpec, YieldField, YieldPlan,
+    AggPlan, BindPlan, BranchPlan, EachPlan, EntityPlan, JoinCondPlan, JoinPlan, MatchPlan,
+    RulePlan, ScorePlan, StepPlan, WindowSpec, YieldField, YieldPlan,
 };
 
 use super::tests::{empty_tracked_bind_fields, empty_tracked_plain_fields, make_test_fanout};
@@ -218,6 +218,7 @@ fn make_join_where_task() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -302,6 +303,217 @@ async fn match_join_where_miss_suppresses() {
         alert_rx.try_recv().is_err(),
         "join miss must suppress (INNER JOIN semantics)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// P0b：2026-08-29 snapshot join 竞态 gate 回归（q6/q20/q3 多规则同跑丢行根因）
+// ---------------------------------------------------------------------------
+// 背景：并行 parse + 跨窗口 actor 独立 commit 使 join 目标窗（person_events /
+// auction_events）的提交可能滞后于驱动窗消费——即时 join 读目标窗时，已 append
+// 但未 commit 的行不可见 → 静默 miss（all 模式实测 q6 872913→788k~845k、q20
+// 196517→189430、q3 6060→4795；单规则隔离全对，竞争放大）。
+// 修复：`process_batch` 处理驱动批前，等目标窗 `committed_frontier_ns` 追平本批
+// max 事件时间（match 规则回退驱动窗时间列名触发）。以下用例构造「目标行在
+// process_batch 等待期间才提交」——无 gate 时 join 立即 miss（无输出），有 gate
+// 时等 frontier 追平后命中（有输出）。
+
+/// match 路径（q3/q6 形态：machine + snapshot join + where，each_time_field
+/// = None → 驱动窗时间列名触发 gate）回归：目标窗提交滞后时等待后 join 命中。
+#[tokio::test]
+async fn match_join_waits_for_target_commit_frontier() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_join_where_task();
+    let ts = 4_000_000_000_000_000i64;
+
+    // 驱动批先提交（auth 10.0.0.1 @ ts）；person 行**尚未**提交——模拟目标窗
+    // actor 滞后（跨窗口独立 commit）：即时 join 此刻读不到 person → miss。
+    router
+        .registry()
+        .get_window("auth_events")
+        .unwrap()
+        .append(driver_batch(&["10.0.0.1"], ts))
+        .unwrap();
+
+    // 处理在后台跑：gate 应等待 person_events frontier 追平 ts（而非立即 join）。
+    let handle = tokio::spawn(async move {
+        task.pull_and_advance().await;
+    });
+
+    // gate 轮询窗口（20ms 轮询、~60ms 停滞兜底）内提交 person 行：其事件时间
+    // 必须覆盖 `batch_max + 跨批前视余量`（250ms）——person 行落在 ts+300ms
+    // （> 余量）→ frontier 追平目标上界 → gate 放行。
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    person_window(&router)
+        .append(person_batch(&["10.0.0.1"], &["OR"], ts + 300_000_000))
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("task must finish promptly")
+        .expect("pull_and_advance ok");
+
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "10.0.0.1",
+        "等待目标窗前沿追平后 join 必须命中（无 gate 时此处 join miss → where 抑制 → 无输出）"
+    );
+}
+
+/// on-each 路径（q20 形态：each + snapshot join + where）回归：目标窗提交滞后时
+/// 等待后 join 命中（q20 p=10 196517→189430 的精确回归锚点）。
+#[tokio::test]
+async fn each_join_waits_for_target_commit_frontier() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_each_join_where_task();
+    let ts = 4_000_000_000_000_000i64;
+
+    router
+        .registry()
+        .get_window("auth_events")
+        .unwrap()
+        .append(driver_batch(&["10.0.0.1"], ts))
+        .unwrap();
+
+    let handle = tokio::spawn(async move {
+        task.pull_and_advance().await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    person_window(&router)
+        .append(person_batch(&["10.0.0.1"], &["OR"], ts + 300_000_000))
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("task must finish promptly")
+        .expect("pull_and_advance ok");
+
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "10.0.0.1",
+        "on-each join 同样必须等目标窗前沿追平（q20 回归）"
+    );
+}
+
+/// 构造 on-each + snapshot join + where 任务（q20 形态，机器为空）：
+/// ```wfl
+/// rule r {
+///   events { fail : auth_events }
+///   on each fail
+///   join person_events snapshot on fail.sip == person_events.id
+///   where person_events.state in ("OR","CA")
+///   entity(ip, fail.sip)
+///   yield alerts ()
+/// }
+/// ```
+fn make_each_join_where_task() -> (
+    rule_task::RuleTask,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
+    Arc<Router>,
+) {
+    let driver = "auth_events";
+    let person = "person_events";
+    let registry = WindowRegistry::build(vec![
+        window_def(driver, &driver_schema()),
+        window_def(person, &person_schema()),
+    ])
+    .unwrap();
+    let router = Arc::new(Router::new(registry));
+    let source_window = router.registry().get_window(driver).unwrap();
+    let source_notify = router.registry().get_notifier(driver).unwrap();
+
+    let rule_plan = RulePlan {
+        conv_window: None,
+        name: "each_join_where".into(),
+        binds: vec![BindPlan {
+            alias: "fail".into(),
+            window: driver.into(),
+            filter: None,
+        }],
+        lets: Vec::new(),
+        match_plan: MatchPlan {
+            keys: vec![],
+            key_map: None,
+            key_join: None,
+            window_spec: WindowSpec::Fixed(std::time::Duration::ZERO),
+            event_steps: vec![],
+            close_steps: vec![],
+            close_mode: CloseMode::Or,
+            tracked_bind_aliases: HashSet::new(),
+            tracked_bind_fields: empty_tracked_bind_fields(),
+            tracked_plain_fields: empty_tracked_plain_fields(),
+            seq: None,
+            match_mode: MatchMode::Seq,
+            accu: false,
+            needs_field_history: false,
+            trigger_event_needed: false,
+        },
+        each_plan: Some(EachPlan {
+            alias: "fail".into(),
+            filter: None,
+        }),
+        stats_plan: None,
+        joins: vec![JoinPlan {
+            right_window: person.into(),
+            mode: JoinMode::Snapshot,
+            conds: vec![JoinCondPlan {
+                left: FieldRef::Simple("sip".into()),
+                right: FieldRef::Simple("id".into()),
+            }],
+            within: None,
+            reduce: None,
+            emit_at: None,
+        }],
+        r#where: Some(where_state_in_or()),
+        entity_plan: EntityPlan {
+            entity_type: "ip".into(),
+            entity_id_expr: Expr::Field(FieldRef::Qualified("fail".into(), "sip".into())),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".into(),
+            version: None,
+            fields: vec![],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(1.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+
+    let executor = RuleExecutor::new(rule_plan);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
+        conv_sink: None,
+        machine: None,
+        each_alias: Some("fail".into()),
+        each_time_field: Some("event_time".into()),
+        executor,
+        window_sources: vec![task_types::WindowSource {
+            window_name: driver.into(),
+            window: source_window,
+            notify: source_notify,
+            aliases: vec!["fail".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        timeout_scan_interval: std::time::Duration::from_secs(60),
+        router: Arc::clone(&router),
+        metrics: None,
+        intermediate_targets: HashSet::new(),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        shard_index: None,
+        shard_count: 1,
+        key_partitioned: false,
+    };
+    let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
+    (task, alert_rx, router)
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +662,7 @@ fn make_interval_join_task() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
