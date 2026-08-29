@@ -61,7 +61,7 @@ pub fn take_alert(
 }
 
 /// Async variant of [`take_alert`] for `recv().await` based assertions.
-async fn take_alert_recv(
+pub async fn take_alert_recv(
     rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>,
 ) -> Arc<wp_model_core::model::DataRecord> {
     let batch = rx.recv().await.expect("expected an alert batch");
@@ -3459,6 +3459,147 @@ async fn round_robin_pulls_whole_batch_despite_foreign_window_sharding() {
     assert!(
         ids.iter().all(|s| sips.contains(&s.as_str())),
         "all batch rows must be emitted"
+    );
+}
+
+/// 2026-08-29 key_partitioned 修复副产物回归：round-robin（whole-batch 分片）规则
+/// 的 ack 必须是**处理位置**（本 shard 份额内最后处理批次 + 1），而不是读位置
+/// （`new_cursor` = 全部批次）。旧代码 ack 读位置会让 `min_acked` 追平
+/// `next_seq` → 窗口驱逐无未读保护 → 删掉**其它 shard 尚未处理**的批次（cursor
+/// gap 静默丢数据，q13a 分片隐患同类）。修复后 `key_partitioned=false` 走处理
+/// 位置 ack。
+///
+/// 本用例：2 shard round-robin，append 4 批（seq 0-3，各 1 行）。shard 0 的
+/// 份额 = 批 0、2 → 处理后 ack=3（批 0 后处理批 2 → last+1 = 3），而非读位置 4。
+#[tokio::test]
+async fn round_robin_shard_acks_processed_not_read_position() {
+    init_tracing();
+    let schema = test_schema();
+    let ts = 1_700_000_000_000_000_000i64;
+
+    let registry = WindowRegistry::build(vec![make_window_def(
+        "auth_events",
+        &schema,
+        &["syslog"],
+        Some(1),
+    )])
+    .unwrap();
+    let router = Arc::new(Router::new(registry));
+    let window = router.registry().get_window("auth_events").unwrap();
+    let notify = router.registry().get_notifier("auth_events").unwrap();
+    // 模拟其它 match 规则注册 key 分片：旧代码 `window_is_sharded` 会因此把
+    // round-robin 规则误判为 key-partitioned → ack 读位置（4）+ 处理全部 4 批；
+    // 新代码 key_partitioned=false → ack 处理位置（3）+ 只处理份额内批 0、2。
+    router.fanout().register_window_sharding(
+        "auth_events",
+        Arc::from(vec![FieldRef::Simple("sip".into())].into_boxed_slice()),
+        2,
+    );
+    // q1 形态 on-each 直通任务（同 round_robin_pulls_whole_batch_despite_foreign_window_sharding）。
+    let rule_plan = RulePlan {
+        conv_window: None,
+        name: "rr_ack".into(),
+        binds: vec![BindPlan {
+            alias: "x".into(),
+            window: "auth_events".into(),
+            filter: None,
+        }],
+        lets: Vec::new(),
+        match_plan: MatchPlan {
+            keys: vec![],
+            key_map: None,
+            key_join: None,
+            window_spec: WindowSpec::Fixed(std::time::Duration::ZERO),
+            event_steps: vec![],
+            close_steps: vec![],
+            close_mode: CloseMode::Or,
+            tracked_bind_aliases: HashSet::new(),
+            tracked_bind_fields: empty_tracked_bind_fields(),
+            tracked_plain_fields: empty_tracked_plain_fields(),
+            seq: None,
+            match_mode: wf_lang::ast::MatchMode::Seq,
+            accu: false,
+            needs_field_history: false,
+            trigger_event_needed: false,
+        },
+        each_plan: Some(EachPlan {
+            alias: "x".into(),
+            filter: None,
+        }),
+        stats_plan: None,
+        joins: vec![],
+        r#where: None,
+        entity_plan: EntityPlan {
+            entity_type: "ip".into(),
+            entity_id_expr: Expr::Field(FieldRef::Qualified("x".into(), "sip".into())),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".into(),
+            version: None,
+            fields: vec![],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(1.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+    let executor = RuleExecutor::new(rule_plan);
+    let (alert_tx, _alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let mut progress = std::collections::HashMap::new();
+    if let Some(slot) = router
+        .registry()
+        .progress("auth_events")
+        .map(|p| p.register())
+    {
+        progress.insert("auth_events".to_string(), slot);
+    }
+    let config = task_types::RuleTaskConfig {
+        progress,
+        conv_sink: None,
+        machine: None,
+        each_alias: Some("x".into()),
+        each_time_field: Some("event_time".into()),
+        executor,
+        window_sources: vec![task_types::WindowSource {
+            window_name: "auth_events".into(),
+            window: Arc::clone(&window),
+            notify: Arc::clone(&notify),
+            aliases: vec!["x".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        timeout_scan_interval: Duration::from_secs(60),
+        router: Arc::clone(&router),
+        metrics: None,
+        intermediate_targets: HashSet::new(),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        shard_index: Some(0),
+        shard_count: 2,
+        key_partitioned: false,
+    };
+    let (mut task, _cancel, _interval) = rule_task::RuleTask::new(config);
+
+    for b in 0..4u32 {
+        let batch = make_batch(&schema, &["10.0.0.1"], ts + b as i64);
+        let size = content_bytes(&batch);
+        window
+            .append_with_watermark_sized(batch, size, None)
+            .unwrap();
+    }
+    task.pull_and_advance().await;
+
+    let floor = router
+        .registry()
+        .progress("auth_events")
+        .expect("progress table exists")
+        .min_acked();
+    assert_eq!(
+        floor, 3,
+        "round-robin shard must ack its PROCESSED position (批 0、2 → 3)，not the read position (4)"
     );
 }
 

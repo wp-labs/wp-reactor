@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use std::collections::HashSet;
 
-use arrow::array::{ArrayRef, StringArray, TimestampNanosecondArray};
+use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use tokio::sync::mpsc;
@@ -15,8 +15,8 @@ use wf_lang::ast::{
     Bound, BoundVal, CloseMode, CmpOp, Expr, FieldRef, JoinMode, MatchMode, Measure, WithinSpec,
 };
 use wf_lang::plan::{
-    AggPlan, BindPlan, BranchPlan, EachPlan, EntityPlan, JoinCondPlan, JoinPlan, MatchPlan,
-    RulePlan, ScorePlan, StepPlan, WindowSpec, YieldField, YieldPlan,
+    AggPlan, BindPlan, BranchPlan, EachPlan, EntityPlan, JoinCondPlan, JoinKeyPlan, JoinPlan,
+    MatchPlan, RulePlan, ScorePlan, StepPlan, WindowSpec, YieldField, YieldPlan,
 };
 
 use super::tests::{empty_tracked_bind_fields, empty_tracked_plain_fields, make_test_fanout};
@@ -394,6 +394,264 @@ async fn each_join_waits_for_target_commit_frontier() {
         super::tests::field_str(&alert, "__wfu_entity_id"),
         "10.0.0.1",
         "on-each join 同样必须等目标窗前沿追平（q20 回归）"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P0c：key_join（join-then-key）形态的 gate 回归（q6：match 键来自 join 右窗）
+// ---------------------------------------------------------------------------
+// q6 的 join 只喂 match 键（`match<seller:10m>`，seller 来自 auction join）、输出
+// 不读右窗字段 → 被 dead-join 消除（compute_live_joins）剔除出 live_joins，但
+// join 在 advance 仍执行——旧 gate 只查 live_joins → 从未对 q6 触发（all 模式
+// 实测 0 次，q6 872913→788k~848k）。修复：`eager_join_target_windows` 把 key_join
+// 右窗并入等待目标。本用例构造「目标行在等待期间才提交」——无 key_join 覆盖时
+// join-then-key miss → scope key 解析失败 → 事件被跳过 → 无输出。
+
+/// q4/q6 形态 key_join 任务：`match<category:10m:fixed>`，键来自
+/// `b.auction == auction_events.id` 的 join 右窗 category；`on event count>=1`。
+/// 输出（entity = b.auction）不读右窗字段 → join 被 dead-elimination 剔除出
+/// live_joins，gate 只能靠 key_join 分支触发。
+fn make_key_join_task() -> (
+    rule_task::RuleTask,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
+    Arc<Router>,
+) {
+    let driver = "bid_events";
+    let target = "auction_events";
+    let bid_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, true),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]));
+    let auction_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("category", DataType::Int64, true),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]));
+    let registry = WindowRegistry::build(vec![
+        window_def(driver, &bid_schema),
+        window_def(target, &auction_schema),
+    ])
+    .unwrap();
+    let router = Arc::new(Router::new(registry));
+    let source_window = router.registry().get_window(driver).unwrap();
+    let source_notify = router.registry().get_notifier(driver).unwrap();
+    // 真实 join 索引（key = id），与 key_join 的 right_key_field 一致。
+    router
+        .registry()
+        .get_window(target)
+        .unwrap()
+        .set_join_key("id".to_string());
+
+    let match_plan = MatchPlan {
+        keys: vec![FieldRef::Simple("category".into())],
+        key_map: None,
+        key_join: Some(JoinKeyPlan {
+            join_idx: 0,
+            right_window: target.into(),
+            left_field: FieldRef::Qualified("b".into(), "auction".into()),
+            right_key_field: "id".into(),
+            right_field: "category".into(),
+            key_name: "category".into(),
+        }),
+        window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(600)),
+        event_steps: vec![StepPlan {
+            branches: vec![BranchPlan {
+                label: Some("c".into()),
+                source: "b".into(),
+                field: None,
+                guard: None,
+                agg: AggPlan {
+                    transforms: vec![],
+                    measure: Measure::Count,
+                    cmp: CmpOp::Ge,
+                    threshold: Expr::Number(1.0),
+                },
+            }],
+        }],
+        close_steps: vec![],
+        close_mode: CloseMode::Or,
+        tracked_bind_aliases: HashSet::new(),
+        tracked_bind_fields: empty_tracked_bind_fields(),
+        tracked_plain_fields: empty_tracked_plain_fields(),
+        seq: None,
+        match_mode: MatchMode::Seq,
+        accu: false,
+        needs_field_history: false,
+        trigger_event_needed: true,
+    };
+    let rule_plan = RulePlan {
+        conv_window: None,
+        name: "key_join_gate".into(),
+        binds: vec![BindPlan {
+            alias: "b".into(),
+            window: driver.into(),
+            filter: None,
+        }],
+        lets: Vec::new(),
+        match_plan: match_plan.clone(),
+        each_plan: None,
+        stats_plan: None,
+        // 输出不读右窗字段 → 此 join 被 dead-elimination 剔除出 live_joins。
+        joins: vec![JoinPlan {
+            right_window: target.into(),
+            mode: JoinMode::Snapshot,
+            conds: vec![JoinCondPlan {
+                left: FieldRef::Simple("auction".into()),
+                right: FieldRef::Simple("id".into()),
+            }],
+            within: None,
+            reduce: None,
+            emit_at: None,
+        }],
+        r#where: None,
+        entity_plan: EntityPlan {
+            entity_type: "digit".into(),
+            entity_id_expr: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".into(),
+            version: None,
+            fields: vec![],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(1.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+
+    let machine = CepStateMachine::new(
+        "key_join_gate".into(),
+        match_plan,
+        Some("event_time".into()),
+    );
+    let executor = RuleExecutor::new(rule_plan);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
+        conv_sink: None,
+        machine: Some(machine),
+        each_alias: None,
+        each_time_field: None,
+        executor,
+        window_sources: vec![task_types::WindowSource {
+            window_name: driver.into(),
+            window: source_window,
+            notify: source_notify,
+            aliases: vec!["b".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        timeout_scan_interval: std::time::Duration::from_secs(60),
+        router: Arc::clone(&router),
+        metrics: None,
+        intermediate_targets: HashSet::new(),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        shard_index: None,
+        shard_count: 1,
+        key_partitioned: false,
+    };
+    let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
+    (task, alert_rx, router)
+}
+
+fn bid_batch(auctions: &[i64], ts: i64) -> RecordBatch {
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(auctions.to_vec())),
+        Arc::new(TimestampNanosecondArray::from(vec![ts; auctions.len()])),
+    ];
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("auction", DataType::Int64, true),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ])),
+        cols,
+    )
+    .unwrap()
+}
+
+fn auction_batch(ids: &[i64], categories: &[i64], ts: i64) -> RecordBatch {
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(ids.to_vec())),
+        Arc::new(Int64Array::from(categories.to_vec())),
+        Arc::new(TimestampNanosecondArray::from(vec![ts; ids.len()])),
+    ];
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("category", DataType::Int64, true),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ])),
+        cols,
+    )
+    .unwrap()
+}
+
+/// key_join（join-then-key，q6 形态）端到端回归：join 被 dead-elimination 剔除出
+/// live_joins，gate 必须靠 `eager_join_target_windows` 的 key_join 分支触发——目标
+/// 行在等待期间才提交 → 等 frontier 追平后 join-then-key 命中 → 状态机匹配输出。
+#[tokio::test]
+async fn key_join_waits_for_target_commit_frontier() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_key_join_task();
+    let ts = 4_000_000_000_000_000i64;
+
+    // 驱动批先提交（bid auction=5 @ ts）；auction id=5 行**尚未**提交（目标窗滞后）。
+    router
+        .registry()
+        .get_window("bid_events")
+        .unwrap()
+        .append(bid_batch(&[5], ts))
+        .unwrap();
+
+    let handle = tokio::spawn(async move {
+        task.pull_and_advance().await;
+    });
+
+    // 等待窗口内提交 auction id=5（event_time 覆盖 batch_max + 跨批余量 250ms）。
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    router
+        .registry()
+        .get_window("auction_events")
+        .unwrap()
+        .append(auction_batch(&[5], &[10], ts + 300_000_000))
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("task must finish promptly")
+        .expect("pull_and_advance ok");
+
+    // 批尾 flush_alerts 已把 alert 送入 fanout 通道（`recv().await` 阻塞等待投递）。
+    let alert = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        super::tests::take_alert_recv(&mut alert_rx),
+    )
+    .await
+    .expect("alert must be delivered");
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "5",
+        "key_join 等待目标窗前沿追平后必须命中（无 key_join 覆盖时 join-then-key miss → 无输出）"
     );
 }
 
