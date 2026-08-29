@@ -339,10 +339,11 @@ async fn match_join_waits_for_target_commit_frontier() {
         task.pull_and_advance().await;
     });
 
-    // gate 轮询窗口（20ms 轮询、~60ms 停滞兜底）内提交 person 行：其事件时间
+    // gate 轮询窗口（10ms 轮询、~30ms 停滞兜底）内提交 person 行：其事件时间
     // 必须覆盖 `batch_max + 跨批前视余量`（250ms）——person 行落在 ts+300ms
-    // （> 余量）→ frontier 追平目标上界 → gate 放行。
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    // （> 余量）→ frontier 追平目标上界 → gate 放行。sleep 10ms 保证 append 在
+    // 第 1 次轮询后落地、第 2 次 poll（20ms）看到（bail 前留足余量）。
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     person_window(&router)
         .append(person_batch(&["10.0.0.1"], &["OR"], ts + 300_000_000))
         .unwrap();
@@ -384,7 +385,7 @@ async fn each_join_waits_for_target_commit_frontier() {
         task.pull_and_advance().await;
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     person_window(&router)
         .append(person_batch(&["10.0.0.1"], &["OR"], ts + 300_000_000))
         .unwrap();
@@ -623,7 +624,9 @@ async fn key_join_waits_for_target_commit_frontier() {
     });
 
     // 等待窗口内提交 auction id=5（event_time 覆盖 batch_max + 跨批余量 250ms）。
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    // sleep 10ms：gate 轮询 10ms/次、bail 30ms——append 在第 1 次轮询后落地，
+    // 第 2 次 poll 看到 frontier 推进 → 放行（留足 bail 前余量）。
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     router
         .registry()
         .get_window("auction_events")

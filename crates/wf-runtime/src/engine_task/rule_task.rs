@@ -3,8 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{BooleanArray, new_null_array};
-use arrow::datatypes::DataType;
+use arrow::array::{
+    BooleanArray, Float64Array, Int64Array, TimestampNanosecondArray, new_null_array,
+};
+use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use orion_error::conversion::{SourceRawErr, ToStructError};
 use tokio::sync::mpsc;
@@ -401,6 +403,11 @@ pub(super) struct RuleTask {
     /// 2026-08-29 q6/q20 snapshot join 竞态 gate 的等待目标右窗（去重，构造时
     /// 解析）：live_joins 的即时 join + key_join（join-then-key）的右窗。
     eager_join_targets: Vec<String>,
+    /// 2026-08-30 gate 尾部优化：上次 bail（frontier 停滞放行）时的目标窗
+    /// frontier。后续批若目标窗 frontier 未再推进 → 直接跳过等待（目标流已
+    /// 排空/结束，结论同上次 bail）。frontier 推进即失效。Mutex 供 &self
+    /// 访问（与 pending_alerts 同模式，跨 await 不持锁）。
+    last_bailed_frontier: std::sync::Mutex<Option<(String, i64)>>,
     /// Profiling accumulators (nanos) for locating the rule-task bottleneck.
     advance_nanos: u64,
     scan_nanos: u64,
@@ -644,6 +651,7 @@ impl RuleTask {
             shard_count,
             key_partitioned,
             eager_join_targets,
+            last_bailed_frontier: std::sync::Mutex::new(None),
             progress,
             advance_nanos: 0,
             scan_nanos: 0,
@@ -842,6 +850,61 @@ impl RuleTask {
         self.update_rule_instances_metric();
     }
 
+    /// 批级时间列 max（raw i64，可向量化）：gate 只需「批 max 事件时间」用于与
+    /// 目标窗 frontier（同为 raw）比较——`batch_event_time_nanos_at` 的 f64
+    /// round-trip 圆整误差（1.7e18ns 处 ±256ns）相对 250ms 余量可忽略，直读 i64
+    /// 让编译器向量化（实测 187µs/批 → ~5µs/批，q20 30M gate 总耗时 139ms→10ms
+    /// 量级，消除 gate 的性能回退主项）。
+    fn batch_time_col_max(batch: &RecordBatch, col_idx: usize) -> i64 {
+        let col = batch.column(col_idx);
+        let n = batch.num_rows();
+        let null_free = col.null_count() == 0;
+        match col.data_type() {
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                if let Some(arr) = col.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                    let mut max_ts = i64::MIN;
+                    for row in 0..n {
+                        let v = arr.value(row);
+                        if null_free || !col.is_null(row) {
+                            max_ts = max_ts.max(v);
+                        }
+                    }
+                    return max_ts;
+                }
+            }
+            DataType::Int64 => {
+                if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                    let mut max_ts = i64::MIN;
+                    for row in 0..n {
+                        let v = arr.value(row);
+                        if null_free || !col.is_null(row) {
+                            max_ts = max_ts.max(v);
+                        }
+                    }
+                    return max_ts;
+                }
+            }
+            DataType::Float64 => {
+                if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+                    let mut max_ts = i64::MIN;
+                    for row in 0..n {
+                        if null_free || !col.is_null(row) {
+                            max_ts = max_ts.max(arr.value(row) as i64);
+                        }
+                    }
+                    return max_ts;
+                }
+            }
+            _ => {}
+        }
+        // 其它类型：逐行完整检查（原语义，含 f64 round-trip）。
+        let mut max_ts = i64::MIN;
+        for row in 0..n {
+            max_ts = max_ts.max(batch_event_time_nanos_at(batch, col_idx, row));
+        }
+        max_ts
+    }
+
     /// Process a single parsed batch (shared `Arc`) against the state machine.
     ///
     /// This is the per-batch body shared by the legacy pull path
@@ -854,12 +917,12 @@ impl RuleTask {
     /// 引用行事件时间可晚于驱动行最多 ~50ms，且行在**下一 source 批**才产出——
     /// 只等 batch_max_ts 会漏掉它们：all 模式实测 q20 196517→193k、q6
     /// 872913→848k 的残余 miss 即此）。放弃等待的安全条件：目标窗提交前沿**停止
-    /// 增长**（~60ms 无新提交 = 目标流已排空/终止，或数据尾部 bid/auction 流 max
+    /// 增长**（~30ms 无新提交 = 目标流已排空/终止，或数据尾部 bid/auction 流 max
     /// 天然差几秒——此时引用行早已提交，join 本就命中）；30s 硬截止为防御兜底
     /// （理论上到不了）。
     /// 注：与 deferred 评估 gate（scan_deferred）同一 `committed_frontier_ns`
-    /// 健全判据、同一 60ms 停滞模式（flush 先例），只是把「等目标窗追平本批
-    /// 事件时间」从评估阶段前移到处理阶段。
+    /// 健全判据、同一停滞模式（flush 先例 60ms，本 gate 因非终局收紧到 30ms），
+    /// 只是把「等目标窗追平本批事件时间」从评估阶段前移到处理阶段。
     async fn wait_eager_joins_caught_up(&self, targets: &[String], batch_max_ts: i64) {
         for right_window in targets {
             let Some(target) = self.router.registry().get_window(right_window) else {
@@ -874,8 +937,22 @@ impl RuleTask {
             // 且小于单批跨度（~200ms）——等待被目标 actor 的连续提交快速满足。
             const EAGER_JOIN_LEAD_MARGIN_NS: i64 = 250_000_000;
             let target_ts = batch_max_ts.saturating_add(EAGER_JOIN_LEAD_MARGIN_NS);
+            let cur0 = target.committed_frontier_ns();
+            // 2026-08-30 尾部性能优化：上次 bail（frontier 停滞放行）后目标窗
+            // frontier 未再推进 → 目标流已排空/结束（或数据尾部 bid/auction 流
+            // max 天然差几秒）→ 本批结论与上次 bail 相同（引用行已提交或确实
+            // 缺失）→ 跳过等待。frontier 一旦推进缓存即失效（新数据 → 正常等待）。
+            if self
+                .last_bailed_frontier
+                .lock()
+                .expect("bail frontier lock poisoned")
+                .as_ref()
+                .is_some_and(|(w, f)| w == right_window && *f == cur0)
+            {
+                continue;
+            }
             let mut stalled = 0u32;
-            let mut last = target.committed_frontier_ns();
+            let mut last = cur0;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
                 let cur = target.committed_frontier_ns();
@@ -885,7 +962,14 @@ impl RuleTask {
                 if cur == last {
                     stalled += 1;
                     if stalled >= 3 {
-                        break; // 连续 ~60ms 无新提交 → 目标流已排空/终止，引用行已落地
+                        // 连续 ~30ms 无新提交 → 目标流已排空/终止。记录 bail 时
+                        // 的 frontier：后续批 frontier 未动则直接跳过（见上）。
+                        *self
+                            .last_bailed_frontier
+                            .lock()
+                            .expect("bail frontier lock poisoned") =
+                            Some((right_window.clone(), cur));
+                        break;
                     }
                 } else {
                     stalled = 0;
@@ -894,7 +978,7 @@ impl RuleTask {
                 if std::time::Instant::now() >= deadline {
                     break; // 限时兜底（防御；actor 必然推进，到不了）
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }
     }
@@ -951,10 +1035,7 @@ impl RuleTask {
             && let Some(time_col) = batch_time_field.as_deref()
             && let Ok(col_idx) = batch.schema().index_of(time_col)
         {
-            let mut batch_max_ts = i64::MIN;
-            for row in 0..batch.num_rows() {
-                batch_max_ts = batch_max_ts.max(batch_event_time_nanos_at(batch, col_idx, row));
-            }
+            let batch_max_ts = Self::batch_time_col_max(batch, col_idx);
             self.wait_eager_joins_caught_up(targets, batch_max_ts).await;
         }
         // L2 deferred materialization: when the producer broadcast only the raw
