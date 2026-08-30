@@ -2,7 +2,7 @@ use md5::Digest as Md5Digest;
 use md5::Md5;
 use sha1::Digest as Sha1Digest;
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 use super::{Event, Value, YieldMeta, eval_expr_with_l3, step_data, utils};
 use crate::match_engine::match_engine::{EngineHashMap, value_to_string, values_equal};

@@ -2,7 +2,7 @@ use md5::Digest as Md5Digest;
 use md5::Md5;
 use sha1::Digest as Sha1Digest;
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use wf_lang::ast::Expr;
 
 use crate::time::{normalize_epoch_timestamp_float_nanos, positive_interval_seconds_to_nanos};
