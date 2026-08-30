@@ -961,7 +961,13 @@ impl RuleTask {
                 }
                 if cur == last {
                     stalled += 1;
-                    if stalled >= 3 {
+                    // 2026-08-30 q3 冷启动保护：目标窗**从未提交**（frontier ==
+                    // i64::MIN）时不 bail——停滞可能是目标窗 actor 尚未处理首个
+                    // mailbox batch（跨窗 actor 独立调度，冷启动首个 commit 前
+                    // frontier 必为 i64::MIN），bail 会让本批对空窗/半索引 join 全
+                    // miss。bail 只对「目标流已排空/结束」安全（frontier 停在真实
+                    // 提交值，引用行早已落地）。真无数据的目标窗靠 30s 硬截止兜底。
+                    if stalled >= 3 && cur != i64::MIN {
                         // 连续 ~30ms 无新提交 → 目标流已排空/终止。记录 bail 时
                         // 的 frontier：后续批 frontier 未动则直接跳过（见上）。
                         *self
@@ -976,7 +982,13 @@ impl RuleTask {
                 }
                 last = cur;
                 if std::time::Instant::now() >= deadline {
-                    break; // 限时兜底（防御；actor 必然推进，到不了）
+                    // 限时兜底（防御；actor 必然推进，到不了）。记录 frontier：
+                    // 后续批若 frontier 未动（真无数据的目标窗）直接跳过等待。
+                    *self
+                        .last_bailed_frontier
+                        .lock()
+                        .expect("bail frontier lock poisoned") = Some((right_window.clone(), cur));
+                    break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }

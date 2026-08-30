@@ -343,9 +343,18 @@ async fn match_join_waits_for_target_commit_frontier() {
     // 必须覆盖 `batch_max + 跨批前视余量`（250ms）——person 行落在 ts+300ms
     // （> 余量）→ frontier 追平目标上界 → gate 放行。sleep 10ms 保证 append 在
     // 第 1 次轮询后落地、第 2 次 poll（20ms）看到（bail 前留足余量）。
+    // 2026-08-30 改用 actor 路径（带 source）提交：普通 `append()` 不推进
+    // per-source 前沿，gate 只能靠停滞 bail 放行；actor 路径才记录提交前沿
+    // （生产路径），gate 真正等到 frontier 追平。
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let src: Arc<str> = Arc::from("ingress");
     person_window(&router)
-        .append(person_batch(&["10.0.0.1"], &["OR"], ts + 300_000_000))
+        .append_with_watermark_sized_from(
+            person_batch(&["10.0.0.1"], &["OR"], ts + 300_000_000),
+            0,
+            None,
+            src,
+        )
         .unwrap();
 
     tokio::time::timeout(std::time::Duration::from_secs(10), handle)
@@ -363,6 +372,63 @@ async fn match_join_waits_for_target_commit_frontier() {
         super::tests::field_str(&alert, "__wfu_entity_id"),
         "10.0.0.1",
         "等待目标窗前沿追平后 join 必须命中（无 gate 时此处 join miss → where 抑制 → 无输出）"
+    );
+}
+
+/// q3 冷启动回归（2026-08-30）：目标窗**首个** commit 晚于 gate 的停滞 bail
+/// 阈值（30ms）时，gate 必须继续等待而不是 bail——bail 会让本批对空窗 join 全
+/// miss。旧实现无冷启动保护：目标窗从未提交（frontier == i64::MIN）时停滞
+/// ~30ms 即放行，首个 person 批在 60ms 才落地 → join miss → 无输出（nexmark_pk
+/// q3 丢 0~16 早期 auction 的另一半根因：首个 actor 批提交前 gate 已放行）。
+#[tokio::test]
+async fn match_join_waits_for_target_first_commit_past_bail_threshold() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_join_where_task();
+    let ts = 4_000_000_000_000_000i64;
+
+    // 驱动批先提交；目标窗**从未提交**（模拟冷启动首个 mailbox batch 尚未
+    // 落地）。gate 的停滞 bail 阈值 ~30ms（3 × 10ms 轮询），这里把首个提交
+    // 拖到 60ms——旧实现（无冷启动保护）在 ~30ms 处 bail → join 对空窗 miss。
+    router
+        .registry()
+        .get_window("auth_events")
+        .unwrap()
+        .append(driver_batch(&["10.0.0.1"], ts))
+        .unwrap();
+
+    let handle = tokio::spawn(async move {
+        task.pull_and_advance().await;
+    });
+
+    // 超过 bail 阈值后目标行才提交（事件时间覆盖 batch_max + 250ms 余量）。
+    // 用 actor 路径（带 source）提交：普通 `append()` 不推进 per-source 前沿，
+    // gate 永远等不到 frontier 追平；actor 路径才会记录提交前沿（q3 生产路径）。
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let src: Arc<str> = Arc::from("ingress");
+    person_window(&router)
+        .append_with_watermark_sized_from(
+            person_batch(&["10.0.0.1"], &["OR"], ts + 300_000_000),
+            0,
+            None,
+            src,
+        )
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("task must finish promptly")
+        .expect("pull_and_advance ok");
+
+    let alert = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        super::tests::take_alert_recv(&mut alert_rx),
+    )
+    .await
+    .expect("alert must be delivered");
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "10.0.0.1",
+        "冷启动首个提交晚于 bail 阈值时 gate 必须等待而非 bail（bail → join miss → 无输出）"
     );
 }
 
@@ -386,8 +452,17 @@ async fn each_join_waits_for_target_commit_frontier() {
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    // 2026-08-30 改用 actor 路径（带 source）提交：普通 `append()` 不推进
+    // per-source 前沿，gate 只能靠停滞 bail 放行；actor 路径才记录提交前沿
+    // （生产路径），gate 真正等到 frontier 追平。
+    let src: Arc<str> = Arc::from("ingress");
     person_window(&router)
-        .append(person_batch(&["10.0.0.1"], &["OR"], ts + 300_000_000))
+        .append_with_watermark_sized_from(
+            person_batch(&["10.0.0.1"], &["OR"], ts + 300_000_000),
+            0,
+            None,
+            src,
+        )
         .unwrap();
 
     tokio::time::timeout(std::time::Duration::from_secs(10), handle)
@@ -626,12 +701,21 @@ async fn key_join_waits_for_target_commit_frontier() {
     // 等待窗口内提交 auction id=5（event_time 覆盖 batch_max + 跨批余量 250ms）。
     // sleep 10ms：gate 轮询 10ms/次、bail 30ms——append 在第 1 次轮询后落地，
     // 第 2 次 poll 看到 frontier 推进 → 放行（留足 bail 前余量）。
+    // 2026-08-30 改用 actor 路径（带 source）提交：普通 `append()` 不推进
+    // per-source 前沿，gate 只能靠停滞 bail 放行；actor 路径才记录提交前沿
+    // （生产路径），gate 真正等到 frontier 追平。
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let src: Arc<str> = Arc::from("ingress");
     router
         .registry()
         .get_window("auction_events")
         .unwrap()
-        .append(auction_batch(&[5], &[10], ts + 300_000_000))
+        .append_with_watermark_sized_from(
+            auction_batch(&[5], &[10], ts + 300_000_000),
+            0,
+            None,
+            src,
+        )
         .unwrap();
 
     tokio::time::timeout(std::time::Duration::from_secs(10), handle)

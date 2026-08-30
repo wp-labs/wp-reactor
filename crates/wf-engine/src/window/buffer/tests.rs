@@ -837,6 +837,86 @@ fn committed_frontier_ignores_dropped_late() {
     );
 }
 
+/// q3 根因回归（nexmark_pk，2026-08-30）：**首次** append 期间 `committed_frontier_ns`
+/// 不得领先于 join 索引内容。旧实现在 `append_inner`（含 join 索引构建）**之前**
+/// 推进 `max_event_time_nanos`，而 per-source 提交前沿在 append 完成后才记录——
+/// 首次 append（per-source 为空）时 `committed_frontier_ns` 回退到全局 max，把
+/// 尚未建索引的批次 max 报为已提交 → eager join gate 提前放行 → snapshot join
+/// 与目标窗建索引并发 → 静默 miss（buffer 有行、索引没有，q3 丢 0~16 早期
+/// auction，oracle 字段级对拍定位）。
+///
+/// 本用例用并发采样器验证不变式：只要 `committed_frontier_ns() > i64::MIN`（目标
+/// 窗报告了真实提交水位），join 索引就必须已包含首批全部探测键。修复后
+/// max_event_time 只在 append（含索引）完成后推进，采样器永远看不到
+/// 「frontier 已推进、索引仍空」的中间态；旧实现会在索引构建期间观察到它。
+#[test]
+fn committed_frontier_never_leads_the_join_index() {
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    let win = StdArc::new(test_window(3600, usize::MAX));
+    win.set_join_key("value".into());
+    let schema = win.schema().clone();
+
+    // 大批首次 append：把 index_batch 的临界区拉长到几十 ms，让采样器稳定
+    // 落入「旧实现下 frontier 已推进、索引未建完」的窗口。
+    let n = 400_000usize;
+    let times: Vec<i64> = (0..n as i64).map(|i| 10_000_000_000i64 + i).collect();
+    let values: Vec<i64> = (0..n as i64).collect();
+    let batch = make_batch(&schema, &times, &values);
+    // 探测键散布在不同分片：旧实现索引逐片写入，任意时刻大概率有分片未写。
+    let probes: Vec<JoinKey> = vec![
+        JoinKey::Int(0),
+        JoinKey::Int(97_000),
+        JoinKey::Int(199_999),
+        JoinKey::Int(300_001),
+        JoinKey::Int(399_999),
+    ];
+
+    let stop = StdArc::new(AtomicBool::new(false));
+    let seen_bad = StdArc::new(AtomicBool::new(false));
+    let w = StdArc::clone(&win);
+    let s = StdArc::clone(&stop);
+    let bad = StdArc::clone(&seen_bad);
+    let probes_s = probes.clone();
+    let sampler = std::thread::spawn(move || {
+        while !s.load(AtomicOrdering::Relaxed) {
+            let f = w.committed_frontier_ns();
+            if f != i64::MIN {
+                // 报告了真实提交水位 → 索引必须已含全部探测行（修复后成立；
+                // 旧实现索引构建期间此处会命中空索引）。
+                let all_present = probes_s
+                    .iter()
+                    .all(|k| w.join_lookup(k, None).is_some_and(|rows| !rows.is_empty()));
+                if !all_present {
+                    bad.store(true, AtomicOrdering::Relaxed);
+                }
+            }
+        }
+    });
+
+    let src: Arc<str> = Arc::from("ingress#1");
+    win.append_with_watermark_sized_from(batch, 0, None, src)
+        .unwrap();
+
+    stop.store(true, AtomicOrdering::Relaxed);
+    sampler.join().expect("sampler thread join");
+    assert!(
+        !seen_bad.load(AtomicOrdering::Relaxed),
+        "committed_frontier_ns 领先于 join 索引内容（首次 append 期间把未提交 max 报为已提交）"
+    );
+
+    // 提交后收敛：frontier = per-source = 批次 max，探测键全部可查。
+    let max = 10_000_000_000i64 + n as i64 - 1;
+    assert_eq!(win.committed_frontier_ns(), max);
+    for k in &probes {
+        assert!(
+            win.join_lookup(k, None).is_some_and(|r| !r.is_empty()),
+            "提交后探测键 {k:?} 必须可查"
+        );
+    }
+}
+
 #[test]
 fn append_with_watermark_drop_late() {
     // watermark delay = 5s, allowed_lateness = 0s, late_policy = Drop
