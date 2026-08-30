@@ -199,11 +199,12 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
         }
         let win = self.router.registry().get_window(window)?;
         let join_key = JoinKey::from_value(key)?;
-        // Indexed lookup with seq-cut（M2 pull 一致性）: 索引行带 batch seq，
-        // `max_seq` 过滤后只返回读者已拉取的 batch 的行（2026-08：索引此前无
-        // seq 感知，pull 模式被迫全量扫描 → q13 等 join 查询 CPU/积压瓶颈）。
-        // `None`（窗口无索引）→ 回退 snapshot 扫描。
-        if let Some(rows) = win.join_lookup(&join_key, self.eff_max_seq(window)) {
+        // 索引按**每个注册** join 右字段建（2026-08-30 多 key 索引：q8 按
+        // seller / q20 按 id 共窗各建各的 O(1) 索引，不再回退全窗扫描）。
+        // 该字段无索引才回退扫描（正确性兜底，见 2026-08-29 假空 miss 修复）。
+        if win.has_join_key(key_field)
+            && let Some(rows) = win.join_lookup(key_field, &join_key, self.eff_max_seq(window))
+        {
             return Some(rows);
         }
         // Scan fallback (no index): filter the seq-bounded snapshot by key
@@ -233,10 +234,12 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
     ) -> Option<Vec<(i64, JoinRow)>> {
         let win = self.router.registry().get_window(window)?;
         let join_key = JoinKey::from_value(key)?;
-        // Indexed asof lookup（seq-cut）: 索引行带 batch seq + 原始时间戳,
-        // `max_seq` 过滤后 O(1)（2026-08 前 pull 模式回退全量扫描）。
-        // `None`（无索引）→ 回退 timestamped 扫描。
-        if let Some(rows) = win.join_lookup_timestamped(&join_key, self.eff_max_seq(window)) {
+        // 索引按每个注册 join 右字段建（2026-08-30 多 key，见 join_lookup）：
+        // 该字段无索引才回退 timestamped 扫描。
+        if win.has_join_key(key_field)
+            && let Some(rows) =
+                win.join_lookup_timestamped(key_field, &join_key, self.eff_max_seq(window))
+        {
             return Some(rows);
         }
         // Scan fallback: filter the seq-bounded timestamped snapshot by key. The
@@ -258,7 +261,7 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
     fn asof_lookup_max(
         &self,
         window: &str,
-        _key_field: &str,
+        key_field: &str,
         key: &Value,
         event_time_nanos: i64,
         within: Option<&Duration>,
@@ -273,10 +276,16 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
             let nanos = i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
             event_time_nanos.saturating_sub(nanos)
         });
+        // 索引按每个注册 join 右字段建（2026-08-30 多 key，见 join_lookup）：
+        // 该字段无索引 → Fallback（调用方走 asof_candidates 扫描）。
+        if !win.has_join_key(key_field) {
+            return AsofLookup::Fallback;
+        }
         // 索引 asof 快路径（seq-cut: max_seq 过滤后取最新行; 2026-08 前 pull
         // 模式回退 `asof_candidates` 全量扫描）。`Fallback`（无索引）由调用方
         // 走 asof_candidates。
         win.join_lookup_asof(
+            key_field,
             &join_key,
             event_time_nanos,
             min_ts,
@@ -426,6 +435,63 @@ mod tests {
             .join_lookup("threat_intel", "ip", &Value::Str("9.9.9.9".into()))
             .expect("indexed window exists");
         assert!(none.is_empty(), "unknown key → empty rows");
+    }
+
+    /// 回归（2026-08-29 q8 多规则 7565→1 根因 + 2026-08-30 多 key）：请求的
+    /// key_field 在该窗口**没有索引**时必须回退扫描（按请求字段过滤），不能返回
+    /// 「索引命中但空」的假空（静默全 miss）。2026-08-30 起多 key 支持让每个
+    /// 注册字段都有索引，但未注册字段的回退路径仍是正确性兜底，必须保留。
+    #[tokio::test]
+    async fn join_lookup_key_field_mismatch_falls_back_to_scan() {
+        let schema = ts_schema();
+        let reg = WindowRegistry::build(vec![make_def("threat_intel", vec!["feed"])]).unwrap();
+        let router = Router::new(reg);
+        // 另一规则（q20 形态，join 键 id）先注册 ip 索引——本测试模拟 q8
+        // （请求 score 字段）：score 未注册索引 → 扫描回退而非假空 miss。
+        router
+            .registry()
+            .get_window("threat_intel")
+            .unwrap()
+            .set_join_key("ip".into());
+        assert!(
+            router
+                .registry()
+                .get_window("threat_intel")
+                .unwrap()
+                .has_join_key("ip")
+        );
+        assert!(
+            !router
+                .registry()
+                .get_window("threat_intel")
+                .unwrap()
+                .has_join_key("score")
+        );
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_000_000_000,
+                    2_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["10.0.0.1", "10.0.0.2"])),
+                Arc::new(Int64Array::from(vec![80, 95])),
+            ],
+        )
+        .unwrap();
+        router.route("feed", batch).await.unwrap();
+
+        let lookup = RegistryLookup::new(&router);
+        // 请求 key_field=score（≠ 索引 ip）→ 必须扫描回退，按 score 过滤。
+        let rows = lookup
+            .join_lookup("threat_intel", "score", &Value::Number(95.0))
+            .expect("field mismatch must fall back to scan, not return empty");
+        assert_eq!(rows.len(), 1, "score=95 的行经扫描回退命中");
+        assert_eq!(
+            rows[0].field_value("ip"),
+            Some(Value::Str("10.0.0.2".into()))
+        );
     }
 
     /// P4 side input：provider 窗口 join_lookup——无 buffer 窗口/索引，按精确

@@ -108,18 +108,29 @@ pub fn compile_wfl_with_diagnostics(
     source: &str,
     path: impl AsRef<Path>,
 ) -> LangResult<Vec<RulePlan>> {
-    let errors = check_wfl_errors(file, schemas);
+    // 顶层列表引用（issue #73）先展开（未知名/非法位置在此报错, 带文件路径）。
+    let file = crate::compiler::lists::resolve_list_refs(file).map_err(|e| {
+        crate::error::error(
+            LangReason::Compile,
+            format!(
+                "file: {}\ncategory: compile\n{}",
+                path.as_ref().display(),
+                e.detail().clone().unwrap_or_else(|| e.to_string())
+            ),
+        )
+    })?;
+    let errors = check_wfl_errors(&file, schemas);
     if !errors.is_empty() {
         let diagnostics: Vec<String> = errors
             .iter()
-            .map(|error| format_check_error_with_source(error, file, source, path.as_ref()))
+            .map(|error| format_check_error_with_source(error, &file, source, path.as_ref()))
             .collect();
         return crate::error::fail(
             LangReason::Compile,
             format!("semantic errors:\n{}", diagnostics.join("\n\n")),
         );
     }
-    crate::compiler::compile_wfl_after_semantic_checks(file, schemas).map_err(|error| {
+    crate::compiler::compile_wfl_after_semantic_checks(&file, schemas).map_err(|error| {
         crate::error::error(
             LangReason::Compile,
             format!(

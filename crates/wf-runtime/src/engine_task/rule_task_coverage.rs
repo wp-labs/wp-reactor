@@ -445,6 +445,7 @@ fn make_bare_task() -> RuleTask {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
         progress: HashMap::new(),
         conv_sink: None,
     };

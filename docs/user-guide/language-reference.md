@@ -537,7 +537,47 @@ yield scan_alerts : base_alerts, ioc_fields (
 - 必填参数不能排在带默认值参数之后；缺少必填参数、实参数量过多、未知 `$param` 都是编译错误
 - preset 中引用的事件 alias 在使用点解析；推荐 preset 优先放常量、`@score`、`@__wfu_*` 和时间系统变量
 
-项目级公共 preset 可集中放入规则根目录下的 `_global.wfl`。规则根目录由 `runtime.rules` glob 的非通配前缀推导，例如 `rules/**/*.wfl` 对应 `rules/_global.wfl`，`rules/current/*.wfl` 对应 `rules/current/_global.wfl`。运行时会自动把它作为 project prelude 加载，并从普通规则文件列表中排除；`_global.wfl` 只允许 `yield preset` 声明，不会自动启用普通 `rule`。
+项目级公共 preset 可集中放入规则根目录下的 `_global.wfl`。规则根目录由 `runtime.rules` glob 的非通配前缀推导，例如 `rules/**/*.wfl` 对应 `rules/_global.wfl`，`rules/current/*.wfl` 对应 `rules/current/_global.wfl`。运行时会自动把它作为 project prelude 加载，并从普通规则文件列表中排除；`_global.wfl` 只允许 `yield preset` 声明，不会自动启用普通 `rule`（列表请走下面的 `use` 导入）。
+
+#### 顶层列表 + `use` 导入
+
+跨规则复用公共允许列表（issue #73）：一组 `in (...)` 右值只定义一次，多条规则以 `expr in <name>`（或 `expr not in <name>`）引用。列表声明是**顶层裸绑定**（无关键字、无可见性控制——WFL 规模小不做导出控制，use 导入的文件其全部顶层列表都可见）：
+
+```wfl
+// security_lists.wfl —— 列表定义文件（不含规则）
+security_log_types = (
+    "360_active_defense_log",
+    "edr_alert_log",
+    "fw_ips_protect_log"
+)
+high_risk_types = ("attack", "malware")
+```
+
+```wfl
+// rules.wfl —— 规则文件 use 导入
+use "security_lists.wfl"
+
+rule alert_rule {
+    events { s : sdm_event && s.log_type in security_log_types }
+    ...
+}
+
+rule alert_entity_rule {
+    events { s : sdm_event && s.log_type in security_log_types }
+    ...
+}
+```
+
+语义：
+
+- 列表声明必须在规则之前（与 `yield preset` / `pattern` 同文法位置）；元素与手写 `in (...)` 列表同文法
+- `use "file.wfl"` 是 **include 语义**：目标文件的全部顶层列表并入当前作用域（flatten、无限定名）；递归传播（A use B、C use A → C 也可见 B 的列表）；相对路径以被导入文件所在目录为基准
+- `.wfs` 目标的 `use` 维持原样（schema 引用，由加载层另行加载，不在此导入）
+- 编译期把引用展开为字面列表——元素类型检查、运行时求值与手写列表**逐字节等价**，不引入新语义
+- **类型检查**：列表元素推断同类型（`in (...)` 字面列表与命名列表统一）；元素混合类型 → 报错；`expr in <list>` 左值类型与元素类型不兼容 → 报错（推断不出的元素如函数调用跳过，不误报）
+- 错误面：引用未声明列表 / use 目标缺失 / 循环引用（A↔B）/ 重名（文件内与导入、导入与导入）→ 编译错误，可定位
+- 支持 `not in <name>`；列表元素不支持嵌套引用其他列表
+- `use` 只导入顶层列表——`pattern` 在解析阶段展开（技术上不可导入）、`yield preset` 走 `_global.wfl` prelude
 
 #### 时间系统变量
 
@@ -895,7 +935,7 @@ fmt("{} failed {} times from {}", fail.username, count(fail), fail.sip)
 - 结构化对象：`merge`
 - 时间：`time_diff`、`time_bucket`
 - 网络：`cidr_match(ip, subnet)`（IP 是否落在子网内，subnet 为 `"addr/prefix"`，兼容 IPv4/IPv6，Sigma `|cidr` 等效）
-- 当前引擎时间：`now`、`now_s`、`now_ms`、`now_us`、`now_ns`
+- 当前引擎时间：`now`、`now_s`、`now_ms`、`now_us`、`now_ns`；时间值转换：`time_to_s`、`time_to_ms`
 - 哈希 / 编码：`md5`、`sha1`、`sha1_n`、`sha256`、`hex`、`stable_id`
 - 窗口集合：`collect_set`、`collect_list`、`first`、`last`
 - 画像 / 回看：`baseline`
@@ -966,6 +1006,29 @@ yield security_alerts (
 - 同一条输出记录的多个 `yield` 字段里调用 `now_*`，会复用同一个内部时间戳。
 - 默认 `time` 数值使用 epoch milliseconds；显式单位函数 `now_s()` / `now_us()` / `now_ns()` 按函数名返回对应单位。
 - 当前运行时数值统一使用 `f64` 表示；需要可精确持久化的业务时间，优先写入 `time` 字段。
+
+#### 时间值转换（epoch 单位）
+
+| 函数 | 返回类型 | 说明 |
+|------|----------|------|
+| `time_to_ms(ts)` | `digit` | time/数值 → epoch 毫秒（13 位）；参数可为系统变量、时间字段或聚合结果，自动识别秒/毫秒/微秒/纳秒输入 |
+| `time_to_s(ts)` | `digit` | time/数值 → epoch 秒（10 位） |
+
+示例（告警表统一毫秒时间戳）：
+
+```wfl
+yield security_alerts (
+    first_alert_time = time_to_ms(@event_first_time),
+    first_insert_time = time_to_ms(s.parse_time),
+    update_time = time_to_ms(@emit_time)
+)
+```
+
+说明：
+
+- 引擎内部时间表示对业务不可见——系统变量（`@event_*_time` 等）为毫秒，输入时间字段为纳秒；`time_to_*` 按数量级归一化后统一输出目标单位，两种来源结果一致。
+- `time_to_ms(@event_first_time)` 等价于把该时间直接写入 `digit` 字段并输出毫秒；`strftime` 仍用于格式化为字符串。
+- 注意：`yield` 表达式里的 `min(f)` / `max(f)` 是**匹配步骤序列聚合**（如 `min(match_event(e).x)`），对普通字段返回空；窗口内聚合请在 `match` 内用聚合语法，再在 `yield` 引用其结果。
 
 #### 时间格式化与解析
 

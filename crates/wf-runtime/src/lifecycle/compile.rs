@@ -81,6 +81,17 @@ pub(crate) fn compile_rules(
             .map_err(lang_diagnostic)?;
         validate_rule_prelude_conflicts(&wfl_file, &preprocessed, full_path, prelude.as_ref())?;
         apply_rule_prelude(&mut wfl_file, prelude.as_ref());
+        // issue #73: `use "file.wfl"` 导入顶层列表（include 语义, 递归/循环/重名报错）。
+        wfl_file =
+            wf_lang::compiler::lists::resolve_imports(&wfl_file, full_path, &mut |import_path| {
+                load_wfl_with_context(import_path, ctx, Some(base_dir)).map_err(|e| {
+                    wf_lang::error::error(
+                        wf_lang::LangReason::Compile,
+                        e.detail().clone().unwrap_or_else(|| e.to_string()),
+                    )
+                })
+            })
+            .map_err(lang_diagnostic)?;
         all_rules.extend(wfl_file.rules.iter().cloned());
         parsed_files.push(ParsedRuleFile {
             path: full_path.clone(),
@@ -622,6 +633,9 @@ fn validate_rule_prelude(
         Some("use declarations")
     } else if !file.patterns.is_empty() {
         Some("pattern declarations")
+    } else if !file.lists.is_empty() {
+        // issue #73 定稿: 列表走 `use` 导入, prelude 只管 yield preset。
+        Some("list declarations (declare lists in a separate file and `use` it)")
     } else if !file.rules.is_empty() {
         Some("rule declarations")
     } else if !file.tests.is_empty() {

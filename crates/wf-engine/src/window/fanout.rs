@@ -290,6 +290,24 @@ impl RuleFanout {
             .contains_key(window_name)
     }
 
+    /// 窗口分片冲突检测（2026-08-29 q11/q6 多规则根因）：`window_sharding` 是
+    /// **每窗口单一 (keys, shard_count) 配置**（覆盖式 insert），多个规则以
+    /// **不同 keys** 分片同一窗口时互相覆盖——后注册规则的 shard 拉取按被覆盖的
+    /// key 分片，同 key 事件分散到不同 shard → 有状态规则状态被切碎（q11
+    /// bidder session 单规则 17081 → all 118234、q6 872913 → 787704）。
+    /// 注册方（spawn）用它判定：窗口已被不同 keys 注册 → 本规则回退单 worker
+    /// （整批处理，正确性优先）。同 keys（如 q11/q12 都按 bidder）不算冲突。
+    pub fn window_sharding_conflicts(&self, window_name: &str, keys: &[FieldRef]) -> bool {
+        let reg = self
+            .window_sharding
+            .read()
+            .expect("fanout sharding lock poisoned");
+        match reg.get(window_name) {
+            Some((existing, _)) => existing.as_ref() != keys,
+            None => false,
+        }
+    }
+
     /// 输入行索引分区注册（空键 stats 输入分片, 2026-08-24 q15）:
     /// `shard_rows[i] = 行号 % shard_count == i` 的行。空键 = index 分区标记。
     pub fn register_window_index_sharding(&self, window_name: &str, shard_count: usize) {
@@ -762,6 +780,43 @@ mod tests {
 
     fn keys() -> Vec<FieldRef> {
         vec![FieldRef::Simple("id".into())]
+    }
+
+    /// 窗口分片冲突检测（2026-08-29 q11/q6 多规则根因）：window_sharding 是每
+    /// 窗口单一 (keys) 配置（覆盖式 insert），多规则不同 key 分片同一窗口互相
+    /// 覆盖 → 后注册者必须回退单 worker。同 keys 不算冲突（共享分片）。
+    #[test]
+    fn window_sharding_conflicts_detects_key_mismatch() {
+        let fanout = RuleFanout::new();
+        let k_bidder = [FieldRef::Simple("bidder".into())];
+        let k_auction = [FieldRef::Simple("auction".into())];
+
+        // 未注册 → 不冲突。
+        assert!(
+            !fanout.window_sharding_conflicts("bid_events", &k_bidder),
+            "未注册窗口不冲突"
+        );
+
+        // 注册 bidder 分片。
+        fanout.register_window_sharding("bid_events", Arc::from(k_bidder.as_slice()), 10);
+        assert!(
+            !fanout.window_sharding_conflicts("bid_events", &k_bidder),
+            "同 keys（q11/q12 都按 bidder）不冲突，共享分片"
+        );
+        assert!(
+            fanout.window_sharding_conflicts("bid_events", &k_auction),
+            "不同 keys（q5/q7 按 auction）冲突 → 后注册者回退单 worker"
+        );
+        assert!(
+            fanout.window_sharding_conflicts("bid_events", &[]),
+            "空 keys（stats index 分区）与已有 key 分片同样冲突"
+        );
+
+        // 不同窗口互不影响。
+        assert!(
+            !fanout.window_sharding_conflicts("auction_events", &k_auction),
+            "其它窗口独立"
+        );
     }
 
     /// `round_robin_only` 驱动中间窗广播裁剪（2026-08-25 q13 分片内存）：

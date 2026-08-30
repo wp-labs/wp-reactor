@@ -628,7 +628,7 @@ impl WindowLookup for Q20WinLookup<'_> {
     }
     fn join_lookup(&self, _w: &str, _kf: &str, key: &Value) -> Option<Vec<JoinRow>> {
         let jk = JoinKey::from_value(key)?;
-        self.win.join_lookup(&jk, None)
+        self.win.join_lookup("id", &jk, None)
     }
 }
 

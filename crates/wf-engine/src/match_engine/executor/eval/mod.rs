@@ -429,7 +429,12 @@ fn contains_l3_func(expr: &wf_lang::ast::Expr) -> bool {
 }
 
 fn is_eval_time_func(name: &str) -> bool {
-    matches!(name, "now" | "now_s" | "now_ms" | "now_us" | "now_ns")
+    // now 系列 + 时间转换（time_to_s/time_to_ms，issue #69）都需要 L3 时间
+    // 工具（current_time_nanos / normalize_epoch_timestamp_float_nanos）。
+    matches!(
+        name,
+        "now" | "now_s" | "now_ms" | "now_us" | "now_ns" | "time_to_s" | "time_to_ms"
+    )
 }
 
 fn contains_eval_time_func(expr: &wf_lang::ast::Expr) -> bool {

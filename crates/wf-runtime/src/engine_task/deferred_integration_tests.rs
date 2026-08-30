@@ -359,6 +359,7 @@ fn make_deferred_join_task_with_over(
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -1046,6 +1047,7 @@ fn make_q8_task() -> (
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -1094,6 +1096,77 @@ async fn deferred_q8_hit_outputs_when_watermark_passes_bucket_end() {
         super::tests::field_str(&alert, "__wfu_entity_id"),
         "5",
         "桶内 seller==5 的 auction → person 5 输出"
+    );
+}
+
+/// 回归（2026-08-29 q8 多规则 7565→1 根因 + 2026-08-30 多 key 索引）：
+/// 旧实现 join 索引**首键独占**——另一规则先用不同 key（id）注册 auction_events
+/// 后，q8（join 键 seller）的索引查询会得到「索引命中但空」的假空（不触发扫描
+/// 回退）→ 静默全 miss；后改为 key_field 不匹配回退扫描（2026-08-29），再改为
+/// **每 key 字段各建索引**（2026-08-30，多 key 支持）。本测试覆盖两条路径：
+/// ① 只注册 id → q8 的 seller 无索引走扫描回退仍正确；② 补注册 seller → q8
+/// 走 O(1) 索引仍正确（两种路径结果一致）。
+#[tokio::test]
+async fn deferred_q8_join_key_conflict_falls_back_to_scan() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_q8_task();
+
+    // 模拟 q20（join auction_events on b.auction == auction_events.id）先注册
+    // id 索引——q8 的 join 键是 seller。
+    q8_auction_window(&router).set_join_key("id".into());
+    assert!(q8_auction_window(&router).has_join_key("id"));
+    assert!(!q8_auction_window(&router).has_join_key("seller"));
+
+    // 与 deferred_q8_hit_outputs_when_watermark_passes_bucket_end 相同的场景。
+    q8_person_window(&router)
+        .append_with_watermark(person_batch(&[(5, T)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    assert!(alert_rx.try_recv().is_err(), "未到期 — 不输出");
+
+    q8_auction_window(&router)
+        .append_with_watermark(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .unwrap();
+    q8_auction_window(&router)
+        .append_with_watermark(q8_auction_batch(&[(99, T + 11_000_000_000)]))
+        .unwrap();
+    q8_person_window(&router)
+        .append_with_watermark(person_batch(&[(6, T + 11_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "5",
+        "id 索引占用时 q8（seller 无索引）走扫描回退仍命中"
+    );
+
+    // 2026-08-30 多 key：补注册 seller → q8 走 O(1) 索引，同场景输出不变。
+    q8_auction_window(&router).set_join_key("seller".into());
+    assert!(q8_auction_window(&router).has_join_key("seller"));
+    let (mut task2, mut alert_rx2, router2) = make_q8_task();
+    q8_auction_window(&router2).set_join_key("id".into());
+    q8_auction_window(&router2).set_join_key("seller".into());
+    q8_person_window(&router2)
+        .append_with_watermark(person_batch(&[(5, T)]))
+        .unwrap();
+    task2.pull_and_advance().await;
+    q8_auction_window(&router2)
+        .append_with_watermark(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .unwrap();
+    q8_auction_window(&router2)
+        .append_with_watermark(q8_auction_batch(&[(99, T + 11_000_000_000)]))
+        .unwrap();
+    q8_person_window(&router2)
+        .append_with_watermark(person_batch(&[(6, T + 11_000_000_000)]))
+        .unwrap();
+    task2.pull_and_advance().await;
+    let alert2 = super::tests::take_alert(&mut alert_rx2);
+    assert_eq!(
+        super::tests::field_str(&alert2, "__wfu_entity_id"),
+        "5",
+        "多 key 索引（seller 有索引）时 q8 走 O(1) 仍命中"
     );
 }
 
@@ -1854,6 +1927,7 @@ async fn q13_dual_chain_intermediate_window_pressure() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (mut task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
 
@@ -1892,6 +1966,7 @@ async fn q13_dual_chain_intermediate_window_pressure() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (mut task_b, _cancel_b, _interval_b) = rule_task::RuleTask::new(config_b);
 
@@ -2066,6 +2141,7 @@ async fn q13_dual_chain_sharded_push_consumption_complete() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (mut task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
 
@@ -2112,6 +2188,7 @@ async fn q13_dual_chain_sharded_push_consumption_complete() {
             push_rx: Some(push_rx),
             shard_index: Some(shard_idx),
             shard_count: SHARDS,
+            key_partitioned: false,
         };
         let (mut task_b, _cancel_b, _interval_b) = rule_task::RuleTask::new(config_b);
         // RuleTask 持有 push_rx（run_rule_task 里 take）；测试自己保留接收端
@@ -2286,6 +2363,7 @@ async fn q13_dual_chain_sharded_push_high_slope_repro() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
 
@@ -2331,6 +2409,7 @@ async fn q13_dual_chain_sharded_push_high_slope_repro() {
             push_rx: Some(push_rx),
             shard_index: Some(shard_idx),
             shard_count: SHARDS,
+            key_partitioned: false,
         };
         let (mut task_b, _cancel_b, _interval_b) = rule_task::RuleTask::new(config_b);
         shard_rxs.push(Some(task_b.push_rx.take().unwrap()));
@@ -2478,6 +2557,7 @@ async fn q13_dual_chain_sharded_producer_and_consumer() {
             push_rx: None,
             shard_index: Some(shard_idx),
             shard_count: PRODUCER_SHARDS,
+            key_partitioned: false,
         };
         let (task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
         producer_tasks.push(task_a);
@@ -2525,6 +2605,7 @@ async fn q13_dual_chain_sharded_producer_and_consumer() {
             push_rx: Some(push_rx),
             shard_index: Some(shard_idx),
             shard_count: SHARDS,
+            key_partitioned: false,
         };
         let (mut task_b, _cancel_b, _interval_b) = rule_task::RuleTask::new(config_b);
         shard_rxs.push(Some(task_b.push_rx.take().unwrap()));
@@ -2637,6 +2718,7 @@ async fn q13_sharded_pull_acks_processed_not_read_position() {
             push_rx: None,
             shard_index: Some(shard_idx),
             shard_count: SHARDS,
+            key_partitioned: false,
         };
         let (task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
         tasks.push(task_a);
@@ -2754,6 +2836,7 @@ async fn q13_dual_chain_intermediate_window_unregistered_consumer_loses() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (mut task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
 
@@ -2834,6 +2917,7 @@ async fn deferred_q9_real_wfl_compiled_plan_runs() {
         push_rx: None,
         shard_index: None,
         shard_count: 1,
+        key_partitioned: false,
     };
     let (mut task, _cancel, _interval) = rule_task::RuleTask::new(config);
     let mut alert_rx = alert_rx;

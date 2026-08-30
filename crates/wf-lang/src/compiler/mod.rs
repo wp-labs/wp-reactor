@@ -19,6 +19,8 @@ use crate::yield_preset::expand_yield_args;
 use crate::{LangReason, LangResult};
 use orion_error::conversion::ToStructError;
 
+pub mod lists;
+
 #[cfg(test)]
 mod tests;
 
@@ -31,7 +33,11 @@ mod tests;
 /// Contracts, use declarations, and meta blocks are stripped — only rule
 /// logic is compiled.
 pub fn compile_wfl(file: &WflFile, schemas: &[WindowSchema]) -> LangResult<Vec<RulePlan>> {
-    let errors = check_wfl(file, schemas);
+    // 顶层列表引用（issue #73）先展开——checker 只见到字面 InList（既有类型
+    // 检查原样生效）, 未知名/非法位置在此报错。use 导入在加载层完成
+    // （`lists::resolve_imports`）, 这里只管本文件内已合并的列表展开。
+    let file = lists::resolve_list_refs(file)?;
+    let errors = check_wfl(&file, schemas);
     let hard_errors: Vec<_> = errors
         .iter()
         .filter(|e| e.severity == crate::checker::Severity::Error)
@@ -43,7 +49,7 @@ pub fn compile_wfl(file: &WflFile, schemas: &[WindowSchema]) -> LangResult<Vec<R
             .with_detail(format!("semantic errors:\n{}", msgs.join("\n")))
             .err();
     }
-    compile_wfl_after_semantic_checks(file, schemas)
+    compile_wfl_after_semantic_checks(&file, schemas)
 }
 
 pub(crate) fn compile_wfl_after_semantic_checks(
@@ -880,7 +886,8 @@ fn expr_uses_l3_series(e: &Expr) -> bool {
         | Expr::SystemVar(_)
         | Expr::WfuMeta(_)
         | Expr::Field(_)
-        | Expr::PresetParam(_) => false,
+        | Expr::PresetParam(_)
+        | Expr::ListRef(_) => false,
         Expr::BinOp { left, right, .. } => expr_uses_l3_series(left) || expr_uses_l3_series(right),
         Expr::Neg(inner) => expr_uses_l3_series(inner),
         Expr::Not(inner) => expr_uses_l3_series(inner),
@@ -1240,7 +1247,9 @@ fn rewrite_expr_label_refs(expr: &Expr, labels: &HashSet<String>) -> Expr {
         | Expr::Bool(_)
         | Expr::SystemVar(_)
         | Expr::WfuMeta(_)
-        | Expr::PresetParam(_) => expr.clone(),
+        | Expr::PresetParam(_)
+        // 编译期已展开（resolve_list_refs 在 checker 前）; 防御性保留。
+        | Expr::ListRef(_) => expr.clone(),
         Expr::Object(items) => Expr::Object(
             items
                 .iter()

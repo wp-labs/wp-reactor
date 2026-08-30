@@ -3,8 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{BooleanArray, new_null_array};
-use arrow::datatypes::DataType;
+use arrow::array::{
+    BooleanArray, Float64Array, Int64Array, TimestampNanosecondArray, new_null_array,
+};
+use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use orion_error::conversion::{SourceRawErr, ToStructError};
 use tokio::sync::mpsc;
@@ -394,6 +396,18 @@ pub(super) struct RuleTask {
     /// Total shard count this rule is split across (1 when unsharded). Used by
     /// the on-each round-robin gate (`seq % shard_count == shard_index`).
     shard_count: usize,
+    /// 2026-08-29 q1/q20 all 模式分片误拉修复：本规则是否**自己** key 分片消费
+    /// （仅 sharded match 规则为 true；见 `RuleTaskConfig::key_partitioned`）。
+    /// `pull_and_advance` 用它替代全局 `window_is_sharded` 决定拉取行子集。
+    key_partitioned: bool,
+    /// 2026-08-29 q6/q20 snapshot join 竞态 gate 的等待目标右窗（去重，构造时
+    /// 解析）：live_joins 的即时 join + key_join（join-then-key）的右窗。
+    eager_join_targets: Vec<String>,
+    /// 2026-08-30 gate 尾部优化：上次 bail（frontier 停滞放行）时的目标窗
+    /// frontier。后续批若目标窗 frontier 未再推进 → 直接跳过等待（目标流已
+    /// 排空/结束，结论同上次 bail）。frontier 推进即失效。Mutex 供 &self
+    /// 访问（与 pending_alerts 同模式，跨 await 不持锁）。
+    last_bailed_frontier: std::sync::Mutex<Option<(String, i64)>>,
     /// Profiling accumulators (nanos) for locating the rule-task bottleneck.
     advance_nanos: u64,
     scan_nanos: u64,
@@ -498,6 +512,7 @@ impl RuleTask {
             conv_sink,
             shard_index,
             shard_count,
+            key_partitioned,
         } = config;
         let aliases: HashMap<String, Vec<String>> = window_sources
             .iter()
@@ -590,6 +605,26 @@ impl RuleTask {
             })
             .collect();
 
+        // 2026-08-29 q6/q20 snapshot join 竞态 gate 的等待目标（编译期固定，
+        // 构造时解析一次，免每批 clone live_joins/key_join）：本规则**实际执行**
+        // 的即时 join 右窗（去重）。key_join 必需：q6 形态的 join 只喂 match 键、
+        // 输出不读右窗字段 → 被 dead-join 消除剔除出 live_joins，但 join 在
+        // advance 仍执行——漏掉它则 gate 不触发、竞态照旧（实测从未触发）。
+        let eager_join_targets = {
+            let mut targets: Vec<String> = Vec::new();
+            for join in executor.live_joins() {
+                if join.emit_at.is_none() && !targets.contains(&join.right_window) {
+                    targets.push(join.right_window.clone());
+                }
+            }
+            if let Some(kjp) = machine.as_ref().and_then(|m| m.plan().key_join.clone())
+                && !targets.contains(&kjp.right_window)
+            {
+                targets.push(kjp.right_window);
+            }
+            targets
+        };
+
         let task = Self {
             task_id,
             machine,
@@ -614,6 +649,9 @@ impl RuleTask {
             pushed_seq: 0,
             shard_index,
             shard_count,
+            key_partitioned,
+            eager_join_targets,
+            last_bailed_frontier: std::sync::Mutex::new(None),
             progress,
             advance_nanos: 0,
             scan_nanos: 0,
@@ -675,7 +713,7 @@ impl RuleTask {
             // Key-partitioned (match) windows yield per-shard row subsets;
             // everything else (on-each round-robin, unsharded) pulls whole
             // batches and is gated below.
-            let key_partitioned = self.router.fanout().window_is_sharded(&source.window_name);
+            let key_partitioned = self.key_partitioned;
             let pull_shard = if key_partitioned {
                 self.shard_index
             } else {
@@ -812,11 +850,151 @@ impl RuleTask {
         self.update_rule_instances_metric();
     }
 
+    /// 批级时间列 max（raw i64，可向量化）：gate 只需「批 max 事件时间」用于与
+    /// 目标窗 frontier（同为 raw）比较——`batch_event_time_nanos_at` 的 f64
+    /// round-trip 圆整误差（1.7e18ns 处 ±256ns）相对 250ms 余量可忽略，直读 i64
+    /// 让编译器向量化（实测 187µs/批 → ~5µs/批，q20 30M gate 总耗时 139ms→10ms
+    /// 量级，消除 gate 的性能回退主项）。
+    fn batch_time_col_max(batch: &RecordBatch, col_idx: usize) -> i64 {
+        let col = batch.column(col_idx);
+        let n = batch.num_rows();
+        let null_free = col.null_count() == 0;
+        match col.data_type() {
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                if let Some(arr) = col.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                    let mut max_ts = i64::MIN;
+                    for row in 0..n {
+                        let v = arr.value(row);
+                        if null_free || !col.is_null(row) {
+                            max_ts = max_ts.max(v);
+                        }
+                    }
+                    return max_ts;
+                }
+            }
+            DataType::Int64 => {
+                if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                    let mut max_ts = i64::MIN;
+                    for row in 0..n {
+                        let v = arr.value(row);
+                        if null_free || !col.is_null(row) {
+                            max_ts = max_ts.max(v);
+                        }
+                    }
+                    return max_ts;
+                }
+            }
+            DataType::Float64 => {
+                if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+                    let mut max_ts = i64::MIN;
+                    for row in 0..n {
+                        if null_free || !col.is_null(row) {
+                            max_ts = max_ts.max(arr.value(row) as i64);
+                        }
+                    }
+                    return max_ts;
+                }
+            }
+            _ => {}
+        }
+        // 其它类型：逐行完整检查（原语义，含 f64 round-trip）。
+        let mut max_ts = i64::MIN;
+        for row in 0..n {
+            max_ts = max_ts.max(batch_event_time_nanos_at(batch, col_idx, row));
+        }
+        max_ts
+    }
+
     /// Process a single parsed batch (shared `Arc`) against the state machine.
     ///
     /// This is the per-batch body shared by the legacy pull path
     /// ([`Self::pull_and_advance`]) and the push path (channel recv). `batch_seq`
     /// is used only for debug event references.
+    /// 等所有即时 join 目标窗的 committed frontier 追平 `batch_max_ts + 余量`（本批
+    /// 驱动事件的最大事件时间 + 跨批引用前视余量）。数据生成保证 bid 引用的 auction
+    /// 事件时间早于 bid（同一 source 批内交错），故目标窗 commit 覆盖该上界即所有
+    /// 引用行可见。余量覆盖「未来 lead 引用」（NEXMark AUCTION_ID_LEAD=10 →
+    /// 引用行事件时间可晚于驱动行最多 ~50ms，且行在**下一 source 批**才产出——
+    /// 只等 batch_max_ts 会漏掉它们：all 模式实测 q20 196517→193k、q6
+    /// 872913→848k 的残余 miss 即此）。放弃等待的安全条件：目标窗提交前沿**停止
+    /// 增长**（~30ms 无新提交 = 目标流已排空/终止，或数据尾部 bid/auction 流 max
+    /// 天然差几秒——此时引用行早已提交，join 本就命中）；30s 硬截止为防御兜底
+    /// （理论上到不了）。
+    /// 注：与 deferred 评估 gate（scan_deferred）同一 `committed_frontier_ns`
+    /// 健全判据、同一停滞模式（flush 先例 60ms，本 gate 因非终局收紧到 30ms），
+    /// 只是把「等目标窗追平本批事件时间」从评估阶段前移到处理阶段。
+    async fn wait_eager_joins_caught_up(&self, targets: &[String], batch_max_ts: i64) {
+        for right_window in targets {
+            let Some(target) = self.router.registry().get_window(right_window) else {
+                continue; // provider 等无 buffer 窗口的 join 目标：无 actor/frontier
+            };
+            if target.time_col_index().is_none() {
+                continue; // 无时间列 → frontier 无意义（防御：不等待）
+            }
+            // 目标上界 = 驱动批 max 事件时间 + 跨批引用前视余量（见函数注释）：
+            // 引用行可在**下一 source 批**才产出，事件时间晚于驱动批 max 最多
+            // 一个 lead 窗口（NEXMark ≤50ms）。250ms = 5× 实测前视（19ms），
+            // 且小于单批跨度（~200ms）——等待被目标 actor 的连续提交快速满足。
+            const EAGER_JOIN_LEAD_MARGIN_NS: i64 = 250_000_000;
+            let target_ts = batch_max_ts.saturating_add(EAGER_JOIN_LEAD_MARGIN_NS);
+            let cur0 = target.committed_frontier_ns();
+            // 2026-08-30 尾部性能优化：上次 bail（frontier 停滞放行）后目标窗
+            // frontier 未再推进 → 目标流已排空/结束（或数据尾部 bid/auction 流
+            // max 天然差几秒）→ 本批结论与上次 bail 相同（引用行已提交或确实
+            // 缺失）→ 跳过等待。frontier 一旦推进缓存即失效（新数据 → 正常等待）。
+            if self
+                .last_bailed_frontier
+                .lock()
+                .expect("bail frontier lock poisoned")
+                .as_ref()
+                .is_some_and(|(w, f)| w == right_window && *f == cur0)
+            {
+                continue;
+            }
+            let mut stalled = 0u32;
+            let mut last = cur0;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let cur = target.committed_frontier_ns();
+                if cur >= target_ts {
+                    break; // 所有引用行（含跨批前视）已提交
+                }
+                if cur == last {
+                    stalled += 1;
+                    // 2026-08-30 q3 冷启动保护：目标窗**从未提交**（frontier ==
+                    // i64::MIN）时不 bail——停滞可能是目标窗 actor 尚未处理首个
+                    // mailbox batch（跨窗 actor 独立调度，冷启动首个 commit 前
+                    // frontier 必为 i64::MIN），bail 会让本批对空窗/半索引 join 全
+                    // miss。bail 只对「目标流已排空/结束」安全（frontier 停在真实
+                    // 提交值，引用行早已落地）。真无数据的目标窗靠 30s 硬截止兜底。
+                    if stalled >= 3 && cur != i64::MIN {
+                        // 连续 ~30ms 无新提交 → 目标流已排空/终止。记录 bail 时
+                        // 的 frontier：后续批 frontier 未动则直接跳过（见上）。
+                        *self
+                            .last_bailed_frontier
+                            .lock()
+                            .expect("bail frontier lock poisoned") =
+                            Some((right_window.clone(), cur));
+                        break;
+                    }
+                } else {
+                    stalled = 0;
+                }
+                last = cur;
+                if std::time::Instant::now() >= deadline {
+                    // 限时兜底（防御；actor 必然推进，到不了）。记录 frontier：
+                    // 后续批若 frontier 未动（真无数据的目标窗）直接跳过等待。
+                    *self
+                        .last_bailed_frontier
+                        .lock()
+                        .expect("bail frontier lock poisoned") = Some((right_window.clone(), cur));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn process_batch(
         &mut self,
@@ -840,6 +1018,38 @@ impl RuleTask {
         let Some(ordered_aliases) = self.ordered_aliases.get(window_name) else {
             return;
         };
+        // 2026-08-29 q6/q20 snapshot join 竞态 gate：处理驱动批前，等即时
+        // （snapshot/asof/inner，非 deferred）join 目标窗 commit 追平本批 max
+        // 事件时间。并行 parse + 跨窗口 actor 独立 commit 使 auction_events
+        // 的提交可能滞后于 bid_events 消费——即时 join 读目标窗时，已 append
+        // 但未 commit 的行不可见 → 静默 miss（q20 p=10 196517→189430、q6
+        // 872913→788k~845k、q3 6060→4795，oracle 对拍定位；单规则隔离全对，
+        // 多规则同跑竞争放大）。deferred join 已有评估 gate（scan_deferred 的
+        // committed frontier），不需要本 gate；无即时 join / 无时间列的规则
+        // 零开销。
+        // 触发条件的时间列：on-each 规则用 `each_time_field`；match 规则
+        // （each_time_field = None，q6/q3 形态）回退到驱动窗的时间列名——
+        // match 的 join 也在本批行循环内求值，需要同样的 frontier 保证。
+        let batch_time_field = match self.each_time_field.as_deref() {
+            Some(tf) => Some(tf.to_string()),
+            None => self
+                .router
+                .registry()
+                .get_window(window_name)
+                .and_then(|w| {
+                    let idx = w.time_col_index()?;
+                    Some(w.schema().field(idx).name().clone())
+                }),
+        };
+        let targets = &self.eager_join_targets;
+        if !targets.is_empty()
+            && let Some(batch) = batch
+            && let Some(time_col) = batch_time_field.as_deref()
+            && let Ok(col_idx) = batch.schema().index_of(time_col)
+        {
+            let batch_max_ts = Self::batch_time_col_max(batch, col_idx);
+            self.wait_eager_joins_caught_up(targets, batch_max_ts).await;
+        }
         // L2 deferred materialization: when the producer broadcast only the raw
         // batch, materialize only the rows the bind filter accepts. The time
         // column is still scanned over every row (watermark/expiry), but the
@@ -2616,6 +2826,14 @@ impl RuleTask {
             return;
         }
         let Some(_) = &self.machine else {
+            // on-each（无 match 状态机、无 deferred）：运行期 emit 按
+            // ALERT_BATCH_SIZE 满批 flush，但**最后一个未满批**（<4096）留在
+            // pending builder / pipe staging——关机 flush 必须补一次收口，否则
+            // 该批被静默丢弃（q1 920000→917469 尾批丢失根因，2026-08-28
+            // verify_file.sh 定位；metrics 在 emit 时已计数，只有文件/EMIT
+            // 对拍才暴露）。
+            self.flush_alerts().await;
+            self.flush_pipes().await;
             return;
         };
         self.cached_wall_nanos
@@ -2769,9 +2987,8 @@ impl RuleTask {
         }
         // Drain the batched alert delivery after close emissions.
         self.flush_alerts().await;
-        // Drain staged intermediate rows after close emissions (each rules
-        // early-return above — their rows are covered by the per-batch
-        // flush in `process_batch`).
+        // Drain staged intermediate rows after close emissions（on-each 规则已
+        // 在上面分支补收口，这里只覆盖 match 规则 close 发射装载的中间行）。
         self.flush_pipes().await;
     }
 

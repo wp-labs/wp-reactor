@@ -35,6 +35,8 @@ pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
             _ => scope.resolve_field_ref(fref).ok().flatten(),
         },
         Expr::PresetParam(_) => None,
+        // 编译期已展开（resolve_list_refs 在 checker 前）。
+        Expr::ListRef(_) => None,
         Expr::Object(_) => Some(ValType::Object),
         Expr::Array(items) => infer_array_type(items, scope),
         Expr::BinOp { op, left, right } => infer_binop(*op, left, right, scope),
@@ -167,6 +169,7 @@ fn infer_func_call(
         "baseline" | "time_diff" => Some(ValType::Base(BaseType::Float)),
         "now" => Some(ValType::Base(BaseType::Time)),
         "now_s" | "now_ms" | "now_us" | "now_ns" => Some(ValType::Base(BaseType::Digit)),
+        "time_to_s" | "time_to_ms" => Some(ValType::Base(BaseType::Digit)),
         "strftime" => Some(ValType::Base(BaseType::Chars)),
         "strptime" => Some(ValType::Base(BaseType::Time)),
         "lower" | "upper" | "replace" | "trim" | "ltrim" | "rtrim" | "concat" | "join"

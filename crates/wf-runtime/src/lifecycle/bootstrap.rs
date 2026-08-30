@@ -1,6 +1,6 @@
 use orion_error::conversion::ToStructError;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,8 +107,9 @@ pub(super) async fn load_and_compile(
 
     // 5.5. Initialize wp_knowledge if knowdb.toml exists
     //      (Redis provider + [fun] registry for external(), CSV/DB tables for windows)
-    let knowdb_path = base_dir.join("knowdb.toml");
-    if knowdb_path.exists() {
+    // 2026-08-30: knowdb.toml 允许放 models/schemas/（与 windows.toml/schemas 同目录，
+    // nexmark_pk 已迁移）；根目录旧位保留作向后兼容回退。
+    if let Some(knowdb_path) = find_knowdb_path(base_dir) {
         // Load provider windows (table=)
         if !provider_configs.is_empty() {
             load_knowledge_into_windows(&knowdb_path, base_dir, &mut registry)?;
@@ -231,9 +232,10 @@ pub(crate) fn build_pipe_registry(
 
 /// Configure hash-join indexes on buffer windows targeted by rule joins, so
 /// join lookups are O(1) hash lookups instead of O(rows) snapshot scans.
-/// Each join's first condition's right field becomes the window's join key.
+/// 2026-08-30 多 key：收集每个窗口的**全部去重** join 右字段（多个规则以不同
+/// key join 同一窗口时各自建索引），不再首键独占。
 fn configure_join_indexes(router: &Router, plans: &[wf_lang::plan::RulePlan]) {
-    let mut keys_by_window: HashMap<String, String> = HashMap::new();
+    let mut keys_by_window: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     for plan in plans {
         for join in &plan.joins {
             if let Some(cond) = join.conds.first()
@@ -241,13 +243,16 @@ fn configure_join_indexes(router: &Router, plans: &[wf_lang::plan::RulePlan]) {
             {
                 keys_by_window
                     .entry(join.right_window.clone())
-                    .or_insert_with(|| field.to_string());
+                    .or_default()
+                    .insert(field.to_string());
             }
         }
     }
-    for (window, key_field) in keys_by_window {
+    for (window, keys) in keys_by_window {
         if let Some(win) = router.registry().get_window(&window) {
-            win.set_join_key(key_field);
+            for key_field in keys {
+                win.set_join_key(key_field);
+            }
         }
     }
 }
@@ -344,6 +349,17 @@ fn inject_sentinel_window(
         table: None,
     });
     Ok(())
+}
+
+/// Locate knowdb.toml：优先 `models/schemas/knowdb.toml`（与 windows.toml/schemas 同
+/// 目录，nexmark_pk 2026-08-30 迁移位置），回退根目录 `knowdb.toml`（历史位置）。
+/// 都找不到返回 None（无静态表/外部函数，正常跳过加载）。
+fn find_knowdb_path(base_dir: &Path) -> Option<PathBuf> {
+    let candidates = [
+        base_dir.join("models/schemas/knowdb.toml"),
+        base_dir.join("knowdb.toml"),
+    ];
+    candidates.into_iter().find(|p| p.exists())
 }
 
 /// Initialize wp_knowledge Redis provider and [fun] registry from knowdb.toml.

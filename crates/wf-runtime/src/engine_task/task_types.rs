@@ -63,6 +63,13 @@ pub(crate) struct RuleTaskConfig {
     pub shard_index: Option<usize>,
     /// Total shard count this rule is split across (1 when unsharded).
     pub shard_count: usize,
+    /// 2026-08-29 q1/q20 all 模式分片误拉修复：本规则是否**自己** key 分片消费
+    /// （match 规则的 `match<key>` 行子集）。仅 sharded match 分支为 true；
+    /// on-each round-robin 与单 worker 均为 false。`pull_and_advance` 用它决定
+    /// 拉取行子集（`shard_rows[i]`）还是整批——不能用全局
+    /// `window_is_sharded`（同窗口被其它 match 规则注册分片时，round-robin 规则
+    /// 会被误当 key-partitioned 拉取别人的行子集 → 走行式路径 + 偶发丢行）。
+    pub key_partitioned: bool,
     /// Consumption-progress slots by window name. The task acks `seq + 1`
     /// after fully processing a batch; on drop the slots are released so a
     /// shutdown task cannot pin window memory. Gates time-based eviction.

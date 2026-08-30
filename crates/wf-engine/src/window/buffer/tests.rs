@@ -837,6 +837,88 @@ fn committed_frontier_ignores_dropped_late() {
     );
 }
 
+/// q3 根因回归（nexmark_pk，2026-08-30）：**首次** append 期间 `committed_frontier_ns`
+/// 不得领先于 join 索引内容。旧实现在 `append_inner`（含 join 索引构建）**之前**
+/// 推进 `max_event_time_nanos`，而 per-source 提交前沿在 append 完成后才记录——
+/// 首次 append（per-source 为空）时 `committed_frontier_ns` 回退到全局 max，把
+/// 尚未建索引的批次 max 报为已提交 → eager join gate 提前放行 → snapshot join
+/// 与目标窗建索引并发 → 静默 miss（buffer 有行、索引没有，q3 丢 0~16 早期
+/// auction，oracle 字段级对拍定位）。
+///
+/// 本用例用并发采样器验证不变式：只要 `committed_frontier_ns() > i64::MIN`（目标
+/// 窗报告了真实提交水位），join 索引就必须已包含首批全部探测键。修复后
+/// max_event_time 只在 append（含索引）完成后推进，采样器永远看不到
+/// 「frontier 已推进、索引仍空」的中间态；旧实现会在索引构建期间观察到它。
+#[test]
+fn committed_frontier_never_leads_the_join_index() {
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    let win = StdArc::new(test_window(3600, usize::MAX));
+    win.set_join_key("value".into());
+    let schema = win.schema().clone();
+
+    // 大批首次 append：把 index_batch 的临界区拉长到几十 ms，让采样器稳定
+    // 落入「旧实现下 frontier 已推进、索引未建完」的窗口。
+    let n = 400_000usize;
+    let times: Vec<i64> = (0..n as i64).map(|i| 10_000_000_000i64 + i).collect();
+    let values: Vec<i64> = (0..n as i64).collect();
+    let batch = make_batch(&schema, &times, &values);
+    // 探测键散布在不同分片：旧实现索引逐片写入，任意时刻大概率有分片未写。
+    let probes: Vec<JoinKey> = vec![
+        JoinKey::Int(0),
+        JoinKey::Int(97_000),
+        JoinKey::Int(199_999),
+        JoinKey::Int(300_001),
+        JoinKey::Int(399_999),
+    ];
+
+    let stop = StdArc::new(AtomicBool::new(false));
+    let seen_bad = StdArc::new(AtomicBool::new(false));
+    let w = StdArc::clone(&win);
+    let s = StdArc::clone(&stop);
+    let bad = StdArc::clone(&seen_bad);
+    let probes_s = probes.clone();
+    let sampler = std::thread::spawn(move || {
+        while !s.load(AtomicOrdering::Relaxed) {
+            let f = w.committed_frontier_ns();
+            if f != i64::MIN {
+                // 报告了真实提交水位 → 索引必须已含全部探测行（修复后成立；
+                // 旧实现索引构建期间此处会命中空索引）。
+                let all_present = probes_s.iter().all(|k| {
+                    w.join_lookup("value", k, None)
+                        .is_some_and(|rows| !rows.is_empty())
+                });
+                if !all_present {
+                    bad.store(true, AtomicOrdering::Relaxed);
+                }
+            }
+        }
+    });
+
+    let src: Arc<str> = Arc::from("ingress#1");
+    win.append_with_watermark_sized_from(batch, 0, None, src)
+        .unwrap();
+
+    stop.store(true, AtomicOrdering::Relaxed);
+    sampler.join().expect("sampler thread join");
+    assert!(
+        !seen_bad.load(AtomicOrdering::Relaxed),
+        "committed_frontier_ns 领先于 join 索引内容（首次 append 期间把未提交 max 报为已提交）"
+    );
+
+    // 提交后收敛：frontier = per-source = 批次 max，探测键全部可查。
+    let max = 10_000_000_000i64 + n as i64 - 1;
+    assert_eq!(win.committed_frontier_ns(), max);
+    for k in &probes {
+        assert!(
+            win.join_lookup("value", k, None)
+                .is_some_and(|r| !r.is_empty()),
+            "提交后探测键 {k:?} 必须可查"
+        );
+    }
+}
+
 #[test]
 fn append_with_watermark_drop_late() {
     // watermark delay = 5s, allowed_lateness = 0s, late_policy = Drop
@@ -1554,17 +1636,20 @@ fn join_index_maintained_on_append_and_evict() {
 
     // Lookup by key: value 42 has 2 rows, 44 has 1, 999 has none.
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(42), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(42), None)
+            .map(|v| v.len()),
         Some(2),
         "two rows with value 42 indexed"
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(44), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(44), None)
+            .map(|v| v.len()),
         Some(1),
         "one row with value 44 indexed"
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(999), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(999), None)
+            .map(|v| v.len()),
         Some(0),
         "indexed but no match → empty (not None)"
     );
@@ -1573,7 +1658,7 @@ fn join_index_maintained_on_append_and_evict() {
     // (1-4ms), so all batches are time-evicted and index entries removed.
     win.evict_expired(4_000_000_000_000);
     assert!(
-        win.join_lookup(&JoinKey::Int(42), None)
+        win.join_lookup("value", &JoinKey::Int(42), None)
             .is_none_or(|v| v.is_empty()),
         "index cleared after eviction"
     );
@@ -1613,15 +1698,85 @@ fn join_key_from_value_conversion() {
 fn join_index_absent_without_set_join_key() {
     let win = test_window(3600, usize::MAX);
     assert!(
-        win.join_lookup(&JoinKey::Int(1), None).is_none(),
+        win.join_lookup("value", &JoinKey::Int(1), None).is_none(),
         "no join index → None (caller falls back to scan)"
     );
     // The asof fast path must also fall back (not Miss) without an index: the
     // caller then runs the full timestamped scan.
     assert!(matches!(
-        win.join_lookup_asof(&JoinKey::Int(1), 5_000_000_000, 0, None),
+        win.join_lookup_asof("value", &JoinKey::Int(1), 5_000_000_000, 0, None),
         AsofLookup::Fallback
     ));
+}
+
+#[test]
+fn join_index_multi_key_fields_each_get_own_index() {
+    // 2026-08-30 混跑 q8 卡死根因修复：同一窗口被不同规则以不同 key join
+    // （q8 按 seller / q20 按 id），每个 key 字段各建索引——后注册者不再被
+    // 首键独占而回退全窗扫描（deferred join O(全窗) × pending 数 → 卡死）。
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new("id", DataType::Int64, false),
+        Field::new("seller", DataType::Int64, false),
+    ]));
+    let win = Window::new(
+        WindowParams {
+            name: "multi_key_win".into(),
+            schema: Arc::clone(&schema),
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        test_config(usize::MAX),
+    );
+    // q20 先注册 id、q8 后注册 seller——两个索引并存（旧实现首键独占）。
+    win.set_join_key("id".into());
+    win.set_join_key("seller".into());
+    assert!(win.has_join_key("id"), "id 索引已建");
+    assert!(win.has_join_key("seller"), "seller 索引已建");
+    assert!(!win.has_join_key("nope"), "未注册字段无索引");
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(TimestampNanosecondArray::from(vec![
+                1_000_000, 2_000_000, 3_000_000,
+            ])),
+            Arc::new(Int64Array::from(vec![11, 22, 33])),
+            Arc::new(Int64Array::from(vec![101, 102, 103])),
+        ],
+    )
+    .unwrap();
+    win.append(batch).unwrap();
+
+    // id 索引 O(1) 命中。
+    assert_eq!(
+        win.join_lookup("id", &JoinKey::Int(22), None)
+            .map(|v| v.len()),
+        Some(1),
+        "id=22 经 id 索引命中"
+    );
+    // seller 索引 O(1) 命中（旧实现此处回退全窗扫描）。
+    assert_eq!(
+        win.join_lookup("seller", &JoinKey::Int(103), None)
+            .map(|v| v.len()),
+        Some(1),
+        "seller=103 经 seller 索引命中"
+    );
+    // timestamped 双索引各自命中。
+    assert_eq!(
+        win.join_lookup_timestamped("id", &JoinKey::Int(11), None)
+            .map(|v| v.len()),
+        Some(1)
+    );
+    assert_eq!(
+        win.join_lookup_timestamped("seller", &JoinKey::Int(102), None)
+            .map(|v| v.len()),
+        Some(1)
+    );
+    // 未注册字段 → None（调用方回退扫描语义保留）。
+    assert!(win.join_lookup("nope", &JoinKey::Int(22), None).is_none());
 }
 
 #[test]
@@ -1638,12 +1793,14 @@ fn join_index_built_for_existing_batches_on_set_join_key() {
         .unwrap();
     win.set_join_key("value".into());
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(42), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(42), None)
+            .map(|v| v.len()),
         Some(1),
         "existing rows indexed by set_join_key"
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(44), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(44), None)
+            .map(|v| v.len()),
         Some(1),
         "rows from a later batch indexed"
     );
@@ -1672,17 +1829,18 @@ fn join_index_updated_on_oldest_eviction() {
         "evict_oldest returns byte size"
     );
     assert!(
-        win.join_lookup(&JoinKey::Int(42), None)
+        win.join_lookup("value", &JoinKey::Int(42), None)
             .is_none_or(|v| v.is_empty()),
         "key 42 (first batch) removed after evict_oldest"
     );
     assert!(
-        win.join_lookup(&JoinKey::Int(43), None)
+        win.join_lookup("value", &JoinKey::Int(43), None)
             .is_none_or(|v| v.is_empty()),
         "key 43 (first batch) removed after evict_oldest"
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(44), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(44), None)
+            .map(|v| v.len()),
         Some(1),
         "key 44 (second batch) still indexed"
     );
@@ -1698,14 +1856,16 @@ fn join_index_duplicate_key_keeps_all_rows() {
     win.append(make_batch(&test_schema(), &[2_000_000], &[42]))
         .unwrap();
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(42), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(42), None)
+            .map(|v| v.len()),
         Some(2),
         "both rows with key 42 kept"
     );
     // Evict one batch → one row remains.
     win.evict_oldest();
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(42), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(42), None)
+            .map(|v| v.len()),
         Some(1),
         "one row removed on evict, one kept"
     );
@@ -1729,7 +1889,7 @@ fn join_index_stays_columnar_without_materializing_parsed_events() {
 
     // Columnar lookup still works.
     let rows = win
-        .join_lookup(&JoinKey::Int(42), None)
+        .join_lookup("value", &JoinKey::Int(42), None)
         .expect("indexed window should return rows");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].field_value("value"), Some(Value::Number(42.0)));
@@ -1753,7 +1913,13 @@ fn join_lookup_asof_max_fast_path() {
         .unwrap();
 
     // Fast-path hit: max_ts=3s falls within [2s, 5s] → returns the latest row.
-    match win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 2_000_000_000, None) {
+    match win.join_lookup_asof(
+        "value",
+        &JoinKey::Int(42),
+        5_000_000_000,
+        2_000_000_000,
+        None,
+    ) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(3_000_000_000.0)));
         }
@@ -1763,13 +1929,19 @@ fn join_lookup_asof_max_fast_path() {
 
     // max_ts too old (3s < min_ts=4s) → Miss (no scan needed).
     assert!(matches!(
-        win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 4_000_000_000, None),
+        win.join_lookup_asof(
+            "value",
+            &JoinKey::Int(42),
+            5_000_000_000,
+            4_000_000_000,
+            None
+        ),
         AsofLookup::Miss
     ));
     // Miss must be consistent with the fallback scan: every candidate ts is
     // below min_ts, so `find_asof_row` would also return `None`.
     let cands = win
-        .join_lookup_timestamped(&JoinKey::Int(42), None)
+        .join_lookup_timestamped("value", &JoinKey::Int(42), None)
         .unwrap();
     assert!(
         cands.iter().all(|(ts, _)| *ts < 4_000_000_000),
@@ -1778,7 +1950,7 @@ fn join_lookup_asof_max_fast_path() {
 
     // max_ts too new (3s > event_time=2s): a smaller row (ts=1s) qualifies, so
     // the index scans and returns it directly — no caller-side fallback scan.
-    match win.join_lookup_asof(&JoinKey::Int(42), 2_000_000_000, 0, None) {
+    match win.join_lookup_asof("value", &JoinKey::Int(42), 2_000_000_000, 0, None) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(1_000_000_000.0)));
         }
@@ -1788,12 +1960,18 @@ fn join_lookup_asof_max_fast_path() {
 
     // Unknown key → Miss.
     assert!(matches!(
-        win.join_lookup_asof(&JoinKey::Int(99), 5_000_000_000, 0, None),
+        win.join_lookup_asof("value", &JoinKey::Int(99), 5_000_000_000, 0, None),
         AsofLookup::Miss
     ));
 
     // Boundary: max_ts == min_ts (3s == 3s) → still a hit (inclusive lower bound).
-    match win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 3_000_000_000, None) {
+    match win.join_lookup_asof(
+        "value",
+        &JoinKey::Int(42),
+        5_000_000_000,
+        3_000_000_000,
+        None,
+    ) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(3_000_000_000.0)));
         }
@@ -1802,7 +1980,13 @@ fn join_lookup_asof_max_fast_path() {
     }
 
     // Boundary: max_ts == event_time (3s == 3s) → still a hit (inclusive upper bound).
-    match win.join_lookup_asof(&JoinKey::Int(42), 3_000_000_000, 2_000_000_000, None) {
+    match win.join_lookup_asof(
+        "value",
+        &JoinKey::Int(42),
+        3_000_000_000,
+        2_000_000_000,
+        None,
+    ) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(3_000_000_000.0)));
         }
@@ -1833,7 +2017,7 @@ fn join_lookup_asof_max_scans_when_max_is_future() {
     }
 
     // event_time=7s, min_ts=0: max_ts(9s) > 7s → scan picks 5s (greatest ≤ 7s).
-    match win.join_lookup_asof(&JoinKey::Int(42), 7_000_000_000, 0, None) {
+    match win.join_lookup_asof("value", &JoinKey::Int(42), 7_000_000_000, 0, None) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(5_000_000_000.0)));
         }
@@ -1842,7 +2026,13 @@ fn join_lookup_asof_max_scans_when_max_is_future() {
     }
 
     // Tight window [4s, 6s]: 5s qualifies, 3s/1s below, 9s above → 5s.
-    match win.join_lookup_asof(&JoinKey::Int(42), 6_000_000_000, 4_000_000_000, None) {
+    match win.join_lookup_asof(
+        "value",
+        &JoinKey::Int(42),
+        6_000_000_000,
+        4_000_000_000,
+        None,
+    ) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(5_000_000_000.0)));
         }
@@ -1852,7 +2042,13 @@ fn join_lookup_asof_max_scans_when_max_is_future() {
 
     // No candidate in [8s, 9s] below event_time=9s: max_ts==9s (== event_time)
     // is the fast-path hit, not the scan path.
-    match win.join_lookup_asof(&JoinKey::Int(42), 9_000_000_000, 8_000_000_000, None) {
+    match win.join_lookup_asof(
+        "value",
+        &JoinKey::Int(42),
+        9_000_000_000,
+        8_000_000_000,
+        None,
+    ) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(9_000_000_000.0)));
         }
@@ -1863,7 +2059,13 @@ fn join_lookup_asof_max_scans_when_max_is_future() {
     // No candidate in [7.5s, 8.5s] (max_ts=9s > event_time=8.5s, all rows ≤7.5s
     // or =9s are outside [7.5s,8.5s]) → Miss.
     assert!(matches!(
-        win.join_lookup_asof(&JoinKey::Int(42), 8_500_000_000, 7_500_000_000, None),
+        win.join_lookup_asof(
+            "value",
+            &JoinKey::Int(42),
+            8_500_000_000,
+            7_500_000_000,
+            None
+        ),
         AsofLookup::Miss
     ));
 }
@@ -1889,7 +2091,7 @@ fn join_lookup_asof_max_miss_without_timestamps() {
     win.append(make_batch_no_time(&schema, &[42])).unwrap();
 
     assert!(matches!(
-        win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 0, None),
+        win.join_lookup_asof("value", &JoinKey::Int(42), 5_000_000_000, 0, None),
         AsofLookup::Miss
     ));
 }
@@ -1974,12 +2176,13 @@ fn join_index_sharded_lookup_evict_and_asof_span_all_shards() {
     }
     for key in &keys {
         assert_eq!(
-            win.join_lookup(&JoinKey::Int(*key), None).map(|v| v.len()),
+            win.join_lookup("value", &JoinKey::Int(*key), None)
+                .map(|v| v.len()),
             Some(2),
             "key {key} must be found with both rows (regardless of shard)"
         );
         // asof：两行都在 [ts, ts+50]，event_time 取后行 → 命中后行。
-        match win.join_lookup_asof(&JoinKey::Int(*key), i64::MAX, i64::MIN, None) {
+        match win.join_lookup_asof("value", &JoinKey::Int(*key), i64::MAX, i64::MIN, None) {
             AsofLookup::Hit(row) => {
                 assert_eq!(row.field_value("value"), Some(Value::Number(*key as f64)));
             }
@@ -1992,7 +2195,7 @@ fn join_index_sharded_lookup_evict_and_asof_span_all_shards() {
     win.evict_expired(4_000_000_000_000);
     for key in &keys {
         assert!(
-            win.join_lookup(&JoinKey::Int(*key), None)
+            win.join_lookup("value", &JoinKey::Int(*key), None)
                 .is_none_or(|v| v.is_empty()),
             "key {key} must be removed from its shard after eviction"
         );
@@ -2018,7 +2221,8 @@ fn join_index_incremental_remove_only_touches_the_evicted_batch() {
         win.append(make_batch(&test_schema(), &[ts], &[v])).unwrap();
     }
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(42), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(42), None)
+            .map(|v| v.len()),
         Some(2),
         "both batches' rows visible before eviction"
     );
@@ -2026,17 +2230,20 @@ fn join_index_incremental_remove_only_touches_the_evicted_batch() {
     // 弹掉 seq0（key 42 的第一行）→ 42 只剩 seq2 的一行；43/44 不受影响。
     win.evict_oldest();
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(42), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(42), None)
+            .map(|v| v.len()),
         Some(1),
         "cross-batch key keeps only the surviving batch's row"
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(43), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(43), None)
+            .map(|v| v.len()),
         Some(1),
         "untouched batch's key must be unaffected"
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(44), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(44), None)
+            .map(|v| v.len()),
         Some(1),
         "untouched key must be unaffected by another batch's eviction"
     );
@@ -2044,28 +2251,31 @@ fn join_index_incremental_remove_only_touches_the_evicted_batch() {
     // 弹掉 seq1（key 43）→ 43 清空；42/44 仍在。
     win.evict_oldest();
     assert!(
-        win.join_lookup(&JoinKey::Int(43), None)
+        win.join_lookup("value", &JoinKey::Int(43), None)
             .is_none_or(|v| v.is_empty()),
         "evicted batch's sole key must be cleared"
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(42), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(42), None)
+            .map(|v| v.len()),
         Some(1)
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(44), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(44), None)
+            .map(|v| v.len()),
         Some(1)
     );
 
     // 弹掉 seq2（第二个 42）→ 42 清空；44 仍在。
     win.evict_oldest();
     assert!(
-        win.join_lookup(&JoinKey::Int(42), None)
+        win.join_lookup("value", &JoinKey::Int(42), None)
             .is_none_or(|v| v.is_empty()),
         "last 42 row removed"
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(44), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(44), None)
+            .map(|v| v.len()),
         Some(1)
     );
 }
@@ -2079,7 +2289,7 @@ fn join_index_incremental_remove_recomputes_max_ts() {
         .unwrap();
     win.append(make_batch(&test_schema(), &[1_000_000_000], &[42]))
         .unwrap();
-    match win.join_lookup_asof(&JoinKey::Int(42), 9_000_000_000, 0, None) {
+    match win.join_lookup_asof("value", &JoinKey::Int(42), 9_000_000_000, 0, None) {
         AsofLookup::Hit(row) => assert_eq!(
             row.field_value("ts"),
             Some(Value::Number(5_000_000_000.0)),
@@ -2091,7 +2301,7 @@ fn join_index_incremental_remove_recomputes_max_ts() {
 
     // 驱逐 ts=5s 的批 → max_ts 必须回落到剩余行的 1s（asof 不再命中旧 max）。
     win.evict_oldest();
-    match win.join_lookup_asof(&JoinKey::Int(42), 9_000_000_000, 0, None) {
+    match win.join_lookup_asof("value", &JoinKey::Int(42), 9_000_000_000, 0, None) {
         AsofLookup::Hit(row) => assert_eq!(
             row.field_value("ts"),
             Some(Value::Number(1_000_000_000.0)),
@@ -2101,7 +2311,8 @@ fn join_index_incremental_remove_recomputes_max_ts() {
         AsofLookup::Fallback => panic!("expected Hit, got Fallback"),
     }
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(42), None).map(|v| v.len()),
+        win.join_lookup("value", &JoinKey::Int(42), None)
+            .map(|v| v.len()),
         Some(1)
     );
 }
@@ -2213,10 +2424,10 @@ fn join_index_concurrent_append_evict_lookup_no_deadlock() {
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
         let key = JoinKey::Int(((state >> 33) % 16) as i64);
-        if win.join_lookup(&key, None).is_some() {
+        if win.join_lookup("value", &key, None).is_some() {
             hit += 1;
         }
-        let _ = win.join_lookup_asof(&key, i64::MAX, i64::MIN, None);
+        let _ = win.join_lookup_asof("value", &key, i64::MAX, i64::MIN, None);
     }
     stop.store(true, Ordering::Relaxed);
     writer.join().expect("writer join");

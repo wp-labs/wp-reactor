@@ -1529,6 +1529,54 @@ fn stats_last_keeps_last_row_and_injects_fields() {
 }
 
 #[test]
+fn stats_q18_shape_subset_excluding_keys_row_fields_readable() {
+    // 生产形态（spawn.rs stats_row_fields P5 优化）: 行字段子集**排除桶键字段**
+    // （bidder/auction——注释声称 close 时键字段从 scope_key 单独注入）。
+    // 验证排除后 close 条目的行字段仍携带非键字段（price/bidder）。
+    let plan = keyed_plan(
+        vec![field_key("b", "bidder"), field_key("b", "auction")],
+        vec![
+            last_measure("last_price", "price"),
+            last_measure("last_bidder", "bidder"),
+        ],
+    );
+    let rows = vec![row(&[
+        ("bidder", num(7.0)),
+        ("auction", num(1.0)),
+        ("price", num(250.0)),
+    ])];
+    // 子集 = 非键字段（spawn.rs 对 q18 移除 bidder/auction 后的形态）
+    let subset: Arc<HashSet<String>> = Arc::new(["price".into()].into_iter().collect());
+    // 行式路径
+    let mut row_exec = StatsExecutor::with_row_fields(plan.clone(), Some(subset.clone()));
+    row_exec.process_rows(&rows, extract);
+    let r_buckets = row_exec.close_window_by_bucket_rows();
+    let r_rf = r_buckets[0].measures[0][0]
+        .row_fields
+        .as_ref()
+        .expect("行式: last 携带行字段");
+    assert_eq!(
+        row_val(r_rf, &["price".to_string()], "price"),
+        Some(num(250.0)),
+        "行式: 排除键字段后非键字段仍可读"
+    );
+    // 列式路径（生产 q18 走列式 process_batch）
+    let batch = rows_to_batch(&rows);
+    let mut col_exec = StatsExecutor::with_row_fields(plan, Some(subset));
+    assert!(col_exec.process_batch(&batch), "应可列式化");
+    let c_buckets = col_exec.close_window_by_bucket_rows();
+    let c_rf = c_buckets[0].measures[0][0]
+        .row_fields
+        .as_ref()
+        .expect("列式: last 携带行字段");
+    assert_eq!(
+        row_val(c_rf, &["price".to_string()], "price"),
+        Some(num(250.0)),
+        "列式: 排除键字段后非键字段仍可读"
+    );
+}
+
+#[test]
 fn stats_top_keeps_top_n_desc() {
     // Q19 形状: group by (auction), top(2, price) —— key DESC 前 2 条, 各带行字段
     let plan = keyed_plan(
@@ -3265,5 +3313,160 @@ fn stats_mask_cache_two_shards_match_single() {
         merged.final_measure_values_by_bucket(),
         single.final_measure_values_by_bucket(),
         "两片共享缓存 + 分片行域归并 = 单实例全批"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// q18/q19 close 键字段注入回归（2026-08-30 修复）
+// ---------------------------------------------------------------------------
+// `execute_stats_close_batch_columnar` 的键来源：修复前用 `match_plan.keys`
+// （stats 规则为空），修复后用 `stats_plan.keys`（group by）。本用例端到端验证
+// q18/q19 生产形态——行字段子集排除键字段（spawn.rs stats_row_fields）——close
+// 直装时 entity/yield 里的**键字段**（b.auction / b.bidder）仍能解析出值。
+#[test]
+fn stats_close_columnar_resolves_key_fields_in_entity_and_yield() {
+    use wf_lang::ast::{CloseMode, MatchMode};
+    use wf_lang::plan::{
+        BindPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, YieldField, YieldPlan,
+    };
+
+    use crate::alert::AlertColumnBuilder;
+    use crate::match_engine::RuleExecutor;
+
+    // 键字段的 Qualified FieldRef（entity/yield 里以 Expr::Field 引用）。
+    let auction_ref = FieldRef::Qualified("b".into(), "auction".into());
+    let bidder_ref = FieldRef::Qualified("b".into(), "bidder".into());
+    let stats_plan = keyed_plan(
+        vec![field_key("b", "bidder"), field_key("b", "auction")],
+        vec![last_measure("last_price", "price")],
+    );
+    // q18/q19 形态：match_plan.keys = []（stats 规则），键在 stats_plan.keys。
+    let rule_plan = RulePlan {
+        conv_window: None,
+        name: "q18_last_bid_stats".into(),
+        binds: vec![BindPlan {
+            alias: "b".into(),
+            window: "bid_events".into(),
+            filter: None,
+        }],
+        lets: Vec::new(),
+        match_plan: MatchPlan {
+            keys: vec![],
+            key_map: None,
+            key_join: None,
+            window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(86400)),
+            event_steps: vec![],
+            close_steps: vec![],
+            close_mode: CloseMode::And,
+            match_mode: MatchMode::Seq,
+            accu: false,
+            seq: None,
+            tracked_bind_aliases: HashSet::new(),
+            tracked_bind_fields: HashMap::new(),
+            tracked_plain_fields: HashSet::new(),
+            needs_field_history: false,
+            trigger_event_needed: false,
+        },
+        each_plan: None,
+        stats_plan: Some(stats_plan),
+        joins: vec![],
+        r#where: None,
+        entity_plan: EntityPlan {
+            entity_type: "digit".into(),
+            entity_id_expr: Expr::Field(auction_ref.clone()),
+        },
+        yield_plan: YieldPlan {
+            target: "nexmark_alerts".into(),
+            version: None,
+            fields: vec![
+                YieldField {
+                    name: "id".into(),
+                    value: Expr::Field(auction_ref.clone()),
+                },
+                YieldField {
+                    name: "detail".into(),
+                    value: Expr::Field(bidder_ref.clone()),
+                },
+                YieldField {
+                    name: "alert_type".into(),
+                    value: Expr::StringLit("q18_last_stats".into()),
+                },
+                YieldField {
+                    name: "request_count".into(),
+                    value: Expr::Number(1.0),
+                },
+            ],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(1.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+    let exec = RuleExecutor::new(rule_plan);
+    assert!(exec.close_plan_columnar_safe(), "q18 形态必须列式安全");
+
+    // 生产形态：行字段子集**排除键字段**（bidder/auction），仅留 price。
+    let subset: Arc<HashSet<String>> = Arc::new(["price".into()].into_iter().collect());
+    let mut stats = StatsExecutor::with_row_fields(
+        keyed_plan(
+            vec![field_key("b", "bidder"), field_key("b", "auction")],
+            vec![last_measure("last_price", "price")],
+        ),
+        Some(subset),
+    );
+    let batch = rows_to_batch(&[row(&[
+        ("bidder", num(7.0)),
+        ("auction", num(1.0)),
+        ("price", num(250.0)),
+    ])]);
+    assert!(stats.process_batch(&batch), "列式前置应满足");
+    let buckets = stats.close_window_by_bucket_rows();
+    assert_eq!(buckets.len(), 1, "(bidder=7, auction=1) 单桶");
+    let labels: Vec<String> = stats
+        .plan
+        .measures
+        .iter()
+        .map(|m| m.label.clone())
+        .collect();
+    let row_names = stats.row_field_names().cloned();
+
+    let mut builder = AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
+    let outcome = exec.execute_stats_close_batch_columnar(
+        &buckets,
+        &labels,
+        row_names.as_ref(),
+        &mut builder,
+        1_700_000_000_000,
+        1_700_000_000_000 + 86_400_000_000_000,
+    );
+    assert_eq!(outcome.appended, 1, "1 行 close 输出");
+    assert_eq!(outcome.failed, 0);
+    let batch = builder.finish();
+    let rows: Vec<_> = batch
+        .iter_data_records()
+        .collect::<crate::error::CoreResult<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let field_of = |name: &str| {
+        rows[0]
+            .items
+            .iter()
+            .find(|f| f.get_name() == name)
+            .map(|f| f.get_value().to_string())
+            .unwrap_or_default()
+    };
+    // 修复前：键字段从空 match_plan.keys 解析 → entity/yield 键字段全 None。
+    assert_eq!(
+        field_of("__wfu_entity_id"),
+        "1",
+        "entity = b.auction 键字段必须解析（修复前为 None/空）"
+    );
+    assert_eq!(field_of("id"), "1", "yield id = b.auction 键字段必须解析");
+    assert_eq!(
+        field_of("detail"),
+        "7",
+        "yield detail = b.bidder 键字段必须解析"
     );
 }

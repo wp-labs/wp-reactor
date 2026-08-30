@@ -173,10 +173,6 @@ impl Window {
             let delay = self.config.watermark.as_duration().as_nanos() as i64;
             let candidate = max_event_time.saturating_sub(delay);
             self.watermark_nanos.fetch_max(candidate, Ordering::AcqRel);
-            // Raw max event time (before the watermark delay) — the global data
-            // tail the rule task needs at flush (see `max_event_time_nanos`).
-            self.max_event_time_nanos
-                .fetch_max(max_event_time, Ordering::AcqRel);
         }
 
         let seq = match (parsed_events, byte_size) {
@@ -196,6 +192,20 @@ impl Window {
                 0
             }
         };
+        // 2026-08-30 q3 根因（nexmark_pk）：`max_event_time_nanos` 必须在批次
+        // **提交后**（append_inner 完成、join 索引已建）才推进——此前在
+        // append_inner（含 index_batch）之前推进，而 `committed_frontier_ns` 对
+        // per-source 为空（首个 actor append 进行中）回退到全局 max → 把未提交
+        // 的 max 报为已提交 → eager join gate 提前放行 → join 与目标窗建索引并发
+        // → snapshot join 静默 miss（buffer 有行、索引没有；q3 丢 0~16 早期
+        // auction，oracle 对拍定位）。推进时序与 per-source 提交前沿一致：只在
+        // 真正 append 后记录，提交前沿永远不会领先索引内容。
+        if self.time_col_index.is_some() && max_event_time != i64::MAX {
+            // Raw max event time (before the watermark delay) — the global data
+            // tail the rule task needs at flush (see `max_event_time_nanos`).
+            self.max_event_time_nanos
+                .fetch_max(max_event_time, Ordering::AcqRel);
+        }
         // 2026-08-25（跨源提交乱序修复）：记录该 source 的已提交最大事件时间。
         // 只在真正 append（非 DroppedLate）后记录；无时间列窗口不推进 max，
         // 不记录（源路径不产生时间语义）。

@@ -238,7 +238,9 @@ fn substitute_preset_params(
         | Expr::Bool(_)
         | Expr::SystemVar(_)
         | Expr::WfuMeta(_)
-        | Expr::Field(_) => Ok(expr.clone()),
+        | Expr::Field(_)
+        // 编译期已展开（resolve_list_refs 在 checker 前）。
+        | Expr::ListRef(_) => Ok(expr.clone()),
         Expr::PresetParam(name) => bindings.get(name.as_str()).cloned().ok_or_else(|| {
             YieldPresetError::UnknownPresetParam {
                 preset: preset_name.to_string(),
@@ -358,7 +360,9 @@ fn collect_preset_params<'a>(expr: &'a Expr, on_param: &mut impl FnMut(&'a str))
         | Expr::Bool(_)
         | Expr::SystemVar(_)
         | Expr::WfuMeta(_)
-        | Expr::Field(_) => {}
+        | Expr::Field(_)
+        // 编译期已展开（resolve_list_refs 在 checker 前）。
+        | Expr::ListRef(_) => {}
     }
 }
 

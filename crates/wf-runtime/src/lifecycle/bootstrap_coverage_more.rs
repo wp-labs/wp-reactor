@@ -265,6 +265,51 @@ async fn load_and_compile_loads_knowledge_provider_window() {
 }
 
 #[tokio::test]
+async fn load_and_compile_loads_knowledge_provider_window_from_models_schemas() {
+    let dir = TempDir::new().expect("tempdir");
+    write_fixture(
+        &dir,
+        "[window.countries]\nmode = \"local\"\nover_cap = \"1h\"\ntable = \"countries\"\n",
+    );
+
+    let data_dir = dir.path().join("data/countries");
+    std::fs::create_dir_all(&data_dir).expect("dir");
+    std::fs::write(
+        data_dir.join("data.csv"),
+        "code,name\ncn,China\nus,United States\n",
+    )
+    .expect("csv");
+    // knowdb.toml 放 models/schemas/（nexmark_pk 2026-08-30 迁移位置）；
+    // base_dir 相对本文件目录 → "../../data" 指回工程根 data/。
+    let schemas_dir = dir.path().join("models/schemas");
+    std::fs::create_dir_all(&schemas_dir).expect("dir");
+    std::fs::write(
+        schemas_dir.join("knowdb.toml"),
+        r#"
+        base_dir = "../../data"
+        [[tables]]
+        name = "countries"
+        enabled = true
+        dir = "countries"
+        data_file = "data.csv"
+        "#,
+    )
+    .expect("knowdb");
+
+    let (_raw, config) = load_config(&dir);
+    let data = load_and_compile(&config, dir.path())
+        .await
+        .expect("load and compile with knowdb in models/schemas");
+    let provider = data
+        .router
+        .registry()
+        .get_provider("countries")
+        .expect("provider window registered from CSV in models/schemas");
+    let snapshot = provider.read().expect("lock").snapshot();
+    assert_eq!(snapshot.len(), 2, "both CSV rows loaded");
+}
+
+#[tokio::test]
 async fn load_and_compile_without_sinks_errors() {
     let dir = TempDir::new().expect("tempdir");
     // 无 sink 布局（空 sinks 目录）→ build_sink_dispatcher 启动守卫失败。

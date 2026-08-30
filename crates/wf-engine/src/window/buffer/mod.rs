@@ -441,15 +441,17 @@ pub struct Window {
     /// mutation). `window.has()` / join snapshot caches key off this to
     /// invalidate stale distinct-value sets without a per-call scan.
     generation: AtomicU64,
-    /// Fast path: whether a join index has been configured. Non-join windows
-    /// (the common case) skip the join-index lock entirely.
+    /// Fast path: whether at least one join index has been configured. Non-join
+    /// windows (the common case) skip the join-index lock entirely.
     join_enabled: AtomicBool,
-    /// Optional hash index for join lookups (see `set_join_key`). Only
-    /// mutated while `join_enabled` is true.
-    /// 2026-08-25 q4 100M 分片后：外层锁仅保护 `Option` 配置（`set_join_key`
-    /// 一次性写、后续不变），稳态读写都走读锁；真正的并发是 `JoinIndex` 内部
-    /// 的 64 片独立 RwLock（`index_batch` 逐片短暂持写锁，查找只锁一片）。
-    join_index: PLRwLock<Option<JoinIndex>>,
+    /// Per-key-field hash indexes for join lookups (see `set_join_key`). One
+    /// index per registered join key field — `set_join_key` 不再首键独占：多个规则
+    /// 以不同 key join 同一窗口时各自建索引（q8 按 seller / q20·q6 按 id 共窗），
+    /// 不再回退全窗扫描（混跑 q8 deferred join O(全窗) 卡死根因，2026-08-30）。
+    /// 2026-08-25 q4 100M 分片后：外层锁仅保护配置（`set_join_key` 在 spawn 期
+    /// 写入、稳态不变），稳态读写都走读锁；真正的并发是每个 `JoinIndex` 内部的
+    /// 64 片独立 RwLock（`index_batch` 逐片短暂持写锁，查找只锁一片）。
+    join_index: PLRwLock<Vec<JoinIndex>>,
     /// Optional per-event field whitelist (see `WindowParams`). Immutable
     /// after construction — readers (`Router::route_parse`) access it with no
     /// synchronization at all.
@@ -508,7 +510,7 @@ impl Window {
             batch_count: AtomicUsize::new(0),
             generation: AtomicU64::new(0),
             join_enabled: AtomicBool::new(false),
-            join_index: PLRwLock::new(None),
+            join_index: PLRwLock::new(Vec::new()),
             materialize_fields,
             defer_materialization,
             progress: RwLock::new(None),
@@ -612,12 +614,23 @@ impl Window {
     /// Configure this window as a join target: build a hash index on `key_field`
     /// and index any rows already buffered. Called by the runtime after rules
     /// are loaded (join target windows are only known from rule plans).
-    /// Idempotent: a second call with the same/different key is a no-op (the
-    /// first join condition's right field wins — consistent with
-    /// `first_join_key`).
+    /// 逐字段幂等：同一字段重复注册是 no-op。与旧首键独占不同，每个不同
+    /// key 字段都建自己的索引——多个规则以不同 key join 同一窗口时全部
+    /// 走 O(1) 索引，不再回退全窗扫描（2026-08-30 混跑 q8 卡死根因）。
+    ///
+    /// 一致性：**持 log 读锁贯穿构建+注册**（锁序 log→join_index，与 append 的
+    /// log→join_index 一致，无死锁）。读锁挡住并发 append/驱逐 → 新索引与注册
+    /// 时刻的日志完全一致（无漏批/无已驱逐残留）——旧实现先释放日志快照再注册，
+    /// 热重载新增 key 时存在竞态窗口（2026-08-30 review）。
     pub fn set_join_key(&self, key_field: String) {
-        if self.join_enabled.load(Ordering::Acquire) {
-            return; // 已配置（首个 join 条件的右字段），幂等
+        // 快路径：该字段已建索引 → 幂等返回（读锁，spawn 期串行，无竞争）。
+        if self
+            .join_index
+            .read()
+            .iter()
+            .any(|i| i.key_field == key_field.as_str())
+        {
+            return;
         }
         let key_field = SmolStr::new(&key_field);
         let index = JoinIndex {
@@ -629,71 +642,79 @@ impl Window {
             mask: JOIN_INDEX_SHARDS - 1,
             batch_keys: PLRwLock::new(crate::match_engine::EngineHashMap::default()),
         };
-        // Read the log under its read lock; the guard is released before the
-        // join-index write lock is taken (lock ordering: log → join_index,
-        // never the reverse). The index holds columnar row locators — no
-        // per-row `Event` materialization.
-        let existing: Vec<(Arc<RecordBatch>, Vec<Option<i64>>, u64)> = {
-            let log = self.log.read().expect("window log lock poisoned");
-            log.values()
-                .map(|tb| (Arc::clone(&tb.batch), self.raw_ts_list(tb), tb.seq))
-                .collect()
-        };
-        for (batch, ts_list, seq) in &existing {
-            index.index_batch(batch, ts_list, *seq);
+        // log 读锁 → join_index 写锁（锁序同 append，无死锁）；构建与注册在
+        // 同一临界区，期间 append/驱逐被读锁挡在门外 → 索引内容 == 日志内容。
+        let log = self.log.read().expect("window log lock poisoned");
+        let mut idx = self.join_index.write();
+        if idx.iter().any(|i| i.key_field == index.key_field) {
+            return;
         }
+        for tb in log.values() {
+            index.index_batch(&tb.batch, &self.raw_ts_list(tb), tb.seq);
+        }
+        idx.push(index);
         self.join_enabled.store(true, Ordering::Release);
-        *self.join_index.write() = Some(index);
+    }
+
+    /// Whether a join index for `key_field` exists（无 → 调用方回退扫描）。
+    pub fn has_join_key(&self, key_field: &str) -> bool {
+        if !self.join_enabled.load(Ordering::Acquire) {
+            return false;
+        }
+        self.join_index
+            .read()
+            .iter()
+            .any(|i| i.key_field == key_field)
     }
 
     /// O(1) lookup of rows whose `key_field` equals `key`, as columnar
-    /// [`JoinRow`]s. `Some(empty)` if this window is indexed but the key has no
-    /// matching rows; `None` if it has no join index (not a join target — the
-    /// caller falls back to a snapshot scan).
+    /// [`JoinRow`]s. `Some(empty)` if this window is indexed on `key_field` but
+    /// the key has no matching rows; `None` if there is no join index for that
+    /// field (the caller falls back to a snapshot scan).
     ///
     /// `max_seq`（M2 pull 一致性）: 只返回 `seq <= max_seq` 的行（读者只能看到
     /// 自己已拉取的 batch）; `None` = 全量（push 模式）。
-    pub fn join_lookup(&self, key: &JoinKey, max_seq: Option<u64>) -> Option<Vec<JoinRow>> {
+    pub fn join_lookup(
+        &self,
+        key_field: &str,
+        key: &JoinKey,
+        max_seq: Option<u64>,
+    ) -> Option<Vec<JoinRow>> {
         if !self.join_enabled.load(Ordering::Acquire) {
             return None;
         }
-        Some(
-            self.join_index
-                .read()
-                .as_ref()?
-                .lookup(key, max_seq)
-                .unwrap_or_default(),
-        )
+        let guard = self.join_index.read();
+        let index = guard.iter().find(|i| i.key_field == key_field)?;
+        Some(index.lookup(key, max_seq).unwrap_or_default())
     }
 
     /// O(1) timestamped lookup for the asof-join path: rows whose `key_field`
     /// equals `key`, as `(raw_ts_nanos, JoinRow)` — rows without a
-    /// `Timestamp(Ns)` time value are skipped. `Some(empty)` when indexed but
-    /// the key has no timestamped rows; `None` when there is no join index
-    /// (caller falls back to a timestamped snapshot scan).
+    /// `Timestamp(Ns)` time value are skipped. `Some(empty)` when indexed on
+    /// `key_field` but the key has no timestamped rows; `None` when there is no
+    /// join index for that field (caller falls back to a timestamped snapshot
+    /// scan).
     pub fn join_lookup_timestamped(
         &self,
+        key_field: &str,
         key: &JoinKey,
         max_seq: Option<u64>,
     ) -> Option<Vec<(i64, JoinRow)>> {
         if !self.join_enabled.load(Ordering::Acquire) {
             return None;
         }
-        Some(
-            self.join_index
-                .read()
-                .as_ref()?
-                .lookup_timestamped(key, max_seq)
-                .unwrap_or_default(),
-        )
+        let guard = self.join_index.read();
+        let index = guard.iter().find(|i| i.key_field == key_field)?;
+        Some(index.lookup_timestamped(key, max_seq).unwrap_or_default())
     }
 
     /// Asof fast path: return `key`'s row whose timestamp is the maximum
     /// `<= event_time` and `>= min_ts`, using the index's per-key `max_ts` —
     /// O(1), no candidate scan. See [`AsofLookup`] for the three outcomes.
-    /// [`AsofLookup::Fallback`] when the window has no join index.
+    /// [`AsofLookup::Fallback`] when the window has no join index for `key_field`.
     pub fn join_lookup_asof(
         &self,
+        key_field: &str,
         key: &JoinKey,
         event_time: i64,
         min_ts: i64,
@@ -703,7 +724,7 @@ impl Window {
             return AsofLookup::Fallback;
         }
         let guard = self.join_index.read();
-        let Some(index) = guard.as_ref() else {
+        let Some(index) = guard.iter().find(|i| i.key_field == key_field) else {
             return AsofLookup::Fallback;
         };
         index.lookup_asof_max(key, event_time, min_ts, max_seq)
@@ -918,13 +939,16 @@ impl Window {
             }
 
             // Index the newly appended batch (after eviction, so rows evicted
-            // by the incoming batch aren't kept in the index).
+            // by the incoming batch aren't kept in the index) — into every
+            // registered key-field index.
             if self.join_enabled.load(Ordering::Acquire)
                 && let Some(tb) = log.get(&seq)
-                && let Some(idx) = self.join_index.read().as_ref()
             {
                 let ts_list = self.raw_ts_list(tb);
-                idx.index_batch(&tb.batch, &ts_list, seq);
+                let idxs = self.join_index.read();
+                for idx in idxs.iter() {
+                    idx.index_batch(&tb.batch, &ts_list, seq);
+                }
             }
         }
         if evicted_rows > 0 {
@@ -956,15 +980,16 @@ impl Window {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// Remove an evicted batch's rows from the join index (if configured).
-    /// 外层只取读锁（索引设置后不变）；`JoinIndex::remove_batch` 内部按
-    /// `batch_keys` 增量清理（只动该批贡献过的 key）——q4 100M 断崖修复：
+    /// Remove an evicted batch's rows from all join indexes (if configured).
+    /// 外层只取读锁（索引配置在 spawn 期定、稳态不变）；`JoinIndex::remove_batch`
+    /// 内部按 `batch_keys` 增量清理（只动该批贡献过的 key）——q4 100M 断崖修复：
     /// 旧实现每驱逐一批就全索引扫描（33M 行 × 每批），evictor 线程卡死一核。
     fn remove_batch_from_index(&self, evicted: &TimedBatch) {
         if !self.join_enabled.load(Ordering::Acquire) {
             return;
         }
-        if let Some(idx) = self.join_index.read().as_ref() {
+        let idxs = self.join_index.read();
+        for idx in idxs.iter() {
             idx.remove_batch(evicted.seq);
         }
     }

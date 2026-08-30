@@ -117,6 +117,7 @@ struct Spec {
     push_rx: Option<mpsc::Receiver<RulePush>>,
     shard_index: Option<usize>,
     shard_count: usize,
+    key_partitioned: bool,
     progress: HashMap<String, Arc<AtomicU64>>,
     conv_sink: Option<ConvShardSink>,
 }
@@ -137,6 +138,7 @@ impl Default for Spec {
             push_rx: None,
             shard_index: None,
             shard_count: 1,
+            key_partitioned: false,
             progress: HashMap::new(),
             conv_sink: None,
         }
@@ -158,6 +160,7 @@ fn make_task(spec: Spec) -> RuleTask {
         push_rx,
         shard_index,
         shard_count,
+        key_partitioned,
         progress,
         conv_sink,
     } = spec;
@@ -178,6 +181,7 @@ fn make_task(spec: Spec) -> RuleTask {
         push_rx,
         shard_index,
         shard_count,
+        key_partitioned,
         progress,
         conv_sink,
     };
@@ -441,6 +445,46 @@ async fn stage_or_emit_record_flushes_at_batch_size() {
         .expect("flush timed out")
         .expect("sink channel closed");
     assert_eq!(got.len(), ALERT_BATCH_SIZE);
+}
+
+#[tokio::test]
+async fn flush_on_each_rule_drains_partial_pending_batch() {
+    // 回归（2026-08-28 q1 尾批丢失）：on-each 规则（无 match 状态机、无
+    // deferred）运行期只按 ALERT_BATCH_SIZE 满批 flush，关机 flush() 若
+    // 不补收口，最后一个未满批（< ALERT_BATCH_SIZE）会留在 pending builder
+    // 被静默丢弃（q1 920000 条 emitted_total vs 文件 917469 的尾批根因）。
+    // flush() 必须对 on-each 规则也 flush_alerts + flush_pipes。
+    let (tx, mut rx) = mpsc::channel::<AlertBatch>(8);
+    let mut cache = HashMap::new();
+    let groups = Arc::new(vec![(0usize, Arc::new(vec![tx]))]);
+    cache.insert("alerts".to_string(), groups);
+    let fanout = SinkFanout::from_resolved(cache);
+    let mut task = make_task(Spec {
+        sink_fanout: fanout,
+        ..Spec::default()
+    });
+    // 只发一个未满批（< ALERT_BATCH_SIZE）——运行期满批 flush 不触发。
+    let n = ALERT_BATCH_SIZE - 1;
+    for i in 0..n {
+        task.emit(record_with("alerts", i as i64)).await;
+    }
+    assert_eq!(
+        task.pending_alerts.lock().unwrap().count,
+        n,
+        "未满批应留在 pending（不触发运行期 flush）"
+    );
+    // 关机 flush（on-each 分支）必须把未满批投递到 sink。
+    task.flush().await;
+    assert_eq!(
+        task.pending_alerts.lock().unwrap().count,
+        0,
+        "flush 后 pending 应清空"
+    );
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("flush timed out")
+        .expect("sink channel closed");
+    assert_eq!(got.len(), n, "未满批应完整投递（不丢尾批）");
 }
 
 #[tokio::test]
