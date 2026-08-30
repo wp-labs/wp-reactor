@@ -865,7 +865,23 @@ impl RuleExecutor {
         let mut stats = EachDirectBatchStats::default();
         debug_assert!(self.close_plan_columnar_safe());
         let statics = self.output_static();
-        let keys = &self.plan.match_plan.keys;
+        // 2026-08-30 修复: stats 规则的桶键在 `stats_plan.keys`（group by）,
+        // `match_plan.keys` 对 stats 规则为空——此前 resolve 第 1 段永远匹配不到
+        // 键字段, 而 spawn 的 `stats_row_fields` 又把键字段从 row_fields 子集移除
+        // → yield/entity 读键字段（q18/q19 的 id=b.auction、detail 里 b.bidder）
+        // 全部解析为 None（q18 detail 全空、q19 id 缺失）。改从 stats 键注入。
+        let keys: std::borrow::Cow<'_, [FieldRef]> = match &self.plan.stats_plan {
+            Some(sp) => std::borrow::Cow::Owned(
+                sp.keys
+                    .iter()
+                    .filter_map(|k| match k {
+                        Expr::Field(fr) => Some(fr.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            None => std::borrow::Cow::Borrowed(&self.plan.match_plan.keys),
+        };
         let emit_time = self.cached_emit_time(emit_time_nanos);
         let score_const = match &self.plan.score_plan.expr {
             Expr::Number(n) => *n,
@@ -939,7 +955,7 @@ impl RuleExecutor {
         // prepare: General yield 物化源 = (桶, 记录) → 字段值
         let prepared = self.close_batch_prepare_with(total, |row, name| {
             let (bi, k) = row_index[row];
-            resolve_stats_bucket_field(&buckets[bi], k, keys, labels, row_names, name)
+            resolve_stats_bucket_field(&buckets[bi], k, &keys, labels, row_names, name)
         });
 
         let mut wfx_ids: Vec<SmolStr> = Vec::with_capacity(total);
@@ -1000,7 +1016,7 @@ impl RuleExecutor {
                         resolve_stats_bucket_field(
                             bucket,
                             k,
-                            keys,
+                            &keys,
                             labels,
                             row_names,
                             entity_field_name.unwrap_or(""),
@@ -1035,7 +1051,7 @@ impl RuleExecutor {
                 };
                 let summary = build_summary_from_labels(
                     &self.plan.name,
-                    keys,
+                    &keys,
                     &scope_values,
                     step_iter,
                     &origin,
@@ -1060,7 +1076,7 @@ impl RuleExecutor {
                         Expr::Field(_) => resolve_stats_bucket_field(
                             bucket,
                             k,
-                            keys,
+                            &keys,
                             labels,
                             row_names,
                             field_ref_name_of(&field.value),

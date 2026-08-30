@@ -1529,6 +1529,54 @@ fn stats_last_keeps_last_row_and_injects_fields() {
 }
 
 #[test]
+fn stats_q18_shape_subset_excluding_keys_row_fields_readable() {
+    // 生产形态（spawn.rs stats_row_fields P5 优化）: 行字段子集**排除桶键字段**
+    // （bidder/auction——注释声称 close 时键字段从 scope_key 单独注入）。
+    // 验证排除后 close 条目的行字段仍携带非键字段（price/bidder）。
+    let plan = keyed_plan(
+        vec![field_key("b", "bidder"), field_key("b", "auction")],
+        vec![
+            last_measure("last_price", "price"),
+            last_measure("last_bidder", "bidder"),
+        ],
+    );
+    let rows = vec![row(&[
+        ("bidder", num(7.0)),
+        ("auction", num(1.0)),
+        ("price", num(250.0)),
+    ])];
+    // 子集 = 非键字段（spawn.rs 对 q18 移除 bidder/auction 后的形态）
+    let subset: Arc<HashSet<String>> = Arc::new(["price".into()].into_iter().collect());
+    // 行式路径
+    let mut row_exec = StatsExecutor::with_row_fields(plan.clone(), Some(subset.clone()));
+    row_exec.process_rows(&rows, extract);
+    let r_buckets = row_exec.close_window_by_bucket_rows();
+    let r_rf = r_buckets[0].measures[0][0]
+        .row_fields
+        .as_ref()
+        .expect("行式: last 携带行字段");
+    assert_eq!(
+        row_val(r_rf, &["price".to_string()], "price"),
+        Some(num(250.0)),
+        "行式: 排除键字段后非键字段仍可读"
+    );
+    // 列式路径（生产 q18 走列式 process_batch）
+    let batch = rows_to_batch(&rows);
+    let mut col_exec = StatsExecutor::with_row_fields(plan, Some(subset));
+    assert!(col_exec.process_batch(&batch), "应可列式化");
+    let c_buckets = col_exec.close_window_by_bucket_rows();
+    let c_rf = c_buckets[0].measures[0][0]
+        .row_fields
+        .as_ref()
+        .expect("列式: last 携带行字段");
+    assert_eq!(
+        row_val(c_rf, &["price".to_string()], "price"),
+        Some(num(250.0)),
+        "列式: 排除键字段后非键字段仍可读"
+    );
+}
+
+#[test]
 fn stats_top_keeps_top_n_desc() {
     // Q19 形状: group by (auction), top(2, price) —— key DESC 前 2 条, 各带行字段
     let plan = keyed_plan(
