@@ -2,33 +2,23 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [2.0.9] -- latest
+## [2.0.10] -- latest
+
+### Fixed
+
+- **wf-engine: join 索引多 key 支持**——`Window.join_index` 改为每 key 字段一个索引，`set_join_key` 逐字段幂等累积（不再首键独占）；`join_lookup*` 增加 `key_field` 按字段选索引，无索引字段才回退扫描；`set_join_key` 持 log 读锁贯穿构建+注册（消除热重载新增 key 竞态）。
+
+### Performance
+
+- **混跑 q8 deferred join 全窗扫描 → O(1) 索引**——mix 30M 从冻结（卡 ~1.5M）到 105s / EPS 763K / clean；`multi_key_bench` 扫描 vs 索引加速 **2039×~30103×**。
+
+## [2.0.9] — 2026-08-28
 
 ### Added
 
-- **wf-lang / wf-engine: 时间值转 epoch 秒/毫秒 `time_to_s` / `time_to_ms`（issue #69）**——time/数值 → `digit`；运行时按数量级归一化到纳秒再转目标单位，系统变量（毫秒）与输入时间字段（纳秒）两种来源结果一致，业务规则无需感知引擎内部纳秒表示。
-  - 类型检查：返回 `digit`；参数须 time/数值、个数为 1（否则编译报错）。
-  - L3 路由：并入 `is_eval_time_func`，嵌套参数（如 `fmt("{}", time_to_ms(x))`）自动路由；列式 yield 未收录函数自动回落解释路径。
-  - 示例：`time_to_ms(@event_first_time)` / `time_to_ms(s.parse_time)` / `time_to_s(@emit_time)`。
-  - 测试：wf-engine eval 6 例（秒/毫秒/微秒/纳秒单位矩阵、零、分数截断、NaN、系统变量包装、嵌套路由、strptime 组合）+ wf-lang 类型检查 6 例。
-
-- **wf-lang: 顶层列表 + `use` 导入（issue #73）**——顶层裸绑定 `name = ("a", "b", ...)` 声明列表，规则内 `expr in <name>` / `expr not in <name>` 引用，`use "file.wfl"` include 导入目标文件全部顶层列表（一处定义、多处引用；无可见性控制）。
-  - 解析：`Expr::ListRef` 占位（仅 `in <ident>` 右值产出）；列表声明须在规则之前（与 `yield preset`/`pattern` 同文法位置）。
-  - use 导入：`lists::resolve_imports` 递归解析（相对被导入文件目录；`.wfs` 目标跳过；循环引用/缺失/重名报错）；加载层接线（wfgen `load_wfl_files`、wf-runtime `lifecycle/compile.rs`、wfl crate 四命令共用 `load_wfl_with_imports`）。
-  - 编译：`compile_wfl` / `compile_wfl_with_diagnostics` 先 `resolve_list_refs` 展开为字面列表——checker/运行时只见字面 InList，与手写列表逐字节等价。
-  - **类型检查（新增）**：InList 元素-左值类型比对（字面与命名列表统一）——元素混类型报错、左值类型不兼容报错、推断不出（函数调用/字段引用）跳过；顶层列表声明混类型在声明处报错。
-  - 错误面：未知名列表 → 编译错误（带规则名+列表名）；use 目标缺失/循环引用/重名 → 报错。
-  - prelude 回退：`_global.wfl` 只管 `yield preset`（列表走 `use`）；`pattern` 解析期展开不可导入（文档说明）。
-  - lint：`wfl lint` 先解析 use + 展开列表再 check（不绕过编译期错误）。
-
-- **wf-lang / wf-engine / wf-runtime**: HOP sliding window operator — `match<key:hop(size, slide)>`（`size % slide == 0`）。每个事件扇入 `size/slide` 个覆盖窗口（epoch slide 对齐），窗口在 `w_start + size` 收口（slide 对齐）。
-  - 引擎：`advance_at_with_diagnostics` 尾部抽取为 `advance_window(scope_key, window_start)` 助手，HOP 逐窗口扇出并 `merge_step_outcome` 合并结果；`expire_time_for`/`close`/expiry 堆均按 hop 窗口收口。
-  - 扫描：hop 规则 per-event 扫描用无界预算（每 slide 边界恰一个窗口到期，关闭数受窗口内键数约束）——1024 预算会把同一窗口关闭拆多批、inline conv 逐批 top-1 造成同窗口重复 EMIT。
-  - conv：`conv` 块对 hop 窗口放开（checker），inline conv 每窗口一个收口批。
-  - oracle（wfgen）：hop 扫描步长 = slide 边界 + 无界预算，与引擎口径一致。
-  - 已知 v1 局限：hop + OR-mode `on event`（无 close 块）时，同一事件的多窗口 fire 经 `merge_step_outcome` 仅返回一个 Matched——每事件输出一个窗口命中（`and close` 形态不受影响，输出在窗口收口扫描逐窗口完整）。
-  - **conv `top_ties(N)`（RANK 语义并列全输出）**：`sort(...) | top_ties(N)` 取前 N 条并保留所有与第 N 条排序键等值的条目（并列全出）。checker 要求前导 `sort`；Q5/Q7 并列语义对齐（Q5 窗口并列最高 count、Q7 窗口并列最高价 auction 全输出）。修复 `top_ties(0)` 越界 panic（退化为空输出）。
-  - **测试**：新增代码（HOP 引擎/语法链/rule_task 扫描 + conv `top_ties`）测试覆盖率 **100%**（cargo llvm-cov 新增行口径，全 workspace 2587 测试全绿）；rule-task 级 hop 集成测试 4 例（slide 边界逐窗收口、多 key 独立收口、size==slide 等价 fixed、conv-sink 无界扫描路由 + flush drained），编译器/explain 补 hop 窗与 top_ties 格式/编译臂，lifecycle 补管道 hop stage `over=size` 臂。
+- **wf-lang / wf-engine: `time_to_s` / `time_to_ms`（issue #69）**——time/数值 → epoch 秒/毫秒 `digit`，纳秒归一化后转目标单位。
+- **wf-lang: 顶层列表 + `use` 导入（issue #73）**——`expr in <name>` 引用、`use` include 导入，编译期展开为字面 InList + 类型检查。
+- **wf-lang / wf-engine / wf-runtime: HOP 滑动窗口 `match<key:hop(size, slide)>`**——事件扇入 size/slide 个覆盖窗口、`w_start+size` 收口；附带 conv `top_ties(N)` 并列全输出。Q5/Q7 对齐，覆盖率 100%。
 
 ## [1.2.0] — 2026-08-19
 

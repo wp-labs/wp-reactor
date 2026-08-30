@@ -584,3 +584,52 @@ bench 侧后续；对拍可比性不受影响：Q13 的输出键/计数不变，
   `window.has()` 查 provider 留后续。
 - bootstrap `_static_schemas` 加载仍为冗余（parse 已合并）；若需“wfs 声明必有 table
   绑定”的强校验，可在此处加（v1 未加，避免与 `__window_miss` 等内部 provider 冲突）。
+
+## 15. join 索引多 key 支持（2026-08-30，混跑 q8 卡死根因）
+
+> 背景：NEXMark 混跑（`bench.sh mix`，21 查询 23 规则同跑一个 daemon）30M 冻结在
+> ~1.5M（13 分钟不前进）。根因链：join 索引**首键独占**（`set_join_key` 幂等、后注册者
+> no-op）→ q8（join 键 `seller`）与 q20（`id`）共窗 auction_events 时，后注册者查询
+> 回退**全窗扫描**（`snapshot_with_timestamps` 逐行物化 JoinRow + 过滤）→ 混跑背压下
+> 窗口驻留 10 万+ 行 × deferred pending 数千 → O(pending×全窗) 空转（CPU 采样定位
+> `asof_candidates`/`columnar_timestamped_join_rows`）。
+
+### 15.1 设计
+
+- **`Window.join_index`：单索引（`Option<JoinIndex>`）→ 每 key 字段一个索引（`Vec<JoinIndex>`）**。
+  `set_join_key(field)` **逐字段幂等累积**：同一字段重复注册 no-op，不同字段各建独立
+  `JoinIndex`（各自的 64 片 sharded lock、`batch_keys` 增量驱逐记账）。
+- **lookup 按字段选索引**：`join_lookup(key_field, …)` / `join_lookup_timestamped` /
+  `join_lookup_asof` 增加 `key_field` 参数；新增 `has_join_key(field)` 判断该字段是否有索引；
+  **无索引字段才回退扫描**（保留 2026-08-29「假空 miss」修复的兜底语义，见 §2）。
+- **append/驱逐迭代维护全部索引**：`append_inner` 的 `index_batch` 与
+  `remove_batch_from_index`（append 内联 / `evict_oldest` / `evict_oldest_acked` /
+  `evict_expired_impl` 四路径共用）遍历所有索引；`remove_batch` 仍按 `batch_keys[seq]`
+  增量清理（q4 100M 断崖修复不回归）。
+- **`configure_join_indexes`（bootstrap）**：首键 → 收集每个窗口**全部去重** key 并全部注册；
+  `spawn_rule_tasks` 逐规则注册不变（多 key 下自动累积）；provider 窗口单 key 语义不变。
+- **一致性（review 修复）**：`set_join_key` **持 log 读锁贯穿构建+注册**——锁序
+  log→join_index 与 append/驱逐一致（无死锁）；读锁挡住并发 append/驱逐 → 新索引与
+  注册时刻日志完全一致。旧实现「先快照日志、再释放锁、再注册」在热重载新增 key 时存在
+  竞态窗口（快照后被 append 的批不进新索引、已驱逐的批残留）。
+
+### 15.2 性能
+
+- 混跑 q8 查询从全窗扫描 → O(1) 索引：**mix 30M 冻结 → 105s / EPS 763K / clean**；
+  mix 1m EPS 211K → 1.27M（6×）。
+- 调和模型：`1/mix = Σ(1/solo_i) − (N−1)·P`（P≈35ns 共享管线成本），由 `all` 单跑
+  预测 30M ≈ 763K，与实测 762,800 吻合（混跑吞吐 = 各规则每事件成本之和的倒数）。
+- 微基准 `engine_task/multi_key_bench.rs`（release-only，走真实 `RegistryLookup`
+  + Window）：同一窗口按 seller 查询，仅 id 索引（全窗扫描回退）vs id+seller 双索引
+  （O(1)）——窗内 10k/50k/100k/200k 行加速 **2039× / 8817× / 18594× / 30103×**
+  （旧路径 ~21ns/行线性，新路径 90–141ns 恒定）。
+
+### 15.3 测试
+
+- `join_index_multi_key_fields_each_get_own_index`：双 key 注册后各自 O(1) 命中 +
+  未注册字段回退扫描。
+- `deferred_q8_join_key_conflict_falls_back_to_scan`：双路径——无索引字段走扫描回退、
+  多 key 索引命中，输出一致。
+- `join_lookup_key_field_mismatch_falls_back_to_scan`：更新为 `has_join_key` 语义。
+- 全量回归：wf-engine 1272 + wf-runtime 604 全绿；nexmark `verify_daemon.sh all 1m`
+  22/22 PASS（L1+L2+L3 oracle identical）。
