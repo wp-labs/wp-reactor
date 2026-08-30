@@ -2,7 +2,13 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [2.0.10] -- latest
+## [2.0.11] -- latest
+
+### Changed
+
+- **Dependencies**: `foldhash` 0.1 → 0.2、`toml` 1.0 → 1.1、`sha1` 0.10 → 0.11、`wp-arrow` 0.2 → 0.3。
+
+## [2.0.10]
 
 ### Fixed
 

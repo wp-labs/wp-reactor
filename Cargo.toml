@@ -5,14 +5,14 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "Elastic-2.0"
-version = "2.0.10" # @gxl:set(version)
+version = "2.0.11" # @gxl:set(version)
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
 smol_str = { version = "0.3", features = ["serde"] }
-foldhash = "0.1"
+foldhash = "0.2"
 serde_json = "1.0"
-toml = "1.0"
+toml = "1.1"
 winnow = "1.0"
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 async-trait = "0.1"
@@ -21,7 +21,7 @@ regex = "1"
 chrono = "0.4"
 hex = "0.4"
 md5 = { package = "md-5", version = "0.10" }
-sha1 = "0.10"
+sha1 = "0.11"
 glob = "0.3"
 wildmatch = "2"
 tokio = { version = "1", features = ["sync"] }
