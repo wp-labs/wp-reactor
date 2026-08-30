@@ -12,7 +12,8 @@ use tokio::sync::mpsc;
 use wf_engine::match_engine::{CepStateMachine, RuleExecutor};
 use wf_engine::window::{Router, Window, WindowDef, WindowParams, WindowRegistry};
 use wf_lang::ast::{
-    Bound, BoundVal, CloseMode, CmpOp, Expr, FieldRef, JoinMode, MatchMode, Measure, WithinSpec,
+    BinOp, Bound, BoundVal, CloseMode, CmpOp, Expr, FieldRef, JoinMode, MatchMode, Measure,
+    WithinSpec,
 };
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EachPlan, EntityPlan, JoinCondPlan, JoinKeyPlan, JoinPlan,
@@ -228,6 +229,145 @@ fn person_window(router: &Router) -> Arc<Window> {
     router.registry().get_window("person_events").unwrap()
 }
 
+/// 双 snapshot join 目标窗任务（gate 多目标窗回归）：驱动窗 auth_events，join
+/// 右窗 person_events 与 region_events（同 person_schema）。eager_join_targets =
+/// [person_events, region_events]，gate 必须等**所有**目标窗 frontier 追平才放行
+/// ——只等其中一个会让另一个 miss → where 抑制 → 无输出。
+fn make_dual_join_task() -> (
+    rule_task::RuleTask,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
+    Arc<Router>,
+) {
+    let driver = "auth_events";
+    let person = "person_events";
+    let region = "region_events";
+    let registry = WindowRegistry::build(vec![
+        window_def(driver, &driver_schema()),
+        window_def(person, &person_schema()),
+        window_def(region, &person_schema()),
+    ])
+    .unwrap();
+    let router = Arc::new(Router::new(registry));
+    let source_window = router.registry().get_window(driver).unwrap();
+    let source_notify = router.registry().get_notifier(driver).unwrap();
+
+    let match_plan = MatchPlan {
+        keys: vec![FieldRef::Simple("sip".into())],
+        key_map: None,
+        key_join: None,
+        window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(300)),
+        event_steps: vec![StepPlan {
+            branches: vec![BranchPlan {
+                label: Some("fail".into()),
+                source: "fail".into(),
+                field: None,
+                guard: None,
+                agg: AggPlan {
+                    transforms: vec![],
+                    measure: Measure::Count,
+                    cmp: CmpOp::Ge,
+                    threshold: Expr::Number(1.0),
+                },
+            }],
+        }],
+        close_steps: vec![],
+        close_mode: CloseMode::Or,
+        tracked_bind_aliases: HashSet::new(),
+        tracked_bind_fields: empty_tracked_bind_fields(),
+        tracked_plain_fields: empty_tracked_plain_fields(),
+        seq: None,
+        match_mode: MatchMode::Seq,
+        accu: false,
+        needs_field_history: true,
+        trigger_event_needed: false,
+    };
+
+    let snapshot_join = |right: &str| JoinPlan {
+        right_window: right.into(),
+        mode: JoinMode::Snapshot,
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Simple("sip".into()),
+            right: FieldRef::Simple("id".into()),
+        }],
+        within: None,
+        reduce: None,
+        emit_at: None,
+    };
+    let rule_plan = RulePlan {
+        conv_window: None,
+        name: "dual_join".into(),
+        binds: vec![BindPlan {
+            alias: "fail".into(),
+            window: driver.into(),
+            filter: None,
+        }],
+        lets: Vec::new(),
+        match_plan: match_plan.clone(),
+        each_plan: None,
+        stats_plan: None,
+        joins: vec![snapshot_join(person), snapshot_join(region)],
+        r#where: Some(Expr::BinOp {
+            op: BinOp::And,
+            left: Box::new(where_state_in_or()),
+            right: Box::new(Expr::InList {
+                expr: Box::new(Expr::Field(FieldRef::Qualified(
+                    "region_events".to_string(),
+                    "state".to_string(),
+                ))),
+                list: vec![Expr::StringLit("OR".into()), Expr::StringLit("CA".into())],
+                negated: false,
+            }),
+        }),
+        entity_plan: EntityPlan {
+            entity_type: "ip".into(),
+            entity_id_expr: Expr::Field(FieldRef::Qualified("fail".into(), "sip".into())),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".into(),
+            version: None,
+            fields: vec![],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(1.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+
+    let machine = CepStateMachine::new("dual_join".into(), match_plan, Some("event_time".into()));
+    let executor = RuleExecutor::new(rule_plan);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
+        conv_sink: None,
+        machine: Some(machine),
+        each_alias: None,
+        each_time_field: None,
+        executor,
+        window_sources: vec![task_types::WindowSource {
+            window_name: driver.into(),
+            window: source_window,
+            notify: source_notify,
+            aliases: vec!["fail".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        timeout_scan_interval: std::time::Duration::from_secs(60),
+        router: Arc::clone(&router),
+        metrics: None,
+        intermediate_targets: HashSet::new(),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        shard_index: None,
+        shard_count: 1,
+        key_partitioned: false,
+    };
+    let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
+    (task, alert_rx, router)
+}
+
 #[tokio::test]
 async fn match_join_where_hit_emits() {
     super::tests::init_tracing();
@@ -429,6 +569,72 @@ async fn match_join_waits_for_target_first_commit_past_bail_threshold() {
         super::tests::field_str(&alert, "__wfu_entity_id"),
         "10.0.0.1",
         "冷启动首个提交晚于 bail 阈值时 gate 必须等待而非 bail（bail → join miss → 无输出）"
+    );
+}
+
+/// gate 多目标窗回归：eager_join_targets = [person_events, region_events] 时，
+/// gate 必须等**所有**目标窗 frontier 追平才放行——person 已提交、region 未提交
+/// 时放行会让 region join miss → where（region_events.state）抑制 → 无输出。
+/// 提交顺序交错（person 先、region 后，都超过 bail 阈值）验证「最慢目标窗
+/// 决定放行时机」。
+#[tokio::test]
+async fn dual_join_waits_for_all_target_frontiers() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_dual_join_task();
+    let ts = 4_000_000_000_000_000i64;
+
+    // 驱动批先提交；person 行**已**提交（frontier 满足），region 行未提交。
+    // 若 gate 只等 person 就放行 → region snapshot join miss → where 抑制。
+    router
+        .registry()
+        .get_window("auth_events")
+        .unwrap()
+        .append(driver_batch(&["10.0.0.1"], ts))
+        .unwrap();
+    let src_a: Arc<str> = Arc::from("ingress");
+    person_window(&router)
+        .append_with_watermark_sized_from(
+            person_batch(&["10.0.0.1"], &["OR"], ts + 300_000_000),
+            0,
+            None,
+            src_a,
+        )
+        .unwrap();
+
+    let handle = tokio::spawn(async move {
+        task.pull_and_advance().await;
+    });
+
+    // 超过 bail 阈值后 region 行才提交（覆盖 batch_max + 250ms 余量）。
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let src_b: Arc<str> = Arc::from("ingress");
+    router
+        .registry()
+        .get_window("region_events")
+        .unwrap()
+        .append_with_watermark_sized_from(
+            person_batch(&["10.0.0.1"], &["CA"], ts + 300_000_000),
+            0,
+            None,
+            src_b,
+        )
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("task must finish promptly")
+        .expect("pull_and_advance ok");
+
+    let alert = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        super::tests::take_alert_recv(&mut alert_rx),
+    )
+    .await
+    .expect("alert must be delivered");
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "10.0.0.1",
+        "双目标窗 gate 必须等最慢目标窗（region）追平后才 join（否则 region join miss → where 抑制 → 无输出）"
     );
 }
 

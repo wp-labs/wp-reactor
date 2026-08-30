@@ -1040,6 +1040,50 @@ fn close_all_hop_aligns_by_slide_not_size() {
 }
 
 #[test]
+fn close_all_hop_window_end_exact_uses_window_start_not_event_time() {
+    // 2026-08-30（hop 完整性判定精度回归）：hop 实例的 `created_at` = 窗口起点
+    // （advance_window 的 `created = window_start.unwrap_or(now_nanos)`），close_all
+    // 的 w_start = floor(created_at/slide)*slide 因此精确。若 created_at 被误改为
+    // 事件时间（如 sliding），事件落在窗口后半段时 w_start 推导会偏移 → 窗口
+    // end 虚高 → 误判未完整 → 丢窗口。本用例：事件 T+6s 落在窗口 [T-2s, T+8s)
+    // 后半段，wm=T+8s（= 窗口 end，恰为 slide 边界）→ 窗口必须判完整发射；
+    // 其它覆盖窗口（end > T+8s）不发射。
+    let mut plan = plan_with_close(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+        Duration::from_secs(10),
+        CloseMode::And,
+    );
+    plan.window_spec = WindowSpec::Hop {
+        size: Duration::from_secs(10),
+        slide: Duration::from_secs(2),
+    };
+    let mut sm = CepStateMachine::new("r".into(), plan, None);
+    let t = 1_700_000_000_000_000_000i64; // 2s/10s 均整除
+    // 事件 t=T+6s 扇入窗口 w_start ∈ {T-2s, T, T+2s, T+4s, T+6s}。
+    sm.advance_at(
+        "e",
+        &event(vec![("sip", str_val("10.0.0.1"))]),
+        t + 6_000_000_000,
+    );
+    // 另一 key 把水位推到 T+8s（恰为 slide 边界，= 窗口 [T-2s, T+8s) 的 end）。
+    sm.advance_at(
+        "e",
+        &event(vec![("sip", str_val("10.0.0.2"))]),
+        t + 8_000_000_000,
+    );
+    assert_eq!(sm.watermark_nanos(), t + 8_000_000_000);
+    let outs = sm.close_all(CloseReason::Flush);
+    assert_eq!(
+        outs.len(),
+        1,
+        "窗口 [T-2s, T+8s) 在 wm=end 时完整发射（w_start 用窗口起点非事件时间）"
+    );
+    assert_eq!(sm.instance_count(), 0, "实例仍被释放（无泄漏）");
+}
+
+#[test]
 fn recalibrate_memory_recomputes_exact_estimate() {
     let mut plan = simple_plan(
         vec![simple_key("sip")],
