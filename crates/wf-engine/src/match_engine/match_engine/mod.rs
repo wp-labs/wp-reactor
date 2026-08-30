@@ -1369,6 +1369,17 @@ impl CepStateMachine {
         apply_conv_filtered(outputs, conv_plan, &self.plan.keys)
     }
 
+    /// 窗口粒度向上对齐（真 ceil）：`wm` 恰在边界时返回 `wm` 本身（不再 +1
+    /// 档——旧 `div_euclid+1` 在整除时多对齐一档，会把下一桶误判完整）。
+    fn ceil_align(wm: i64, step_ns: i64) -> i64 {
+        let q = wm.div_euclid(step_ns);
+        if wm.rem_euclid(step_ns) == 0 {
+            wm
+        } else {
+            q.saturating_add(1).saturating_mul(step_ns)
+        }
+    }
+
     /// Close all active instances, returning a [`CloseOutput`] for each.
     ///
     /// Used during shutdown to flush all in-flight state.
@@ -1389,8 +1400,39 @@ impl CepStateMachine {
         keys.sort_by(|(k1, t1), (k2, t2)| t1.cmp(t2).then_with(|| k1.cmp(k2)));
         let mut results = Vec::with_capacity(keys.len());
         let wm = self.watermark_nanos;
-        // HOP/Fixed 窗口的收口尺寸（w_end = created_at + size）；sliding
-        // 无窗口完整性概念，全部收口。
+        // 2026-08-30 修复（q7 尾桶缺失，verify_file L3 对拍定位）：
+        // - 窗口终点用**窗口起点 + size**（`floor(created_at/size)×size`），而非
+        //   created_at + size（实例创建可能晚于窗口起点——尾桶第一个事件 > 桶起点
+        //   时 created_at + size 虚高一个桶内偏移 → 误判未完整）；
+        // - 水位按窗口粒度**向上对齐到桶边界**（`ceil(wm/size)×size`），对齐 oracle
+        //   流末用数据覆盖末尾（scenario 边界 eos_nanos）扫收口的语义——尾桶
+        //   （窗口终点恰在数据覆盖末尾）完整收口。此前用最后事件时间判 incomplete
+        //   → 尾桶被丢（q7 oracle 10 vs 引擎 9 实测）。
+        // sliding 无窗口完整性概念，全部收口。
+        let aligned_wm: Option<i64> = if wm > 0 {
+            match &self.plan.window_spec {
+                // 2026-08-30 对齐粒度修正：hop 窗口在 **slide** 边界收口
+                // （w_end = k*slide + size，k 为 slide 倍数），水位对齐应取 slide
+                // 粒度——用 size 会把尾部未收口的 hop 窗（end ∈ (wm, ceil(wm/size))
+                // 段内）误判为完整（hop 单测回归：10s/2s 窗 wm=T+6s 时 size 对齐到
+                // T+10s → T+8s/T+10s 两个未完整窗被 flush 发射；slide 对齐到
+                // T+6s → 无）。fixed 的 slide == size，无差异。
+                // 向上对齐必须用**真 ceil**（wm 恰在边界时不再 +1 档）：旧
+                // `div_euclid+1` 在整除时多对齐一档 → wm=整边界时把下一桶误判完整。
+                WindowSpec::Hop { slide, .. } => {
+                    let step_ns = slide.as_nanos() as i64;
+                    Some(Self::ceil_align(wm, step_ns))
+                }
+                WindowSpec::Fixed(size) => {
+                    let size_ns = size.as_nanos() as i64;
+                    // 水位按桶大小向上对齐（尾桶终点恰在数据覆盖末尾 → 完整）
+                    Some(Self::ceil_align(wm, size_ns))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         for (key, _) in keys {
             if let Some(instance) = self.remove_instance(&key) {
                 // P1②: close_all is a permanent remove — release each slot.
@@ -1403,8 +1445,24 @@ impl CepStateMachine {
                 // 释放实例但不发射（Q11 10M 实测多 204/197095≈0.1%）。
                 let incomplete = wm > 0
                     && match &self.plan.window_spec {
-                        WindowSpec::Hop { size, .. } | WindowSpec::Fixed(size) => {
-                            instance.created_at.saturating_add(size.as_nanos() as i64) > wm
+                        WindowSpec::Hop { size, slide } => {
+                            let size_ns = size.as_nanos() as i64;
+                            let step_ns = slide.as_nanos() as i64;
+                            // hop 窗口起点按 slide 对齐
+                            let w_start = instance
+                                .created_at
+                                .div_euclid(step_ns)
+                                .saturating_mul(step_ns);
+                            w_start.saturating_add(size_ns) > aligned_wm.unwrap_or(i64::MAX)
+                        }
+                        WindowSpec::Fixed(size) => {
+                            let size_ns = size.as_nanos() as i64;
+                            // fixed 窗口起点按 size 对齐（slide = size）
+                            let w_start = instance
+                                .created_at
+                                .div_euclid(size_ns)
+                                .saturating_mul(size_ns);
+                            w_start.saturating_add(size_ns) > aligned_wm.unwrap_or(i64::MAX)
                         }
                         WindowSpec::Session(gap) => {
                             instance

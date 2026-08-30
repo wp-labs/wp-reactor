@@ -968,6 +968,78 @@ fn close_all_session_emits_sessions_expired_by_watermark() {
 }
 
 #[test]
+fn close_all_fixed_aligns_wm_without_over_aligning_exact_boundary() {
+    // 2026-08-30（q7 尾桶修复的边界修正）：fixed 窗 flush 收口把水位向上对齐到
+    // 桶边界（近似 oracle 的 eos 扫收口）。但向上对齐必须是**真 ceil**——旧
+    // `div_euclid+1` 在 wm 恰为桶边界时多对齐一档（把下一桶误判完整）。本用例：
+    // wm 恰在 10s 边界（T+10s），桶 [T, T+10s) 已完整 → 发射；下一桶
+    // [T+10s, T+20s) 未完整（无事件）→ 不得发射。
+    let mut plan = plan_with_close(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+        Duration::from_secs(10),
+        CloseMode::And,
+    );
+    plan.window_spec = WindowSpec::Fixed(Duration::from_secs(10));
+    let mut sm = CepStateMachine::new("r".into(), plan, None);
+    let t = 1_000_000_000_000i64; // 桶 [t-10s, t)
+    sm.advance_at("e", &event(vec![("sip", str_val("10.0.0.1"))]), t - 1);
+    assert_eq!(sm.watermark_nanos(), t - 1);
+    // 另一 key 把水位推到桶边界 t（桶 [t-10s, t) 完整）。
+    sm.advance_at("e", &event(vec![("sip", str_val("10.0.0.2"))]), t);
+    let outs = sm.close_all(CloseReason::Flush);
+    assert_eq!(
+        outs.len(),
+        1,
+        "wm 恰在桶边界：只有已完整桶发射（旧 div_euclid+1 会把下一桶也误判完整）"
+    );
+    assert_eq!(sm.instance_count(), 0);
+}
+
+#[test]
+fn close_all_hop_aligns_by_slide_not_size() {
+    // 2026-08-30（hop 尾窗过度收口回归）：hop 窗在 **slide** 边界收口
+    // （w_end = k*slide + size），flush 水位对齐必须取 slide 粒度——用 size
+    // 会把 end ∈ (wm, ceil(wm/size)) 段的未收口 hop 窗误判完整并发射。
+    // 本用例：hop(10s, 2s)，wm 恰在 2s 边界 T+6s，尾部窗 end=T+8s/T+10s
+    // 均 > 对齐后水位 → 不得发射（旧 size 对齐把 wm 顶到 T+10s → 误发 2 条）。
+    let mut plan = plan_with_close(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+        Duration::from_secs(10),
+        CloseMode::And,
+    );
+    plan.window_spec = WindowSpec::Hop {
+        size: Duration::from_secs(10),
+        slide: Duration::from_secs(2),
+    };
+    let mut sm = CepStateMachine::new("r".into(), plan, None);
+    let t = 1_700_000_000_000_000_000i64; // 2s/10s 均整除
+    // 事件落在 T（尾窗 [T-2s, T+8s) 与 [T, T+10s) 各 count≥1）。
+    sm.advance_at("e", &event(vec![("sip", str_val("10.0.0.1"))]), t);
+    // 把水位推到 T+6s（恰为 2s 边界）：窗 [T-2s, T+8s) / [T, T+10s) 未到
+    // 收口点，且 flush 对齐（slide=2s → T+6s）后仍不完整 → 不发射。
+    sm.advance_at(
+        "e",
+        &event(vec![("sip", str_val("10.0.0.2"))]),
+        t + 6_000_000_000,
+    );
+    assert_eq!(sm.watermark_nanos(), t + 6_000_000_000);
+    let outs = sm.close_all(CloseReason::Flush);
+    // 完整窗（end ≤ 对齐水位 T+6s）：w_start ∈ {T-8s, T-6s, T-4s} → 3 条。
+    // 未收口窗（end = T+8s / T+10s）不得发射——旧 size 对齐把 wm 顶到
+    // T+10s，会把它们也误发（共 5 条）。
+    assert_eq!(
+        outs.len(),
+        3,
+        "hop flush 只发射 end≤slide 对齐水位的完整窗（旧 size 对齐误发 5 条）"
+    );
+    assert_eq!(sm.instance_count(), 0, "实例仍被释放（无泄漏）");
+}
+
+#[test]
 fn recalibrate_memory_recomputes_exact_estimate() {
     let mut plan = simple_plan(
         vec![simple_key("sip")],
