@@ -1,0 +1,41 @@
+// ---------------------------------------------------------------------------
+// engine domain — flows
+// Crate: wf-engine
+// ---------------------------------------------------------------------------
+
+// ProcessEvents：Arrow IPC RecordBatch → 窗口路由 → 缓冲 → NFA 匹配 → 告警输出
+// 概念步骤：Route → Buffer → Match → Emit
+flow ProcessEvents {
+  trigger IncomingBatch
+  creates OutputRecord
+
+  step<stop> Emit {
+    create OutputRecord {
+      wfx_id = IncomingBatch.stream_name
+    }
+  }
+}
+
+// EvictWindow：内存压力触发窗口旧事件驱逐
+flow EvictWindow {
+  trigger MemoryPressure
+  creates EvictReport
+
+  step<stop> Purge {
+    create EvictReport {
+    }
+  }
+}
+
+// StatsWindowClose：水位推进触发 stats 桶关闭与落盘
+// 概念步骤：Accumulate → Close
+flow StatsWindowClose {
+  trigger NewEvents
+  creates CloseOutput
+
+  step<stop> Close {
+    create CloseOutput {
+      rule_name = NewEvents.events
+    }
+  }
+}

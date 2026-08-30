@@ -1,0 +1,29 @@
+// ---------------------------------------------------------------------------
+// config domain — flows
+// Crate: wf-config
+// ---------------------------------------------------------------------------
+
+// LoadConfig：fusion 配置加载管道 —— 读 TOML → 展开变量 → 校验 → 解析为 FusionConfig
+// 概念步骤：Expand → Validate → Resolve
+flow LoadConfig {
+  trigger ConfigLoadRequest
+  creates FusionConfig
+
+  step<stop> Resolve {
+    create FusionConfig {
+      sinks = ConfigLoadRequest.path
+    }
+  }
+}
+
+// DetectConfigChange：对比新旧配置，分类变更并产出热重载计划
+// 概念步骤：Classify → Plan
+flow DetectConfigChange {
+  trigger ConfigLoadRequest
+  creates FusionReloadPlan
+
+  step<stop> Plan {
+    create FusionReloadPlan {
+    }
+  }
+}

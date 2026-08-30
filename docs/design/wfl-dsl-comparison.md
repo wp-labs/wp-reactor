@@ -1,9 +1,9 @@
 # WFL 与主流关联引擎 DSL 对比分析
-<!-- 角色：架构师 | 状态：v2.1 对齐完成（Top50） | 创建：2026-02-13 | 更新：2026-02-26 -->
+<!-- 角色：架构师 | 状态：v2.2 覆盖范围扩展（五原语 + 函数族补齐） | 创建：2026-02-13 | 更新：2026-08-28 -->
 
 > 本文档对比 WFL（Warp Fusion Language）与 YARA-L 2.0、Elastic EQL、Sigma、Splunk SPL、KQL（Microsoft Sentinel）五种主流关联/检测 DSL 的能力差异，分析 WFL 的设计优势与已知短板。
 >
-> 本文基于 [wfl-design.md](wfl-design.md)（2026-02-20，v2.1）的最新设计。
+> 本文基于 [wfl-design.md](wfl-design.md) 的设计基线（v2.1），并补充 v2.2 新增的 `stats` 原语与扩展函数族。
 
 
 ## 1. 能力矩阵
@@ -30,11 +30,11 @@
 | Join 时点语义 | `snapshot` / `asof within` 一等语法 | ✗ | ✗ | ✗ | ✗ | ✗ |
 | 集合判定 | `window.has(field[, target])` (L2) | `$e.ip in %list` | ✗ | ✗ | `inputlookup` | `in (externaldata)` |
 | 数值风险评分 | `-> score(expr)` (L1) | ✗ | ✗ | ✗ | ✗（需 eval 手算） | ✗ |
-| 分项可解释评分 | `-> score { item = expr @ weight; }` (L2) | ✗ | ✗ | ✗ | ✗ | ✗ |
-| 条件命中映射 | `hit(cond)` → 1.0/0.0 (L2) | ✗ | ✗ | ✗ | ✗ | ✗ |
+| 分项可解释评分 | `-> score { item = expr @ weight; }`（规划，当前为单通道 `-> score(expr)`） | ✗ | ✗ | ✗ | ✗ | ✗ |
+| 条件命中映射 | `hit(cond)` → 1.0/0.0（规划，以 `if/then/else` 替代） | ✗ | ✗ | ✗ | ✗ | ✗ |
 | 实体声明 | `entity(type, id_expr)` 必选 (L1) | ✗ | ✗ | ✗ | ✗ | ✗ |
 | 风险等级派生 | `score` → runtime `level_map` 映射 | 固定 | 固定 | `level:` 固定 | 无 | 固定 |
-| 基线偏离 | `baseline(expr, dur[, method])` (L2/L3) | ✗ | ✗ | ✗ | ✗（需外部 ML） | ✗（Fusion ML） |
+| 基线偏离 | `baseline(expr, dur[, method])` (L2/L3) 🟡 持久化待落地 | ✗ | ✗ | ✗ | ✗（需外部 ML） | ✗（Fusion ML） |
 | 统一输出 | `yield` 统一告警与归并 | ✗ | ✗ | ✗ | ✗ | ✗ |
 | 子查询合并 | 隐式 yield 规则链 + join | ✗ | ✗ | ✗ | `join [subsearch]` | `join (subquery)` |
 | 变量参数化 | `$VAR` / `${VAR:default}` (L1) | ✗ | ✗ | ✗ | `$token$` | ✗ |
@@ -46,6 +46,20 @@
 | 能力分层 | L1/L2/L3 feature gate | ✗ | ✗ | ✗ | ✗ | ✗ |
 | 热加载 | `wf reload` (Drop) | 平台管理 | Kibana UI | 无运行时 | 平台管理 | 平台管理 |
 | 编辑器与语言服务 | Zed 已支持语法高亮 + LSP（诊断/跳转/补全） | 平台 UI | Kibana/IDE 插件 | 社区插件丰富 | 平台 UI + 插件 | Azure/Kusto 工具链 |
+| 声明式窗口统计 | `stats<dur> [group by ...] { agg(f) as label ; }` + `tier` 数值分档 (L3) | ✗ | ✗ | ✗ | `stats` 命令 | `summarize` |
+| 跳窗（HOP） | `match<key:hop(size, slide)>` (L3) | ✗ | ✗ | ✗ | ✗ | ✗ |
+| 反连接 | `join ... anti on ...` (L3) | ✗ | ✗ | ✗ | `NOT join` | ✗ |
+| 受控/延迟连接 | `emit at <expr>` 延迟触发 + `reduce maxrow/minrow/last/top` 连接期归约 (L3) | ✗ | ✗ | ✗ | ✗ | ✗ |
+| 哈希/编码 | `md5`/`sha1`/`sha1_n`/`sha256`/`hex`/`stable_id` (L2) | ✗ | ✗ | ✗ | `md5()` 等 | `hash_*` |
+| 网络判定 | `cidr_match(ip, subnet)` (L2) | ✗ | ✗ | ✗ | `cidrmatch` | `ipv4_is_in_range` |
+| 当前时间 | `now`/`now_s`/`now_ms`/`now_us`/`now_ns` (L2) | ✗ | ✗ | ✗ | `now()` | `now()` |
+| 字符串拼接 | `join`/`join_by(sep, ...)` (L2) | ✗ | ✗ | ✗ | `mvjoin` | `strcat` |
+| 空白/空值处理 | `is_blank`/`null_if_blank`/`default_if_blank` (L2) | ✗ | ✗ | ✗ | `nullif` 等 | `isempty`/`isnotempty` |
+| 对象合并/字面量 | `merge(o1,o2,...)` + `object{}`/`array[]` (L2) | ✗ | ✗ | ✗ | ✗ | ✗ |
+| RANK 取并列 | `conv { top_ties(N) ; }` (L3) | ✗ | ✗ | ✗ | `eventstats rank` | `row_rank` |
+| 基线方法扩展 | `baseline(expr, dur, ewma\|median)` (L3) | ✗ | ✗ | ✗ | MLTK | Fusion ML |
+| 规则级绑定 | `let <id> = <expr>` (L1) | ✗ | ✗ | ✗ | `eval` | `let` |
+| 外部服务调用 | `external(service, ...)` (L2) | ✗ | ✗ | ✗ | `lookup`(外部) | `externaldata` |
 
 
 ## 2. 逐引擎对比
@@ -61,7 +75,7 @@
 | 表达式 | `if/then/else` + `hit()` + 字符串/时间函数 + `in`/`not in` | 仅基础条件 |
 | 字符串函数 | `contains`/`regex_match`/`replace`/`replace_plain`/`trim`/`ltrim`/`rtrim`/`split`/`len`/`lower`/`upper`/`concat`/`indexof`/`startswith_any`/`endswith_any` | `re.regex`（能力有限） |
 | 时间格式化/解析 | `strftime`/`strptime` | 无 |
-| 风险评分 | `-> score(expr)` 单通道 + `-> score { item @ weight }` 分项可解释 + 跨规则累加 | ✗ |
+| 风险评分 | `-> score(expr)` 单通道（分项可解释 `score { item @ weight }` 与跨规则累加为规划） | ✗ |
 | 实体建模 | `entity(type, id_expr)` 一等语法，必选声明 | 无实体概念 |
 | 输出 | `yield` 统一告警与归并，窗口可配 sinks | 仅告警，无数据归并 |
 | 风险等级 | `score` + runtime `level_map` 配置化映射（可版本化） | 规则级固定 |
@@ -69,7 +83,7 @@
 | 上手成本 | 三文件 + 六阶段 + L1/L2/L3 分层 | 单文件 + 四段式，门槛更低 |
 | 生态 | 独立引擎，需自建 | Chronicle 平台内置，开箱即用 |
 
-**总结**：WFL 在检测表达力上全面超越 YARA-L。WFL 的核心差异化在于：① OR 分支时序 + 双阶段匹配（`on event`/`on close`）；② 分项可解释评分（`score { item @ weight }`）+ 跨规则累加；③ 一等实体声明（`entity()`），YARA-L 完全没有实体行为建模能力；④ 行为分析扩展（session window、collect 函数、baseline、score）进一步拉开差距；⑤ v2.1 的 `join snapshot/asof`、`limits`、`yield@vN` 与 conformance 门禁提高了可治理性。代价是学习曲线更陡——但 L1/L2/L3 分层降低了初始上手门槛。
+**总结**：WFL 在检测表达力上全面超越 YARA-L。WFL 的核心差异化在于：① OR 分支时序 + 双阶段匹配（`on event`/`on close`）；② 分项可解释评分（`score { item @ weight }`，规划态）+ 跨规则累加（规划态）；③ 一等实体声明（`entity()`），YARA-L 完全没有实体行为建模能力；④ 行为分析扩展（session window、collect 函数、baseline、score）进一步拉开差距；⑤ v2.1 的 `join snapshot/asof`、`limits`、`yield@vN` 与 conformance 门禁提高了可治理性。代价是学习曲线更陡——但 L1/L2/L3 分层降低了初始上手门槛。
 
 ### 2.2 vs Elastic EQL
 
@@ -79,7 +93,7 @@
 | 双阶段匹配 | `on event` + `on close` | 无 |
 | 聚合 | 完整聚合 + 统计函数 + `conv` + `fixed` | 无聚合能力 |
 | 行为分析 | session window + collect 函数 + baseline + score | 无 |
-| 风险评分 | `-> score(expr)` + 分项可解释评分 + 实体声明 | 无 |
+| 风险评分 | `-> score(expr)` 单通道（分项可解释评分为规划）+ 实体声明 | 无 |
 | 字符串 | `contains`/`regex_match`/`replace`/`replace_plain`/`trim`/`ltrim`/`rtrim`/`split`/`len`/`lower`/`upper`/`concat`/`indexof`/`startswith_any`/`endswith_any` | `match`/`wildcard`/`length`/`stringContains` |
 | 时间格式化/解析 | `strftime`/`strptime` | 非核心能力（通常依赖平台侧处理） |
 | 外部关联 | `join` + `.has()` | 无 |
@@ -108,11 +122,11 @@
 | 时序链 | `match` 多步 + OR 分支 | `transaction` 功能等价但语法不同 |
 | 双阶段匹配 | `on event` + `on close` 显式分离 | 无对应概念 |
 | OR 分支 | `branch_a \|\| branch_b ;` 一等语法 | 无直接支持 |
-| 风险评分 | `-> score(expr)` 单通道 + `-> score { item @ weight }` 分项可解释 + 跨规则累加 | 无内置概念（需 eval 手算） |
+| 风险评分 | `-> score(expr)` 单通道（分项可解释 `score { item @ weight }` 与跨规则累加为规划） | 无内置概念（需 eval 手算） |
 | 实体建模 | `entity(type, id_expr)` 一等语法 + 跨规则评分累加键 | 无内置（需外部模型） |
 | 会话窗口 | `match<key:session(gap)>` 一等语法 | `transaction maxpause=` 功能等价 |
 | 统一输出 | `yield` 告警+归并+行为分析统一 | 告警是平台层，非语言层 |
-| 基线偏离 | `baseline(expr, dur, method)` 内置 + 持久化 | 无内置（需 MLTK 外部模块） |
+| 基线偏离 | `baseline(expr, dur, method)` 内置（🟡 **持久化待落地**，见 §3 注） | 无内置（需 MLTK 外部模块） |
 | 风险等级 | `score` → runtime `level_map` 可版本化映射 | 无内置概念 |
 | 聚合深度 | 基础聚合 + `stddev`/`percentile` + `conv` + `fixed` | **仍超** — `eventstats/streamstats` + 无限管道 + 200+ 函数 |
 | 集合收集 | `collect_set`/`collect_list`/`first`/`last` + `mvcount`/`mvjoin`/`mvdedup` | `values`/`list`/`first`/`last` + `mvcount`/`mvjoin` 功能等价 |
@@ -123,7 +137,7 @@
 | 行保留 | 无 | `eventstats` 保留原始行 |
 | 部署 | 单机轻量 | 重量级平台 |
 
-**总结**：行为分析扩展后，WFL 与 SPL 的差距进一步缩小。集合收集、统计函数、条件表达式都已对齐 SPL 核心能力；字符串侧在 `replace_plain`/`ltrim`/`rtrim`/`concat`/`indexof`/`startswith_any`/`endswith_any` 落地后继续收敛，时间侧新增 `strftime`/`strptime`。**WFL 的新增差异化**：分项可解释评分（`score { ... }`）、一等实体建模（`entity()`）、跨规则评分累加——这三项是 SPL 完全不具备的检测/分析原语。SPL 仍在通用计算（200+ 函数、eventstats、无限管道）上保持优势，两者的差距从"聚合能力远弱"收窄到"通用函数库丰富度"——这是检测 DSL vs 通用查询语言的本质差异。
+**总结**：行为分析扩展后，WFL 与 SPL 的差距进一步缩小。集合收集、统计函数、条件表达式都已对齐 SPL 核心能力；字符串侧在 `replace_plain`/`ltrim`/`rtrim`/`concat`/`indexof`/`startswith_any`/`endswith_any` 落地后继续收敛，时间侧新增 `strftime`/`strptime`。**WFL 的新增差异化**：分项可解释评分（`score { ... }`，规划态）、一等实体建模（`entity()`）、跨规则评分累加（规划态）——这三项是 SPL 完全不具备的检测/分析原语。SPL 仍在通用计算（200+ 函数、eventstats、无限管道）上保持优势，两者的差距从"聚合能力远弱"收窄到"通用函数库丰富度"——这是检测 DSL vs 通用查询语言的本质差异。
 
 ### 2.5 vs KQL（Microsoft Sentinel）
 
@@ -132,9 +146,9 @@
 | 时序链 | `match` 多步 + OR 分支 | 无原生时序链（需手写 join + 时间条件） |
 | 双阶段匹配 | `on event` + `on close` | 无 |
 | 会话窗口 | `match<key:session(gap)>` 一等语法 | 无原生（需 `row_window_session` 手写） |
-| 风险评分 | `-> score(expr)` + 分项可解释评分 + 跨规则累加 | 无 |
+| 风险评分 | `-> score(expr)` 单通道（分项可解释评分与跨规则累加为规划）+ 实体声明 | 无 |
 | 实体建模 | `entity(type, id_expr)` 一等语法 | 无（UEBA 是平台层 ML，非语言层） |
-| 基线偏离 | `baseline(expr, dur, method)` 内置 + 持久化 | 无（Sentinel Fusion 依赖 ML 模型） |
+| 基线偏离 | `baseline(expr, dur, method)` 内置（🟡 **持久化待落地**，见 §3 注） | 无（Sentinel Fusion 依赖 ML 模型） |
 | 风险等级 | `score` → runtime `level_map` 配置化映射 | 无 |
 | 统一输出 | `yield` | 无 |
 | 字符串函数 | `contains`/`regex_match`/`replace`/`replace_plain`/`trim`/`ltrim`/`rtrim`/`split`/`len`/`lower`/`upper`/`concat`/`indexof`/`startswith_any`/`endswith_any` | `contains`/`startswith`/`endswith`/`replace_string`/`trim`/`split`/`strlen`/`tolower`/`toupper`/`strcat`/`indexof` 等 |
@@ -146,7 +160,7 @@
 | 子查询 | 规则链 | `join (subquery)` 内联 |
 | 部署 | 独立轻量 | Azure 云平台绑定 |
 
-**总结**：KQL 没有原生时序链和会话窗口检测（Sentinel 的 Fusion 引擎是 ML 驱动而非规则驱动），WFL 在多步序列检测和行为分析上有结构性优势。随着 `replace_plain`/`ltrim`/`rtrim`/`concat`/`indexof`/`startswith_any`/`endswith_any` 及 `strftime`/`strptime` 落地，WFL 在字符串与时间处理上的可用性进一步提升。**WFL 的新增差异化**：分项可解释评分和一等实体建模是 KQL/Sentinel 在语言层完全缺失的（Sentinel UEBA 依赖平台 ML，非规则可控）。WFL 的 baseline 内置能力也优于 KQL。KQL 在聚合丰富度和可视化上更强，但绑定 Azure 生态。
+**总结**：KQL 没有原生时序链和会话窗口检测（Sentinel 的 Fusion 引擎是 ML 驱动而非规则驱动），WFL 在多步序列检测和行为分析上有结构性优势。随着 `replace_plain`/`ltrim`/`rtrim`/`concat`/`indexof`/`startswith_any`/`endswith_any` 及 `strftime`/`strptime` 落地，WFL 在字符串与时间处理上的可用性进一步提升。**WFL 的新增差异化**：分项可解释评分（规划态）和一等实体建模是 KQL/Sentinel 在语言层完全缺失的（Sentinel UEBA 依赖平台 ML，非规则可控）。WFL 的 baseline 内置能力也优于 KQL。KQL 在聚合丰富度和可视化上更强，但绑定 Azure 生态。
 
 
 ## 3. WFL 独有能力
@@ -159,9 +173,9 @@
 | 双阶段匹配 | `on event { ... }` + `on close { ... }` | L1 | 实时求值与窗口关闭求值显式分离，缺失检测（A→NOT B）语义清晰 |
 | 实体声明 | `entity(type, id_expr)` | L1 | 规则必选的一等实体键声明，驱动跨规则评分累加 |
 | 数值风险评分 | `-> score(expr)` | L1 | 规则只产出数值分，与等级解耦，支持跨规则累加 |
-| 分项可解释评分 | `-> score { item = expr @ weight; ... }` | L2 | 多维指标加权评分，产出 `score_contrib` JSON 明细 |
-| 条件命中映射 | `hit(cond)` → 1.0/0.0 | L2 | 布尔条件映射为评分权重，简化 score 表达式 |
-| 内置基线偏离 | `baseline(expr, dur[, method])` | L2/L3 | 无需外部 ML 模块即可做行为偏离检测，支持持久化 |
+| 分项可解释评分 | `-> score { item = expr @ weight; ... }` | 规划 | 多维指标加权评分，产出 `score_contrib` JSON 明细（尚未实现，当前为单通道 `-> score(expr)`） |
+| 条件命中映射 | `hit(cond)` → 1.0/0.0 | 规划 | 布尔条件映射为评分权重（尚未实现，当前用 `if/then/else` 替代） |
+| 内置基线偏离 | `baseline(expr, dur[, method])` | L2/L3 | 无需外部 ML 模块即可做行为偏离检测，支持 `ewma`/`median` 方法。<br>⚠ **现状受限（2026-08-30 源码核查）**：`dur` 在实现中**被忽略**（`eval/mod.rs:187` 只读 `args[0]`/`args[2]`），实为"实例启动以来累积统计量"；状态键不含 `dur`；**无持久化**（状态挂 match 实例，`state.rs:138/304` 淘汰即清）。完整设计见 `baseline-online-design.md` v2.2（**已定稿未落地**），对外勿宣称"支持持久化" |
 | Join 时点语义一等化 | `join ... snapshot/asof ... within` | L2 | 消除在线/回放在维表取值时点上的语义漂移 |
 | 规则资源预算 | `limits { max_memory; ... }` | v2.1 | 规则级资源防护，阻断高基数状态膨胀 |
 | 输出契约版本化 | `yield target@vN` + `meta.contract_version` | v2.1 | 下游字段演进可灰度、可回滚、可审计 |
@@ -172,6 +186,19 @@
 | 隐式 window | `yield (...)` 无目标名，编译器推导 | L3 | 多级规则链零配置 |
 | 能力分层 | L1(MVP) / L2(增强) / L3(高级+feature gate) | — | 渐进学习，避免首版认知过载 |
 | 格式化函数 | `fmt(STRING, expr, ...)` | L1 | 统一告警 message 格式化 |
+| 声明式窗口统计 | `stats<dur> [group by (k)] { agg(f) as label ; }` + `tier` 分档 | L3 | 编译期定型的窗口聚合 DSL，含 `count/sum/avg/min/max/distinct_count/last/top(N)` 与数值区间分档（多列输出） |
+| 跳窗（HOP） | `match<key:hop(size, slide)>` | L3 | 固定步长的重叠滑动窗口，要求 `size` 为 `slide` 整数倍 |
+| 反连接 | `join ... anti on ...` | L3 | 维表无匹配即触发的反连接语义（如"不在白名单"） |
+| 受控/延迟连接 | `emit at <expr>` + `reduce maxrow/minrow/last/top` | L3 | 连接结果延迟到指定事件点触发，或连接期归约到单行 |
+| 哈希/编码族 | `md5`/`sha1`/`sha1_n`/`sha256`/`hex`/`stable_id` | L2 | 字段指纹、去敏 ID、内容哈希，无需外部脚本 |
+| 网络判定 | `cidr_match(ip, subnet)` | L2 | Sigma `\|cidr` 等效，IP 子网归属判定 |
+| 当前时间戳 | `now`/`now_s`/`now_ms`/`now_us`/`now_ns` | L2 | 多精度当前时间，支撑"相对此刻"的窗口/基线 |
+| 字符串拼接 | `join(v...)`/`join_by(sep, v...)` | L2 | 标量/多值拼为字符串，替代多 `concat` 嵌套 |
+| 空白/空值处理 | `is_blank`/`null_if_blank`/`default_if_blank` | L2 | 统一处理空串与空白，简化字段清洗 |
+| 对象合并/字面量 | `merge(o1,o2,...)` + `object{}`/`array[]` | L2 | 结构化字段构造与浅合并 |
+| RANK 取并列 | `conv { top_ties(N) ; }` | L3 | 保留并列末位等值行的 Top-N（RANK 语义），要求前导 `sort` |
+| 规则级绑定 | `let <id> = <expr>` | L1 | 逐事件求值的中间变量，避免重复子表达式 |
+| 外部服务调用 | `external(service, ...)` | L2 | 在规则内分发到外部服务/维表，编译期可检查 |
 
 
 ## 4. 与 SPL/KQL 聚合差距分析
@@ -187,7 +214,7 @@ WFL 设计初期与 SPL/KQL 在聚合能力上存在多项差距，经过 `fixed
 | 条件表达式 | **已消除** | `if c then a else b` + `hit(c)` (L2) | `eval if(c,a,b)` |
 | 集合收集 | **已消除** | `collect_set`/`collect_list`/`first`/`last` + `mvcount`/`mvjoin`/`mvdedup` (L3) | `values`/`list`/`first`/`last` + `mvcount`/`mvjoin` |
 | 统计函数 | **已消除** | `stddev`/`percentile` (L3) | `stdev`/`perc95` |
-| 字符串函数 | **进一步缩小** | `contains`/`regex_match`/`replace`/`replace_plain`/`trim`/`ltrim`/`rtrim`/`split`/`len`/`lower`/`upper`/`concat`/`indexof`/`startswith_any`/`endswith_any` (L2, 15 个) | 200+ 函数 |
+| 字符串函数 | **进一步缩小** | `contains`/`regex_match`/`replace`/`replace_plain`/`trim`/`ltrim`/`rtrim`/`split`/`len`/`lower`/`upper`/`concat`/`indexof`/`startswith_any`/`endswith_any`/`count_char`/`join`/`join_by`/`is_blank`/`null_if_blank`/`default_if_blank`/`cidr_match`/`merge` (L2, 20+ 个) + 哈希族 `md5`/`sha1`/`sha1_n`/`sha256`/`hex`/`stable_id` | 200+ 函数 |
 | 多级管道 | **大幅缩小** | `\|>` 规则内串联 + 隐式 window (L3) | `\|` 无限管道 |
 | 子查询合并 | **大幅缩小** | 隐式 yield 规则链 + join 引用规则名 | `\| join [subsearch]` |
 | 行保留聚合 | 仍有差距 | 无（流式模型不保留原始行） | `eventstats` |
@@ -198,11 +225,13 @@ WFL 设计初期与 SPL/KQL 在聚合能力上存在多项差距，经过 `fixed
 
 | 维度 | WFL | SPL | KQL |
 |------|-----|-----|-----|
-| 分项可解释评分 | `score { item @ weight }` + `score_contrib` JSON | ✗ | ✗ |
+| 分项可解释评分 | `score { item @ weight }` + `score_contrib` JSON（**规划，当前为单通道 `-> score(expr)`**） | ✗ | ✗ |
+| 跨规则评分累加 | `(entity_type, entity_id, time_bucket)` 累加键（**依赖 score 块，规划**） | ✗ | ✗ |
 | 一等实体声明 | `entity(type, id_expr)` 必选 | ✗ | ✗（平台 ML） |
-| 跨规则评分累加 | `(entity_type, entity_id, time_bucket)` 累加键 | ✗ | ✗ |
-| 内置基线 + 持久化 | `baseline(expr, dur, method)` 语言原语 | 需 MLTK | 需 Fusion ML |
+| 内置基线（**持久化待落地**） | `baseline(expr, dur, method)` 语言原语，`dur` 语义与持久化**尚未实现**（设计已定稿，见 `baseline-online-design.md` v2.2） | 需 MLTK | 需 Fusion ML |
 | 双阶段匹配 | `on event` + `on close` | ✗ | ✗ |
+| 声明式窗口统计 | `stats<dur> [group by] { agg as label }` + `tier` 分档 | 需 `stats` 命令 | 需 `summarize` |
+| HOP/反连接/延迟连接 | `match<key:hop>`、`join ... anti`、`emit at` | ✗ | ✗ |
 
 
 ## 5. 已知短板
@@ -210,8 +239,9 @@ WFL 设计初期与 SPL/KQL 在聚合能力上存在多项差距，经过 `fixed
 | 短板 | 影响 | 是否需要解决 |
 |------|------|-------------|
 | 行保留聚合（eventstats） | 无法"给每行附加聚合值后保留原始行" | 否——分析查询能力，交给下游 SIEM |
-| 字符串/多值函数库深度 | 已补齐 `substr`/`startswith`/`endswith`/`mvindex`/`mvappend`，但整体函数总量仍低于 SPL | 可后续按需扩展 |
-| 通用数学函数 | 已补齐 `abs`/`round`/`ceil`/`floor`/`sqrt`/`pow`/`log`/`exp`/`sign`/`trunc`/`clamp`，仍缺 `sin`/`cos` 等 | 可后续按需扩展 |
+| 字符串/多值函数库深度 | v2.2 已补齐 `substr`/`startswith`/`endswith`/`mvindex`/`mvappend`/`count_char`/`join`/`join_by`/`is_blank`/`null_if_blank`/`default_if_blank`/`cidr_match`/`merge` 等，并新增强哈希族（`md5`/`sha1`/`sha256`/`hex`/`stable_id`），整体函数总量已显著接近 SPL | 可后续按需扩展至 SPL 全量 |
+| 通用数学函数 | 已补齐 `abs`/`round`/`ceil`/`floor`/`sqrt`/`pow`/`log`/`exp`/`sign`/`trunc`/`clamp`，仍缺三角函数（`sin`/`cos`/`tan`/`atan` 等）与 `log10`/`log2`/`hypot`/`cbrt`/`gcd`/`lcm` | 可后续按需扩展 |
+| 暂未落地的规划项 | `hit(cond)` 与分项可解释评分 `-> score { item @ weight }` 在对比文档早期标为已支持，实际仍为规划态（当前以 `if/then/else` 与单通道 `-> score(expr)` 替代） | 落地后补入 §3 独有能力 |
 | 社区规则库 | 无现成规则 | 可考虑支持 Sigma 规则导入 |
 | 三文件 + pack.yaml 认知成本 | 新用户需理解文件协作关系 | L1 子集 + 模板 + 文档覆盖 + Zed 语法高亮/LSP 降低上手成本 |
 | L3 feature gate 复杂度 | 高级特性需显式启用，增加配置步骤 | 文档明确分层边界 |
@@ -230,7 +260,7 @@ YARA-L ░░░░░░░░░░░░░░░█████████�
 Sigma ░░░░░░░░░░░░░░░░░░██████░░░░         规则分发格式，无执行
 ```
 
-WFL 在检测语言中表达力最强（OR 分支、双阶段匹配、缺失检测、数据归并），同时通过行为分析扩展（session window、collect 函数、统计函数、baseline、score）将能力边界从"安全检测"推进到"实体行为分析"。与 SPL/KQL 的差距从设计初期的"远弱"持续收窄——11 项差距中 7 项已消除，剩余差距集中在通用函数库丰富度和行保留聚合，这是 DSL vs 通用查询语言的设计边界，不是能力缺陷。v2.1 进一步补上工程治理维度（`join` 时点语义、规则预算、契约版本、conformance 门禁），让“能表达”走向“可证明、可演进”。
+WFL 在检测语言中表达力最强（OR 分支、双阶段匹配、缺失检测、数据归并），同时通过行为分析扩展（session window、HOP window、collect 函数、统计函数、baseline、score）将能力边界从"安全检测"推进到"实体行为分析"。与 SPL/KQL 的差距从设计初期的"远弱"持续收窄——11 项差距中 7 项已消除、3 项大幅缩小（字符串/多值/时间函数随着 v2.2 哈希族、cidr、now、merge 等 20+ 新函数进一步逼近），剩余差距集中在通用三角函数库与行保留聚合，这是 DSL vs 通用查询语言的设计边界，不是能力缺陷。v2.1 补上工程治理维度（`join` 时点语义、规则预算、契约版本、conformance 门禁），v2.2 进一步补上第五原语 `stats`、HOP/反连接/延迟连接、声明式统计与扩展函数族，让“能表达”走向“可证明、可演进、覆盖广”。
 
 **WFL v2.1 的核心设计演进**：
 
@@ -238,13 +268,29 @@ WFL 在检测语言中表达力最强（OR 分支、双阶段匹配、缺失检�
 |------|------|
 | 评分模型统一 | 规则只产出 `score`（`[0,100]`），不再声明等级；等级由 runtime `level_map` 配置化派生 |
 | 实体一等化 | `entity(type, id_expr)` 为必选语法，驱动跨规则评分累加键 `(entity_type, entity_id, time_bucket)` |
-| 评分可解释 | `score { item = expr @ weight; ... }` 分项评分产出 `score_contrib` JSON 明细 |
-| Core IR 收敛 | 四原语（Bind/Match/Join/Yield）为唯一语义内核，所有语法糖编译期 desugar |
+| 评分可解释 | `score { item = expr @ weight; ... }` 分项评分产出 `score_contrib` JSON 明细（规划，尚未实现） |
+| Core IR 收敛 | 五原语（Bind/Match/Stats/Join/Yield）为唯一语义内核，所有语法糖编译期 desugar |
 | 六阶段管道 | BIND→SCOPE→JOIN→ENTITY→YIELD→CONV（ENTITY 为声明位，不新增计算算子） |
 | Join 语义固定 | `join` 必须显式声明 `snapshot` 或 `asof within` |
 | 资源预算内建 | `limits` 成为规则必填，编译阶段产出成本/风险评估 |
 | 输出契约治理 | `yield target@vN` + `meta.contract_version`，支持版本化演进 |
 | 正确性门禁 | `test + shuffle + scenario verify` 三层校验作为发布门槛 |
+
+**WFL v2.2 的核心设计演进（覆盖范围扩展）**：
+
+| 演进 | 说明 |
+|------|------|
+| 第五原语 `stats` | 声明式窗口统计成为与 `match`/`join` 平级的原语：`stats<dur> [group by (k)] { agg(f) as label ; }` + `tier` 数值分档（多列输出），编译期定型、聚合在 set 层求值 |
+| HOP 跳窗 | `match<key:hop(size, slide)>` 固定步长重叠滑动窗口（要求 `size` 为 `slide` 整数倍） |
+| Join 关系扩展 | `anti` 反连接（维表无匹配即触发）；`within [lo, hi]` 非对称区间；连接期 `reduce maxrow/minrow/last/top(N)` 归约；`emit at <expr>` 延迟触发 |
+| 哈希/编码族 | `md5`/`sha1`/`sha1_n`/`sha256`/`hex`/`stable_id` 一等函数，支撑指纹、去敏 ID、内容哈希 |
+| 网络/时间/空白处理 | `cidr_match(ip, subnet)`、`now`/`now_s`/`now_ms`/`now_us`/`now_ns`、`is_blank`/`null_if_blank`/`default_if_blank` |
+| 字符串/对象增强 | `join`/`join_by` 标量拼接、`count_char` 字符计数、`merge` 对象浅合并 + `object{}`/`array[]` 字面量 |
+| RANK 取并列 | `conv { top_ties(N) ; }` 保留并列末位等值行的 Top-N（要求前导 `sort`） |
+| 基线方法扩展 | `baseline(expr, dur, method)`，第三参 `method ∈ { mean(默认), ewma, median }` |
+| 规则级绑定 | `let <id> = <expr>` 逐事件中间变量，避免重复子表达式 |
+| 外部服务调用 | `external(service, ...)` 在规则内分发到外部服务/维表，编译期可检查 |
+| 函数目录扩容 | 新增 20+ 标量/字符串/哈希/网络/时间函数，整体函数量从 Top50（50/50）扩展至覆盖 SPL 高频 + 安全检测专有族 |
 
 WFL 的独特定位：**唯一同时提供时序检测、实体建模、可解释数值评分、内置基线的独立 DSL**。SPL/KQL 通过平台能力（ML 模块、外部插件）可实现类似效果，但不是语言层原语——WFL 将这些能力内化为编译期可检查、运行期可解释的语言一等公民。随着 Zed 语法高亮与 LSP 落地，WFL 在开发体验上的短板也开始收敛。
 
@@ -310,7 +356,7 @@ WFL 的独特定位：**唯一同时提供时序检测、实体建模、可解�
 | `mvsort` | `mvsort` | ✅ 已支持 | — |
 | `reverse`（多值） | `mvreverse` | ✅ 已支持 | — |
 
-> 当前清单口径下，Top50 已支持 50/50（100.0%），覆盖率目标已超额完成。
+> 当前清单口径下，Top50 已支持 50/50（100.0%），覆盖率目标已超额完成。v2.2 在 Top50 之外进一步扩展了安全检测专有函数族（哈希/编码、网络、当前时间、对象合并、空白处理等），整体函数目录显著扩容。
 
 ### 7.2 实现批次回顾
 
@@ -320,6 +366,30 @@ WFL 的独特定位：**唯一同时提供时序检测、实体建模、可解�
 | Batch-2 | `abs` | ✅ 已完成，达到 Top30 覆盖率 90%（27/30） |
 | Batch-3 | `round`, `ceil`, `floor`, `strftime`, `strptime` | ✅ 已完成，补齐数值取整与时间格式化/解析能力（5 个函数） |
 | Batch-4 | `sqrt`, `pow`, `log`, `exp`, `clamp`, `sign`, `trunc`, `is_finite`, `ltrim`, `rtrim`, `concat`, `indexof`, `replace_plain`, `startswith_any`, `endswith_any`, `coalesce`, `isnull`, `isnotnull`, `mvsort`, `mvreverse` | ✅ 已完成，扩展 20 个函数并达成 Top50（50/50） |
+| Batch-5（v2.2 扩展族） | `md5`/`sha1`/`sha1_n`/`sha256`/`hex`/`stable_id`、`cidr_match`、`now`/`now_s`/`now_ms`/`now_us`/`now_ns`、`merge`、`join`/`join_by`、`count_char`、`is_blank`/`null_if_blank`/`default_if_blank`、`bucket_end`、`external`、`stat.count`/`stat.value` | ✅ 已完成，覆盖 SPL 高频之外的检测专有族；配合第五原语 `stats`、HOP 窗口、`anti`/`emit at`/`reduce` join、`conv top_ties`、`baseline` 方法扩展、`let` 绑定 |
+
+### 7.3 扩展函数族清单（v2.2，超出 SPL Top50 范围）
+
+下表为 v2.2 新增、非 SPL Top50 但显著提升检测表达力的函数/能力：
+
+| 类别 | 函数 / 语法 | 能力 |
+|---|---|---|
+| 哈希/编码 | `md5`/`sha1`/`sha1_n`/`sha256`/`hex`/`stable_id` | 字段指纹、内容哈希、去敏稳定 ID |
+| 网络 | `cidr_match(ip, subnet)` | IP 子网归属（Sigma `\|cidr` 等效） |
+| 当前时间 | `now`/`now_s`/`now_ms`/`now_us`/`now_ns` | 多精度当前时间戳 |
+| 时间边界 | `bucket_end(t, interval)` | 时间桶结束边界 |
+| 字符串拼接 | `join(v...)`/`join_by(sep, v...)` | 标量/多值拼为字符串 |
+| 字符计数 | `count_char(text, ch)` | 字符出现次数 |
+| 空白/空值 | `is_blank`/`null_if_blank`/`default_if_blank` | 空串与空白统一处理 |
+| 对象 | `merge(o1,o2,...)` + `object{}`/`array[]` 字面量 | 结构化字段构造与浅合并 |
+| 外部 | `external(service, ...)` | 规则内分发到外部服务/维表 |
+| 统计选择器 | `stat.count(...)`/`stat.value(...)` | 稳定统计上下文选择器（L3，yield 内） |
+| 声明式统计 | `stats<dur> [group by] { agg as label }` + `tier` | 第五原语：窗口聚合 DSL |
+| 窗口 | `match<key:hop(size, slide)>` | HOP 跳窗 |
+| 连接 | `anti` / `within [lo,hi]` / `reduce maxrow|minrow|last|top(N)` / `emit at <expr>` | 反连接、非对称区间、连接期归约、延迟触发 |
+| 结果变换 | `conv { top_ties(N) ; }` | RANK 语义取并列 |
+| 基线 | `baseline(expr, dur, ewma\|median)` | 指数加权/中位数基线 |
+| 绑定 | `let <id> = <expr>` | 规则级逐事件中间变量 |
 
 
 ## 相关文档

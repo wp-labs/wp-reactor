@@ -1,0 +1,15 @@
+// ---------------------------------------------------------------------------
+// Reactor subsystem — the wp-reactor daemon business boundary
+// ---------------------------------------------------------------------------
+
+subsystem Reactor {
+  meta {
+    label zh "Reactor 引擎子系统"
+    label en "Reactor Engine Subsystem"
+  }
+
+  uses service wp-reactor
+  uses module Runtime.ReactorLifecycle
+  uses module Engine.MatchEngine
+  uses module Config.FusionConfig
+}

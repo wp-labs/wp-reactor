@@ -1,0 +1,117 @@
+// ---------------------------------------------------------------------------
+// lang domain — module architecture for WFL / WFS / WFG DSL language crate
+// Crate: wf-lang
+// ---------------------------------------------------------------------------
+
+module LangSchema {
+  layer DataFusion
+  owns WindowSchema, StaticWindowSchema, FieldDef, FieldType, BaseType
+  responsible_for "WFS window schema definition — field types, base types, and static window schema structure"
+}
+
+module LangRule {
+  layer DataFusion
+  owns WflFile, UseDecl, RuleDecl, MetaBlock, MetaEntry, PatternDecl, PipelineStage, LetDecl, EventsBlock, EventDecl, YieldPresetDecl, YieldPresetParam, PatternOrigin
+  responsible_for "WFL rule file structure — rule declarations, metadata, events, and pipeline stages"
+}
+
+module LangMatch {
+  layer DataFusion
+  owns MatchClause, MatchMode, EachClause, KeyMapItem, MatchStep, StepBranch, PipeChain, Transform, Measure, CloseBlock, CloseMode, CloseTrigger, WindowMode, SeqClause, SeqStep, SeqSkip
+  responsible_for "WFL match clause AST — sequential pattern matching steps, close behavior, and window modes"
+}
+
+module LangExpr {
+  layer DataFusion
+  owns Expr, FieldRef, FieldSelector, CmpOp, BinOp, SystemVar, ObjectItem, PathSegment, WfuMetaField, WfuIntermediateMetaField
+  responsible_for "WFL expression language — field references, comparison/arithmetic operators, and expression tree nodes"
+}
+
+module LangClauses {
+  layer DataFusion
+  owns ScoreExpr, EntityClause, EntityTypeVal, YieldClause, YieldPresetRef, NamedArg, LimitsBlock, LimitItem
+  responsible_for "WFL clause AST — scoring, entity extraction, yield output, and rate limiting"
+}
+
+module LangJoin {
+  layer DataFusion
+  owns JoinClause, JoinMode, JoinCondition, Bound, BoundVal, ReduceClause, ReduceMeasure, TieSpec, WithinSpec
+  responsible_for "WFL join clause AST — window join modes (snapshot, asof, anti, inner) and join conditions"
+}
+
+module LangConv {
+  layer DataFusion
+  owns ConvClause, ConvChain, ConvStep, SortKey
+  responsible_for "WFL conv clause AST — post-match conversion chains (sort, top, top_ties, dedup, where)"
+}
+
+module LangStats {
+  layer DataFusion
+  owns StatsClause, StatsAgg, StatsMeasure, StatsWindow, StatsWindowMode, StatsOutputShape
+  responsible_for "WFL stats clause AST — windowed aggregation measures and output shapes"
+}
+
+module LangTest {
+  layer DataFusion
+  owns TestBlock, InputStmt, FieldAssign, ExpectStmt, HitAssert, TestOptions, EvalMode, PermutationMode
+  responsible_for "WFL test contract — input/output assertions, evaluation modes, and permutation testing"
+}
+
+module LangScenario {
+  layer DataFusion
+  owns WfgFile, ScenarioDecl, TimeClause, SyntaxScenario, ScenarioAttr, AttrValue, TrafficBlock, SyntaxStreamDecl, RateExpr, WaveShape, TimelineSegment, SyntaxInjectionBlock, SyntaxInjectCase, InjectCaseMode, SeqBlock, ScenarioSeqStep, FieldPredicate, ExpectBlock, ExpectCheck, ExpectMetric, CompareOp, ExpectValue, Rate, RateUnit, StreamBlock, FieldOverride, GenExpr, GenArg, InjectBlock, InjectLine, InjectUseStep, InjectMode, FaultsBlock, FaultType, FaultLine, OracleBlock, ParamAssign, ParamValue
+  responsible_for "WFG scenario grammar — traffic generation, injections, faults, and oracle expectations"
+}
+
+module LangChecker {
+  layer DataFusion
+  owns CheckError, Severity, LangReason, Scope, ValType, StatLabelInfo, StatLabelStage, JoinKeySource
+  responsible_for "Semantic validation, scope/type resolution, and linting of WFL rules against schemas"
+}
+
+module LangCompile {
+  layer DataFusion
+  owns CompileRequest, RulePlan, BindPlan, MatchPlan, KeyMapPlan, JoinKeyPlan, WindowSpec, StepPlan, BranchPlan, AggPlan, EachPlan, PatternOriginPlan, LetPlan, SeqPlan, SeqStepPlan, SeqSkipPlan, StatsPlan, StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, SpillMode, JoinPlan, JoinCondPlan, LimitsPlan, ExceedAction, RateSpec, EntityPlan, ScorePlan, YieldPlan, ConvPlan, ConvChainPlan, ConvOpPlan, SortKeyPlan, ExprPlan, ConvWindowPlan, YieldField
+  responsible_for "WFL compilation — compile WFL rules into executable match, join, stats, limits, entity, score, yield, and conv plans"
+}
+
+module LangExplain {
+  layer DataFusion
+  owns RuleExplanation, BindingExpl, MatchExpl
+  responsible_for "Rule explanation output — human-readable bindings, match, and score diagnostics"
+}
+
+module LangColumnar {
+  layer DataFusion
+  owns ColumnarFunc, ColumnarOutputFunc
+  responsible_for "Columnar evaluation builtins — predicate and output functions over columnar batches"
+}
+
+module LangCidr {
+  layer DataFusion
+  owns Cidr
+  responsible_for "CIDR address parsing and prefix matching helper"
+}
+
+dependency_rule LangDeps {
+  LangRule -> LangMatch
+  LangRule -> LangExpr
+  LangRule -> LangClauses
+  LangRule -> LangJoin
+  LangRule -> LangConv
+  LangRule -> LangStats
+  LangRule -> LangTest
+  LangMatch -> LangExpr
+  LangClauses -> LangExpr
+  LangJoin -> LangExpr
+  LangConv -> LangExpr
+  LangStats -> LangExpr
+  LangTest -> LangExpr
+  LangTest -> LangMatch
+  LangScenario -> LangRule
+  LangChecker -> LangMatch
+  LangCompile -> LangExpr
+  LangCompile -> LangMatch
+  LangCompile -> LangJoin
+  LangExplain -> LangMatch
+}

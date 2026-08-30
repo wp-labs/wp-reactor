@@ -1,0 +1,912 @@
+// ---------------------------------------------------------------------------
+// engine domain — streaming CEP / match engine (crates/wf-engine)
+// Static model: columnar batch processing, NFA-style matching, stats SoA
+// accumulation, spill-to-disk, window actor management, alert output, and
+// sink dispatch.
+// ---------------------------------------------------------------------------
+
+// =============================================================
+// EventIngress — external data event entry points
+// =============================================================
+
+actor DataSender {
+  can IncomingBatch
+}
+
+command IncomingBatch {
+  stream_name: String
+}
+
+command MemoryPressure {
+  window_name: String
+}
+
+command NewEvents {
+  events: List<Event>
+}
+
+// =============================================================
+// ColumnarBatch — columnar batch representation and evaluation
+// =============================================================
+
+struct ColumnarBatch {
+  batch: String
+  projection: List<Int>
+  field_map: Map<String,Value>
+}
+
+state CVec {
+  Int
+  Float
+  Str
+  Bool
+  Scalar
+}
+
+state CScalar {
+  Int
+  Float
+  Str
+  Bool
+  Structured
+}
+
+state ColKind {
+  Int64
+  Float64
+  Utf8
+  Bool
+  TimestampNs
+  JsonArray
+  List
+  LargeList
+  FixedSizeList
+  Null
+}
+
+struct ColRef {
+  proj: Int
+  kind: ColKind
+}
+
+state ColumnExpr {
+  Lit
+  Col
+  ListIndex
+  Neg
+  Not
+  And
+  Or
+  Cmp
+  Arith
+  CidrMatch
+  RegexMatch
+  StrFunc
+  Fmt
+  Strftime
+  CountChar
+  SplitIndex
+  Concat
+  InList
+  IfThenElse
+}
+
+struct GuardMasks {
+  event: Map<String,Bool>
+  close: Map<String,Bool>
+  neg: Map<String,Bool>
+}
+
+state StrFuncOp {
+  Contains
+  StartsWith
+  EndsWith
+}
+
+struct ColumnarEvent {
+  batch: String
+  row: Int
+  index: String?
+  projection: List<Int>?
+}
+
+state JoinRow {
+  Columnar
+  Event
+}
+
+// =============================================================
+// WindowManager — window buffer, registry, routing, and actor
+// =============================================================
+
+struct Window {
+  name: String
+  schema: String
+  time_col_index: Int?
+  over: Duration
+  config: WindowConfig
+  watermark_nanos: Int
+  max_event_time_nanos: Int
+  per_source_max_event_time: Map<String,Int>
+  current_bytes: Int
+  current_alloc_bytes: Int
+  total_rows: Int
+  batch_count: Int
+  generation: Int
+  join_enabled: Bool
+  materialize_fields: List<String>?
+  defer_materialization: Bool
+  progress: WindowProgress
+}
+
+struct WindowParams {
+  name: String
+  schema: String
+  time_col_index: Int?
+  over: Duration
+  materialize_fields: List<String>?
+  defer_materialization: Bool
+}
+
+struct TimedBatch {
+  batch: String
+  event_time_range: String
+  ingested_at: DateTime
+  row_count: Int
+  byte_size: Int
+  alloc_size: Int
+  seq: Int
+  shard_rows: List<Int>?
+  parsed_events: List<Event>?
+}
+
+state AppendOutcome {
+  Appended
+  DroppedLate
+}
+
+struct WindowRegistry {
+  windows: List<Window>
+  provider_windows: List<ProviderWindow>
+  subscriptions: List<Subscription>
+  notifiers: Map<String,String>
+  progress: WindowProgress
+  has_cache: Bool
+}
+
+struct WindowDef {
+  params: WindowParams
+  streams: List<String>
+  config: WindowConfig
+}
+
+struct Router {
+  registry: WindowRegistry
+  rule_fanout: RuleFanout
+  mailboxes: Map<String,WindowMailbox>
+  window_seq: Map<String,Int>
+}
+
+struct RouteReport {
+  delivered: Int
+  dropped_late: Int
+  skipped_non_local: Int
+  per_window: List<WindowRouteOutcome>
+}
+
+struct WindowRouteOutcome {
+  window_name: String
+  rows: Int
+  late: Bool
+}
+
+struct WindowMailbox {
+  tx: String
+  budget: Int
+  budget_bytes: Int
+}
+
+state WindowMsg {
+  Append
+}
+
+struct IndexedRow {
+  ts_nanos: Int?
+  batch: String
+  row: Int
+  index: String
+  seq: Int
+}
+
+struct JoinIndex {
+  key_field: String
+  projection: List<String>?
+  shards: List<KeyedRows>
+  mask: Int
+  batch_keys: String
+}
+
+struct KeyedRows {
+  rows: List<IndexedRow>
+  max_ts: Int?
+}
+
+struct WindowProgress {
+  slots: Int
+  row_slots: Int
+  pins: Int
+}
+
+struct ProviderWindow {
+  table: String
+  query: String
+  refresh: String?
+  rows: List<Map<String,Value>>
+  join_key: String?
+  join_index: Map<String,Value>?
+  join_rows: Map<String,Value>?
+}
+
+// =============================================================
+// WindowEviction — window memory/time eviction policy
+// =============================================================
+
+struct Evictor {
+  gate: EvictionGate
+}
+
+struct EvictionGate {
+  max_total_bytes: Int
+  current_bytes: Int
+  freed: String
+  pressure_since: String
+  pressure_release_after: String
+  force_release: Bool
+}
+
+struct EvictReport {
+  windows_scanned: Int
+  batches_time_evicted: Int
+  batches_memory_evicted: Int
+  per_window_evicted: List<WindowEvictCount>
+  memory_pressure: Bool
+}
+
+struct WindowEvictCount {
+  window_name: String
+  time_evicted: Int
+}
+
+// =============================================================
+// RuleFanout — window-to-rule event fanout
+// =============================================================
+
+struct RuleFanout {
+  table: String
+  window_sharding: String
+}
+
+struct RulePush {
+  window_name: String
+  events: List<Event>?
+  batch: String?
+  materialize_fields: List<String>?
+  seq: Int
+  shard_rows: List<Int>?
+}
+
+state Subscription {
+  Single
+  Sharded
+  RoundRobin
+}
+
+// =============================================================
+// MatchEngine — NFA-style CEP state machine
+// =============================================================
+
+struct CepStateMachine {
+  rule_name: String
+  plan: String
+  instances: Map<InstanceKey,Instance>
+  time_field: String?
+  watermark_nanos: Int
+  limits: String?
+  failed: Bool
+  emit_count: Int
+  emit_window_start: Int
+  shared: SharedLimits?
+  raw_conv_mode: Bool
+  expiry_heap: List<InstanceKey>
+  pending_expiry: List<InstanceKey>
+  estimated_memory_bytes: Int
+  seq_meta: SeqRuntime?
+}
+
+struct InstanceKey {
+  scope_key: ScopeKey
+  bucket_start: Int?
+}
+
+state ScopeKey {
+  Empty
+  Int
+  Float
+  Str
+  Pair
+}
+
+struct Instance {
+  machine_id: String
+  created_at: Int
+  last_event_nanos: Int
+  current_step: Int
+  event_ok: Bool
+  event_emitted: Bool
+  step_states: List<StepState>
+  completed_steps: List<String>
+  close_step_states: List<StepState>
+  alias_states: Map<String,AliasState>?
+  baselines: Map<String,RollingStats>
+  neg_violated: Bool
+  satisfied_flags: List<Bool>
+  base_cost: Int
+}
+
+struct StepState {
+  branch_states: List<BranchState>
+}
+
+struct BranchState {
+  count: Int
+  sum: Float
+  min: Float
+  max: Float
+  min_val: Value?
+  max_val: Value?
+  avg_sum: Float
+  avg_count: Int
+  distinct_set: List<ValueKey>?
+  event_first_time_nanos: Int?
+  event_last_time_nanos: Int?
+  collected_values: List<Value>?
+  field_values: Map<String,Value>?
+}
+
+struct StepData {
+  satisfied_branch_index: Int
+  label: String?
+  measure_value: Float
+  event_first_time_nanos: Int?
+  event_last_time_nanos: Int?
+  collected_values: List<Value>
+  field_values: Map<String,Value>
+}
+
+state StepResult {
+  Accumulate
+  Advance
+  Matched
+}
+
+struct StepProgress {
+  rule_name: String
+  scope_key: List<Value>
+  machine_id: String
+  step_index: Int
+  step_label: String?
+  branch_index: Int
+  branch_source: String
+  threshold_checked_branches: Int
+  measure_value: Float
+  cmp: String
+  threshold: String
+  satisfied: Bool
+  instances: Int
+}
+
+struct StepOutcome {
+  result: StepResult
+  progress: StepProgress?
+}
+
+struct MatchedContext {
+  rule_name: String
+  scope_key: List<Value>
+  step_data: List<StepData>
+  bind_data: List<BindData>
+  event_time_nanos: Int
+  event_first_time_nanos: Int
+  event_last_time_nanos: Int
+  window_start_time_nanos: Int
+  window_end_time_nanos: Int
+  machine_id: String
+  trigger_event: Event?
+}
+
+struct CloseOutput {
+  rule_name: String
+  scope_key: List<Value>
+  close_reason: CloseReason
+  event_ok: Bool
+  close_ok: Bool
+  close_mode: String
+  event_emitted: Bool
+  event_step_data: List<StepData>
+  close_step_data: List<StepData>
+  bind_data: List<BindData>
+  watermark_nanos: Int
+  machine_id: String
+  event_first_time_nanos: Int
+  event_last_time_nanos: Int
+  window_start_time_nanos: Int
+  window_end_time_nanos: Int
+  last_event_nanos: Int
+  row_fields: String?
+  row_field_names: String?
+}
+
+state CloseReason {
+  Timeout
+  Flush
+  Eos
+}
+
+struct BindData {
+  alias: String
+  count: Int
+  field_values: Map<String,Value>
+}
+
+struct RollingStats {
+  count: Int
+  sum: Float
+  sum_sq: Float
+  method: String
+  ewma: Float
+  ewma_alpha: Float
+  values: List<Float>
+}
+
+struct AliasState {
+  count: Int
+  field_values: Map<String,Value>?
+}
+
+struct SeqRuntime {
+  within: List<Duration?>
+  negs: List<String>
+  consec: Bool
+}
+
+struct SharedLimits {
+  emit_count: Int
+  emit_window_start: Int
+  instance_count: Int
+  estimated_memory_bytes: Int
+  failed: Bool
+}
+
+// Rust trait contract — external window access for has() and join
+struct WindowLookup {
+}
+
+// Rust trait contract — per-row named-field source for the state machine
+struct FieldSource {
+}
+
+state AsofLookup {
+  Hit
+  Miss
+  Fallback
+}
+
+state JoinKey {
+  Int
+  Str
+  Bool
+}
+
+struct Event {
+  fields: Map<String,Value>
+}
+
+state Value {
+  Number
+  Str
+  Bool
+  Array
+  Object
+}
+
+state ValueKey {
+  Number
+  Str
+  Bool
+  Array
+  Object
+}
+
+state CoreReason {
+  WindowBuild
+  RuleExec
+  DataFormat
+  Sink
+  General
+}
+
+// =============================================================
+// StatsEngine — stats SoA accumulation with spill
+// =============================================================
+
+struct StatsExecutor {
+  plan: String
+  window: StatsWindowState
+  watermark_nanos: Int
+  unique_wheres: List<String>
+  measure_where: List<Int?>
+  row_field_names: String?
+  measure_field_idx: List<Int?>
+  row_field_layout: String?
+  spill_redb: String?
+  mem_used_shared: String?
+  soa_layout: NumericSoALayout?
+}
+
+struct StatsWindowState {
+  buckets: Map<ScopeKey,StatsBucket>
+  window_start_nanos: Int
+  last_event_nanos: Int
+  event_count: Int
+  limit_bytes: Int?
+  mem_used_shared: String?
+  estimated_bytes: Int
+  over_limit_new_buckets: Int
+  limit_warned: Bool
+  rule_name: String
+  spill: String?
+  spill_index: List<Int>
+  spill_limit_bytes: Int?
+  spill_used: String?
+  spill_failed: Bool
+  spill_warned: Bool
+  spill_create: SpillCreateSpec?
+  clock: List<ScopeKey>
+  readback: List<Int>
+  spill_evictions: Int
+  spill_readbacks: Int
+  spill_scan_ns: Int
+  spill_clone_ns: Int
+  spill_write_ns: Int
+  spill_evict_calls: Int
+  soa_layout: NumericSoALayout?
+}
+
+struct StatsBucket {
+  scope_key: ScopeKey
+  accs: StatsBucketAccs
+  touch: Int
+}
+
+state StatsBucketAccs {
+  Numeric
+  Classic
+}
+
+struct StatsCloseBucket {
+  key: ScopeKey
+  measures: List<List<StatsCloseEntry>>
+}
+
+struct StatsCloseEntry {
+  measure_value: Float
+  row_fields: String?
+}
+
+state StatsAccum {
+  Numeric
+  Distinct
+  Last
+  Top
+}
+
+struct NumericAccum {
+  count: Int
+  sum: String
+  min: String?
+  max: String?
+}
+
+struct NumericSoA {
+  counts: List<Int>
+  sums: List<Float>
+  mins: List<Float>
+  maxs: List<Float>
+}
+
+struct NumericSoALayout {
+  n_measures: Int
+  sum_slot: Int
+  min_slot: Int
+  max_slot: Int
+  groups: String
+}
+
+state RowFieldSlot {
+  Numeric
+  Str
+  Other
+}
+
+struct SoAColGroup {
+  entries: String
+}
+
+struct RowFields {
+  layout: RowFieldLayout
+  numeric: String
+  strings: String
+  others: String
+  null_mask: String
+}
+
+struct RowFieldLayout {
+  slots: List<RowFieldSlot>
+  n_numeric: Int
+  n_strings: Int
+  n_others: Int
+}
+
+struct SpillCreateSpec {
+  path: String
+  layout: String
+}
+
+struct TopEntry {
+  key: Float
+  row: RowFields
+}
+
+struct DistinctSet {
+  ints: List<Int>
+  others: List<Value>
+}
+
+state DistinctKey {
+  Int
+  Float
+  Str
+}
+
+struct StatsMaskCache {
+  inner: String
+  time_inner: String
+  max_rows: Int
+  total_rows: String
+  time_total_rows: String
+}
+
+state NumericKind {
+  Sum
+  Min
+  Max
+}
+
+// =============================================================
+// SpillStore — spill-to-disk storage backends
+// =============================================================
+
+// Rust trait contract — state overflow spill storage (put_batch/take/drain)
+struct SpillStore {
+}
+
+struct RedbSpillStore {
+  db: String?
+  path: String
+  layout: String
+  drain_cursor: Int?
+  writer: AsyncPersister?
+  write_failed: String
+}
+
+struct MemSpillStore {
+  map: String
+}
+
+struct NoopSpillStore {
+}
+
+state SpillError {
+  Corrupt
+  Unsupported
+  Io
+  Redb
+  Closed
+}
+
+struct Reader {
+  buf: String
+  pos: Int
+}
+
+struct Writer {
+  buf: List<Int>
+}
+
+struct RedbBatchWriter {
+  db: String
+  put_batches: Int
+  fsync_every: Int
+}
+
+struct AsyncPersister {
+  txs: String
+  byte_budget: Int
+  queued_bytes: Int
+  idle: String
+  workers: List<String>
+}
+
+// Rust trait contract — batch write backend for async persist
+struct BatchWriter {
+}
+
+state PersistError {
+  Backpressure
+  Failed
+  Closed
+}
+
+// =============================================================
+// AlertOutput — alert record production and columnar output
+// =============================================================
+
+struct OutputRecord {
+  wfx_id: String
+  rule_name: String
+  score: Float
+  entity_type: String
+  entity_id: String
+  origin: AlertOrigin
+  fired_at: String
+  emit_time: String
+  matched_rows: List<String>
+  summary: String
+  yield_target: String
+  yield_fields: List<Value>
+  yield_field_types: String
+  event_time_nanos: Int
+  machine_id: String
+  scope_key: List<Value>
+}
+
+state AlertOrigin {
+  Event
+  Close
+  Deferred
+}
+
+struct AlertColumnBatch {
+  target: String
+  len: Int
+  wfx_id: List<String>
+  rule_name: ColumnData
+  score: List<Float>
+  entity_type: ColumnData
+  entity_id: List<String>
+  origin: ColumnData
+  close_reason: ColumnData
+  fired_at: List<String>
+  emit_time: ColumnData
+  summary: ColumnData
+  yield_cols: List<YieldCol>
+}
+
+struct AlertColumnBuilder {
+  target: String
+  len: Int
+  wfx_id: List<String>
+  rule_name: ColumnData?
+  score: List<Float>
+  entity_type: ColumnData?
+  entity_id: List<String>
+  origin: ColumnData?
+  close_reason: ColumnData?
+  fired_at: List<String>
+  emit_time: ColumnData?
+  summary: ColumnData?
+  yield_cols: List<YieldCol>
+  layout_cache: String
+  scratch: String
+  staged: String
+}
+
+struct YieldCol {
+  name: String
+  metas: List<String>
+  values: List<String>
+  const_value: String?
+}
+
+state ColumnData {
+  Const
+  Rows
+}
+
+// =============================================================
+// SinkDispatch — sink routing and dispatch
+// =============================================================
+
+struct SinkDispatcher {
+  routes: List<SinkRouteBinding>
+  default_sinks: List<SinkRuntime>
+  error_sinks: List<SinkRuntime>
+  monitor_sinks: List<SinkRuntime>
+  all_sinks: List<SinkRuntime>
+}
+
+struct SinkRuntime {
+  name: String
+  spec: String
+  handle: String
+  tags: List<String>
+  output_fields: List<String>?
+  wf_meta_disable: List<String>
+  wf_meta_disable_matcher: WfMetaDisableMatcher
+  parallel: Int
+  payload_blind: Bool
+}
+
+struct SinkRouteBinding {
+  matcher: WildmatchMatcher
+  sinks: List<SinkRuntime>
+}
+
+struct WfMetaDisableMatcher {
+  patterns: List<String>
+}
+
+struct WildmatchMatcher {
+  patterns: List<String>
+}
+
+// =============================================================
+// PipeExecution — pipe (window-like source) execution
+// =============================================================
+
+struct Pipe {
+  name: String
+  schema: String
+  over: Duration
+  time_col_index: Int?
+}
+
+struct PipeRegistry {
+  pipes: Map<String,Pipe>
+}
+
+// =============================================================
+// ExternalCall — external service call handler
+// =============================================================
+
+// Rust trait contract — external() service call dispatcher
+struct ExternalCallHandler {
+}
+
+// =============================================================
+// RuleExecution — rule plan executor
+// =============================================================
+
+struct RuleExecutor {
+  plan: String
+  each_join_plan: String?
+  live_joins: List<String>
+  yield_field_types: Map<String,String>
+  output: OutputConfig
+  bind_filters: Map<String,String?>
+  output_static: String
+  emit_time_cache: String
+  close_ctx_fields: String
+  reduce_label_reads: String
+  compiled_guards: String
+}

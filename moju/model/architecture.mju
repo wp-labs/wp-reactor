@@ -11,29 +11,48 @@ layer Infrastructure
 dependency_rule LayerDirection {
   Interface -> Application
   Application -> DataFusion
+  Infrastructure -> DataFusion
   DataFusion -> none_external
 }
 
 // -- Cross-domain dependencies -----------------------------------------------
 
 dependency_rule CrossDomainDeps {
-  // Orchestra CLI triggers config loading
-  Orchestra.CliEntry -> Config.ConfigLoader
-  Orchestra.ConfigInspection -> Config.ConfigLoader
+  // CLI entry resolves config
+  Runtime.CliEntry -> Config.ConfigLoader
+  Runtime.CliEntry -> Config.SinkConfig
 
-  // Orchestra orchestrates engine and language
-  Orchestra.ReactorLifecycle -> Config.ConfigLoader
-  Orchestra.ReactorLifecycle -> Engine.WindowManager
-  Orchestra.ReactorLifecycle -> Engine.MatchEngine
-  Orchestra.ReactorLifecycle -> Lang.LangCompiler
-  Orchestra.TaskOrchestration -> Engine.WindowManager
-  Orchestra.HotReload -> Lang.LangCompiler
-  Orchestra.HotReload -> Config.ConfigChange
+  // Reactor lifecycle orchestrates engine, language, config
+  Runtime.ReactorLifecycle -> Config.ConfigLoader
+  Runtime.ReactorLifecycle -> Engine.WindowManager
+  Runtime.ReactorLifecycle -> Engine.MatchEngine
+  Runtime.ReactorLifecycle -> Engine.StatsEngine
+  Runtime.ReactorLifecycle -> Lang.LangCompile
+  Runtime.ReactorLifecycle -> Lang.LangChecker
 
-  // Infrastructure adapters
-  Orchestra.SinkFactory -> Config.SinkConfig
-  Orchestra.Receiver -> Engine.WindowManager
+  // Hot reload compiles rules and replans
+  Runtime.HotReload -> Lang.LangCompile
+  Runtime.HotReload -> Config.ConfigChange
 
-  // Config depends on language for rule/schema compilation
-  Config.ConfigLoader -> Lang.LangCompiler
+  // Engine tasks drive the engine through config-declared windows
+  Runtime.EngineTask -> Engine.WindowManager
+  Runtime.EngineTask -> Engine.MatchEngine
+  Runtime.EngineTask -> Engine.StatsEngine
+  Runtime.EngineTask -> Engine.RuleFanout
+  Runtime.EngineTask -> Engine.SpillStore
+
+  // Receiver feeds events into the window manager
+  Runtime.Receiver -> Engine.WindowManager
+
+  // Config loader validates rules/schemas through the language
+  Config.ConfigLoader -> Lang.LangChecker
+
+  // Sink factory builds sinks from config
+  Runtime.SinkFactory -> Config.SinkConfig
+
+  // Alert dispatch forwards records to the sink dispatcher
+  Runtime.AlertDispatch -> Engine.SinkDispatch
+
+  // External runtime adapters bridge external calls
+  Runtime.ExternalRuntime -> Engine.ExternalCall
 }
