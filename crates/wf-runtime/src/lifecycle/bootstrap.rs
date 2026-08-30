@@ -1,6 +1,6 @@
 use orion_error::conversion::ToStructError;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,8 +107,9 @@ pub(super) async fn load_and_compile(
 
     // 5.5. Initialize wp_knowledge if knowdb.toml exists
     //      (Redis provider + [fun] registry for external(), CSV/DB tables for windows)
-    let knowdb_path = base_dir.join("knowdb.toml");
-    if knowdb_path.exists() {
+    // 2026-08-30: knowdb.toml 允许放 models/schemas/（与 windows.toml/schemas 同目录，
+    // nexmark_pk 已迁移）；根目录旧位保留作向后兼容回退。
+    if let Some(knowdb_path) = find_knowdb_path(base_dir) {
         // Load provider windows (table=)
         if !provider_configs.is_empty() {
             load_knowledge_into_windows(&knowdb_path, base_dir, &mut registry)?;
@@ -344,6 +345,17 @@ fn inject_sentinel_window(
         table: None,
     });
     Ok(())
+}
+
+/// Locate knowdb.toml：优先 `models/schemas/knowdb.toml`（与 windows.toml/schemas 同
+/// 目录，nexmark_pk 2026-08-30 迁移位置），回退根目录 `knowdb.toml`（历史位置）。
+/// 都找不到返回 None（无静态表/外部函数，正常跳过加载）。
+fn find_knowdb_path(base_dir: &Path) -> Option<PathBuf> {
+    let candidates = [
+        base_dir.join("models/schemas/knowdb.toml"),
+        base_dir.join("knowdb.toml"),
+    ];
+    candidates.into_iter().find(|p| p.exists())
 }
 
 /// Initialize wp_knowledge Redis provider and [fun] registry from knowdb.toml.
