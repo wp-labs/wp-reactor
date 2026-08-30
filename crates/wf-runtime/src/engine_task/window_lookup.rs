@@ -199,13 +199,11 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
         }
         let win = self.router.registry().get_window(window)?;
         let join_key = JoinKey::from_value(key)?;
-        // 索引 key 字段校验（2026-08-29 q8 多规则 7565→1 根因）：窗口 join 索引
-        // 只按首个注册 join 的右字段建（set_join_key 幂等），其它规则用不同字段
-        // join 同一窗口时，错字段的索引查询返回「索引命中但空」的假空（不回退
-        // 扫描）→ 静默全 miss。key_field 不匹配 → 跳过索引直接扫描（正确性优先；
-        // 扫描只影响多 key 场景）。
-        if win.join_key_field().as_deref() == Some(key_field)
-            && let Some(rows) = win.join_lookup(&join_key, self.eff_max_seq(window))
+        // 索引按**每个注册** join 右字段建（2026-08-30 多 key 索引：q8 按
+        // seller / q20 按 id 共窗各建各的 O(1) 索引，不再回退全窗扫描）。
+        // 该字段无索引才回退扫描（正确性兜底，见 2026-08-29 假空 miss 修复）。
+        if win.has_join_key(key_field)
+            && let Some(rows) = win.join_lookup(key_field, &join_key, self.eff_max_seq(window))
         {
             return Some(rows);
         }
@@ -236,10 +234,11 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
     ) -> Option<Vec<(i64, JoinRow)>> {
         let win = self.router.registry().get_window(window)?;
         let join_key = JoinKey::from_value(key)?;
-        // 索引 key 字段校验（2026-08-29 q8 多规则 7565→1 根因，见 join_lookup）：
-        // key_field 与索引 key 不匹配 → 跳过索引走 timestamped 扫描。
-        if win.join_key_field().as_deref() == Some(key_field)
-            && let Some(rows) = win.join_lookup_timestamped(&join_key, self.eff_max_seq(window))
+        // 索引按每个注册 join 右字段建（2026-08-30 多 key，见 join_lookup）：
+        // 该字段无索引才回退 timestamped 扫描。
+        if win.has_join_key(key_field)
+            && let Some(rows) =
+                win.join_lookup_timestamped(key_field, &join_key, self.eff_max_seq(window))
         {
             return Some(rows);
         }
@@ -277,15 +276,16 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
             let nanos = i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
             event_time_nanos.saturating_sub(nanos)
         });
-        // 索引 key 字段校验（2026-08-29 q8 多规则 7565→1 根因，见 join_lookup）：
-        // key_field 与索引 key 不匹配 → Fallback（调用方走 asof_candidates 扫描）。
-        if win.join_key_field().as_deref() != Some(key_field) {
+        // 索引按每个注册 join 右字段建（2026-08-30 多 key，见 join_lookup）：
+        // 该字段无索引 → Fallback（调用方走 asof_candidates 扫描）。
+        if !win.has_join_key(key_field) {
             return AsofLookup::Fallback;
         }
         // 索引 asof 快路径（seq-cut: max_seq 过滤后取最新行; 2026-08 前 pull
         // 模式回退 `asof_candidates` 全量扫描）。`Fallback`（无索引）由调用方
         // 走 asof_candidates。
         win.join_lookup_asof(
+            key_field,
             &join_key,
             event_time_nanos,
             min_ts,
@@ -437,31 +437,35 @@ mod tests {
         assert!(none.is_empty(), "unknown key → empty rows");
     }
 
-    /// 回归（2026-08-29 q8 多规则 7565→1 根因）：窗口 join 索引只按首个注册的
-    /// 右字段建（set_join_key 幂等），请求 key_field 与索引 key 不同时，索引查询
-    /// 返回「索引命中但空」的假空（不回退扫描）→ 静默全 miss。修复后 key_field
-    /// 不匹配必须回退扫描（按请求字段过滤），命中正确行。
+    /// 回归（2026-08-29 q8 多规则 7565→1 根因 + 2026-08-30 多 key）：请求的
+    /// key_field 在该窗口**没有索引**时必须回退扫描（按请求字段过滤），不能返回
+    /// 「索引命中但空」的假空（静默全 miss）。2026-08-30 起多 key 支持让每个
+    /// 注册字段都有索引，但未注册字段的回退路径仍是正确性兜底，必须保留。
     #[tokio::test]
     async fn join_lookup_key_field_mismatch_falls_back_to_scan() {
         let schema = ts_schema();
         let reg = WindowRegistry::build(vec![make_def("threat_intel", vec!["feed"])]).unwrap();
         let router = Router::new(reg);
         // 另一规则（q20 形态，join 键 id）先注册 ip 索引——本测试模拟 q8
-        // （请求 score 字段）的查询：索引被占用后必须扫描回退而非假空 miss。
+        // （请求 score 字段）：score 未注册索引 → 扫描回退而非假空 miss。
         router
             .registry()
             .get_window("threat_intel")
             .unwrap()
             .set_join_key("ip".into());
-        assert_eq!(
+        assert!(
             router
                 .registry()
                 .get_window("threat_intel")
                 .unwrap()
-                .join_key_field()
-                .as_deref(),
-            Some("ip"),
-            "先注册的 ip 键生效（set_join_key 幂等）"
+                .has_join_key("ip")
+        );
+        assert!(
+            !router
+                .registry()
+                .get_window("threat_intel")
+                .unwrap()
+                .has_join_key("score")
         );
 
         let batch = RecordBatch::try_new(

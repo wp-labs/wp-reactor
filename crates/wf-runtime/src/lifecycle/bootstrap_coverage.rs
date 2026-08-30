@@ -199,8 +199,12 @@ fn configure_join_indexes_sets_join_key() {
         .expect("window exists");
     // Join index enabled → lookup returns Some (empty for an unknown key).
     assert!(
-        win.join_lookup(&wf_engine::match_engine::JoinKey::Str("nope".into()), None)
-            .is_some(),
+        win.join_lookup(
+            "id",
+            &wf_engine::match_engine::JoinKey::Str("nope".into()),
+            None
+        )
+        .is_some(),
         "join index must be enabled after configure_join_indexes"
     );
 }
@@ -215,8 +219,12 @@ fn configure_join_indexes_no_joins_is_noop() {
         .get_window("auction_events")
         .expect("window exists");
     assert!(
-        win.join_lookup(&wf_engine::match_engine::JoinKey::Str("x".into()), None)
-            .is_none()
+        win.join_lookup(
+            "id",
+            &wf_engine::match_engine::JoinKey::Str("x".into()),
+            None
+        )
+        .is_none()
     );
 }
 
@@ -231,8 +239,12 @@ fn configure_join_indexes_unknown_target_is_skipped() {
         .get_window("auction_events")
         .expect("window exists");
     assert!(
-        win.join_lookup(&wf_engine::match_engine::JoinKey::Str("x".into()), None)
-            .is_none()
+        win.join_lookup(
+            "id",
+            &wf_engine::match_engine::JoinKey::Str("x".into()),
+            None
+        )
+        .is_none()
     );
 }
 

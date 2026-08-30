@@ -13,6 +13,8 @@ mod deferred_integration_tests;
 #[cfg(test)]
 mod hop_integration_tests;
 #[cfg(test)]
+mod multi_key_bench;
+#[cfg(test)]
 mod provider_join_integration_tests;
 #[cfg(test)]
 mod stats_task_tests;
