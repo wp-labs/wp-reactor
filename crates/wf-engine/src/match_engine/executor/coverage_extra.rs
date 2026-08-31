@@ -1132,6 +1132,41 @@ fn branch_guard_masks_empty_without_guards_or_seq() {
 }
 
 #[test]
+fn branch_guard_masks_noncolumnar_only_early_returns() {
+    // 2026-08-31 lazy 视图：规则**有 guard 但全部非列式**时同样提前返回空掩码
+    // （`has_columnar_guard` 为 false）——状态机回退解释求值，语义不变，但
+    // 跳过 `ColumnarBatch::from_all_fields` 视图构建（无 guard 规则每批每规则
+    // 的浪费，lazy 化目标）。
+    let guard_noncol = || Expr::FuncCall {
+        qualifier: None,
+        name: "startswith_any".into(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("sip".into())),
+            Expr::StringLit("10.".into()),
+            Expr::StringLit("192.168.".into()),
+        ],
+    };
+    let plan = simple_rule_plan(
+        "r1",
+        simple_plan(
+            vec![],
+            vec![step(vec![branch_guard(
+                "s1",
+                Some(guard_noncol()),
+                count_ge(1.0),
+            )])],
+        ),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    );
+    let exec = RuleExecutor::new(plan);
+    let batch = batch_of(vec![("sip", vec![Some("10.0.0.1")])]);
+    let masks = exec.branch_guard_masks(&batch);
+    assert!(masks.is_empty(), "非列式 guard → 空掩码 → 解释回退");
+}
+
+#[test]
 fn branch_guard_masks_list_index_path_guard() {
     use crate::match_engine::columnar::GuardMasks;
     use crate::match_engine::{WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY};

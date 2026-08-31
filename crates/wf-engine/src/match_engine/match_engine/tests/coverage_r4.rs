@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::collections::HashSet;
 use std::time::Duration;
 
-use wf_lang::ast::{CloseMode, CmpOp, Expr, FieldRef, MatchMode, Measure};
+use wf_lang::ast::{CloseMode, CmpOp, Expr, FieldRef, MatchMode, Measure, Transform};
 use wf_lang::plan::{
     AggPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, ExceedAction, JoinKeyPlan,
     LimitsPlan, MatchPlan, RateSpec, SeqPlan, SeqSkipPlan, SeqStepPlan, SortKeyPlan, WindowSpec,
@@ -434,6 +434,69 @@ fn rate_limit_suppresses_match_reset_and_fail_rule() {
     );
     assert_eq!(sm.advance_at("e", &e, 0), StepResult::Accumulate);
     assert_eq!(sm.advance_at("e", &e, 1_000), StepResult::Accumulate);
+}
+
+#[test]
+fn memory_limit_non_growable_drop_oldest_admission() {
+    // 2026-08-31 limits 摊还：单步 count（不可增长）的 DropOldest 准入仍然生效
+    // ——新实例准入路径的逐事件检查被保留（摊掉的是非新事件的冗余检查）。
+    // 单步 1 branch 实例 base ≈ 240（128 结构 + 32 键 + 80 分支）；budget=400
+    // 装得下 1 个、装不下 2 个。
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+    );
+    let mut sm = CepStateMachine::with_limits(
+        "r".into(),
+        plan,
+        None,
+        limits(ExceedAction::DropOldest, None, Some(400)),
+    );
+    let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
+    assert!(matches!(sm.advance_at("e", &e1, 0), StepResult::Matched(_)));
+    assert_eq!(sm.instance_count(), 1);
+    // 第二个 key 准入：240+240=480 >= 400 → DropOldest 逐出最旧（key1）后准入。
+    let e2 = event(vec![("sip", str_val("10.0.0.2"))]);
+    assert!(matches!(
+        sm.advance_at("e", &e2, 1_000),
+        StepResult::Matched(_)
+    ));
+    assert_eq!(sm.instance_count(), 1);
+}
+
+#[test]
+fn memory_limit_amortized_shared_admission() {
+    // 2026-08-31 limits 摊还 + shared（P2b）：单步 count（不可增长）规则在
+    // 摊还后仍通过共享镜像做**准入**控制——shard B 的新 key 在共享总量
+    // 240+240>=400 时被 Throttle（摊掉的是跨 shard 逐事件检查，准入不变）。
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+    );
+    let shared = SharedLimits::new();
+    let mut sm_a = CepStateMachine::with_limits_shared(
+        "r".into(),
+        plan.clone(),
+        None,
+        limits(ExceedAction::Throttle, None, Some(400)),
+        Arc::clone(&shared),
+    );
+    let mut sm_b = CepStateMachine::with_limits_shared(
+        "r".into(),
+        plan,
+        None,
+        limits(ExceedAction::Throttle, None, Some(400)),
+        Arc::clone(&shared),
+    );
+    let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
+    assert!(matches!(
+        sm_a.advance_at("e", &e1, 0),
+        StepResult::Matched(_)
+    ));
+    // shard B 新 key：共享 240+240 >= 400 → Throttle（不插入）。
+    let e2 = event(vec![("sip", str_val("10.0.0.2"))]);
+    assert_eq!(sm_b.advance_at("e", &e2, 1_000), StepResult::Accumulate);
+    assert_eq!(sm_b.instance_count(), 0);
 }
 
 #[test]
@@ -1193,4 +1256,80 @@ fn accessors_and_time_field_extraction() {
     ));
     // Plan accessor.
     assert_eq!(sm2.plan().keys.len(), 1);
+}
+
+#[test]
+fn memory_grows_per_event_predicate() {
+    // 2026-08-31 limits 摊还的 growability 判定：纯单步 count 规则不可增长
+    // （逐事件 max_memory 检查摊掉），多步/close/accu/history/seq/distinct
+    // 可增长（保留逐事件检查）。
+    use super::super::plan_memory_grows_per_event;
+
+    // 单步 count → false（摊还目标：qradar c/g/s 家族、真实单步计数规则）
+    let single = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("e", count_ge(3.0))])],
+    );
+    assert!(!plan_memory_grows_per_event(&single), "单步 count 不可增长");
+
+    // 多步（completed_steps 累积）→ true
+    let multi = simple_plan(
+        vec![simple_key("sip")],
+        vec![
+            step(vec![branch("e", count_ge(1.0))]),
+            step(vec![branch("e", count_ge(1.0))]),
+        ],
+    );
+    assert!(plan_memory_grows_per_event(&multi), "多步可增长");
+
+    // distinct → true（distinct_set 无上限累积）
+    let distinct = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch(
+            "e",
+            AggPlan {
+                transforms: vec![Transform::Distinct],
+                measure: Measure::Count,
+                cmp: CmpOp::Ge,
+                threshold: Expr::Number(2.0),
+            },
+        )])],
+    );
+    assert!(plan_memory_grows_per_event(&distinct), "distinct 可增长");
+
+    // close 步骤 → true
+    let close = plan_with_close(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+        vec![step(vec![branch("c", count_ge(1.0))])],
+        Duration::from_secs(60),
+        CloseMode::Or,
+    );
+    assert!(plan_memory_grows_per_event(&close), "close 可增长");
+
+    // accu / needs_field_history / seq 单 flag → true
+    let mut accu = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+    );
+    accu.accu = true;
+    assert!(plan_memory_grows_per_event(&accu), "accu 可增长");
+
+    let mut hist = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+    );
+    hist.needs_field_history = true;
+    assert!(plan_memory_grows_per_event(&hist), "history 可增长");
+
+    let mut seq = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+    );
+    seq.seq = Some(SeqPlan {
+        consec: false,
+        skip: SeqSkipPlan::PastLast,
+        steps: vec![],
+    });
+    assert!(plan_memory_grows_per_event(&seq), "seq 可增长");
 }

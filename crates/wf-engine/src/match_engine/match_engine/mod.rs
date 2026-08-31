@@ -107,6 +107,12 @@ pub struct CepStateMachine {
     /// This keeps `limits.max_memory` checks O(1) for the common path instead
     /// of re-summing every instance for every incoming event.
     estimated_memory_bytes: usize,
+    /// Whether per-event instance state can grow (distinct set / field history /
+    /// seq negation). `false` = instance memory only changes on insert/remove
+    /// (both accounted exactly), so the per-event `max_memory` enforcement check
+    /// can be skipped for non-new events (2026-08-31: qradar/真实规则全部带
+    /// limits，逐事件检查是纯浪费——摊还到新实例准入 + 可增长规则)。
+    memory_grows_per_event: bool,
     /// Chain semantics (`within` / `not` / `consec`) precomputed from the plan.
     seq_meta: Option<SeqRuntime>,
 }
@@ -116,6 +122,37 @@ pub struct CepStateMachine {
 /// heap in one call and starve the pipeline (see `scan_expired_at`).
 const MAX_EXPIRY_SCAN_BUDGET: usize = 1024;
 
+/// 规则实例状态是否**每事件增长**（`estimated_memory_bytes` 只在 insert/remove
+/// 精确记账，增长类状态靠周期 recalibrate 修正后由逐事件检查执行驱逐）：
+/// - 多步 AND/Any：`completed_steps` 随步骤完成累积；
+/// - close 步骤（baselines 等累积状态）；
+/// - `accu`（跨发射累积）；
+/// - 字段历史（`needs_field_history` → collected_values / alias_state 写入）；
+/// - 序列否定（`seq` 否定窗口累积命中）；
+/// - Distinct 度量（`distinct_set` 无上限累积）。
+///
+/// 纯单步 count/sum/min/max/avg 单 bind 规则（无上述任何来源）：实例内存只在
+/// insert/remove 变化 → 逐事件 `max_memory` 检查纯冗余（2026-08-31 摊还；
+/// qradar c/g/s 家族与真实单步计数规则命中此路径）。
+fn plan_memory_grows_per_event(plan: &MatchPlan) -> bool {
+    if plan.needs_field_history
+        || plan.seq.is_some()
+        || plan.accu
+        || plan.event_steps.len() > 1
+        || !plan.close_steps.is_empty()
+    {
+        return true;
+    }
+    plan.event_steps.iter().any(|step| {
+        step.branches.iter().any(|b| {
+            b.agg
+                .transforms
+                .iter()
+                .any(|t| matches!(t, wf_lang::ast::Transform::Distinct))
+        })
+    })
+}
+
 impl CepStateMachine {
     /// Create a new state machine for the given rule + plan.
     pub fn new(rule_name: String, plan: MatchPlan, time_field: Option<String>) -> Self {
@@ -123,6 +160,7 @@ impl CepStateMachine {
             .seq
             .as_ref()
             .map(|c| SeqRuntime::build(&c.steps, c.consec));
+        let memory_grows_per_event = plan_memory_grows_per_event(&plan);
         Self {
             rule_name,
             plan,
@@ -138,6 +176,7 @@ impl CepStateMachine {
             raw_conv_mode: false,
             expiry_heap: BinaryHeap::new(),
             estimated_memory_bytes: 0,
+            memory_grows_per_event,
             seq_meta,
         }
     }
@@ -153,6 +192,7 @@ impl CepStateMachine {
             .seq
             .as_ref()
             .map(|c| SeqRuntime::build(&c.steps, c.consec));
+        let memory_grows_per_event = plan_memory_grows_per_event(&plan);
         Self {
             rule_name,
             plan,
@@ -168,6 +208,7 @@ impl CepStateMachine {
             raw_conv_mode: false,
             expiry_heap: BinaryHeap::new(),
             estimated_memory_bytes: 0,
+            memory_grows_per_event,
             seq_meta,
         }
     }
@@ -185,6 +226,7 @@ impl CepStateMachine {
             .seq
             .as_ref()
             .map(|c| SeqRuntime::build(&c.steps, c.consec));
+        let memory_grows_per_event = plan_memory_grows_per_event(&plan);
         Self {
             rule_name,
             plan,
@@ -200,6 +242,7 @@ impl CepStateMachine {
             raw_conv_mode: false,
             expiry_heap: BinaryHeap::new(),
             estimated_memory_bytes: 0,
+            memory_grows_per_event,
             seq_meta,
         }
     }
@@ -580,8 +623,13 @@ impl CepStateMachine {
         // periodic `recalibrate_memory`. The eviction loop + recalibrate keep it
         // bounded; an exact CAS reserve is impractical for memory (grows
         // non-atomically). `max_instances` above IS exact.
+        // 2026-08-31 摊还：非新实例 + 无每事件增长（纯 count/sum/min/max/avg，无
+        // distinct/历史/seq）时 `estimated_memory_bytes` 只在 insert/remove 变化
+        // （两处已精确记账），逐事件检查纯冗余 → 只在新实例准入或可增长规则上
+        // 执行（qradar/真实规则全带 limits，逐事件检查是每事件每规则浪费）。
         if let Some(ref limits) = self.limits
             && let Some(max_bytes) = limits.max_memory_bytes
+            && (is_new || self.memory_grows_per_event)
         {
             let new_cost = new_base.unwrap_or(0);
             // P2b: with shared limits the budget is the cross-shard memory total.

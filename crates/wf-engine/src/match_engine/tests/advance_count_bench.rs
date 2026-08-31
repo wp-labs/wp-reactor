@@ -51,6 +51,31 @@ fn qradar_batch(n: usize) -> RecordBatch {
 #[test]
 #[ignore]
 fn bench_advance_count_rule_sliding() {
+    run_count_advance("advance c_sip_3 (sliding 2m count>=3, 列式+index)", None);
+}
+
+/// 带 limits（qradar 真实规则：max_memory=512MB / max_instances=100000）的整条
+/// advance——2026-08-31 limits 记账摊还的测量载体：旧代码每事件每规则跑
+/// max_memory 检查，摊还后单步 count 规则（不可增长）只在新实例准入时检查。
+#[test]
+#[ignore]
+fn bench_advance_count_rule_sliding_with_limits() {
+    use wf_lang::plan::{ExceedAction, LimitsPlan};
+    let limits = LimitsPlan {
+        max_memory_bytes: Some(512 * 1024 * 1024),
+        max_instances: Some(100_000),
+        max_throttle: None,
+        on_exceed: ExceedAction::Throttle,
+        disk_provider: None,
+        max_disk_bytes: None,
+    };
+    run_count_advance(
+        "advance c_sip_3 + limits(512MB/100k, 摊还后)",
+        Some(limits),
+    );
+}
+
+fn run_count_advance(label: &str, limits: Option<wf_lang::plan::LimitsPlan>) {
     let n = 1_000_000usize;
     let batch = qradar_batch(n);
     let index = build_field_index(&batch);
@@ -61,7 +86,10 @@ fn bench_advance_count_rule_sliding() {
     );
     // qradar `match<sip:2m>`（simple_plan 默认 300s，显式对齐 2m）。
     plan.window_spec = wf_lang::plan::WindowSpec::Sliding(std::time::Duration::from_secs(120));
-    let mut sm = CepStateMachine::new("c_sip_3".into(), plan, None);
+    let mut sm = match limits {
+        Some(limits) => CepStateMachine::with_limits("c_sip_3".into(), plan, None, Some(limits)),
+        None => CepStateMachine::new("c_sip_3".into(), plan, None),
+    };
     let ts = 1_700_000_000_000_000_000i64;
 
     // 预热 100k 行：实例表进入稳态（热 IP 计数 + 到期）。
@@ -96,10 +124,7 @@ fn bench_advance_count_rule_sliding() {
     }
     let ns = start.elapsed().as_secs_f64() * 1e9 / (n - 100_000) as f64;
     std::hint::black_box(matched);
-    eprintln!(
-        "advance c_sip_3 (sliding 2m count>=3, 列式+index): {:.1} ns/event (matched={matched})",
-        ns
-    );
+    eprintln!("{label}: {:.1} ns/event (matched={matched})", ns);
 }
 
 /// 发射路径语义锁定：count 规则命中后 `MatchedContext.scope_key` 必须等于键的

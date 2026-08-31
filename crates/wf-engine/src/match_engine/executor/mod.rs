@@ -1060,6 +1060,13 @@ impl RuleExecutor {
     /// Non-columnar / absent guards are simply not inserted, so the state
     /// machine falls back to interpreted evaluation for those branches.
     pub fn branch_guard_masks(&self, batch: &RecordBatch) -> GuardMasks {
+        // 无列式 guard（qradar c/s 等无 guard 规则）：跳过 `ColumnarBatch` 视图
+        // 构建——`from_all_fields` 是 O(fields²) 的 schema 线性解析，每批每规则
+        // 一次，对无 guard 规则纯浪费（2026-08-31 惰性化；guardless 规则直接
+        // 空掩码，状态机回退解释求值，语义不变）。
+        if !self.has_columnar_guard() {
+            return GuardMasks::default();
+        }
         let view = ColumnarBatch::from_all_fields(batch);
         let mut masks = GuardMasks::default();
         for (step_idx, step) in self.plan.match_plan.event_steps.iter().enumerate() {
@@ -1107,6 +1114,25 @@ impl RuleExecutor {
             }
         }
         masks
+    }
+
+    /// 规则是否含任意可列式求值的 guard（event/close/seq-neg 三处站点）。
+    fn has_columnar_guard(&self) -> bool {
+        let plan = &self.plan.match_plan;
+        plan.event_steps
+            .iter()
+            .chain(plan.close_steps.iter())
+            .flat_map(|s| s.branches.iter())
+            .any(|b| b.guard.as_ref().is_some_and(wf_lang::columnar::expr_is_columnar))
+            || plan.seq.as_ref().is_some_and(|seq| {
+                seq.steps.iter().any(|s| {
+                    s.neg && s
+                        .branch
+                        .guard
+                        .as_ref()
+                        .is_some_and(wf_lang::columnar::expr_is_columnar)
+                })
+            })
     }
 
     pub fn is_aux_bind_alias(&self, alias: &str) -> bool {
