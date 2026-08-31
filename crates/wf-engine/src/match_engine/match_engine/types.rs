@@ -6,6 +6,9 @@ use foldhash::fast::RandomState as FoldRandomState;
 use smol_str::SmolStr;
 
 use crate::match_engine::event_bridge::JoinRow;
+use super::key::{ScopeKey, extract_scope_key_from_row};
+use wf_lang::ast::FieldRef;
+use wf_lang::plan::KeyMapPlan;
 
 /// HashMap/HashSet over hot-path keys (InstanceKey, field names, event field
 /// keys) using foldhash's fast, minimally-DoS-resistant hasher instead of the
@@ -75,6 +78,21 @@ pub trait FieldSource {
             Some(Value::Str(s)) => s.to_string(),
             _ => String::new(),
         }
+    }
+
+    /// Build the rule's typed match scope key for this row, or `None` when a
+    /// key field is missing / null (the event is skipped). Default: extract the
+    /// key fields as owned [`Value`]s and convert (row-based path). Columnar
+    /// sources override to read the native column straight into a [`ScopeKey`],
+    /// skipping the intermediate `Value` / `Vec` (single-key string rules — the
+    /// qradar hot path).
+    fn extract_scope_key(
+        &self,
+        keys: &[FieldRef],
+        key_map: Option<&[KeyMapPlan]>,
+        alias: &str,
+    ) -> Option<ScopeKey> {
+        extract_scope_key_from_row(self, keys, key_map, alias)
     }
 }
 

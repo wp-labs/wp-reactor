@@ -239,7 +239,7 @@ impl InstanceKey {
 /// returns the raw field Values). Previously Int keys flattened to `Str`, which
 /// broke digit-typed yield/entity fields on `on close` rules (`id = b.auction`
 /// got a string and failed digit coercion).
-fn flatten_scope_values(key: &ScopeKey) -> Vec<Value> {
+pub(super) fn flatten_scope_values(key: &ScopeKey) -> Vec<Value> {
     match key {
         ScopeKey::Empty => vec![],
         ScopeKey::Int(v) => vec![Value::Number(*v as f64)],
@@ -264,9 +264,7 @@ fn flatten_scope_values(key: &ScopeKey) -> Vec<Value> {
 ///
 /// Returns `None` if any key field is missing from the event.
 /// Returns `Some(vec![])` if the key list is empty (shared instance).
-pub(super) fn extract_key<E: FieldSource>(
-    event: &E,
-    keys: &[FieldRef],
+pub(super) fn extract_key<E: FieldSource + ?Sized>(event: &E, keys: &[FieldRef],
     key_map: Option<&[wf_lang::plan::KeyMapPlan]>,
     alias: &str,
 ) -> Option<Vec<Value>> {
@@ -322,7 +320,7 @@ pub(super) fn extract_key<E: FieldSource>(
     Some(result)
 }
 
-pub(crate) fn extract_key_simple<E: FieldSource>(
+pub(crate) fn extract_key_simple<E: FieldSource + ?Sized>(
     event: &E,
     keys: &[FieldRef],
 ) -> Option<Vec<Value>> {
@@ -333,6 +331,19 @@ pub(crate) fn extract_key_simple<E: FieldSource>(
         result.push(val);
     }
     Some(result)
+}
+
+/// Row-based scope-key extraction, shared by the [`FieldSource`] default and
+/// the columnar fast-path fallback: extract the key fields as owned [`Value`]s
+/// then convert to the typed [`ScopeKey`]. `None` when any key field is missing
+/// / null (the event is skipped).
+pub(crate) fn extract_scope_key_from_row<E: FieldSource + ?Sized>(
+    source: &E,
+    keys: &[FieldRef],
+    key_map: Option<&[wf_lang::plan::KeyMapPlan]>,
+    alias: &str,
+) -> Option<ScopeKey> {
+    extract_key(source, keys, key_map, alias).map(|values| scope_key_from_values(&values))
 }
 
 pub fn field_ref_name(fr: &FieldRef) -> &str {

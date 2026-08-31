@@ -9,7 +9,12 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use smol_str::SmolStr;
 
-use super::match_engine::{EngineHashMap, Event, FieldSource, Value};
+use super::match_engine::{
+    EngineHashMap, Event, FieldSource, ScopeKey, Value, extract_scope_key_from_row, field_ref_name,
+};
+use crate::window::scope_key_from_column;
+use wf_lang::ast::FieldRef;
+use wf_lang::plan::KeyMapPlan;
 
 pub const WFL_FIELD_TYPE_METADATA_KEY: &str = "wf.wfl.field_type";
 pub const WFL_FIELD_TYPE_OBJECT: &str = "object";
@@ -496,6 +501,60 @@ impl FieldSource for ColumnarEvent<'_> {
         // The inherent method resolves the same way (index-first, schema
         // fallback); call it directly rather than recursing into the trait.
         self.field_value(name)
+    }
+
+    fn extract_scope_key(
+        &self,
+        keys: &[FieldRef],
+        key_map: Option<&[KeyMapPlan]>,
+        alias: &str,
+    ) -> Option<ScopeKey> {
+        // 列式直读 fast path（qradar 单 key 字符串热路径）：key 字段从 Arrow
+        // 列直接构 typed `ScopeKey`（`scope_key_from_column`），免
+        // `field_value` → `Value`（String/JSON 物化）+ `Vec<Value>` 分配 +
+        // `ScopeKey::from_value` 二次克隆。与行式路径逐类型同构（fanout 分片
+        // 对拍测试锁定同一 canonicalization）。
+        //
+        // 回退行式路径（保持与 `extract_key` 字节一致）：
+        // - `key_map` 别名映射（多事件规则）或空 key 列表；
+        // - 非简单引用（`field_ref_name` 空，路径 key 编译期已拒绝）；
+        // - object/array 结构化 Utf8 列：列式读原始 JSON 串，而行式
+        //   `extract_field_value` 解析成 `Value::Object` →
+        //   `ScopeKey::Str("[object]")`，语义不同必须回退。
+        if key_map.is_none() && !keys.is_empty() {
+            let mut acc: Option<ScopeKey> = None;
+            let mut row_path = false;
+            for key in keys {
+                let name = field_ref_name(key);
+                if name.is_empty() {
+                    row_path = true;
+                    break;
+                }
+                let idx = match &self.index {
+                    Some(index) => *index.get(name)?, // 列缺失 → 同行式 key 缺失跳过
+                    None => match self.batch.schema().index_of(name) {
+                        Ok(i) => i,
+                        Err(_) => return None,
+                    },
+                };
+                let field = self.batch.schema_ref().field(idx);
+                if matches!(field.data_type(), DataType::Utf8)
+                    && wfl_structured_field_kind(field).is_some()
+                {
+                    row_path = true;
+                    break;
+                }
+                let v = scope_key_from_column(self.batch, idx, self.row)?; // key 列 null → 跳过（同行式缺失语义）
+                acc = Some(match acc {
+                    None => v,
+                    Some(prev) => ScopeKey::Pair(Box::new(prev), Box::new(v)),
+                });
+            }
+            if !row_path {
+                return Some(acc.unwrap_or(ScopeKey::Empty));
+            }
+        }
+        extract_scope_key_from_row(self, keys, key_map, alias)
     }
 
     fn field_names(&self) -> Vec<&str> {
@@ -1057,5 +1116,283 @@ mod tests {
         // `field_value` still reads non-projected "id" (join conditions).
         assert_eq!(rows[0].1.field_value("id"), Some(Value::Number(42.0)));
         assert_eq!(rows[1].1.field_value("id"), Some(Value::Number(7.0)));
+    }
+
+    #[test]
+    fn columnar_extract_scope_key_matches_row_based() {
+        // 列式直读 `ColumnarEvent::extract_scope_key`（qradar 单 key 热路径）
+        // 必须与行式 `extract_key_simple` + `scope_key_from_values` 逐行构造出
+        // **同一个** `ScopeKey`——语义锁定（fanout 分片对拍同款 canonicalization）。
+        use crate::match_engine::{extract_key_simple, scope_key_from_values};
+
+        let schema = make_schema(vec![
+            Field::new("sip", DataType::Utf8, true),
+            Field::new("dport", DataType::Int64, true),
+            Field::new("packet_rate", DataType::Float64, true),
+            Field::new("blocked", DataType::Boolean, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("10.0.0.1"),
+                    None,
+                    Some("10.0.0.2"),
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(443), Some(80), Some(80)])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![Some(1.5), Some(2.0), Some(0.0)])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false), Some(true)])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let index = build_field_index(&batch);
+        let events = batch_to_events(&batch);
+
+        // 单 key Utf8（含 null 行 → 双路径均 None）
+        let keys = [FieldRef::Simple("sip".into())];
+        for (row, row_ev) in events.iter().enumerate() {
+            let col = ColumnarEvent::with_index(&batch, row, Arc::clone(&index));
+            assert_eq!(
+                col.extract_scope_key(&keys, None, "c"),
+                extract_key_simple(row_ev, &keys).map(|v| scope_key_from_values(&v)),
+                "sip row {row}"
+            );
+        }
+
+        // 单 key Int64 / Float64 / Boolean 与行式一致
+        for name in ["dport", "packet_rate", "blocked"] {
+            let keys = [FieldRef::Simple(name.into())];
+            for (row, row_ev) in events.iter().enumerate() {
+                let col = ColumnarEvent::with_index(&batch, row, Arc::clone(&index));
+                assert_eq!(
+                    col.extract_scope_key(&keys, None, "c"),
+                    extract_key_simple(row_ev, &keys).map(|v| scope_key_from_values(&v)),
+                    "{name} row {row}"
+                );
+            }
+        }
+
+        // 多 key：Pair 顺序与行式 `scope_key_from_values` 一致
+        let multi = [
+            FieldRef::Simple("sip".into()),
+            FieldRef::Simple("dport".into()),
+        ];
+        for (row, row_ev) in events.iter().enumerate() {
+            let col = ColumnarEvent::with_index(&batch, row, Arc::clone(&index));
+            assert_eq!(
+                col.extract_scope_key(&multi, None, "c"),
+                extract_key_simple(row_ev, &multi).map(|v| scope_key_from_values(&v)),
+                "multi row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn columnar_extract_scope_key_fallbacks() {
+        // 结构化 object 列 / key_map / 无 index / 列缺失：回退或拒绝路径必须
+        // 与行式 `extract_key_simple` 字节一致。
+        use crate::match_engine::{extract_key_simple, scope_key_from_values};
+
+        let obj_field = Field::new("conn_info", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                WFL_FIELD_TYPE_OBJECT.to_string(),
+            )]),
+        );
+        let schema = make_schema(vec![
+            obj_field,
+            Field::new("sip", DataType::Utf8, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some(r#"{"geo":"cn"}"#), None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("10.0.0.1"), Some("10.0.0.2")])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let index = build_field_index(&batch);
+        let events = batch_to_events(&batch);
+
+        // object 结构化 key：行式解析 JSON → Value::Object → Str("[object]")，
+        // 列式直读会给原始 JSON 串——必须回退行式（语义不变）。
+        let keys = [FieldRef::Simple("conn_info".into())];
+        let col = ColumnarEvent::with_index(&batch, 0, Arc::clone(&index));
+        let expected =
+            extract_key_simple(&events[0], &keys).map(|v| scope_key_from_values(&v));
+        assert_eq!(
+            expected,
+            Some(ScopeKey::Str("[object]".into()))
+        );
+        assert_eq!(col.extract_scope_key(&keys, None, "c"), expected);
+
+        // key_map 别名映射（多事件规则）→ 回退行式
+        let keys_sip = [FieldRef::Simple("sip".into())];
+        let km = [wf_lang::plan::KeyMapPlan {
+            logical_name: "sip".into(),
+            source_alias: "c".into(),
+            source_field: "sip".into(),
+        }];
+        let col2 = ColumnarEvent::with_index(&batch, 1, Arc::clone(&index));
+        assert_eq!(
+            col2.extract_scope_key(&keys_sip, Some(&km), "c"),
+            extract_key_simple(&events[1], &keys_sip).map(|v| scope_key_from_values(&v)),
+        );
+
+        // 无 index（ColumnarEvent::new）→ schema index_of 路径，结果一致
+        let col3 = ColumnarEvent::new(&batch, 0);
+        assert_eq!(
+            col3.extract_scope_key(&keys_sip, None, "c"),
+            extract_key_simple(&events[0], &keys_sip).map(|v| scope_key_from_values(&v)),
+        );
+
+        // 列缺失 → None（同行式 key 缺失跳过事件）
+        let missing = [FieldRef::Simple("no_such_col".into())];
+        assert_eq!(col3.extract_scope_key(&missing, None, "c"), None);
+    }
+
+    #[test]
+    fn columnar_extract_scope_key_type_lanes() {
+        // 类型车道锁定（2026-08-31 review 补）：
+        // - Timestamp(Ns) / >2^53 Int64：列式直读 = ScopeKey::Int（精确 i64），
+        //   行式 = Float（f64 舍入）——**已知分歧**（fanout 分片
+        //   `scope_key_columnar_matches_row_based` 同款：>2^53 行式丢精度），
+        //   列式与分片路由一致（本优化的正确方向）；
+        // - Struct / List 列：双路径一致 → Str("[object]") / Str("[array]")
+        //   （结构化键走 from_value 规范化）；
+        // - 空 key 列表 → ScopeKey::Empty（shared instance）。
+        use crate::match_engine::{extract_key_simple, scope_key_from_values};
+        use arrow::array::TimestampNanosecondArray;
+        use arrow::datatypes::TimeUnit;
+
+        // --- Timestamp(Ns) key ---
+        let schema = make_schema(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("sip", DataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_700_000_000_000_000_000]))
+                    as ArrayRef,
+                Arc::new(StringArray::from(vec!["10.0.0.1"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let index = build_field_index(&batch);
+        let keys = [FieldRef::Simple("ts".into())];
+        let col = ColumnarEvent::with_index(&batch, 0, Arc::clone(&index));
+        let col_key = col.extract_scope_key(&keys, None, "c").unwrap();
+        assert_eq!(col_key, ScopeKey::Int(1_700_000_000_000_000_000));
+        // 行式（旧路径）在 >2^53 处发散为 Float——分歧被锁定（fanout 同款）。
+        let row_key = extract_key_simple(&col, &keys)
+            .map(|v| scope_key_from_values(&v))
+            .unwrap();
+        assert_ne!(col_key, row_key);
+        assert!(matches!(row_key, ScopeKey::Float(_)));
+
+        // --- >2^53 Int64 key（同款分歧）---
+        let schema = make_schema(vec![
+            Field::new("big", DataType::Int64, false),
+            Field::new("sip", DataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![9_007_199_254_740_993])) as ArrayRef, // 2^53+1
+                Arc::new(StringArray::from(vec!["10.0.0.1"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let index = build_field_index(&batch);
+        let keys = [FieldRef::Simple("big".into())];
+        let col = ColumnarEvent::with_index(&batch, 0, Arc::clone(&index));
+        let col_key = col.extract_scope_key(&keys, None, "c").unwrap();
+        assert_eq!(col_key, ScopeKey::Int(9_007_199_254_740_993));
+        let row_key = extract_key_simple(&col, &keys)
+            .map(|v| scope_key_from_values(&v))
+            .unwrap();
+        assert_ne!(col_key, row_key, ">2^53 Int64 列式精确 vs 行式 f64 舍入");
+
+        // --- Struct 列 → 双路径均 Str("[object]") ---
+        let inner_field = Field::new("geo", DataType::Utf8, false);
+        let schema = make_schema(vec![Field::new(
+            "obj",
+            DataType::Struct(arrow::datatypes::Fields::from(vec![inner_field.clone()])),
+            false,
+        )]);
+        let inner = StringArray::from(vec!["cn"]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StructArray::from(vec![(Arc::new(inner_field), Arc::new(inner) as ArrayRef)])) as ArrayRef],
+        )
+        .unwrap();
+        let index = build_field_index(&batch);
+        let keys = [FieldRef::Simple("obj".into())];
+        let col = ColumnarEvent::with_index(&batch, 0, Arc::clone(&index));
+        assert_eq!(
+            col.extract_scope_key(&keys, None, "c"),
+            Some(ScopeKey::Str("[object]".into()))
+        );
+
+        // --- 空 key 列表 → Empty（shared instance）---
+        assert_eq!(
+            col.extract_scope_key(&[], None, "c"),
+            Some(ScopeKey::Empty)
+        );
+    }
+
+    #[test]
+    fn columnar_extract_scope_key_multi_key_gaps() {
+        // 多 key 缺口（2026-08-31 review 补）：
+        // - 第二个 key 列在批 schema 中缺失 → None（同行式跳过）；
+        // - 第二个 key 列为 null → None（同行式缺失语义）。
+        use crate::match_engine::{extract_key_simple, scope_key_from_values};
+        let schema = make_schema(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["k1", "k2"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("v1"), None])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let index = build_field_index(&batch);
+        let events = batch_to_events(&batch);
+
+        // 第二个 key 列缺失：a 存在、ghost 不存在 → None（快路径与行式一致）
+        let keys = [
+            FieldRef::Simple("a".into()),
+            FieldRef::Simple("ghost".into()),
+        ];
+        for (row, row_ev) in events.iter().enumerate() {
+            let col = ColumnarEvent::with_index(&batch, row, Arc::clone(&index));
+            assert_eq!(
+                col.extract_scope_key(&keys, None, "c"),
+                extract_key_simple(row_ev, &keys).map(|v| scope_key_from_values(&v)),
+                "missing second key col row {row}"
+            );
+        }
+
+        // 第二个 key 列为 null（row 1）：快路径与行式均 None
+        let keys = [
+            FieldRef::Simple("a".into()),
+            FieldRef::Simple("b".into()),
+        ];
+        for (row, row_ev) in events.iter().enumerate() {
+            let col = ColumnarEvent::with_index(&batch, row, Arc::clone(&index));
+            assert_eq!(
+                col.extract_scope_key(&keys, None, "c"),
+                extract_key_simple(row_ev, &keys).map(|v| scope_key_from_values(&v)),
+                "null second key col row {row}"
+            );
+        }
     }
 }

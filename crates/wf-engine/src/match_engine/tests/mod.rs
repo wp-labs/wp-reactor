@@ -1,4 +1,6 @@
 mod accu;
+mod advance_count_bench;
+mod scope_key_bench;
 mod any_l2;
 mod close_bench;
 mod columnar_bench;

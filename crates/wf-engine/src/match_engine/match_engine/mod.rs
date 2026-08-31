@@ -23,8 +23,8 @@ pub use eval::values_equal;
 pub use key::{ScopeKey, field_ref_name};
 #[allow(unused_imports)] // test-only（key.rs 内部用全限定路径，lib 构建无人消费）
 pub(crate) use key::{
-    eval_field_value, extract_key_simple, push_i64_exact_decimal, scope_key_from_values,
-    scope_key_shard_index, value_to_string,
+    eval_field_value, extract_key_simple, extract_scope_key_from_row, push_i64_exact_decimal,
+    scope_key_from_values, scope_key_shard_index, value_to_string,
 };
 
 pub use conv::apply_conv;
@@ -53,7 +53,7 @@ use wf_lang::plan::{
 use crate::match_engine::columnar::GuardMasks;
 pub(crate) use close::accumulate_close_steps;
 use close::{evaluate_close, evidence_time_range};
-use key::{InstanceKey, extract_key};
+use key::{InstanceKey, flatten_scope_values};
 use seq::{SeqRuntime, consec_broken, scan_negations};
 use state::{AliasState, Instance, snapshot_bind_data};
 use step::{
@@ -375,17 +375,19 @@ impl CepStateMachine {
             self.watermark_nanos = now_nanos;
         }
 
-        // 1. Extract scope key from event. Join-then-key (Path A): when the key
-        //    lives on a snapshot join's right window (plan.key_join), resolve it
-        //    by looking the event's join-left value up in the joined window and
-        //    reading the key field off the joined row. A miss anywhere (no
-        //    lookup, missing left field, join miss, key absent on the row) is
+        // 1. Extract the rule's typed match scope key. Join-then-key (Path A):
+        //    when the key lives on a snapshot join's right window (plan.key_join),
+        //    resolve it by looking the event's join-left value up in the joined
+        //    window and reading the key field off the joined row. A miss anywhere
+        //    (no lookup, missing left field, join miss, key absent on the row) is
         //    the same as a missing key field: skip the event.
         //    `key_override` 存在时（rule_task 批级预解析）直接用其结果，跳过内部
         //    每事件 lookup（q4/q6 join-then-key 热路径：每 bid 一次索引 lookup
         //    + values_equal 复核 + key 字段物化，占 advance 88.8%）。
-        let scope_key = if let Some(kjp) = &self.plan.key_join {
-            if let Some(override_key) = key_override {
+        //    普通规则走 `FieldSource::extract_scope_key`：ColumnarEvent 列式直读
+        //    （免 `Value`/`Vec` 分配，qradar 单 key 热路径），Event 走行式等价转换。
+        let skey: ScopeKey = if let Some(kjp) = &self.plan.key_join {
+            let scope_key = if let Some(override_key) = key_override {
                 let Some(keys) = override_key else {
                     return step_outcome(StepResult::Accumulate, None); // 预解析 miss
                 };
@@ -395,10 +397,11 @@ impl CepStateMachine {
                     return step_outcome(StepResult::Accumulate, None);
                 };
                 scope_key
-            }
+            };
+            scope_key_from_values(&scope_key)
         } else {
-            match extract_key(event, &self.plan.keys, self.plan.key_map.as_deref(), alias) {
-                Some(k) => k,
+            match event.extract_scope_key(&self.plan.keys, self.plan.key_map.as_deref(), alias) {
+                Some(skey) => skey,
                 None => return step_outcome(StepResult::Accumulate, None), // missing key field → skip
             }
         };
@@ -409,7 +412,6 @@ impl CepStateMachine {
         // 分配；skey 只建一次，非命中窗口零分配（ctx 仅在命中时 to_vec，成本
         // 与旧每次 clone 相同，命中最坏持平、非命中纯省）。语义不变：
         // scope_key_from_values 确定性纯函数，同输入同结果（对拍测试锁定）。
-        let skey = scope_key_from_values(&scope_key);
 
         // Build per-window routing. HOP windows (size, slide): one event belongs
         // to `size/slide` overlapping windows aligned to epoch slide boundaries;
@@ -430,7 +432,6 @@ impl CepStateMachine {
                         row,
                         masks,
                         capture_progress,
-                        &scope_key,
                         &skey,
                         Some(k * slide_ns),
                     );
@@ -451,7 +452,6 @@ impl CepStateMachine {
                     row,
                     masks,
                     capture_progress,
-                    &scope_key,
                     &skey,
                     Some(bucket_start),
                 ));
@@ -465,7 +465,6 @@ impl CepStateMachine {
                     row,
                     masks,
                     capture_progress,
-                    &scope_key,
                     &skey,
                     None,
                 ));
@@ -488,7 +487,6 @@ impl CepStateMachine {
         row: usize,
         masks: Option<&GuardMasks>,
         capture_progress: bool,
-        scope_key: &[Value],
         skey: &ScopeKey,
         window_start: Option<i64>,
     ) -> StepOutcome {
@@ -566,9 +564,7 @@ impl CepStateMachine {
         // O(1) per-instance accounting in insert/remove (exact state growth is
         // corrected by periodic `recalibrate_memory`).
         let new_base = if is_new && self.tracks_memory_bytes() {
-            Some(Instance::base_estimated_bytes(
-                &self.plan, scope_key, alias, event,
-            ))
+            Some(Instance::base_estimated_bytes(&self.plan, &[], alias, event))
         } else {
             None
         };
@@ -638,9 +634,7 @@ impl CepStateMachine {
                                 }
                                 // Current key will be re-created — account for base cost
                                 if evicting_current && !is_new {
-                                    total += Instance::base_estimated_bytes(
-                                        &self.plan, scope_key, alias, event,
-                                    );
+                                    total += Instance::base_estimated_bytes(&self.plan, &[], alias, event);
                                 }
                             } else {
                                 // No instances to evict — cannot make room. The
@@ -853,7 +847,7 @@ impl CepStateMachine {
                         .unwrap_or((now_nanos, now_nanos));
                 let ctx = MatchedContext {
                     rule_name: self.rule_name.clone(),
-                    scope_key: scope_key.to_vec(),
+                    scope_key: flatten_scope_values(skey),
                     step_data: instance.completed_steps.clone(),
                     bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
                     event_time_nanos: now_nanos,
@@ -906,6 +900,9 @@ impl CepStateMachine {
             let step_plan = &plan.event_steps[step_idx];
 
             // 6. Evaluate step
+            // 发射 key 值只在 debug 进度捕获时需要；`capture_progress.then`
+            // 惰性计算（生产 debug off 时零开销）。
+            let emit_key_values = capture_progress.then(|| flatten_scope_values(skey));
             let evaluation = {
                 let step_state = &mut instance.step_states[step_idx];
                 evaluate_step_with_progress(
@@ -916,7 +913,7 @@ impl CepStateMachine {
                         windows,
                         progress: capture_progress.then_some(StepProgressCapture {
                             rule_name: &self.rule_name,
-                            scope_key,
+                            scope_key: emit_key_values.as_deref().unwrap_or(&[]),
                             machine_id: &instance.machine_id,
                             step_index: step_idx,
                         }),
@@ -1065,7 +1062,7 @@ impl CepStateMachine {
                         .unwrap_or((now_nanos, now_nanos));
                 let ctx = MatchedContext {
                     rule_name: self.rule_name.clone(),
-                    scope_key: scope_key.to_vec(),
+                    scope_key: flatten_scope_values(skey),
                     step_data: instance.completed_steps.clone(),
                     bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
                     event_time_nanos: now_nanos,
@@ -1126,7 +1123,7 @@ impl CepStateMachine {
                         .unwrap_or((now_nanos, now_nanos));
                 let ctx = MatchedContext {
                     rule_name: self.rule_name.clone(),
-                    scope_key: scope_key.to_vec(),
+                    scope_key: flatten_scope_values(skey),
                     step_data: instance.completed_steps.clone(),
                     bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
                     event_time_nanos: now_nanos,
