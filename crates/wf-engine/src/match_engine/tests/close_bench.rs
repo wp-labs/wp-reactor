@@ -1703,7 +1703,7 @@ fn q15_merge_partial_profile() {
 
     // ---- 分片数敏感度（配置层决策）: 域固定（8M）, 总行数固定（30M）, 分片
     // 越多 → 每片 distinct 越少但**重复 insert 总数越多**（域重叠被反复插入）;
-    // 分片越少 → 单核瓶颈越大。量化归并成本 vs 分片数的关系, 供 rule_parallelism
+    // 分片越少 → 单核瓶颈越大。量化归并成本 vs 分片数的关系, 供 rule_shards
     // 配置取舍（q15 归并是协调片单核尾部, 每多一片多一轮全量 extend）。
     eprintln!(
         "[close-bench] -- 分片数敏感度: 域 8M/度量, 每片 distinct 反比于分片数（总 distinct 域不变）--"

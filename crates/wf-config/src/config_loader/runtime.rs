@@ -9,14 +9,27 @@ use crate::types::HumanDuration;
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[moju(kind = "struct", domain = "Config", module = "Config.ConfigLoader")]
 pub struct RuntimeConfig {
-    /// Parse worker pool parallelism (R2). Defaults to `2`.
+    /// Parse worker pool parallelism (R2). Defaults to `1`. The pool runs
+    /// `route_parse` (routing + optional shard-row partition + conditional
+    /// event materialization for non-columnar windows) for batches the source
+    /// tasks already decoded. `>1` is only reachable when that stage has real
+    /// per-batch work (sharded windows / non-deferred windows) AND rule count
+    /// is small enough that the rule wall does not dominate — no measured
+    /// case has shown a gain (design doc `concurrency-scaling.md` marks W-PDP
+    /// "待墙打破后重测"). Default `1` because extra workers on workless loads
+    /// measured -33% (qradar_pk p=1 75k vs p=2 50k). Distinct axis from
+    /// `rule_shards` (per-rule shard count).
     #[serde(default = "default_parse_parallelism")]
     pub parse_parallelism: usize,
     /// Number of shard workers per shardable rule (P2a). `1` = single worker
     /// (no sharding); `>1` partitions each rule's match key across this many
-    /// shard workers. Defaults to `6`.
-    #[serde(default = "default_rule_parallelism")]
-    pub rule_parallelism: usize,
+    /// shard workers. Note: rule tasks still run concurrently across the tokio
+    /// runtime regardless of this value — this knob only splits **one rule's**
+    /// key space. Defaults to `1` (sharding is an expert opt-in: measured
+    /// negative for cheap-rule × large-rule-set workloads, qradar_pk 148k →
+    /// 49k EPS at shards=10).
+    #[serde(default = "default_rule_shards", alias = "rule_parallelism")]
+    pub rule_shards: usize,
     /// Single rule execution timeout.
     pub rule_exec_timeout: HumanDuration,
     /// Optional engine-side ingest rate cap (events/sec). When set, the source
@@ -62,7 +75,7 @@ pub struct RuntimeConfig {
 }
 
 fn default_parse_parallelism() -> usize {
-    2
+    1
 }
 
 fn default_parse_buffer_bytes() -> usize {
@@ -73,8 +86,8 @@ fn default_window_buffer_bytes() -> usize {
     64 * 1024 * 1024
 }
 
-fn default_rule_parallelism() -> usize {
-    6
+fn default_rule_shards() -> usize {
+    1
 }
 
 /// Expand a glob `pattern` relative to `base_dir` and return matched paths

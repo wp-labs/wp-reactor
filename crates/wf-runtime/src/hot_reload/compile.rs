@@ -110,10 +110,10 @@ pub(super) fn append_effective_config_blockers(
         plan,
         current_raw,
         next_raw,
-        "runtime.rule_parallelism",
+        "runtime.rule_shards",
         wf_config::FusionChangeKind::Runtime,
-        "effective runtime.rule_parallelism changed after variable expansion; task layout requires restart",
-        current_config.runtime.rule_parallelism != next_config.runtime.rule_parallelism,
+        "effective runtime.rule_shards changed after variable expansion; task layout requires restart",
+        current_config.runtime.rule_shards != next_config.runtime.rule_shards,
     );
     push_effective_blocker_if_changed(
         plan,

@@ -426,7 +426,7 @@ impl Reactor {
             cancel.clone(),
             metrics.clone(),
             eos_tx.clone(),
-            config.runtime.rule_parallelism,
+            config.runtime.rule_shards,
         );
         let rule_watch = watch_group(rule_group, cancel.clone());
 

@@ -315,7 +315,7 @@ mod tests {
             mode,
             runtime: crate::config_loader::runtime::RuntimeConfig {
                 parse_parallelism: 2,
-                rule_parallelism: 1,
+                rule_shards: 1,
                 rule_exec_timeout: "30s".parse().unwrap(),
                 max_ingest_rate: None,
                 parse_buffer_bytes: 128 * 1024 * 1024,
@@ -607,5 +607,46 @@ mod tests {
             err.to_string()
                 .contains("file stream_tag must be non-empty")
         );
+    }
+
+    #[test]
+    fn runtime_rule_shards_new_key_alias_and_default() {
+        use crate::config_loader::runtime::RuntimeConfig;
+
+        // 新 key：rule_shards 直接生效（rule_parallelism 已改名）。
+        let cfg: RuntimeConfig = toml::from_str(
+            r#"
+            rule_exec_timeout = "30s"
+            schemas = "schemas/*.wfs"
+            rules = "rules/*.wfl"
+            rule_shards = 4
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rule_shards, 4);
+
+        // 旧 key：rule_parallelism 仍被 serde alias 接受（向后兼容）。
+        let cfg: RuntimeConfig = toml::from_str(
+            r#"
+            rule_exec_timeout = "30s"
+            schemas = "schemas/*.wfs"
+            rules = "rules/*.wfl"
+            rule_parallelism = 4
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rule_shards, 4);
+
+        // 缺省 → 默认 1（分片是专家显式开关，不再默认 6）。
+        let cfg: RuntimeConfig = toml::from_str(
+            r#"
+            rule_exec_timeout = "30s"
+            schemas = "schemas/*.wfs"
+            rules = "rules/*.wfl"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rule_shards, 1);
+        assert_eq!(cfg.parse_parallelism, 1); // 默认 1：无并行 parse 活时多 worker 是纯开销
     }
 }

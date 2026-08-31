@@ -26,7 +26,7 @@ use crate::window::scope_key_from_column;
 // 批级 where mask 共享缓存（2026-08-27 q17 分片去重）
 // ---------------------------------------------------------------------------
 //
-// 背景: 分片（rule_parallelism=S）下每片 `process_batch_rows` 对**整批**计算
+// 背景: 分片（rule_shards=S）下每片 `process_batch_rows` 对**整批**计算
 // where mask（`eval_guard_columnar` 向量化全批）——同一批被 S 片重复 S 次
 // （q17 10 片: mask 占 rules 段 CPU ~85%, sample 顶栈 eval_vec 家族第一热点）。
 // 首片算完写缓存, 其余片复用（保持向量化, 总量 S×→1×）。

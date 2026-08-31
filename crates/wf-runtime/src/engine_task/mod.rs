@@ -108,7 +108,7 @@ async fn run_push_loop(
                 // flush_pipes 广播）与消费者同时被 cancel，生产者的剩余批次可能
                 // 在消费者**第一次 drain 后通道为空**的时刻之后才投递；旧实现
                 // `if rx.is_empty() { break }` 在此提前退出 → 尾部批次被丢
-                // （q13b 1M 丢 0~7%，rule_parallelism=1 时丢 ~96%）。改为截止
+                // （q13b 1M 丢 0~7%，rule_shards=1 时丢 ~96%）。改为截止
                 // 时间驱动的持续消费：通道关闭（recv None）或 1s 宽限耗尽才结束，
                 // 生产者在自身 cancel 路径的 flush_pipes 必然落入该窗口。
                 let deadline =
