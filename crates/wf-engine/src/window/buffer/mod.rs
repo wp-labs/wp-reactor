@@ -1309,7 +1309,7 @@ fn offsets_bytes(n: usize, width: usize) -> usize {
 /// O(1) payload: `offsets[n] - offsets[0]` (offsets only advance by actual
 /// value lengths — null slots carry the previous offset forward), so no
 /// per-row `str::len` walk is needed. Called twice per batch on the hot path
-/// ([`push_decoded_batch`] + [`Router::route_parse`]); the walk version cost
+/// ([`Router::route_parse`] 的 ingest 侧调用 `route_and_dispatch`); the walk version cost
 /// ~2×100k iterator steps per string column per batch at 44M EPS.
 fn utf8_content(n: usize, arr: &StringArray) -> usize {
     offsets_bytes(n, 4) + utf8_payload_bytes(arr.value_offsets())

@@ -387,67 +387,15 @@ fn rule_instances_gauge_sums_deltas_across_shards() {
     assert_eq!(m.snapshot().rule_instances["r1"], 0);
 }
 
-/// 在途量分账指标（2026-08-25）：`parse.inflight_bytes` / `parse.budget_bytes`
-/// 必须经 provider 装入后出现在快照记录里。
-///
-/// 存在理由：q13 的 `peak_commit − Σwindow_bytes` 有 ~14.7GB 未归因，而所有
-/// 「猜持有者」的假说已逐一被实测否决（见
-/// `docs/issues/q13-memory-peak-scales-with-volume.md`）。这两个 gauge 若静默
-/// 失效（provider 未装/名字改动），分账就又变成猜——本测试钉死它们的存在。
-#[test]
-fn parse_inflight_gauges_are_exported() {
-    let metrics = RuntimeMetrics::new(
-        &["r1".to_string()],
-        &["w1".to_string()],
-        &[],
-        BTreeMap::new(),
-    );
-    // 未装 provider：值为 0 但记录仍产出（便于对账脚本恒定取到字段）。
-    let recs = metrics.snapshot().to_records();
-    let find = |recs: &Vec<MetricsRecord>, stage: &str, name: &str| -> Option<String> {
-        recs.iter()
-            .find(|r| {
-                r.fields.iter().any(|(k, v)| k == "stage" && v == stage)
-                    && r.fields.iter().any(|(k, v)| k == "name" && v == name)
-            })
-            .and_then(|r| {
-                r.fields
-                    .iter()
-                    .find(|(k, _)| k == "value")
-                    .map(|(_, v)| v.clone())
-            })
-    };
-    assert_eq!(
-        find(&recs, "parse", "inflight_bytes").as_deref(),
-        Some("0"),
-        "未装 provider 时 parse.inflight_bytes 应为 0 且记录存在"
-    );
-
-    // 装入 provider 后必须反映其读数。
-    metrics.set_parse_inflight_provider(|| (3_000, 8_000));
-    let router = wf_engine::window::Router::new(
-        wf_engine::window::WindowRegistry::build(Vec::new()).unwrap(),
-    );
-    metrics.sample_windows(&router);
-    let recs = metrics.snapshot().to_records();
-    assert_eq!(
-        find(&recs, "parse", "inflight_bytes").as_deref(),
-        Some("3000"),
-        "provider 装入后 inflight 必须反映读数"
-    );
-    assert_eq!(
-        find(&recs, "parse", "budget_bytes").as_deref(),
-        Some("8000"),
-        "provider 装入后 budget 必须反映读数"
-    );
-}
-
 /// `window.allocated_bytes` / `mailbox_inflight_bytes` 指标必须被导出（2026-08-25
 /// 在途量分账）。
 ///
 /// 为何需要：这两个 gauge 是内存分账的账目项；若采样或记录名静默失效，分账脚本
 /// 会读到 0 并把该阶段"误判为已排除"——本 session 正因分析脚本键名写错，白白
 /// 得出过一次「parse 预算 = 0」的错结论。
+/// （原 `parse.inflight_bytes` / `parse.budget_bytes` 已随 parse 池与
+/// `PrereadBudget` 移除而删除——decode-route-merge 2026-08-31，在途背压由
+/// per-window `mailbox_inflight_bytes` 承担。）
 #[test]
 fn window_memory_accounting_gauges_are_exported() {
     let metrics = RuntimeMetrics::new(

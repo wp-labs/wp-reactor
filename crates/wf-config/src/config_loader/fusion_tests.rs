@@ -242,9 +242,12 @@ fn reject_invalid_tcp_source_listen() {
 }
 
 #[test]
-fn reject_zero_parallelism() {
+fn deprecated_parse_parallelism_accepted_but_ignored() {
+    // decode-route-merge（2026-08-31）：parse 池移除，`parse_parallelism`
+    // 废弃——旧 conf（含 0 值）仍可加载，引擎忽略该字段。
     let toml = FULL_TOML.replace("parse_parallelism = 2", "parse_parallelism = 0");
-    assert!(try_load_with_windows(&toml, WINDOWS_TOML).is_err());
+    let cfg = try_load_with_windows(&toml, WINDOWS_TOML).expect("deprecated key must load");
+    assert_eq!(cfg.runtime.parse_parallelism, 0);
 }
 
 #[test]

@@ -1,6 +1,6 @@
 mod bootstrap;
 pub(crate) mod compile;
-pub(crate) mod parse_pool;
+pub(crate) mod ingest;
 mod reload;
 mod signal;
 mod spawn;

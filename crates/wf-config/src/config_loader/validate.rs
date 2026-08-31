@@ -11,10 +11,6 @@ use crate::window::WindowConfig;
 
 /// Internal validation, called automatically during `FusionConfig::from_str` / `load`.
 pub(crate) fn validate(config: &FusionConfig) -> ConfigResult<()> {
-    // runtime.parse_parallelism > 0
-    if config.runtime.parse_parallelism == 0 {
-        return ConfigReason::Validation.fail("runtime.parse_parallelism must be > 0");
-    }
     validate_output_config(config)?;
 
     // Each window's max_window_bytes ≤ window_defaults.max_total_bytes

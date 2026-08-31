@@ -484,9 +484,6 @@ struct RuntimeMetrics {
   window_allocated_bytes: Map<String,Int>
   window_mailbox_inflight: Map<String,Int>
   window_mailbox_budget: Map<String,Int>
-  parse_inflight_bytes: Int
-  parse_budget_bytes: Int
-  parse_inflight_provider: String
   window_capacity_bytes: Map<String,Int>
   window_rows: Map<String,Int>
   window_batches: Map<String,Int>
@@ -600,8 +597,6 @@ struct MetricsSnapshot {
   window_fanout_capacity: Map<String,Int>
   window_mailbox_inflight: Map<String,Int>
   window_mailbox_budget: Map<String,Int>
-  parse_inflight_bytes: Int
-  parse_budget_bytes: Int
   window_capacity_bytes: Map<String,Int>
   window_rows: Map<String,Int>
   window_batches: Map<String,Int>

@@ -6,7 +6,7 @@
 //!   > `flush_ndjson_rows` 空集早退、`normalize_stream_tag_field` 空串默认值。
 //! - csv: fixed stream 中途 flush（>2048 行）、文件打开失败。
 //! - arrow: framed 畸形前缀（非数字/超长/长度 0）、帧解码失败、
-//!   parse 池关闭报错、IPC 文件打开失败、IPC schema 不匹配。
+//!   IPC 文件打开失败、IPC schema 不匹配。
 //! - batch: 不支持的字段类型报错; Utf8 字段的字符串数值/布尔/空值分支。
 //! - route: `batch_machine_id` 空列、`coerce_column` Utf8→Timestamp 坏值 /
 //!   Float64→Utf8、`coerce_column_for_field` 结构化 object 分支与回退、
@@ -20,7 +20,6 @@ use arrow::array::{Array, Int64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 use wf_engine::match_engine::{MACHINE_ID, WFL_FIELD_TYPE_METADATA_KEY, WFL_FIELD_TYPE_OBJECT};
@@ -33,8 +32,6 @@ use super::csv::replay_csv_file;
 use super::ndjson::{flush_ndjson_rows, normalize_stream_tag_field, replay_ndjson_file};
 use super::route::{batch_machine_id, coerce_column, coerce_column_for_field, prepare_batch};
 use super::{DEFAULT_STREAM_TAG_FIELD, ReplayRoute};
-use crate::lifecycle::parse_pool::{ParseItem, PrereadBudget, spawn_parse_pool};
-use crate::lifecycle::types::TaskGroup;
 
 // ---------------------------------------------------------------------------
 // 辅助
@@ -92,17 +89,8 @@ fn make_router(stream_name: &str) -> Arc<Router> {
     Arc::new(Router::new(reg))
 }
 
-fn attach_parse_pool(
-    router: Arc<Router>,
-) -> (
-    Arc<Router>,
-    mpsc::Sender<ParseItem>,
-    PrereadBudget,
-    Arc<AtomicU64>,
-) {
-    let mut group = TaskGroup::new("test_parse_r4");
-    let (parse_tx, preread) = spawn_parse_pool(&router, None, 1, &mut group);
-    (router, parse_tx, preread, Arc::new(AtomicU64::new(0)))
+fn attach_parse_seq(router: Arc<Router>) -> (Arc<Router>, Arc<AtomicU64>) {
+    (router, Arc::new(AtomicU64::new(0)))
 }
 
 async fn wait_for_rows(router: &Router, expected: usize) {
@@ -145,13 +133,6 @@ fn ndjson_schema() -> wf_lang::WindowSchema {
     }
 }
 
-/// 已关闭的 parse 通道（用于错误路径：push_decoded_batch 返回 false）。
-fn closed_parse_channel() -> (mpsc::Sender<ParseItem>, PrereadBudget) {
-    let (tx, rx) = mpsc::channel::<ParseItem>(1);
-    drop(rx);
-    (tx, PrereadBudget::new(1024))
-}
-
 fn ndjson_lines(count: usize) -> String {
     let mut out = String::with_capacity(count * 32);
     for i in 0..count {
@@ -166,7 +147,7 @@ fn ndjson_lines(count: usize) -> String {
 
 #[tokio::test]
 async fn ndjson_blank_lines_are_skipped() {
-    let (router, parse_tx, preread, parse_seq) = attach_parse_pool(make_router("events"));
+    let (router, parse_seq) = attach_parse_seq(make_router("events"));
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.ndjson");
     std::fs::write(
@@ -185,8 +166,6 @@ async fn ndjson_blank_lines_are_skipped() {
         &[ndjson_schema()],
         Arc::clone(&router),
         None,
-        parse_tx,
-        preread,
         parse_seq,
         CancellationToken::new(),
     )
@@ -198,7 +177,6 @@ async fn ndjson_blank_lines_are_skipped() {
 
 #[tokio::test]
 async fn ndjson_invalid_json_line_errors() {
-    let (parse_tx, preread) = closed_parse_channel();
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.ndjson");
     std::fs::write(&file_path, "{\"ts\":1,\"value\":1}\nnot-json\n").unwrap();
@@ -213,8 +191,6 @@ async fn ndjson_invalid_json_line_errors() {
         &[ndjson_schema()],
         make_router("events"),
         None,
-        parse_tx,
-        preread,
         Arc::new(AtomicU64::new(0)),
         CancellationToken::new(),
     )
@@ -226,7 +202,6 @@ async fn ndjson_invalid_json_line_errors() {
 
 #[tokio::test]
 async fn ndjson_non_object_line_errors() {
-    let (parse_tx, preread) = closed_parse_channel();
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.ndjson");
     std::fs::write(&file_path, "[1,2,3]\n").unwrap();
@@ -241,8 +216,6 @@ async fn ndjson_non_object_line_errors() {
         &[ndjson_schema()],
         make_router("events"),
         None,
-        parse_tx,
-        preread,
         Arc::new(AtomicU64::new(0)),
         CancellationToken::new(),
     )
@@ -257,7 +230,6 @@ async fn ndjson_non_object_line_errors() {
 
 #[tokio::test]
 async fn ndjson_missing_file_errors() {
-    let (parse_tx, preread) = closed_parse_channel();
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.ndjson");
     let err = replay_ndjson_file(
@@ -270,8 +242,6 @@ async fn ndjson_missing_file_errors() {
         &[ndjson_schema()],
         make_router("events"),
         None,
-        parse_tx,
-        preread,
         Arc::new(AtomicU64::new(0)),
         CancellationToken::new(),
     )
@@ -284,7 +254,7 @@ async fn ndjson_missing_file_errors() {
 #[tokio::test]
 async fn ndjson_fixed_stream_flushes_mid_file() {
     // >2048 行 → 中途 flush 一次 + 末尾 flush 剩余（覆盖 132-151 与缓存复用）。
-    let (router, parse_tx, preread, parse_seq) = attach_parse_pool(make_router("events"));
+    let (router, parse_seq) = attach_parse_seq(make_router("events"));
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.ndjson");
     std::fs::write(&file_path, ndjson_lines(5_000)).unwrap();
@@ -299,8 +269,6 @@ async fn ndjson_fixed_stream_flushes_mid_file() {
         &[ndjson_schema()],
         Arc::clone(&router),
         None,
-        parse_tx,
-        preread,
         parse_seq,
         CancellationToken::new(),
     )
@@ -333,7 +301,7 @@ async fn ndjson_dynamic_stream_schema_cache_hit() {
         register_miss_provider(&mut reg);
         Arc::new(Router::new(reg))
     };
-    let (router, parse_tx, preread, parse_seq) = attach_parse_pool(router);
+    let (router, parse_seq) = attach_parse_seq(router);
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.ndjson");
     // 3000 行全部归 stream "a": 2048 行一次 flush + 952 行一次 flush。
@@ -356,8 +324,6 @@ async fn ndjson_dynamic_stream_schema_cache_hit() {
         &[schema],
         Arc::clone(&router),
         None,
-        parse_tx,
-        preread,
         parse_seq,
         CancellationToken::new(),
     )
@@ -386,7 +352,6 @@ async fn ndjson_dynamic_stream_schema_cache_hit() {
 
 #[tokio::test]
 async fn flush_ndjson_rows_empty_is_noop() {
-    let (parse_tx, preread) = closed_parse_channel();
     let schema = ndjson_schema();
     let rows: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
     let mut cache = std::collections::HashMap::new();
@@ -399,8 +364,6 @@ async fn flush_ndjson_rows_empty_is_noop() {
         rows,
         make_router("events").as_ref(),
         None,
-        &parse_tx,
-        &preread,
         &AtomicU64::new(0),
         DEFAULT_STREAM_TAG_FIELD,
         "file",
@@ -423,7 +386,7 @@ fn normalize_stream_tag_field_empty_uses_default() {
 
 #[tokio::test]
 async fn csv_fixed_stream_flushes_mid_file() {
-    let (router, parse_tx, preread, parse_seq) = attach_parse_pool(make_router("events"));
+    let (router, parse_seq) = attach_parse_seq(make_router("events"));
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.csv");
     let mut content = String::from("ts,value\n");
@@ -442,8 +405,6 @@ async fn csv_fixed_stream_flushes_mid_file() {
         &[ndjson_schema()],
         Arc::clone(&router),
         None,
-        parse_tx,
-        preread,
         parse_seq,
         CancellationToken::new(),
     )
@@ -455,7 +416,6 @@ async fn csv_fixed_stream_flushes_mid_file() {
 
 #[tokio::test]
 async fn csv_missing_file_errors() {
-    let (parse_tx, preread) = closed_parse_channel();
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.csv");
     let err = replay_csv_file(
@@ -468,8 +428,6 @@ async fn csv_missing_file_errors() {
         &[ndjson_schema()],
         make_router("events"),
         None,
-        parse_tx,
-        preread,
         Arc::new(AtomicU64::new(0)),
         CancellationToken::new(),
     )
@@ -485,7 +443,6 @@ async fn csv_missing_file_errors() {
 
 #[tokio::test]
 async fn arrow_framed_malformed_prefix_errors() {
-    let (parse_tx, preread) = closed_parse_channel();
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("bad.frame");
     std::fs::write(&file_path, "abc").unwrap();
@@ -496,8 +453,6 @@ async fn arrow_framed_malformed_prefix_errors() {
         &[ndjson_schema()],
         make_router("events"),
         None,
-        parse_tx,
-        preread,
         Arc::new(AtomicU64::new(0)),
         CancellationToken::new(),
         None,
@@ -514,7 +469,6 @@ async fn arrow_framed_malformed_prefix_errors() {
 
 #[tokio::test]
 async fn arrow_framed_prefix_too_long_errors() {
-    let (parse_tx, preread) = closed_parse_channel();
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("long.frame");
     std::fs::write(&file_path, "12345678901234567890 x").unwrap();
@@ -525,8 +479,6 @@ async fn arrow_framed_prefix_too_long_errors() {
         &[ndjson_schema()],
         make_router("events"),
         None,
-        parse_tx,
-        preread,
         Arc::new(AtomicU64::new(0)),
         CancellationToken::new(),
         None,
@@ -541,7 +493,6 @@ async fn arrow_framed_prefix_too_long_errors() {
 
 #[tokio::test]
 async fn arrow_framed_zero_length_frame_errors() {
-    let (parse_tx, preread) = closed_parse_channel();
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("zero.frame");
     std::fs::write(&file_path, "0 x").unwrap();
@@ -552,8 +503,6 @@ async fn arrow_framed_zero_length_frame_errors() {
         &[ndjson_schema()],
         make_router("events"),
         None,
-        parse_tx,
-        preread,
         Arc::new(AtomicU64::new(0)),
         CancellationToken::new(),
         None,
@@ -568,7 +517,6 @@ async fn arrow_framed_zero_length_frame_errors() {
 
 #[tokio::test]
 async fn arrow_framed_decode_error() {
-    let (parse_tx, preread) = closed_parse_channel();
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("garbage.frame");
     // 长度前缀 5 + 空格 + 5 字节垃圾 → 解码失败。
@@ -580,8 +528,6 @@ async fn arrow_framed_decode_error() {
         &[ndjson_schema()],
         make_router("events"),
         None,
-        parse_tx,
-        preread,
         Arc::new(AtomicU64::new(0)),
         CancellationToken::new(),
         None,
@@ -593,7 +539,6 @@ async fn arrow_framed_decode_error() {
 
 #[tokio::test]
 async fn arrow_ipc_missing_file_errors() {
-    let (parse_tx, preread) = closed_parse_channel();
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.arrow");
     let err = replay_arrow_ipc_file(
@@ -603,8 +548,6 @@ async fn arrow_ipc_missing_file_errors() {
         &[ndjson_schema()],
         make_router("events"),
         None,
-        parse_tx,
-        preread,
         Arc::new(AtomicU64::new(0)),
         CancellationToken::new(),
     )
@@ -618,7 +561,6 @@ async fn arrow_ipc_missing_file_errors() {
 
 #[tokio::test]
 async fn arrow_ipc_schema_mismatch_errors() {
-    let (parse_tx, preread) = closed_parse_channel();
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("mismatch.arrow");
     // IPC 文件的 schema 与目标 stream 不匹配（只有 value 列, 无 ts）。
@@ -646,8 +588,6 @@ async fn arrow_ipc_schema_mismatch_errors() {
         &[ndjson_schema()],
         make_router("events"),
         None,
-        parse_tx,
-        preread,
         Arc::new(AtomicU64::new(0)),
         CancellationToken::new(),
     )

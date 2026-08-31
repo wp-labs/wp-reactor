@@ -6,16 +6,12 @@ use std::sync::atomic::AtomicU64;
 use arrow::ipc::reader::FileReader;
 use orion_error::conversion::{SourceErr, SourceRawErr, ToStructError};
 use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wf_engine::window::Router;
 use wf_lang::WindowSchema;
 
 use crate::error::{RuntimeReason, RuntimeResult};
-use crate::lifecycle::parse_pool::{
-    IngestLimiter, ParseItem, PrereadBudget, acquire_preread_blocking, build_parse_item,
-    push_decoded_batch,
-};
+use crate::lifecycle::ingest::{IngestLimiter, route_and_dispatch, route_and_dispatch_blocking};
 use crate::metrics::RuntimeMetrics;
 use crate::receiver::miss::record_batch_window_miss;
 use crate::receiver::schema::{
@@ -93,8 +89,6 @@ pub(crate) async fn replay_arrow_framed_file(
     schemas: &[WindowSchema],
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
-    parse_tx: mpsc::Sender<ParseItem>,
-    preread: PrereadBudget,
     parse_seq: Arc<AtomicU64>,
     cancel: CancellationToken,
     limiter: Option<Arc<IngestLimiter>>,
@@ -152,9 +146,7 @@ pub(crate) async fn replay_arrow_framed_file(
                 validate_batch_schema_for_stream(schemas, stream, batch.schema().as_ref())?;
 
                 total_rows += batch.num_rows();
-                if !push_decoded_batch(
-                    &parse_tx,
-                    &preread,
+                route_and_dispatch(
                     &parse_seq,
                     source_name,
                     stream,
@@ -163,13 +155,7 @@ pub(crate) async fn replay_arrow_framed_file(
                     metrics.as_ref(),
                     limiter.as_deref(),
                 )
-                .await
-                {
-                    return RuntimeReason::system_error()
-                        .to_err()
-                        .with_detail("parse worker pool shut down during file replay")
-                        .err();
-                }
+                .await;
             }
         }
     }
@@ -194,8 +180,6 @@ pub(crate) async fn replay_arrow_ipc_file(
     schemas: &[WindowSchema],
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
-    parse_tx: mpsc::Sender<ParseItem>,
-    preread: PrereadBudget,
     parse_seq: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) -> RuntimeResult<()> {
@@ -248,27 +232,18 @@ pub(crate) async fn replay_arrow_ipc_file(
                 format!("read arrow ipc batch from {}", path_for_read.display()),
             )?;
             total_rows += batch.num_rows();
-            // Content bytes (≈ wire), not decoded arrow allocations: the
-            // latter structurally over-counts IPC-decoded batches (~10×),
-            // starving the preread budget to a few slots (see
-            // `push_decoded_batch`).
-            let content = wf_engine::window::content_bytes(&batch);
-            let permits = acquire_preread_blocking(&preread, content);
-            let item = build_parse_item(
+            // decode-route-merge：内联 route + dispatch。blocking 变体在
+            // blocking 池线程上用 runtime 句柄 block_on 驱动（mailbox 预算
+            // 等待仍由 actor 在 runtime 线程推进，不会死锁）。
+            route_and_dispatch_blocking(
                 &parse_seq,
                 &source_for_read,
                 &stream_for_read,
                 batch,
                 router.as_ref(),
                 metrics.as_ref(),
-                permits,
+                None,
             );
-            if parse_tx.blocking_send(item).is_err() {
-                return RuntimeReason::system_error()
-                    .to_err()
-                    .with_detail("parse worker pool shut down during file replay")
-                    .err();
-            }
         }
         Ok(total_rows)
     })

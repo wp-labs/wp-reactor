@@ -1,6 +1,8 @@
 # decode worker 内联 route 架构提案（parse 层移除）
 
-> 状态：**提案评审稿（未实施）**——本文是设计决策记录，不是已实现代码。
+> 状态：**P1+P2 已实施（2026-08-31）**——route 内联进源任务、parse 池与 `PrereadBudget` 移除、
+> 配置废弃（`parse_parallelism` / `parse_buffer_bytes` 字段保留 serde 兼容，引擎忽略）。
+> 实施取的方案与设计稿草案的差异记录在 §4.3 / D3。剩余：A/B 验证（§8）与 P3 文档更新。
 >
 > 关联：
 > - [`concurrency-scaling.md`](concurrency-scaling.md)（六维并行度模型 + 两道墙）——本文是其"W-PDP 待墙打破后重测"的延续回答；
@@ -8,7 +10,7 @@
 > - [`window-channel-actor-design.md`](window-channel-actor-design.md)（单写者 actor + mailbox 字节预算）；
 > - [`preread-budget-design.md`](preread-budget-design.md)（第一道墙：深度节流）。
 >
-> 前情（2026-08-31 qradar_pk 诊断）：`parse_parallelism` 三线合流——**命名误称**（不是解析）、
+> 前情（2026-08-31 qradar_pk 诊断，数据快照见 [`../issues/parse-parallelism-qradar-diagnosis.md`](../issues/parse-parallelism-qradar-diagnosis.md)）：`parse_parallelism` 三线合流——**命名误称**（不是解析）、
 > **无正据**（主文档自标"待墙打破后重测"，无任何 A/B 记录证明 p>1 有用）、**默认伤**
 > （p=2 实测 -33%，qradar 1M：p=1=75k vs p=2=50k，受控 A/B 多轮复现）。
 > 本文提出：**把 route 阶段并入 decode（源）任务，整体移除 parse 池这一层**。
@@ -44,7 +46,7 @@
 1. **seq / window_seqs 已在源任务里分配**（`build_parse_item`，parse_pool.rs L213-243）——"保序契约"在 push 前就已建立，parse worker 不参与；
 2. **route_parse 是只读、无共享可变状态的**（router.rs 注释："the parallelizable half of routing"）——可以在任何任务里执行；
 3. **decode 已经在源任务里且天然并行**（4 连接 key 分片均衡）——把 route 并进去是白赚；
-4. **`spawn_window_actors` 在 daemon 与 batch 模式都无条件执行**（lifecycle/mod.rs L396）→ mailbox 总是注册 → **actor 模式是唯一生产路径**；sync 模式（无 mailbox 的 commit worker）仅测试/embedded。
+4. **`spawn_window_actors` 在 daemon 与 batch 模式都无条件执行**（lifecycle/mod.rs L397）→ mailbox 总是注册 → **actor 模式是唯一生产路径**；sync 模式（无 mailbox 的 commit worker）仅测试/embedded。
 
 ---
 
@@ -108,7 +110,9 @@
 // 每个源任务（TCP handle / file replay）内部：
 loop {
     let batch = receive_batch().await?;              // decode（不变）
-    if perf_cut_append_gate(&stream) { continue; }   // perf-diag 门控（位置不变）
+    // perf-diag 门控（位置不变）：实际符号为 perf_diag::perf_cut_append() + 哨兵流豁免
+    //（现状见 parse_pool.rs push_decoded_batch 开头，L271-274）
+    if crate::perf_diag::perf_cut_append() && stream != PERF_SENTINEL_STREAM { continue; }
     if let Some(l) = limiter { l.acquire(rows).await; }  // 限速（位置不变）
     let (seq, window_seqs) = alloc_seqs();           // 保序契约（原 build_parse_item）
     metrics.receiver_frame(...);                     // 指标（位置不变）
@@ -121,13 +125,30 @@ loop {
 
 生产（daemon + batch）总是 actor 模式（§1.3-4）。sync 模式的 commit worker（per-source seq 重排序 + `route_commit`）**保留不动**，仅作为测试/embedded 的辅助路径；`spawn_parse_pool`（测试入口）改为 spawn 1 个内联消费者即可。
 
-### 4.3 file replay 路径
+### 4.3 file replay 路径（已实施，含一处方案偏离）
 
-- `replay_arrow_framed_file`（async）：直接改调 4.1 的内联循环；
-- `replay_arrow_ipc_file`（`spawn_blocking` + `blocking_send`）：**唯一需要特殊处理**——IPC 解析在 blocking 线程做，内联后 `dispatch_parsed` 的 mailbox `send` 是 async。两个方案：
-  a. 保留 `spawn_blocking`，用 `mailbox.tx.blocking_send`（mpsc 提供）——最省事，dispatch 阻塞在 blocking 池线程，接受；
-  b. 把 IPC 解析也改成 async 批处理（改动大，不推荐 P1）。
-  推荐 (a)。
+- `replay_arrow_framed_file`（async）：直接调用 4.1 的 `route_and_dispatch`；
+- `replay_arrow_ipc_file`（`spawn_blocking`）：**唯一需要特殊处理**——IPC 解析在 blocking
+  池线程做，而 `dispatch_parsed` 是 async。原草案给了两个方案：
+
+  > a. 保留 `spawn_blocking`，用 `mailbox.tx.blocking_send`（mpsc 提供）——最省事；
+  > b. 把 IPC 解析也改成 async 批处理（改动大，不推荐 P1）。
+
+  **实施两者皆未取**，而是折中：新增 `route_and_dispatch_blocking`（`ingest.rs`），
+  在 blocking 线程用 `Handle::block_on(route_and_dispatch(...))` 驱动**完整** dispatch。
+
+  **为什么不能只 `blocking_send`**：`dispatch_parsed` ≠ 一次 send，它还包含
+  ① 每窗 mailbox 字节预算的 async `acquire_window_budget` 等待（**唯一的 ingest 背压**，
+  parse 池移除后背压链是 `window_buffer_bytes` 预算 → 源任务 → TCP 读）；
+  ② 无 mailbox 窗口的 `commit_window` 内联兜底（sync 模式 / 热加窗）。
+  裸 send 跳过预算等待 = 丢背压、上界变无界；且 sync 路径整个漏掉——两者都是语义损失。
+
+  **为什么 `block_on` 无死锁**：`spawn_blocking` 线程**不是 runtime worker 线程**，
+  其上的 `block_on` 只驱动 dispatch 这一个 future，不占用 runtime 调度。它 await 的
+  预算信号量由 window actor 在 runtime 线程消费（append）后释放——actor 的推进不依赖
+  源线程做任何事，等待链无环：`源 blocking 线程 → 等预算 ← actor append → 释放预算`。
+  等待期间 runtime 线程照常调度其它任务。代价与方案 (a) 相同（dispatch 期间该 blocking
+  池线程被占用），但**保住了预算背压与 sync 兜底两条语义**——这正是方案 (a) 会丢掉的部分。
 
 ### 4.4 热重载
 
@@ -165,6 +186,8 @@ loop {
 **修改**
 - `push_decoded_batch` → 源侧内联 `route_and_dispatch`（保留门控/限速/指标/seq 分配）；
 - `spawn_external_source_tasks` / file 分支 / `replay_*`：签名去掉 `parse_tx`/`preread`，保留 `router`；
+- `wf-config` validate.rs L14-16：`parse_parallelism must be > 0` 校验随 P2 语义废弃同步移除（否则校验悬空）；
+- `parse_buffer_bytes` 配置项：与决策点 D1 联动——删除，或重定义为 sync 模式/全局内存护栏的参数；
 - `receiver/tests.rs` / `parse_pool.rs` 测试：按新路径改造。
 
 **保留**
@@ -178,7 +201,7 @@ loop {
 
 | 风险 | 对策 |
 |---|---|
-| IPC replay 的 spawn_blocking + async dispatch 冲突 | §4.3 方案 (a)：blocking_send 到 mailbox |
+| IPC replay 的 spawn_blocking + async dispatch 冲突 | 已实施：`route_and_dispatch_blocking`（`Handle::block_on` 驱动完整 dispatch，含预算背压与 sync 兜底）——论证见 §4.3 |
 | 删除 preread 预算后内存对账口径变化 | 决策点 D2：重定义或删除 `parse.inflight_bytes`；peak_commit 对账更新 |
 | 单连接形态 B（物化重负载）route 串行 | 无正据场景（W-PDP 待重测），接受并在文档标注 |
 | 改动面大（receiver/parse_pool/生命周期/测试） | 分步实施（§9），每步 A/B + 正确性门禁 |
@@ -208,7 +231,7 @@ loop {
 
 - **D1**：`PrereadBudget` 删 vs 保留为全局内存护栏（同步模式还需要）；
 - **D2**：`parse.inflight_bytes` gauge 删除 vs 重定义为"源在途 + mailbox 在途"；
-- **D3**：IPC replay 用 blocking_send（方案 a）vs 改 async（方案 b）；
+- **D3（已定，2026-08-31 实施）**：IPC replay 未取 blocking_send（方案 a，丢预算背压与 sync 兜底）也未改 async（方案 b，改动大）——采用 `route_and_dispatch_blocking`：`Handle::block_on` 驱动完整 dispatch，论证见 §4.3。
 - **D4**：sync 模式（测试/embedded）是否同步内联，还是保留 commit worker 不动（P1 建议不动）。
 
 ---
@@ -228,7 +251,7 @@ loop {
 
 ### 11.2 覆盖清单（物化触发源 → 列式化项）
 
-窗口能否 defer 的判定（field_usage.rs `plan_defer_safe`）：
+窗口能否 defer 的判定（field_usage.rs L109-116 的局部变量 `plan_defer_safe`，非独立函数）：
 `each 规则 || match 有 event/close/seq 步骤 || 全部 bind filter 列式`。
 非 defer 触发源 = 需要行级 eval context 的表达式：
 

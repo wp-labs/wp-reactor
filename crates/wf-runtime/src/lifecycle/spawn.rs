@@ -55,9 +55,7 @@ use wf_connector_api::BatchSource;
 use wp_core_connectors::sources::batch::arrow::WireFormat;
 use wp_model_core::model::{DataRecord, DataType, Field, FieldStorage, Value};
 
-use super::parse_pool::{
-    IngestLimiter, ParseItem, push_decoded_batch, spawn_parse_pool_with_preread,
-};
+use super::ingest::{IngestLimiter, route_and_dispatch};
 use super::types::{RunRule, RunRuleKind, TaskGroup};
 
 // ---------------------------------------------------------------------------
@@ -1292,34 +1290,10 @@ pub(super) async fn spawn_receiver_task(
     let schema_catalog = Arc::new(schemas.to_vec());
     register_builtin_external_sources();
 
-    // R2/actor: parse worker pool — external sources push decoded batches
-    // here and N parallel parse workers run `route_parse`, then dispatch each
-    // window's batch directly to its window actor mailbox (registered by
-    // `spawn_window_actors` before this call). Ordering is per-source: each
-    // source config entry owns a seq counter assigned serially in its receive
-    // loop(s), and the window actor re-orders per source. The preread byte
-    // budget bounds total decoded-batch residency in the pipeline regardless
-    // of frame size.
-    let (parse_tx, preread) = spawn_parse_pool_with_preread(
-        &router,
-        metrics.clone(),
-        config.runtime.parse_parallelism,
-        &mut group,
-        config.runtime.parse_buffer_bytes,
-    );
-    // 在途量分账（2026-08-25）：把 preread 预算句柄装给 metrics，周期采样输出
-    // `parse.inflight_bytes` / `parse.budget_bytes`——供 `peak_commit − Σwindow_bytes`
-    // 的 ~14.7GB 未归因逐段对账（q13 内存 issue §5）。
-    if let Some(m) = &metrics {
-        let budget = preread.clone();
-        wf_info!(
-            sys,
-            used = budget.used_bytes(),
-            capacity = budget.capacity_bytes(),
-            "parse inflight gauge provider installed"
-        );
-        m.set_parse_inflight_provider(move || (budget.used_bytes(), budget.capacity_bytes()));
-    }
+    // decode-route-merge（2026-08-31）：源任务内联 `route_and_dispatch`——
+    // route_parse + dispatch_parsed 在源任务单循环里执行，无中间队列、无
+    // parse 池、无 preread 预算；背压 = dispatch_parsed 的 per-window
+    // mailbox 字节预算直达 TCP 读（design: decode-route-merge-design.md）。
     let ingest_limiter = config.runtime.max_ingest_rate.map(IngestLimiter::new);
 
     for (source_idx, source) in config.sources.iter().enumerate() {
@@ -1348,8 +1322,6 @@ pub(super) async fn spawn_receiver_task(
                     .unwrap_or_else(|| DEFAULT_STREAM_TAG_FIELD.to_string());
                 let router = Arc::clone(&router);
                 let metrics = metrics.clone();
-                let parse_tx = parse_tx.clone();
-                let preread = preread.clone();
                 // Per-source seq: serial assignment inside this source's
                 // replay loop keeps batches ordered for the window actor's
                 // per-source reorder cursor.
@@ -1372,8 +1344,6 @@ pub(super) async fn spawn_receiver_task(
                                 schemas.as_slice(),
                                 router,
                                 metrics,
-                                parse_tx.clone(),
-                                preread.clone(),
                                 Arc::clone(&parse_seq),
                                 cancel,
                             )
@@ -1390,8 +1360,6 @@ pub(super) async fn spawn_receiver_task(
                                 schemas.as_slice(),
                                 router,
                                 metrics,
-                                parse_tx.clone(),
-                                preread.clone(),
                                 Arc::clone(&parse_seq),
                                 cancel,
                             )
@@ -1405,8 +1373,6 @@ pub(super) async fn spawn_receiver_task(
                                 schemas.as_slice(),
                                 router,
                                 metrics,
-                                parse_tx.clone(),
-                                preread.clone(),
                                 Arc::clone(&parse_seq),
                                 cancel,
                                 limiter,
@@ -1421,8 +1387,6 @@ pub(super) async fn spawn_receiver_task(
                                 schemas.as_slice(),
                                 router,
                                 metrics,
-                                parse_tx.clone(),
-                                preread.clone(),
                                 Arc::clone(&parse_seq),
                                 cancel,
                             )
@@ -1452,8 +1416,6 @@ pub(super) async fn spawn_receiver_task(
                     metrics.clone(),
                     cancel.child_token(),
                     &mut group,
-                    parse_tx.clone(),
-                    preread.clone(),
                     parse_seq,
                     ingest_limiter.clone(),
                 )
@@ -1527,8 +1489,6 @@ async fn spawn_external_source_tasks(
     metrics: Option<Arc<RuntimeMetrics>>,
     cancel: CancellationToken,
     group: &mut TaskGroup,
-    parse_tx: tokio::sync::mpsc::Sender<ParseItem>,
-    preread: super::parse_pool::PrereadBudget,
     parse_seq: Arc<AtomicU64>,
     ingest_limiter: Option<Arc<IngestLimiter>>,
 ) -> RuntimeResult<usize> {
@@ -1614,8 +1574,6 @@ async fn spawn_external_source_tasks(
         let source_kind = source_kind.to_string();
         let schema = Arc::clone(&schema);
         let schemas = Arc::clone(schemas);
-        let parse_tx = parse_tx.clone();
-        let preread = preread.clone();
         let parse_seq = Arc::clone(&parse_seq);
         let limiter = ingest_limiter.clone();
         group.push(tokio::spawn(async move {
@@ -1636,7 +1594,7 @@ async fn spawn_external_source_tasks(
             );
 
             let mut consecutive_errors: u32 = 0;
-            'outer: loop {
+            loop {
                 tokio::select! {
                     result = batch_source.receive_batch() => match result {
                         Ok(batches) => {
@@ -1684,12 +1642,13 @@ async fn spawn_external_source_tasks(
                                     );
                                     continue;
                                 }
-                                // Project + hand off to the parse worker pool.
-                                // The source no longer parses (batch_to_events);
-                                // it only decodes, projects, and pushes (R2/R3).
-                                if !push_decoded_batch(
-                                    &parse_tx,
-                                    &preread,
+                                // Inline route + dispatch (decode-route-merge):
+                                // the source loop itself is strictly ordered,
+                                // so the window actor's reorder cursor receives
+                                // gap-free sequences. Backpressure = the
+                                // per-window mailbox byte budget reached inside
+                                // dispatch_parsed.
+                                route_and_dispatch(
                                     &parse_seq,
                                     &source_name,
                                     &route_stream,
@@ -1698,11 +1657,7 @@ async fn spawn_external_source_tasks(
                                     metrics.as_ref(),
                                     limiter.as_deref(),
                                 )
-                                .await
-                                {
-                                    // Parse pool shut down.
-                                    break 'outer;
-                                }
+                                .await;
                             }
                         }
                         Err(e) => {

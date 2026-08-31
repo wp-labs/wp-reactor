@@ -7,13 +7,12 @@ use arrow::datatypes::SchemaRef;
 
 use orion_error::conversion::{SourceErr, ToStructError};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wf_engine::window::Router;
 use wf_lang::WindowSchema;
 
 use crate::error::{RuntimeReason, RuntimeResult};
-use crate::lifecycle::parse_pool::{ParseItem, PrereadBudget, push_decoded_batch};
+use crate::lifecycle::ingest::route_and_dispatch;
 use crate::metrics::RuntimeMetrics;
 use crate::receiver::batch::build_record_batch_from_json;
 use crate::receiver::miss::{WindowMiss, WindowMissReason, report_window_miss};
@@ -35,8 +34,6 @@ pub(crate) async fn replay_ndjson_file(
     schemas: &[WindowSchema],
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
-    parse_tx: mpsc::Sender<ParseItem>,
-    preread: PrereadBudget,
     parse_seq: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) -> RuntimeResult<()> {
@@ -142,8 +139,6 @@ pub(crate) async fn replay_ndjson_file(
                         rows,
                         router.as_ref(),
                         metrics.as_ref(),
-                        &parse_tx,
-                        &preread,
                         &parse_seq,
                         stream_tag_field,
                         "file",
@@ -167,8 +162,6 @@ pub(crate) async fn replay_ndjson_file(
             rows,
             router.as_ref(),
             metrics.as_ref(),
-            &parse_tx,
-            &preread,
             &parse_seq,
             stream_tag_field,
             "file",
@@ -196,8 +189,6 @@ pub(super) async fn flush_ndjson_rows(
     rows: Vec<serde_json::Map<String, serde_json::Value>>,
     router: &Router,
     metrics: Option<&Arc<RuntimeMetrics>>,
-    parse_tx: &mpsc::Sender<ParseItem>,
-    preread: &PrereadBudget,
     parse_seq: &AtomicU64,
     stream_tag_field: &str,
     source_kind: &str,
@@ -235,12 +226,10 @@ pub(super) async fn flush_ndjson_rows(
     };
     let batch = build_record_batch_from_json(&schema, &rows)?;
     let row_count = batch.num_rows();
-    // Push to the parse worker pool (R3) instead of routing inline: the commit
-    // worker applies `route_commit` in order and logs route errors (aligned with
-    // the streaming-source path).
-    if !push_decoded_batch(
-        parse_tx,
-        preread,
+    // Inline route + dispatch (decode-route-merge): the replay loop is the
+    // ordered source task; route errors surface via dispatch_parsed's
+    // per-window fallback logging (aligned with the streaming-source path).
+    route_and_dispatch(
         parse_seq,
         source_name,
         stream_name,
@@ -249,13 +238,7 @@ pub(super) async fn flush_ndjson_rows(
         metrics,
         None,
     )
-    .await
-    {
-        return RuntimeReason::system_error()
-            .to_err()
-            .with_detail("parse worker pool shut down during file replay")
-            .err();
-    }
+    .await;
     Ok(row_count)
 }
 

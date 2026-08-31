@@ -4,28 +4,8 @@ use crate::metrics::RuntimeMetrics;
 use wf_engine::window::Router;
 
 impl RuntimeMetrics {
-    /// 记录 parse pool 预读预算的已用/容量字节（在途量分账，2026-08-25）。
-    ///
-    /// 由持有 `PrereadBudget` 的 bootstrap 装入 provider（metrics 任务本身拿不到
-    /// 预算句柄），之后每次 `sample_windows` 读一次。q13 的
-    /// `peak_commit − Σwindow_bytes` 长期有 ~14.7GB 未归因，而所有"猜持有者"的
-    /// 假说已逐一被实测否决——本 gauge 把 parse 阶段在途字节变成可对账项
-    /// （预算默认 128MiB，nexmark bench 配 2GB）。幂等：只生效一次。
-    pub fn set_parse_inflight_provider<F>(&self, provider: F)
-    where
-        F: Fn() -> (usize, usize) + Send + Sync + 'static,
-    {
-        let _ = self.parse_inflight_provider.set(Box::new(provider));
-    }
-
     /// Periodically sample expensive window gauges to keep scrape path light.
     pub fn sample_windows(&self, router: &Router) {
-        if let Some(provider) = self.parse_inflight_provider.get() {
-            let (used, cap) = provider();
-            self.parse_inflight_bytes
-                .store(used as u64, Ordering::Relaxed);
-            self.parse_budget_bytes.store(cap as u64, Ordering::Relaxed);
-        }
         for window_name in router.registry().window_names() {
             if let Some(win) = router.registry().get_window(&window_name) {
                 if let Some(v) = self.window_memory_bytes.get(&window_name) {
