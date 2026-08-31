@@ -956,15 +956,20 @@ impl Window {
             // the window over max_window_bytes — e.g. a single oversized Arrow
             // frame exceeds the cap and is silently discarded. Log it so rules
             // that stop seeing events aren't a mystery.
+            // `join_pin_floor_ns` = D4 join-retention frontier (oldest event time
+            // a join-target reader still needs); only meaningful when a join
+            // target pinned rows. Plain (non-join) windows have no pin
+            // (`pinned=false`) — the field is omitted rather than printed as a
+            // noise `i64::MAX`. It is NOT the time-eviction cutoff.
             log::warn!(
-                "window `{}` dropped {} row(s) / {} bytes in memory eviction (max_window_bytes={} bytes, incoming batch = {} rows / {} bytes, retention_floor_ns={})",
+                "window `{}` dropped {} row(s) / {} bytes in memory eviction (max_window_bytes={} bytes, incoming batch = {} rows / {} bytes{})",
                 self.name,
                 evicted_rows,
                 evicted_bytes,
                 max_bytes,
                 row_count,
                 byte_size,
-                retention_ns,
+                Self::eviction_warn_pin_suffix(pinned, retention_ns),
             );
         }
 
@@ -973,6 +978,19 @@ impl Window {
         self.generation.fetch_add(1, Ordering::Relaxed);
 
         Ok(seq)
+    }
+
+    /// Suffix for the memory-eviction WARN: the D4 join-retention pin floor
+    /// (oldest event time a join-target reader still needs) when a join target
+    /// pinned rows, or empty for plain windows (no pin — the sweep has no
+    /// time guard to report). Kept separate so the exact message format is
+    /// unit-testable.
+    pub(crate) fn eviction_warn_pin_suffix(pinned: bool, retention_ns: i64) -> String {
+        if pinned {
+            format!(", join_pin_floor_ns={retention_ns}")
+        } else {
+            String::new()
+        }
     }
 
     /// Monotonic content-generation counter (see the struct field docs).

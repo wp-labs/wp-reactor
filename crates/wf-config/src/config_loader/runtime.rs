@@ -21,6 +21,13 @@ pub struct RuntimeConfig {
     /// key space. Defaults to `1` (sharding is an expert opt-in: measured
     /// negative for cheap-rule × large-rule-set workloads, qradar_pk 148k →
     /// 49k EPS at shards=10).
+    ///
+    /// **无状态 each 规则（无 match key）**：不分 key，整批 round-robin 轮转
+    /// 给 N 个 worker（每批整批进一个 shard，批内顺序保持，字节一致）。此时
+    /// 分片的实际收益是**输出链（告警构建）并行**——求值本就无状态可整批轮
+    /// 转，重成本在 emit 构建（q1 实测：full 档 6.5M → 22.7M EPS，增量
+    /// +115.6 → +1.6 ns/事件）。对这种形态，`rule_shards` 是隐式的「输出
+    /// 并行」旋钮（「分片」的命名只对 match/stats 的 key 分片直观）。
     #[serde(default = "default_rule_shards", alias = "rule_parallelism")]
     pub rule_shards: usize,
     /// Single rule execution timeout.

@@ -1790,6 +1790,15 @@ pub(crate) fn metrics_record_to_data_record(record: &MetricsRecord) -> DataRecor
         let field = Field::new(DataType::Chars, key, Value::from(value.as_str()));
         out.push(FieldStorage::from_owned(field));
     }
+    // 墙钟时间戳（RFC3339 UTC，与 daemon 日志同格式）：metrics.ndjson 每行可
+    // 与墙梯档位时间线对齐（2026-08-31 排查——此前无时间戳，采样无法对应
+    // recv/decode/floor/rules/full 各档）。
+    let ts = chrono::Utc::now().to_rfc3339();
+    out.push(FieldStorage::from_owned(Field::new(
+        DataType::Chars,
+        "time",
+        Value::from(ts.as_str()),
+    )));
     out
 }
 

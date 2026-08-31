@@ -286,3 +286,4 @@ loop {
 - qradar 实测规则求值仅 ~1 核、12 核被"机制开销"喂满 → 移除一个中间层（少 ~2 个 worker + 通道泵送 + 锁）正是去机制开销；
 - 本提案与"并行旋钮 = 默认安全 + 无用自动失效"原则一致：`parse_parallelism` 直接不存在，比钳制更彻底；
 - 合并后剩余的可并行维度：连接数（C-UCP/W-RDP，已验证）、规则任务数（tokio 调度，吃满核）、sink parallel（已配 8）。
+- **无状态 each 规则的分片语义（2026-08-31 q1 实测）**：`rule_shards > 1` 对无 match key 的 each 规则不做 key 分片，而是整批 round-robin 轮转（每批整批进一个 shard，批内顺序保持）——此时分片的实际收益是**输出链（告警构建）并行**（每个 shard 是完整规则任务，自带 `AlertColumnBuilder`）。q1 full 档 6.5M → 22.7M EPS（增量 +115.6 → +1.6 ns/事件）。「分片」命名对 match/stats 的 key 分片直观，对无状态 each 规则是隐式的输出并行旋钮（config `rule_shards` 字段注释同源说明）。

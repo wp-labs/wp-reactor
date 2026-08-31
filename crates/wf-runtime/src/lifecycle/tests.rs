@@ -478,15 +478,22 @@ rule repeated_fail_bursts {
         let path = root.join("data/out_dat/metrics.ndjson");
         let data = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("metrics.ndjson not found at {}: {e}", path.display()));
+        // 结构化解析（2026-08-31）：此前用 `rsplit("\"value\":\"")` 取 value，
+        // 依赖 value 是行内最后一个 `"..."` 字段——metrics 加 `time` 墙钟时间戳后
+        // value 后面多了字段导致解析错位（got total=0）。改为 serde_json 逐行
+        // 解析，任何字段序都稳健。
         let total: u64 = data
             .lines()
-            .filter(|l| l.contains("\"emitted_total\"") && l.contains("brute_force_then_scan"))
-            .filter_map(|l| l.rsplit("\"value\":\"").next())
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| {
+                v.get("stage").and_then(|x| x.as_str()) == Some("alert")
+                    && v.get("name").and_then(|x| x.as_str()) == Some("emitted_total")
+                    && v.get("label").and_then(|x| x.as_str()) == Some("brute_force_then_scan")
+            })
             .filter_map(|v| {
-                v.trim_end_matches('}')
-                    .trim_end_matches('"')
-                    .parse::<u64>()
-                    .ok()
+                v.get("value")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
             })
             .sum();
         assert!(

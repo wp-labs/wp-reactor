@@ -437,4 +437,14 @@ fn metrics_record_to_data_record_maps_fields() {
         data.field("value").map(|f| f.get_value().to_string()),
         Some("3".to_string())
     );
+    // 2026-08-31 新增：每条记录携带墙钟时间戳（RFC3339 UTC），metrics.ndjson
+    // 可与墙梯档位时间线对齐。必须存在且可被 chrono 解析。
+    let time = data
+        .field("time")
+        .map(|f| f.get_value().to_string())
+        .expect("metrics record must carry a wall-clock `time` field");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&time).is_ok(),
+        "`time` 必须是可解析的 RFC3339，got {time:?}"
+    );
 }

@@ -207,6 +207,25 @@ fn memory_eviction_on_append() {
     assert!(win.memory_usage() <= max_bytes);
 }
 
+/// 驱逐 WARN 的后缀格式（2026-08-31）：非 join 窗口（无 pin）省略
+/// `join_pin_floor_ns`（而不是打印无意义的 i64::MAX）；join pin 生效时精确
+/// 输出。锁住格式，防止退回旧的误导字段名/恒输出 i64::MAX。
+#[test]
+fn eviction_warn_omits_pin_floor_for_plain_windows() {
+    // 无 pin：无论 retention_ns 是什么（i64::MAX / 0）都不打印该字段。
+    assert_eq!(Window::eviction_warn_pin_suffix(false, i64::MAX), "");
+    assert_eq!(Window::eviction_warn_pin_suffix(false, 0), "");
+    // 有 pin：精确输出（含负值——pin 从 i64::MIN 起，负前沿合法）。
+    assert_eq!(
+        Window::eviction_warn_pin_suffix(true, 3_000_000_000),
+        ", join_pin_floor_ns=3000000000"
+    );
+    assert_eq!(
+        Window::eviction_warn_pin_suffix(true, -5),
+        ", join_pin_floor_ns=-5"
+    );
+}
+
 /// Per-window memory eviction must respect the consumption floor: a batch a
 /// live consumer has not yet acked is never dropped on append, even when the
 /// window exceeds `max_window_bytes`. This is the per-window analogue of the
