@@ -156,3 +156,44 @@ rule stats_r {
 "#;
     assert_no_errors(input, &[auth_events_window(), output_window()]);
 }
+
+/// stats 规则 + let 派生字段（2026-08-31，issue #79）：stats 未接入 per-event
+/// let 求值，checker 显式报错而非静默忽略。
+#[test]
+fn stats_rule_with_lets_rejected() {
+    let input = r#"
+rule stats_r {
+    events { a : auth_events }
+    let tenant = first(a.sip)
+    stats<10s:fixed> {
+        a | count as total;
+    }
+    entity(digit, 1)
+    yield out (y = "x")
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "stats 规则暂不支持 `let` 派生字段",
+    );
+}
+
+/// match 规则 + let 派生字段（2026-08-31，issue #79）：let 求值已接入
+/// match/close 路径，yield 引用 let 名应通过 checker。
+#[test]
+fn match_rule_with_lets_ok() {
+    let input = r#"
+rule r {
+    events { a : auth_events }
+    let tenant = first(a.sip)
+    let dedup = join_by("|", tenant, "x")
+    match<a.sip:10m> {
+        on event { a | count >= 1; }
+    } -> score(50.0)
+    entity(chars, tenant)
+    yield out (y = dedup)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
+}

@@ -2658,6 +2658,18 @@ fn expr_references_wfu_meta(expr: &wf_lang::ast::Expr) -> bool {
                 || expr_references_wfu_meta(then_expr)
                 || expr_references_wfu_meta(else_expr)
         }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            expr_references_wfu_meta(expr)
+                || arms.iter().any(|arm| {
+                    arm.patterns.iter().any(expr_references_wfu_meta)
+                        || expr_references_wfu_meta(&arm.value)
+                })
+                || default.as_ref().is_some_and(|d| expr_references_wfu_meta(d))
+        }
         // 保守兜底：未知变体（non_exhaustive）→ 回退全量 build。
         _ => true,
     }
@@ -2945,6 +2957,20 @@ fn expr_refs_let(expr: &Expr, let_names: &std::collections::HashSet<&str>) -> bo
             expr_refs_let(cond, let_names)
                 || expr_refs_let(then_expr, let_names)
                 || expr_refs_let(else_expr, let_names)
+        }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            expr_refs_let(expr, let_names)
+                || arms.iter().any(|arm| {
+                    arm.patterns.iter().any(|p| expr_refs_let(p, let_names))
+                        || expr_refs_let(&arm.value, let_names)
+                })
+                || default
+                    .as_ref()
+                    .is_some_and(|d| expr_refs_let(d, let_names))
         }
         Expr::Object(items) => items.iter().any(|it| expr_refs_let(&it.value, let_names)),
         Expr::FuncCall { args, .. } => args.iter().any(|a| expr_refs_let(a, let_names)),

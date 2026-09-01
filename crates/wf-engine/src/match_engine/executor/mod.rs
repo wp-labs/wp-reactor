@@ -139,6 +139,12 @@ pub(crate) struct OutputStatic {
 fn plan_close_ctx_fields(plan: &RulePlan) -> CloseCtxFields {
     let mut names = std::collections::HashSet::new();
     let mut force_all = false;
+    // let 派生字段（2026-08-31，issue #79）：let RHS 引用的字段必须进入 Named
+    // 窄化集合——build_eval_context 只注入 needed 字段，否则 apply_lets 读不到
+    // 事件/聚合字段。引用更早 let 名（链式）收集为 ctx 中不存在的名字，无害。
+    for l in &plan.lets {
+        visit_expr_fields(&l.expr, &mut names, &mut force_all);
+    }
     visit_expr_fields(&plan.score_plan.expr, &mut names, &mut force_all);
     visit_expr_fields(&plan.entity_plan.entity_id_expr, &mut names, &mut force_all);
     for field in &plan.yield_plan.fields {
@@ -222,6 +228,22 @@ fn visit_expr_fields(
             visit_expr_fields(cond, names, force_all);
             visit_expr_fields(then_expr, names, force_all);
             visit_expr_fields(else_expr, names, force_all);
+        }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            visit_expr_fields(expr, names, force_all);
+            for arm in arms {
+                for pattern in &arm.patterns {
+                    visit_expr_fields(pattern, names, force_all);
+                }
+                visit_expr_fields(&arm.value, names, force_all);
+            }
+            if let Some(d) = default {
+                visit_expr_fields(d, names, force_all);
+            }
         }
         Expr::Object(items) => {
             for item in items {
@@ -482,6 +504,9 @@ fn compute_match_ctx_free(
 ) -> bool {
     if plan.r#where.is_some()
         || !live_joins.is_empty()
+        // let 派生字段（2026-08-31，issue #79）：需 build_eval_context 注入，
+        // Free 模式（字段直读 scope_key + trigger_event）读不到 let 值。
+        || !plan.lets.is_empty()
         || !matches!(plan.score_plan.expr, Expr::Number(_))
         || !matches!(plan.entity_plan.entity_id_expr, Expr::Field(_))
         || yield_kinds.iter().any(|k| matches!(k, YieldKind::General))
@@ -587,6 +612,22 @@ fn visit_output_expr(
             visit_output_expr(cond, plain_ref, qualified_windows, force_all);
             visit_output_expr(then_expr, plain_ref, qualified_windows, force_all);
             visit_output_expr(else_expr, plain_ref, qualified_windows, force_all);
+        }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            visit_output_expr(expr, plain_ref, qualified_windows, force_all);
+            for arm in arms {
+                for pattern in &arm.patterns {
+                    visit_output_expr(pattern, plain_ref, qualified_windows, force_all);
+                }
+                visit_output_expr(&arm.value, plain_ref, qualified_windows, force_all);
+            }
+            if let Some(d) = default {
+                visit_output_expr(d, plain_ref, qualified_windows, force_all);
+            }
         }
         Expr::Object(items) => {
             for item in items {
@@ -1250,6 +1291,22 @@ pub(crate) fn collect_general_plain_fields(expr: &Expr, out: &mut Vec<String>) {
             collect_general_plain_fields(cond, out);
             collect_general_plain_fields(then_expr, out);
             collect_general_plain_fields(else_expr, out);
+        }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            collect_general_plain_fields(expr, out);
+            for arm in arms {
+                for pattern in &arm.patterns {
+                    collect_general_plain_fields(pattern, out);
+                }
+                collect_general_plain_fields(&arm.value, out);
+            }
+            if let Some(d) = default {
+                collect_general_plain_fields(d, out);
+            }
         }
         Expr::Object(items) => {
             for it in items {

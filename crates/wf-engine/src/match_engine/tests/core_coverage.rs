@@ -2220,6 +2220,49 @@ fn eval_expr_resolves_event_fields_for_bound_expressions() {
     );
 }
 
+/// L1 求值器（eval_expr_ext，guard/where 路径）的 match 表达式（issue #79
+/// Issue 2）：多模式命中、默认分支、无默认未命中 → None。
+#[test]
+fn eval_expr_l1_match_expression() {
+    use wf_lang::ast::MatchArm;
+    let ev = event(vec![("sev", str_val("crit")), ("n", num(2.0))]);
+    let sev = Expr::Match {
+        expr: Box::new(Expr::Field(FieldRef::Simple("sev".into()))),
+        arms: vec![MatchArm {
+            patterns: vec![Expr::StringLit("crit".into()), Expr::StringLit("alert".into())],
+            value: Expr::StringLit("CRITICAL".into()),
+        }],
+        default: Some(Box::new(Expr::Field(FieldRef::Simple("sev".into())))),
+    };
+    assert_eq!(
+        eval_expr(&sev, &ev),
+        Some(Value::Str("CRITICAL".into())),
+        "crit | alert → CRITICAL"
+    );
+    let ev2 = event(vec![("sev", str_val("info"))]);
+    assert_eq!(
+        eval_expr(&sev, &ev2),
+        Some(Value::Str("info".into())),
+        "未命中 → 默认分支（原值透传）"
+    );
+    // 无默认且未命中 → None（guard 语义：filter 不通过）。
+    let no_default = Expr::Match {
+        expr: Box::new(Expr::Field(FieldRef::Simple("n".into()))),
+        arms: vec![MatchArm {
+            patterns: vec![Expr::Number(1.0), Expr::Number(2.0)],
+            value: Expr::Bool(true),
+        }],
+        default: None,
+    };
+    assert_eq!(
+        eval_expr(&no_default, &ev),
+        Some(Value::Bool(true)),
+        "n=2 命中数字模式"
+    );
+    let ev3 = event(vec![("n", num(9.0))]);
+    assert_eq!(eval_expr(&no_default, &ev3), None, "无默认且未命中 → None");
+}
+
 // ===========================================================================
 // executor/close_exec.rs — close 收口执行
 // ===========================================================================

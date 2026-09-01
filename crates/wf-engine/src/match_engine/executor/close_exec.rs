@@ -137,7 +137,14 @@ impl RuleExecutor {
             &self.close_ctx_fields,
             close_row_fields(close),
         );
-        let ctx = annotate_close_step_stages(ctx, close.event_step_data.len());
+        let mut ctx = annotate_close_step_stages(ctx, close.event_step_data.len());
+        // let 派生字段（2026-08-31，issue #79）：close 上下文求值注入——
+        // 引用窗口聚合字段（close_ctx_fields/close_row_fields）的 let 有值；
+        // 引用事件字段的求值为 None → 不注入（close 无触发事件）。与
+        // match/on-each 路径同位置（join/where 之前）。
+        if !self.plan.lets.is_empty() {
+            self.apply_lets(&mut ctx);
+        }
         self.build_close_alert(close, &all_step_data, &ctx)
     }
 
@@ -169,6 +176,11 @@ impl RuleExecutor {
             close_row_fields(close),
         );
         ctx = annotate_close_step_stages(ctx, close.event_step_data.len());
+        // let 派生字段（2026-08-31，issue #79）：join 之前求值注入（对齐
+        // on-each/match——let 不引用 join 富化字段）。
+        if !self.plan.lets.is_empty() {
+            self.apply_lets(&mut ctx);
+        }
         // join 返回值：缺省 inner/interval inner miss 与 anti 命中 → 抑制 close 输出
         //（与 match/on-each 路径一致，设计 D4「miss → 丢」）。
         if !execute_joins(&self.live_joins, &mut ctx, windows, close.last_event_nanos) {
@@ -319,6 +331,12 @@ impl RuleExecutor {
     /// synthetic `_step_*` / `_bind_*` ctx fields are rejected: the columnar
     /// resolver only reads keys / step labels / `field_values` / `bind_data`.
     pub fn close_plan_columnar_safe(&self) -> bool {
+        // let 派生字段（2026-08-31，issue #79）：列式 close 视图（resolve_close_field）
+        // 无 let 视图；解释 close 已支持 apply_lets，但列式内联留给后续优化——
+        // 有 let 的 close 规则回落行式（正确性优先）。
+        if !self.plan.lets.is_empty() {
+            return false;
+        }
         if !matches!(self.plan.score_plan.expr, Expr::Number(_)) {
             return false;
         }
@@ -373,6 +391,22 @@ impl RuleExecutor {
                 Self::yield_general_columnar_safe(cond)
                     && Self::yield_general_columnar_safe(then_expr)
                     && Self::yield_general_columnar_safe(else_expr)
+            }
+            Expr::Match {
+                expr,
+                arms,
+                default,
+            } => {
+                Self::yield_general_columnar_safe(expr)
+                    && arms.iter().all(|arm| {
+                        arm.patterns
+                            .iter()
+                            .all(Self::yield_general_columnar_safe)
+                            && Self::yield_general_columnar_safe(&arm.value)
+                    })
+                    && default
+                        .as_ref()
+                        .is_none_or(|d| Self::yield_general_columnar_safe(d))
             }
             Expr::Object(items) => items
                 .iter()
@@ -829,7 +863,8 @@ impl RuleExecutor {
             };
         }
         // 1. 引用字段集 = 键名（ctx 无条件注入）∪ General yield 引用的普通字段
-        //    （close 编译不内联 let → 非内联收集，保持一致）
+        //    （close 编译不内联 let → 非内联收集；有 let 的规则已被
+        //    `close_plan_columnar_safe` 排除回落行式，见其注释 2026-08-31）
         let ref_fields = self.yield_ref_fields(false);
         if ref_fields.is_empty() {
             return CloseBatchVecs {

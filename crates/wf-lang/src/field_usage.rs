@@ -158,6 +158,13 @@ pub fn compute_window_field_usage(plans: &[RulePlan]) -> WindowFieldUsage {
         for field in &plan.yield_plan.fields {
             collect_expr_fields(&field.value, &mut global);
         }
+        // let 派生字段（2026-08-31，issue #79）：let RHS 引用的字段必须进
+        // 物化集合——窗口按 global_fields 裁剪投递事件，缺字段则 match/close
+        // 路径 apply_lets 读空（实证：match 规则 let 引用非 key 事件字段，
+        // join_by 拼接出空片段）。collect_expr_fields 已递归 match 表达式。
+        for l in &plan.lets {
+            collect_expr_fields(&l.expr, &mut global);
+        }
         // Post-join `where` filter reads joined fields from the eval context
         // (e.g. `person_events.state`) — the join target window must keep them
         // materialized or the enrichment is empty and the strict where
@@ -321,6 +328,22 @@ pub(crate) fn collect_expr_fields(expr: &Expr, out: &mut HashSet<String>) {
             collect_expr_fields(cond, out);
             collect_expr_fields(then_expr, out);
             collect_expr_fields(else_expr, out);
+        }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            collect_expr_fields(expr, out);
+            for arm in arms {
+                for pattern in &arm.patterns {
+                    collect_expr_fields(pattern, out);
+                }
+                collect_expr_fields(&arm.value, out);
+            }
+            if let Some(d) = default {
+                collect_expr_fields(d, out);
+            }
         }
         _ => {}
     }
@@ -533,6 +556,52 @@ mod tests {
         assert!(usage.global_fields.contains("price"));
         assert!(usage.global_fields.contains(MACHINE_ID));
         assert!(!usage.needs_all.contains("bid_events"));
+    }
+
+    #[test]
+    fn let_rhs_fields_are_materialized() {
+        // Regression（2026-08-31，issue #79）：match 规则 let 派生字段引用的
+        // 非 key 事件字段必须进物化集合——否则窗口按 global_fields 裁剪投递
+        // 事件，apply_lets 读空（match_let_demo 实证：join_by 拼出空片段）。
+        let mut rule = make_rule(
+            Vec::new(),
+            MatchPlan {
+                keys: vec![field_ref("tenant_id")],
+                key_map: None,
+                key_join: None,
+                window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
+                event_steps: vec![],
+                close_steps: vec![],
+                close_mode: crate::ast::CloseMode::Or,
+                tracked_bind_aliases: std::collections::HashSet::new(),
+                tracked_bind_fields: std::collections::HashMap::new(),
+                tracked_plain_fields: std::collections::HashSet::new(),
+                match_mode: crate::ast::MatchMode::Any,
+                seq: None,
+                accu: false,
+                needs_field_history: false,
+                trigger_event_needed: false,
+            },
+        );
+        rule.lets = vec![crate::plan::LetPlan {
+            name: "dedup_key".into(),
+            expr: Expr::FuncCall {
+                qualifier: None,
+                name: "join_by".into(),
+                args: vec![
+                    Expr::StringLit("|".into()),
+                    Expr::Field(field_ref("tenant_id")),
+                    Expr::Field(field_ref("log_type")),
+                    Expr::Field(field_ref("occur_time")),
+                ],
+            },
+        }];
+        let usage = compute_window_field_usage(&[rule]);
+        assert!(
+            usage.global_fields.contains("log_type"),
+            "let RHS 引用的非 key 字段必须物化"
+        );
+        assert!(usage.global_fields.contains("occur_time"));
     }
 
     #[test]

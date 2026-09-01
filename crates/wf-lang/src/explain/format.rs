@@ -85,6 +85,28 @@ pub fn format_expr(expr: &Expr) -> String {
                 format_expr(else_expr)
             )
         }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            let mut body: Vec<String> = arms
+                .iter()
+                .map(|arm| {
+                    let pats = arm
+                        .patterns
+                        .iter()
+                        .map(format_expr)
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    format!("{pats} => {}", format_expr(&arm.value))
+                })
+                .collect();
+            if let Some(d) = default {
+                body.push(format!("_ => {}", format_expr(d)));
+            }
+            format!("case {} {{ {} }}", format_expr(expr), body.join(", "))
+        }
     }
 }
 

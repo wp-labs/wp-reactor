@@ -274,6 +274,29 @@ pub(super) fn eval_expr_with_l3(
             Some(Value::Bool(false)) => eval_expr_with_l3(else_expr, ctx, score),
             _ => None,
         },
+        // 模式匹配（issue #79 Issue 2）：subject 求值后逐分支比较（`in` 同款
+        // values_equal），命中短路返回；`_` 默认兜底；无默认且未命中 → None。
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            let subject = eval_expr_with_l3(expr, ctx, score)?;
+            for arm in arms {
+                let hit = arm.patterns.iter().any(|pattern| {
+                    eval_expr_with_l3(pattern, ctx, score)
+                        .map(|v| values_equal(&subject, &v))
+                        .unwrap_or(false)
+                });
+                if hit {
+                    return eval_expr_with_l3(&arm.value, ctx, score);
+                }
+            }
+            match default {
+                Some(d) => eval_expr_with_l3(d, ctx, score),
+                None => None,
+            }
+        }
         Expr::FuncCall {
             qualifier,
             name,
@@ -424,6 +447,18 @@ fn contains_l3_func(expr: &wf_lang::ast::Expr) -> bool {
             then_expr,
             else_expr,
         } => contains_l3_func(cond) || contains_l3_func(then_expr) || contains_l3_func(else_expr),
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            contains_l3_func(expr)
+                || arms.iter().any(|arm| {
+                    arm.patterns.iter().any(contains_l3_func)
+                        || contains_l3_func(&arm.value)
+                })
+                || default.as_ref().is_some_and(|d| contains_l3_func(d))
+        }
         _ => false,
     }
 }
@@ -464,6 +499,18 @@ fn contains_eval_time_func(expr: &wf_lang::ast::Expr) -> bool {
                 || contains_eval_time_func(then_expr)
                 || contains_eval_time_func(else_expr)
         }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            contains_eval_time_func(expr)
+                || arms.iter().any(|arm| {
+                    arm.patterns.iter().any(contains_eval_time_func)
+                        || contains_eval_time_func(&arm.value)
+                })
+                || default.as_ref().is_some_and(|d| contains_eval_time_func(d))
+        }
         _ => false,
     }
 }
@@ -499,6 +546,18 @@ fn contains_stat_selector(expr: &wf_lang::ast::Expr) -> bool {
                 || contains_stat_selector(then_expr)
                 || contains_stat_selector(else_expr)
         }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            contains_stat_selector(expr)
+                || arms.iter().any(|arm| {
+                    arm.patterns.iter().any(contains_stat_selector)
+                        || contains_stat_selector(&arm.value)
+                })
+                || default.as_ref().is_some_and(|d| contains_stat_selector(d))
+        }
         _ => false,
     }
 }
@@ -529,6 +588,18 @@ fn contains_aggregate_func(expr: &wf_lang::ast::Expr) -> bool {
             contains_aggregate_func(cond)
                 || contains_aggregate_func(then_expr)
                 || contains_aggregate_func(else_expr)
+        }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            contains_aggregate_func(expr)
+                || arms.iter().any(|arm| {
+                    arm.patterns.iter().any(contains_aggregate_func)
+                        || contains_aggregate_func(&arm.value)
+                })
+                || default.as_ref().is_some_and(|d| contains_aggregate_func(d))
         }
         _ => false,
     }

@@ -58,6 +58,14 @@ pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
         } => infer_func_call(qualifier.as_deref(), name, args, scope),
         Expr::InList { .. } => Some(ValType::Bool),
         Expr::IfThenElse { then_expr, .. } => infer_type(then_expr, scope),
+        // match 表达式的类型 = 首个分支值类型（分支不统一时由调用方
+        // assignability 宽松处理）；空 arms 取默认分支类型。
+        Expr::Match {
+            arms, default, ..
+        } => arms
+            .first()
+            .and_then(|a| infer_type(&a.value, scope))
+            .or_else(|| default.as_ref().and_then(|d| infer_type(d, scope))),
     }
 }
 

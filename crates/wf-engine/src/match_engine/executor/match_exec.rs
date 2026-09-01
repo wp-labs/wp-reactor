@@ -75,7 +75,7 @@ impl RuleExecutor {
             return self.build_match_alert_free(matched, emit_time_nanos);
         }
         let step_plans: Vec<_> = self.plan.match_plan.event_steps.iter().collect();
-        let ctx = build_eval_context(
+        let mut ctx = build_eval_context(
             &self.plan.match_plan.keys,
             &matched.scope_key,
             &matched.step_data,
@@ -85,6 +85,12 @@ impl RuleExecutor {
             &self.close_ctx_fields,
             None,
         );
+        // let 派生字段（2026-08-31，issue #79）：对齐 on-each 语义——求值后注入
+        // ctx 字段图，后续 yield/score/entity 按裸名引用；在 join 之前求值
+        // （let 表达式不引用 join 富化字段，与 execute_each_with_joins 一致）。
+        if !self.plan.lets.is_empty() {
+            self.apply_lets(&mut ctx);
+        }
         self.build_match_alert(matched, &ctx, emit_time_nanos)
     }
 
@@ -125,6 +131,11 @@ impl RuleExecutor {
             &self.close_ctx_fields,
             None,
         );
+        // let 派生字段（2026-08-31，issue #79）：在 join 之前求值注入（与
+        // execute_each_with_joins 同位置语义——let 不引用 join 富化字段）。
+        if !self.plan.lets.is_empty() {
+            self.apply_lets(&mut ctx);
+        }
         if !execute_joins(
             &self.live_joins,
             &mut ctx,
@@ -180,6 +191,13 @@ impl RuleExecutor {
     /// 裸名在有活 join 时歧义（可能来自右窗 enrich 注入）→ 排除。
     pub fn match_plan_columnar_safe(&self) -> bool {
         let plan = &self.plan;
+        // let 派生字段（2026-08-31，issue #79）：列式视图（resolve_match_field）
+        // 无 let 视图，解释路径 apply_lets 的注入语义靠列式内联等价——但
+        // match 列式直写 gate 从简：有 let 的 match 规则整体回落行式（正确性
+        // 优先；带 let 的规则通常不是每事件 hot path）。列式内联留给后续优化。
+        if !plan.lets.is_empty() {
+            return false;
+        }
         if plan.r#where.is_some() || !matches!(plan.score_plan.expr, Expr::Number(_)) {
             return false;
         }
@@ -246,7 +264,8 @@ impl RuleExecutor {
     /// 列式批级 General yield 槽位（层 2 收口）：`resolve_match_field` 的字段
     /// 解析与 `build_eval_context`（Named 窄化）注入优先级逐位对齐（keys →
     /// trigger_event → step labels/field_values → bind），物化列与解释 ctx
-    /// 无分叉。match 传空 lets（解释 match 路径无 apply_lets）。
+    /// 无分叉。match 传空 lets——有 let 的 match 规则已被
+    /// `match_plan_columnar_safe` 排除（回落行式解释），见其注释（2026-08-31）。
     pub(crate) fn match_batch_prepare(&self, matched: &[&MatchedContext]) -> CloseBatchVecs {
         let n = matched.len();
         let slots = self.plan.yield_plan.fields.len();

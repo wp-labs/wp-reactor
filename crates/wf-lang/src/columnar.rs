@@ -228,7 +228,8 @@ pub fn expr_is_columnar(expr: &Expr) -> bool {
         | Expr::Object(_)
         | Expr::Array(_)
         | Expr::InList { .. }
-        | Expr::IfThenElse { .. } => false,
+        | Expr::IfThenElse { .. }
+        | Expr::Match { .. } => false,
     }
 }
 

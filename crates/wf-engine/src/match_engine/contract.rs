@@ -314,6 +314,20 @@ fn expr_refs_window(expr: &Expr, window: &str) -> bool {
                 || expr_refs_window(then_expr, window)
                 || expr_refs_window(else_expr, window)
         }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            expr_refs_window(expr, window)
+                || arms.iter().any(|arm| {
+                    arm.patterns.iter().any(|p| expr_refs_window(p, window))
+                        || expr_refs_window(&arm.value, window)
+                })
+                || default
+                    .as_ref()
+                    .is_some_and(|d| expr_refs_window(d, window))
+        }
         Expr::FuncCall { args, .. } => args.iter().any(|e| expr_refs_window(e, window)),
         Expr::Array(items) => items.iter().any(|e| expr_refs_window(e, window)),
         Expr::Object(items) => items

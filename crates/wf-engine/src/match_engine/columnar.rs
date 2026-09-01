@@ -47,7 +47,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field as ArrowField, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use smol_str::SmolStr;
-use wf_lang::ast::{BinOp, Expr, FieldRef, PathSegment};
+use wf_lang::ast::{BinOp, Expr, FieldRef, MatchArm, PathSegment};
 
 use super::match_engine::eval::cmp::{apply_fmt_template, timestamp_nanos_to_utc};
 use super::match_engine::{EngineHashMap, Value, field_ref_name, value_to_string, values_equal};
@@ -557,6 +557,27 @@ pub(crate) fn inline_lets(
             then_expr: Box::new(inline_lets(then_expr, lets, visiting)),
             else_expr: Box::new(inline_lets(else_expr, lets, visiting)),
         },
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => Expr::Match {
+            expr: Box::new(inline_lets(expr, lets, visiting)),
+            arms: arms
+                .iter()
+                .map(|arm| MatchArm {
+                    patterns: arm
+                        .patterns
+                        .iter()
+                        .map(|p| inline_lets(p, lets, visiting))
+                        .collect(),
+                    value: inline_lets(&arm.value, lets, visiting),
+                })
+                .collect(),
+            default: default
+                .as_ref()
+                .map(|d| Box::new(inline_lets(d, lets, visiting))),
+        },
         Expr::Object(items) => Expr::Object(
             items
                 .iter()
@@ -899,6 +920,20 @@ pub(crate) fn arg_reads_structured(view: &ColumnarBatch<'_>, expr: &Expr) -> boo
             arg_reads_structured(view, cond)
                 || arg_reads_structured(view, then_expr)
                 || arg_reads_structured(view, else_expr)
+        }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            arg_reads_structured(view, expr)
+                || arms.iter().any(|arm| {
+                    arm.patterns.iter().any(|p| arg_reads_structured(view, p))
+                        || arg_reads_structured(view, &arm.value)
+                })
+                || default
+                    .as_ref()
+                    .is_some_and(|d| arg_reads_structured(view, d))
         }
         _ => false,
     }

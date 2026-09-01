@@ -233,6 +233,18 @@ fn contains_stat_final_selector(expr: &Expr) -> bool {
                 || contains_stat_final_selector(then_expr)
                 || contains_stat_final_selector(else_expr)
         }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            contains_stat_final_selector(expr)
+                || arms.iter().any(|arm| {
+                    arm.patterns.iter().any(contains_stat_final_selector)
+                        || contains_stat_final_selector(&arm.value)
+                })
+                || default.as_ref().is_some_and(|d| contains_stat_final_selector(d))
+        }
         _ => false,
     }
 }

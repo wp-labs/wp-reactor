@@ -44,6 +44,18 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
     let mut base_scope = scope_build::build_scope(rule, schemas, name, errors);
     populate_stat_labels(&mut base_scope, &rule.match_clause);
     if let Some(stats) = &rule.stats_clause {
+        // let 派生字段（2026-08-31，issue #79）：stats 规则（声明式窗口聚合）
+        // 未接入 per-event let 求值，显式拒绝而非静默忽略（plan 虽编译进了
+        // lets，引擎 stats 路径从不求值）。
+        if !rule.lets.is_empty() {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(name.to_string()),
+                test: None,
+                message: "stats 规则暂不支持 `let` 派生字段（let 求值仅接入 on-each / match / deferred / close 路径）"
+                    .to_string(),
+            });
+        }
         populate_stats_measure_labels(&mut base_scope, stats);
         check_stats_measures(stats, &base_scope, name, errors);
     }

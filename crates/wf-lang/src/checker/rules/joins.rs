@@ -505,6 +505,22 @@ fn collect_qualified_aliases<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
             collect_qualified_aliases(then_expr, out);
             collect_qualified_aliases(else_expr, out);
         }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            collect_qualified_aliases(expr, out);
+            for arm in arms {
+                for pattern in &arm.patterns {
+                    collect_qualified_aliases(pattern, out);
+                }
+                collect_qualified_aliases(&arm.value, out);
+            }
+            if let Some(d) = default {
+                collect_qualified_aliases(d, out);
+            }
+        }
         Expr::Array(items) => {
             for i in items {
                 collect_qualified_aliases(i, out);

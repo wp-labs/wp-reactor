@@ -30,6 +30,18 @@ pub(super) fn contains_system_var(expr: &wf_lang::ast::Expr) -> bool {
                 || contains_system_var(then_expr)
                 || contains_system_var(else_expr)
         }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            contains_system_var(expr)
+                || arms.iter().any(|arm| {
+                    arm.patterns.iter().any(contains_system_var)
+                        || contains_system_var(&arm.value)
+                })
+                || default.as_ref().is_some_and(|d| contains_system_var(d))
+        }
         _ => false,
     }
 }
@@ -124,6 +136,30 @@ pub(super) fn materialize_system_vars(
             cond: Box::new(materialize_system_vars(cond, score)?),
             then_expr: Box::new(materialize_system_vars(then_expr, score)?),
             else_expr: Box::new(materialize_system_vars(else_expr, score)?),
+        }),
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => Some(Expr::Match {
+            expr: Box::new(materialize_system_vars(expr, score)?),
+            arms: arms
+                .iter()
+                .map(|arm| {
+                    Some(wf_lang::ast::MatchArm {
+                        patterns: arm
+                            .patterns
+                            .iter()
+                            .map(|p| materialize_system_vars(p, score))
+                            .collect::<Option<Vec<_>>>()?,
+                        value: materialize_system_vars(&arm.value, score)?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+            default: default
+                .as_ref()
+                .and_then(|d| materialize_system_vars(d, score))
+                .map(Box::new),
         }),
         _ => None,
     }

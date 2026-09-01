@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Expr, NamedArg, ObjectItem, RuleDecl, YieldClause, YieldPresetDecl};
+use crate::ast::{Expr, MatchArm, NamedArg, ObjectItem, RuleDecl, YieldClause, YieldPresetDecl};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum YieldPresetError {
@@ -313,6 +313,31 @@ fn substitute_preset_params(
             then_expr: Box::new(substitute_preset_params(then_expr, bindings, preset_name)?),
             else_expr: Box::new(substitute_preset_params(else_expr, bindings, preset_name)?),
         }),
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => Ok(Expr::Match {
+            expr: Box::new(substitute_preset_params(expr, bindings, preset_name)?),
+            arms: arms
+                .iter()
+                .map(|arm| {
+                    Ok(MatchArm {
+                        patterns: arm
+                            .patterns
+                            .iter()
+                            .map(|p| substitute_preset_params(p, bindings, preset_name))
+                            .collect::<Result<Vec<_>, _>>()?,
+                        value: substitute_preset_params(&arm.value, bindings, preset_name)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            default: default
+                .as_ref()
+                .map(|d| substitute_preset_params(d, bindings, preset_name))
+                .transpose()?
+                .map(Box::new),
+        }),
     }
 }
 
@@ -354,6 +379,22 @@ fn collect_preset_params<'a>(expr: &'a Expr, on_param: &mut impl FnMut(&'a str))
             collect_preset_params(cond, on_param);
             collect_preset_params(then_expr, on_param);
             collect_preset_params(else_expr, on_param);
+        }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            collect_preset_params(expr, on_param);
+            for arm in arms {
+                for pattern in &arm.patterns {
+                    collect_preset_params(pattern, on_param);
+                }
+                collect_preset_params(&arm.value, on_param);
+            }
+            if let Some(d) = default {
+                collect_preset_params(d, on_param);
+            }
         }
         Expr::Number(_)
         | Expr::StringLit(_)

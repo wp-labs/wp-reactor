@@ -147,6 +147,30 @@ pub(crate) fn eval_expr_ext(
                 _ => None,
             }
         }
+        // 模式匹配（issue #79 Issue 2）：subject 求值后逐分支比较模式
+        // （`in` 同款 values_equal），命中即返回分支值（短路）；未命中继续；
+        // `_` 默认兜底；无默认且全部未命中 → None。
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            let subject = eval_expr_ext(expr, event, windows, baselines)?;
+            for arm in arms {
+                let hit = arm.patterns.iter().any(|pattern| {
+                    eval_expr_ext(pattern, event, windows, baselines)
+                        .map(|v| values_equal(&subject, &v))
+                        .unwrap_or(false)
+                });
+                if hit {
+                    return eval_expr_ext(&arm.value, event, windows, baselines);
+                }
+            }
+            match default {
+                Some(d) => eval_expr_ext(d, event, windows, baselines),
+                None => None,
+            }
+        }
         _ => None,
     }
 }

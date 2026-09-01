@@ -39,6 +39,132 @@ rule r {
     }
 }
 
+// -----------------------------------------------------------------------
+// 模式匹配表达式（issue #79 Issue 2）
+// -----------------------------------------------------------------------
+
+#[test]
+fn parse_match_expr_with_multi_patterns_and_default() {
+    // `|` 是多模式分隔符（不能被 or_expr 吞掉）；`_` 默认分支兜底。
+    let input = r#"
+rule r {
+    events { e : win }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = case e.sip {
+        "10.0.0.1" | "10.0.0.2" => "dmz",
+        "10.0.0.3" => "app",
+        _ => "other",
+    })
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let arg = &file.rules[0].yield_clause.args[0].value;
+    let Expr::Match { expr, arms, default } = arg else {
+        panic!("expected Match, got {arg:?}");
+    };
+    assert!(matches!(expr.as_ref(), Expr::Field(FieldRef::Qualified(alias, field)) if alias == "e" && field == "sip"));
+    assert_eq!(arms.len(), 2);
+    assert_eq!(arms[0].patterns.len(), 2, "`|` 拆成两个模式");
+    assert!(matches!(arms[0].patterns[0], Expr::StringLit(ref s) if s == "10.0.0.1"));
+    assert!(matches!(arms[1].patterns[0], Expr::StringLit(ref s) if s == "10.0.0.3"));
+    assert!(matches!(arms[0].value, Expr::StringLit(ref s) if s == "dmz"));
+    assert!(default.is_some());
+}
+
+#[test]
+fn parse_match_expr_no_default_and_trailing_comma() {
+    // 无默认分支：全部未命中 → 求值 None。尾逗号合法。
+    let input = r#"
+rule r {
+    events { e : win }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = case e.count {
+        1 | 2 => "low",
+        3 => "mid",
+    })
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let arg = &file.rules[0].yield_clause.args[0].value;
+    let Expr::Match { arms, default, .. } = arg else {
+        panic!("expected Match, got {arg:?}");
+    };
+    assert_eq!(arms.len(), 2);
+    assert!(matches!(arms[1].patterns[0], Expr::Number(3.0)));
+    assert!(default.is_none());
+}
+
+#[test]
+fn parse_match_expr_value_can_be_arbitrary_expr() {
+    // 分支值可以是任意表达式（函数调用/字段引用），模式可以是字段（值比较）。
+    let input = r#"
+rule r {
+    events { e : win }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = case e.action {
+        e.action => join_by("|", e.sip, "hit"),
+        _ => "none",
+    })
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let arg = &file.rules[0].yield_clause.args[0].value;
+    let Expr::Match { arms, .. } = arg else {
+        panic!("expected Match, got {arg:?}");
+    };
+    assert!(matches!(arms[0].patterns[0], Expr::Field(FieldRef::Qualified(_, _))));
+    assert!(matches!(arms[0].value, Expr::FuncCall { ref name, .. } if name == "join_by"));
+}
+
+#[test]
+fn parse_match_expr_error_scenarios() {
+    // `_` 默认分支必须是最后一个：其后还有 arm → 报错。
+    let default_not_last = r#"
+rule r {
+    events { e : win }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = case e.action {
+        _ => "none",
+        "a" => "A",
+    })
+}
+"#;
+    assert!(parse_wfl(default_not_last).is_err(), "`_` 默认分支必须最后");
+
+    // 分支缺少 `=>` → 报错。
+    let missing_arrow = r#"
+rule r {
+    events { e : win }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = case e.action {
+        "a" "A",
+    })
+}
+"#;
+    assert!(parse_wfl(missing_arrow).is_err(), "分支必须 `=>` 连接");
+
+    // 空 match 块：无分支无默认 → 合法（恒 None）。
+    let empty = r#"
+rule r {
+    events { e : win }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = case e.action {})
+}
+"#;
+    let file = parse_wfl(empty).unwrap();
+    let arg = &file.rules[0].yield_clause.args[0].value;
+    let Expr::Match { arms, default, .. } = arg else {
+        panic!("expected Match, got {arg:?}");
+    };
+    assert!(arms.is_empty() && default.is_none());
+}
+
 #[test]
 fn parse_expr_logical_not_bang() {
     // `!<cond>` 符号否定。

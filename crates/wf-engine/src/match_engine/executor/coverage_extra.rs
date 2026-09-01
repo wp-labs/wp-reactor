@@ -18,8 +18,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field as ArrowField, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{
-    BinOp, Bound, BoundVal, CloseMode, CmpOp, Expr, FieldRef, JoinMode, MatchMode, Measure,
-    PathSegment, ReduceClause, ReduceMeasure, SystemVar, TieSpec, WithinSpec,
+    BinOp, Bound, BoundVal, CloseMode, CmpOp, Expr, FieldRef, JoinMode, MatchArm, MatchMode,
+    Measure, PathSegment, ReduceClause, ReduceMeasure, SystemVar, TieSpec, WithinSpec,
 };
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EachPlan, EntityPlan, JoinCondPlan, JoinPlan, LetPlan,
@@ -5794,6 +5794,347 @@ fn apply_lets_injects_bindings_and_skips_failures() {
     assert_eq!(ctx.fields.get("a"), Some(&num(6.0)));
     assert!(!ctx.fields.contains_key("b"));
     assert_eq!(ctx.fields.get("c"), Some(&num(12.0)));
+}
+
+/// match 表达式（issue #79 Issue 2）：on-each 路径 yield 求值——多模式命中
+/// 取分支值、未命中取默认分支。列式 gate 不识别 match → 回落行式。
+#[test]
+fn execute_each_match_expr_yield() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    );
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    plan.binds[0].alias = "e".into();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "sev".into(),
+        value: Expr::Match {
+            expr: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "action".into()))),
+            arms: vec![MatchArm {
+                patterns: vec![Expr::StringLit("crit".into()), Expr::StringLit("alert".into())],
+                value: Expr::StringLit("CRITICAL".into()),
+            }],
+            default: Some(Box::new(Expr::Field(FieldRef::Qualified("e".into(), "action".into())))),
+        },
+    }];
+    let exec = RuleExecutor::new(plan);
+    // crit | alert → CRITICAL
+    let rec = exec
+        .execute_each(
+            &event(vec![("sip", str_val("10.0.0.1")), ("action", str_val("crit"))]),
+            0,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.yield_fields[0].1, str_val("CRITICAL"));
+    // 未命中 → 默认分支（原值透传）
+    let rec = exec
+        .execute_each(
+            &event(vec![("sip", str_val("10.0.0.1")), ("action", str_val("info"))]),
+            0,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.yield_fields[0].1, str_val("info"));
+    // 数字 subject 命中数字模式
+    let mut plan = simple_rule_plan(
+        "r2",
+        simple_plan(vec![], vec![]),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    );
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    plan.binds[0].alias = "e".into();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "bucket".into(),
+        value: Expr::Match {
+            expr: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "count".into()))),
+            arms: vec![MatchArm {
+                patterns: vec![Expr::Number(1.0), Expr::Number(2.0)],
+                value: Expr::StringLit("low".into()),
+            }],
+            default: None,
+        },
+    }];
+    let exec = RuleExecutor::new(plan);
+    let rec = exec
+        .execute_each(&event(vec![("sip", str_val("10.0.0.1")), ("count", num(2.0))]), 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.yield_fields[0].1, str_val("low"));
+    // 无默认且未命中 → match 求值 None → yield 回退空串（eval_yield_expr_with_meta
+    // 语义：None → Value::Str("")）。
+    let rec = exec
+        .execute_each(
+            &event(vec![("sip", str_val("10.0.0.1")), ("count", num(9.0))]),
+            0,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.yield_fields[0].1, str_val(""));
+}
+
+/// match 表达式在 close 输出路径（issue #79 Issue 2）：subject 读 close ctx
+/// 字段（键/聚合），分支值做归一化。
+#[test]
+fn execute_close_match_expr_yield() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(
+            vec![simple_key("sip")],
+            vec![step(vec![branch("x", count_ge(1.0))])],
+        ),
+        Expr::Number(70.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    );
+    plan.yield_plan.fields = vec![YieldField {
+        name: "zone".into(),
+        value: Expr::Match {
+            expr: Box::new(Expr::Field(FieldRef::Simple("sip".into()))),
+            arms: vec![MatchArm {
+                patterns: vec![Expr::StringLit("10.0.0.1".into())],
+                value: Expr::StringLit("dmz".into()),
+            }],
+            default: Some(Box::new(Expr::StringLit("other".into()))),
+        },
+    }];
+    let exec = RuleExecutor::new(plan);
+    let close = close_output(
+        true,
+        true,
+        CloseMode::And,
+        vec![step_data(Some("x"), 1.0, EngineHashMap::default())],
+        vec![],
+    );
+    let rec = exec.execute_close(&close).unwrap().unwrap();
+    assert_eq!(
+        rec.yield_fields[0].1,
+        str_val("dmz"),
+        "close ctx 键字段命中 match 分支"
+    );
+}
+
+/// match 表达式 × let 派生字段协同（issue #79）：let 求值注入 ctx 后，match
+/// 的 subject/模式/分支值均可引用 let 名；列式 gate 对含 match 的 yield 回落
+/// 行式（apply_lets 逐行注入与 match 求值同路径）。
+#[test]
+fn match_expr_references_let_bindings() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    );
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    plan.binds[0].alias = "e".into();
+    plan.lets = vec![LetPlan {
+        name: "flag".into(),
+        expr: Expr::StringLit("admin".into()),
+    }];
+    plan.yield_plan.fields = vec![YieldField {
+        name: "level".into(),
+        value: Expr::Match {
+            expr: Box::new(Expr::Field(FieldRef::Simple("flag".into()))),
+            arms: vec![MatchArm {
+                patterns: vec![Expr::StringLit("admin".into())],
+                value: Expr::StringLit("root".into()),
+            }],
+            default: Some(Box::new(Expr::StringLit("user".into()))),
+        },
+    }];
+    let exec = RuleExecutor::new(plan);
+    // subject = let 派生值 "admin" → 命中 admin 分支。
+    let rec = exec
+        .execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.yield_fields[0].1, str_val("root"));
+    // 列式 gate：match yield 不列式（columnar_output_expr=false）→ 回落行式。
+    assert!(
+        !exec.each_plan_columnar_safe(),
+        "含 match 的 yield 回落行式（apply_lets 逐行注入）"
+    );
+}
+
+/// match 路径的 let 派生字段（2026-08-31，issue #79）：execute_match_at 在
+/// ctx 构建后 apply_lets，yield 引用 let 名得到派生值。let 链：`a = sip`（键
+/// 字段注入）、`b = a * 2`。
+#[test]
+fn execute_match_applies_lets_before_alert_build() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    );
+    plan.lets = vec![
+        LetPlan {
+            name: "a".into(),
+            expr: Expr::Field(FieldRef::Simple("sip".into())),
+        },
+        LetPlan {
+            name: "b".into(),
+            expr: Expr::BinOp {
+                op: BinOp::Mul,
+                left: Box::new(Expr::Field(FieldRef::Simple("a".into()))),
+                right: Box::new(Expr::Number(2.0)),
+            },
+        },
+    ];
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "a_out".into(),
+            value: Expr::Field(FieldRef::Simple("a".into())),
+        },
+        YieldField {
+            name: "b_out".into(),
+            value: Expr::Field(FieldRef::Simple("b".into())),
+        },
+    ];
+    let exec = RuleExecutor::new(plan);
+    let mut mc = default_matched_context();
+    mc.scope_key = vec![num(5.0)]; // key `sip` = 5
+    let rec = exec.execute_match_at(&mc, 0).unwrap();
+    assert_eq!(rec.yield_fields.len(), 2);
+    assert_eq!(rec.yield_fields[0].1, num(5.0), "a = sip = 5");
+    assert_eq!(rec.yield_fields[1].1, num(10.0), "b = a * 2 = 10");
+}
+
+/// 有 let 的 match 规则必须禁用 ctx-free 快路径与列式直写（列式视图无 let，
+/// 回落行式保证 apply_lets 注入语义一致）；无 let 的对照组仍走快路径。
+#[test]
+fn match_lets_force_rowwise_paths() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    );
+    plan.lets = vec![LetPlan {
+        name: "a".into(),
+        expr: Expr::Field(FieldRef::Simple("sip".into())),
+    }];
+    let exec = RuleExecutor::new(plan);
+    assert!(
+        !exec.output_static().match_ctx_free,
+        "let 需要 build_eval_context 注入，ctx-free 快路径必须禁用"
+    );
+    assert!(
+        !exec.match_plan_columnar_safe(),
+        "let 规则回落行式（列式视图无 let 视图）"
+    );
+    // 对照组：无 let 时仍列式安全 + ctx-free。
+    let exec2 = RuleExecutor::new(simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    ));
+    assert!(exec2.match_plan_columnar_safe());
+    assert!(exec2.output_static().match_ctx_free);
+}
+
+/// close 路径的 let 派生字段（2026-08-31，issue #79）：execute_close 在 close
+/// ctx（键字段 + 窗口聚合）上求值注入。`a = sip`（键注入）、`b = concat(a,
+/// "_s")`（字符串派生）。
+#[test]
+fn execute_close_applies_lets() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(
+            vec![simple_key("sip")],
+            vec![step(vec![branch("x", count_ge(1.0))])],
+        ),
+        Expr::Number(70.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    );
+    plan.lets = vec![
+        LetPlan {
+            name: "a".into(),
+            expr: Expr::Field(FieldRef::Simple("sip".into())),
+        },
+        LetPlan {
+            name: "b".into(),
+            expr: Expr::FuncCall {
+                qualifier: None,
+                name: "concat".into(),
+                args: vec![
+                    Expr::Field(FieldRef::Simple("a".into())),
+                    Expr::StringLit("_s".into()),
+                ],
+            },
+        },
+    ];
+    plan.yield_plan.fields = vec![YieldField {
+        name: "b_out".into(),
+        value: Expr::Field(FieldRef::Simple("b".into())),
+    }];
+    let exec = RuleExecutor::new(plan);
+    let close = close_output(
+        true,
+        true,
+        CloseMode::And,
+        vec![step_data(Some("x"), 1.0, EngineHashMap::default())],
+        vec![],
+    );
+    let rec = exec.execute_close(&close).unwrap().unwrap();
+    assert_eq!(rec.yield_fields.len(), 1);
+    assert_eq!(rec.yield_fields[0].1, str_val("10.0.0.1_s"), "b = concat(a, _s)");
+}
+
+/// 有 let 的 close 规则必须禁用列式 close 直写（回落行式，apply_lets 注入
+/// 语义一致）；无 let 对照组仍列式安全。
+#[test]
+fn close_lets_force_rowwise_paths() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(
+            vec![simple_key("sip")],
+            vec![step(vec![branch("x", count_ge(1.0))])],
+        ),
+        Expr::Number(70.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    );
+    plan.lets = vec![LetPlan {
+        name: "a".into(),
+        expr: Expr::Field(FieldRef::Simple("sip".into())),
+    }];
+    let exec = RuleExecutor::new(plan);
+    assert!(
+        !exec.close_plan_columnar_safe(),
+        "let close 规则回落行式（列式视图无 let 视图）"
+    );
+    let exec2 = RuleExecutor::new(simple_rule_plan(
+        "r1",
+        simple_plan(
+            vec![simple_key("sip")],
+            vec![step(vec![branch("x", count_ge(1.0))])],
+        ),
+        Expr::Number(70.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    ));
+    assert!(exec2.close_plan_columnar_safe());
 }
 
 // ---------------------------------------------------------------------------

@@ -4047,3 +4047,84 @@ fn builtin_dispatch_entry_points() {
         None
     );
 }
+
+/// review 2026-08-31：`contains_*` 递归检测必须穿透 match 表达式（issue #79
+/// Issue 2）——否则 `fmt("{}", match x { ... => stat.value(final(t)) })` 里
+/// 的 stat/时间/聚合/L3 函数藏在不同分支，判定为不含 → 走 L1 eval → 求值
+/// None（静默错值）。
+#[test]
+fn contains_selector_checks_penetrate_match() {
+    use super::{
+        contains_aggregate_func, contains_eval_time_func, contains_l3_func, contains_stat_selector,
+    };
+    use wf_lang::ast::MatchArm;
+
+    // `match x { "a" => <selector>, _ => 0 }`——selector 藏在分支值里。
+    let arms = |value: Expr| vec![MatchArm {
+        patterns: vec![lit("a")],
+        value,
+    }];
+    let m = |value: Expr| Expr::Match {
+        expr: Box::new(field("sev")),
+        arms: arms(value),
+        default: Some(Box::new(Expr::Number(0.0))),
+    };
+
+    let stat = m(Expr::FuncCall {
+        qualifier: Some("stat".into()),
+        name: "value".into(),
+        args: vec![Expr::FuncCall {
+            qualifier: None,
+            name: "final".into(),
+            args: vec![field("t")],
+        }],
+    });
+    assert!(contains_stat_selector(&stat), "match 分支里的 stat.* 必须被检测");
+
+    let time = m(Expr::FuncCall {
+        qualifier: None,
+        name: "now_ns".into(),
+        args: vec![],
+    });
+    assert!(contains_eval_time_func(&time), "match 分支里的 now 系列必须被检测");
+
+    let agg = m(Expr::FuncCall {
+        qualifier: None,
+        name: "sum".into(),
+        args: vec![field("x")],
+    });
+    assert!(contains_aggregate_func(&agg), "match 分支里的聚合函数必须被检测");
+
+    let l3 = m(Expr::FuncCall {
+        qualifier: None,
+        name: "collect_list".into(),
+        args: vec![field("e")],
+    });
+    assert!(contains_l3_func(&l3), "match 分支里的 L3 函数必须被检测");
+}
+
+/// review 2026-08-31：match 表达式在 L3 求值器内可求值，且分支值里的时间
+/// 函数（now_ns）走 L3 时间工具——验证 eval_expr_with_l3 的 Match 分支与
+/// contains_eval_time_func 穿透的协同。
+#[test]
+fn eval_expr_with_l3_match_branch_time_func() {
+    use wf_lang::ast::MatchArm;
+    let ctx = ctx_with(vec![("sev", Value::Str("crit".into()))]);
+    let expr = Expr::Match {
+        expr: Box::new(field("sev")),
+        arms: vec![MatchArm {
+            patterns: vec![lit("crit")],
+            value: Expr::FuncCall {
+                qualifier: None,
+                name: "now_ns".into(),
+                args: vec![],
+            },
+        }],
+        default: Some(Box::new(Expr::Number(0.0))),
+    };
+    let v = eval_expr_with_l3(&expr, &ctx, YieldMeta::default());
+    let Some(Value::Number(ns)) = v else {
+        panic!("now_ns in match branch should evaluate via L3, got {v:?}");
+    };
+    assert!(ns > 1_700_000_000_000_000_000.0, "now_ns 应为当前墙钟（ns）");
+}

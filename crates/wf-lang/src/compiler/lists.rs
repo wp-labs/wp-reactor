@@ -18,8 +18,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use crate::ast::{
-    BoundVal, CloseBlock, ConvClause, ConvStep, Expr, ListDecl, MatchClause, MatchStep, PipeChain,
-    RuleDecl, SeqClause, SeqStep, SortKey, StepBranch, WflFile, WithinSpec, YieldClause,
+    BoundVal, CloseBlock, ConvClause, ConvStep, Expr, ListDecl, MatchArm, MatchClause, MatchStep,
+    PipeChain, RuleDecl, SeqClause, SeqStep, SortKey, StepBranch, WflFile, WithinSpec, YieldClause,
     YieldPresetRef,
 };
 use crate::parse_wfl;
@@ -495,6 +495,31 @@ fn resolve_expr(expr: &Expr, lists: &HashMap<&str, &ListDecl>) -> Result<Expr, S
             cond: Box::new(resolve_expr(cond, lists)?),
             then_expr: Box::new(resolve_expr(then_expr, lists)?),
             else_expr: Box::new(resolve_expr(else_expr, lists)?),
+        }),
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => Ok(Expr::Match {
+            expr: Box::new(resolve_expr(expr, lists)?),
+            arms: arms
+                .iter()
+                .map(|arm| -> Result<MatchArm, String> {
+                    Ok(MatchArm {
+                        patterns: arm
+                            .patterns
+                            .iter()
+                            .map(|p| resolve_expr(p, lists))
+                            .collect::<Result<Vec<_>, _>>()?,
+                        value: resolve_expr(&arm.value, lists)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            default: default
+                .as_ref()
+                .map(|d| resolve_expr(d, lists))
+                .transpose()?
+                .map(Box::new),
         }),
         other => Ok(other.clone()),
     }

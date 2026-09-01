@@ -259,7 +259,7 @@ fn primary(input: &mut &str) -> ModalResult<Expr> {
             system_var,
             preset_param,
         )),
-        alt((if_expr, object_expr, array_expr, paren_expr, ident_primary)),
+        alt((if_expr, case_expr, object_expr, array_expr, paren_expr, ident_primary)),
     ))
     .context(StrContext::Expected(StrContextValue::Description(
         "expression",
@@ -563,5 +563,93 @@ fn if_expr(input: &mut &str) -> ModalResult<Expr> {
         cond: Box::new(cond),
         then_expr: Box::new(then_e),
         else_expr: Box::new(else_e),
+    })
+}
+
+/// case 模式匹配表达式（issue #79 Issue 2；2026-09-01 由 `match` 改名——
+/// 避免与规则级 CEP 子句 `match<keys:window> { ... }` 撞名）：
+/// `case <expr> { pat1 | pat2 => value, ..., _ => default }`。
+///
+/// - pattern 用 `and_expr` 以下层级解析——`|` 是分支多模式分隔符，不能被
+///   `or_expr` 当作逻辑或吞掉；
+/// - arm 以 `,` 分隔，允许尾逗号；`_` 默认分支必须最后（其后不再接受 arm）；
+/// - 无匹配且无默认 → 求值 None（与 if 条件非 bool 同语义）。
+fn case_expr(input: &mut &str) -> ModalResult<Expr> {
+    kw("case").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let subject = cut_err(or_expr)
+        .context(StrContext::Expected(StrContextValue::Description(
+            "case subject expression",
+        )))
+        .parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(literal("{"))
+        .context(StrContext::Expected(StrContextValue::Description(
+            "'{' after case subject",
+        )))
+        .parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let mut arms = Vec::new();
+    let mut default = None;
+    loop {
+        ws_skip.parse_next(input)?;
+        if input.starts_with('}') {
+            break;
+        }
+        // `_` 默认分支（必须最后一个；其后残留内容由 `}` 检查报错）。
+        if opt(literal("_"))
+            .parse_next(input)?
+            .is_some()
+        {
+            ws_skip.parse_next(input)?;
+            cut_err(literal("=>"))
+                .context(StrContext::Expected(StrContextValue::Description(
+                    "'=>' after case default pattern '_'",
+                )))
+                .parse_next(input)?;
+            ws_skip.parse_next(input)?;
+            let value = cut_err(parse_expr).parse_next(input)?;
+            default = Some(Box::new(value));
+            ws_skip.parse_next(input)?;
+            opt(literal(",")).parse_next(input)?;
+            ws_skip.parse_next(input)?;
+            break;
+        }
+        // 模式列表：`pat1 | pat2 | ...`（and_expr 不含逻辑或）。
+        let mut patterns = vec![cut_err(and_expr).parse_next(input)?];
+        loop {
+            ws_skip.parse_next(input)?;
+            if opt(literal("|")).parse_next(input)?.is_some() {
+                ws_skip.parse_next(input)?;
+                patterns.push(cut_err(and_expr).parse_next(input)?);
+            } else {
+                break;
+            }
+        }
+        ws_skip.parse_next(input)?;
+        cut_err(literal("=>"))
+            .context(StrContext::Expected(StrContextValue::Description(
+                "'=>' after case patterns",
+            )))
+            .parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        let value = cut_err(parse_expr).parse_next(input)?;
+        arms.push(MatchArm { patterns, value });
+        ws_skip.parse_next(input)?;
+        if opt(literal(",")).parse_next(input)?.is_some() {
+            continue;
+        }
+        break;
+    }
+    ws_skip.parse_next(input)?;
+    cut_err(literal("}"))
+        .context(StrContext::Expected(StrContextValue::Description(
+            "'}' closing case block",
+        )))
+        .parse_next(input)?;
+    Ok(Expr::Match {
+        expr: Box::new(subject),
+        arms,
+        default,
     })
 }

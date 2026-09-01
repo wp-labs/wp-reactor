@@ -501,6 +501,57 @@ fn check_expr_type_inner(
                 });
             }
         }
+        // 模式匹配（issue #79 Issue 2）：subject / 各模式 / 分支值 / 默认值
+        // 全部递归检查（模式是值表达式，与 `in` 列表项同语义，不做模式专项
+        // 字面量约束——允许字段/函数模式）。
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            check_expr_type_inner(
+                expr,
+                scope,
+                rule_name,
+                allow_l3_funcs,
+                allow_yield_context,
+                false,
+                errors,
+            );
+            for arm in arms {
+                for pattern in &arm.patterns {
+                    check_expr_type_inner(
+                        pattern,
+                        scope,
+                        rule_name,
+                        allow_l3_funcs,
+                        allow_yield_context,
+                        false,
+                        errors,
+                    );
+                }
+                check_expr_type_inner(
+                    &arm.value,
+                    scope,
+                    rule_name,
+                    allow_l3_funcs,
+                    allow_yield_context,
+                    false,
+                    errors,
+                );
+            }
+            if let Some(d) = default {
+                check_expr_type_inner(
+                    d,
+                    scope,
+                    rule_name,
+                    allow_l3_funcs,
+                    allow_yield_context,
+                    false,
+                    errors,
+                );
+            }
+        }
     }
 }
 

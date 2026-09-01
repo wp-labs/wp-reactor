@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use crate::ast::{
     BoundVal, CloseMode, EachClause, EntityClause, EntityTypeVal, EventsBlock, Expr, FieldRef,
-    MatchClause, Measure, PathSegment, RuleDecl, ScoreExpr, SeqSkip, WflFile, WindowMode,
-    WithinSpec, YieldClause,
+    LetDecl, MatchArm, MatchClause, Measure, PathSegment, RuleDecl, ScoreExpr, SeqSkip, WflFile,
+    WindowMode, WithinSpec, YieldClause,
 };
 use crate::checker::check_wfl;
 use crate::plan::{
@@ -270,6 +270,7 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
         &yield_plan.fields,
         &joins,
         rule.r#where.as_ref(),
+        &rule.lets,
     );
 
     let conv_plan = compile_conv(&rule.conv);
@@ -910,6 +911,18 @@ fn expr_uses_l3_series(e: &Expr) -> bool {
                 || expr_uses_l3_series(then_expr)
                 || expr_uses_l3_series(else_expr)
         }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            expr_uses_l3_series(expr)
+                || arms.iter().any(|arm| {
+                    arm.patterns.iter().any(expr_uses_l3_series)
+                        || expr_uses_l3_series(&arm.value)
+                })
+                || default.as_ref().is_some_and(|d| expr_uses_l3_series(d))
+        }
     }
 }
 
@@ -1000,6 +1013,7 @@ fn compute_trigger_event_needed(
     yield_fields: &[YieldField],
     joins: &[JoinPlan],
     r#where: Option<&Expr>,
+    lets: &[LetDecl],
 ) -> bool {
     let key_names: HashSet<&str> = match_plan
         .keys
@@ -1011,6 +1025,11 @@ fn compute_trigger_event_needed(
     crate::field_usage::collect_expr_fields(entity_expr, &mut refs);
     for f in yield_fields {
         crate::field_usage::collect_expr_fields(&f.value, &mut refs);
+    }
+    // let 派生字段（2026-08-31，issue #79）：let RHS 引用的非键字段必须保留
+    // trigger_event——否则 rule_task 丢弃事件，match 路径 apply_lets 读不到。
+    for l in lets {
+        crate::field_usage::collect_expr_fields(&l.expr, &mut refs);
     }
     for join in joins {
         for cond in &join.conds {
@@ -1305,6 +1324,27 @@ fn rewrite_expr_label_refs(expr: &Expr, labels: &HashSet<String>) -> Expr {
             cond: Box::new(rewrite_expr_label_refs(cond, labels)),
             then_expr: Box::new(rewrite_expr_label_refs(then_expr, labels)),
             else_expr: Box::new(rewrite_expr_label_refs(else_expr, labels)),
+        },
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => Expr::Match {
+            expr: Box::new(rewrite_expr_label_refs(expr, labels)),
+            arms: arms
+                .iter()
+                .map(|arm| MatchArm {
+                    patterns: arm
+                        .patterns
+                        .iter()
+                        .map(|p| rewrite_expr_label_refs(p, labels))
+                        .collect(),
+                    value: rewrite_expr_label_refs(&arm.value, labels),
+                })
+                .collect(),
+            default: default
+                .as_ref()
+                .map(|d| Box::new(rewrite_expr_label_refs(d, labels))),
         },
     }
 }

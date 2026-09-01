@@ -177,6 +177,22 @@ fn collect_expr_aliases<'a>(expr: &'a Expr, declared: &HashSet<&str>, used: &mut
             collect_expr_aliases(then_expr, declared, used);
             collect_expr_aliases(else_expr, declared, used);
         }
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            collect_expr_aliases(expr, declared, used);
+            for arm in arms {
+                for pattern in &arm.patterns {
+                    collect_expr_aliases(pattern, declared, used);
+                }
+                collect_expr_aliases(&arm.value, declared, used);
+            }
+            if let Some(d) = default {
+                collect_expr_aliases(d, declared, used);
+            }
+        }
     }
 }
 

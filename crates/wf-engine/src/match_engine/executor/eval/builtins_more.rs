@@ -402,3 +402,37 @@ fn merge_accepts_two_object_literals() {
         ])))
     );
 }
+
+/// review 2026-08-31：contains_system_var / materialize_system_vars 必须穿透
+/// match 表达式（issue #79 Issue 2）——`fmt("{}", match ... => @score)` 里
+/// 的 @score 藏在不同分支，不穿透会误判为无系统变量 → 走 L1 eval → @score
+/// 求值 None → 整个表达式 None（静默错值）。
+#[test]
+fn system_var_detection_and_materialization_penetrate_match() {
+    use wf_lang::ast::{MatchArm, SystemVar};
+    let arm_value = Expr::SystemVar(SystemVar::Score);
+    let m = Expr::Match {
+        expr: Box::new(field("sev")),
+        arms: vec![MatchArm {
+            patterns: vec![lit("crit")],
+            value: arm_value.clone(),
+        }],
+        default: Some(Box::new(num_expr(0.0))),
+    };
+    // 检测穿透：match 分支里的 @score 必须被识别。
+    assert!(contains_system_var(&m), "match 分支里的 @score 必须被检测");
+
+    // 物化穿透：@score → 具体分数（meta.score = 77）。
+    let meta = YieldMeta {
+        score: Some(77.0),
+        ..YieldMeta::default()
+    };
+    let materialized = materialize_system_vars(&m, meta).expect("materialize should succeed");
+    match materialized {
+        Expr::Match { arms, default, .. } => {
+            assert_eq!(arms[0].value, num_expr(77.0), "@score 物化为 77");
+            assert_eq!(default.as_deref(), Some(&num_expr(0.0)));
+        }
+        other => panic!("expected Match preserved, got {other:?}"),
+    }
+}

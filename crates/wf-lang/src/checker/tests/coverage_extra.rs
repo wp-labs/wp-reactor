@@ -1955,6 +1955,43 @@ rule r {
 }
 
 #[test]
+fn match_expr_ok_and_unknown_field_rejected() {
+    // issue #79 Issue 2：severity 枚举归一化——多模式 `|` + 默认 `_` 通过 checker。
+    let ok = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (y = case e.action {
+        "emerg" | "alert" | "crit" => "CRITICAL",
+        "error" => "HIGH",
+        "warning" => "MEDIUM",
+        _ => e.action,
+    })
+}
+"#;
+    assert_no_errors(ok, &[auth_events_window(), output_window()]);
+
+    // match 的 subject/模式/分支值引用未知字段 → 报错（递归检查）。
+    let bad = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (y = case e.action {
+        "x" => missing_field,
+        _ => "none",
+    })
+}
+"#;
+    assert_has_error(
+        bad,
+        &[auth_events_window(), output_window()],
+        "`missing_field` not found",
+    );
+}
+
+#[test]
 fn logical_not_requires_bool_operand() {
     // `not <非 bool 字段>`（guard 上下文）→ 报错。
     let bad = r#"

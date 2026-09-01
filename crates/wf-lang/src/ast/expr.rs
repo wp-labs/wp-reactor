@@ -101,6 +101,16 @@ pub struct ObjectItem {
     pub value: Expr,
 }
 
+/// 模式匹配分支（issue #79 Issue 2）：`pat1 | pat2 => value`。
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangExpr")]
+pub struct MatchArm {
+    /// 本分支的模式值表达式（求值后与 subject 比较；`|` 表示多个模式）。
+    pub patterns: Vec<Expr>,
+    /// 命中本分支时的结果表达式。
+    pub value: Expr,
+}
+
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------
@@ -158,5 +168,15 @@ pub enum Expr {
         cond: Box<Expr>,
         then_expr: Box<Expr>,
         else_expr: Box<Expr>,
+    },
+    /// 模式匹配表达式（issue #79 Issue 2）：
+    /// `match <expr> { pat1 | pat2 => arm, ..., _ => default }`。
+    /// 模式求值后与 subject 按值比较（同 `in` 的相等语义）；短路：命中即
+    /// 返回对应 arm，未命中继续下一分支；`_` 默认分支兜底；无默认且全部
+    /// 未命中 → None。
+    Match {
+        expr: Box<Expr>,
+        arms: Vec<MatchArm>,
+        default: Option<Box<Expr>>,
     },
 }
