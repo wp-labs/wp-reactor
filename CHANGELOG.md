@@ -6,29 +6,19 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Added
 
-- **wf-lang / wf-engine: `let` 派生字段补齐 match（CEP）/ close 路径（issue #79）**——match/close 接入 `apply_lets`（join 前注入，entity/yield/where/score 可引用），配套修复 Named 窄化注入 / trigger_event 保留 / 窗口物化字段三处可见性；stats 规则 + let 由 checker 报错。
-- **wf-lang / wf-engine: `case` 值分派表达式（issue #79）**——`case x { "a" | "b" => v, _ => d }` 替代多层 if/else（多模式 `|` / 默认 `_` / 短路求值）；关键字定稿用 `case`，`match` 保留给规则级 CEP 子句。
-- **wf-runtime: decode-route-merge（P1+P2）**——route+dispatch 内联进 decode 任务，拆除 parse 池（727 行）；`parse_parallelism` 保留但 ignored（非破坏）。
+- **wf-lang / wf-engine: `let` 派生字段补齐 match（CEP）/ close 路径（issue #79）**——match/close 接入 `apply_lets`（join 前注入，entity/yield/where/score 可引用）；
+- **wf-lang / wf-engine: `case` 值分派表达式（issue #79）**；
+- **wf-runtime: decode-route-merge（P1+P2）**——route+dispatch 内联进 decode 任务，拆除 parse 池；
 
 ### Changed
 
-- **wf-config: `rule_parallelism` → `rule_shards`**（default 1，alias 兼容；分片为专家显式开启——廉价规则×大规则集负收益）；`parse_parallelism` default 2 → 1（无分片负载实测 -33%）。
-- **wf-engine: 内存驱逐 WARN 按窗口形态输出**——非 join 窗口省略 `retention_floor_ns`，join 窗口输出 `join_pin_floor_ns`。
+- **wf-config: `rule_parallelism` → `rule_shards`**（default 1，alias 兼容；分片为专家显式开启——廉价规则×大规则集负收益）；
 - **wf-runtime: metrics.ndjson 每行追加 `time` 字段**（RFC3339 UTC，墙梯档位对齐）。
 
 ### Performance
 
 - **wf-engine: 单 key 字符串规则列式直读 ScopeKey**——免 Value/Vec 物化，advance −10.8%。
 - **wf-engine: limits 内存检查摊还 + branch_guard_masks 视图惰性化**——advance −2.9%。
-
-### Fixed
-
-- **wf-engine: `Expr::Match` 新增后 12 处 `_ =>` 兑底递归遍历补全**（contains_* 系列 / expr_refs_let / materialize_system_vars 等，防 match/case 藏在分支里时检测/展开/字段收集失效）。
-
-### Documentation
-
-- **decode-route-merge-design.md**：parse 层移除提案 + 无状态 each 分片 = 输出链并行附注（q1 full 6.5M → 22.7M EPS）。
-- **issues/parse-parallelism-qradar-diagnosis.md**：parse_parallelism 实测诊断。
 
 ## [2.0.11]
 
