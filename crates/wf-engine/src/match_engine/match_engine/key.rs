@@ -264,7 +264,9 @@ pub(super) fn flatten_scope_values(key: &ScopeKey) -> Vec<Value> {
 ///
 /// Returns `None` if any key field is missing from the event.
 /// Returns `Some(vec![])` if the key list is empty (shared instance).
-pub(super) fn extract_key<E: FieldSource + ?Sized>(event: &E, keys: &[FieldRef],
+pub(super) fn extract_key<E: FieldSource + ?Sized>(
+    event: &E,
+    keys: &[FieldRef],
     key_map: Option<&[wf_lang::plan::KeyMapPlan]>,
     alias: &str,
 ) -> Option<Vec<Value>> {

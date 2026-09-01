@@ -399,9 +399,7 @@ impl RuleExecutor {
             } => {
                 Self::yield_general_columnar_safe(expr)
                     && arms.iter().all(|arm| {
-                        arm.patterns
-                            .iter()
-                            .all(Self::yield_general_columnar_safe)
+                        arm.patterns.iter().all(Self::yield_general_columnar_safe)
                             && Self::yield_general_columnar_safe(&arm.value)
                     })
                     && default

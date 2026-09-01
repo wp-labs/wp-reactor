@@ -37,8 +37,7 @@ pub(super) fn contains_system_var(expr: &wf_lang::ast::Expr) -> bool {
         } => {
             contains_system_var(expr)
                 || arms.iter().any(|arm| {
-                    arm.patterns.iter().any(contains_system_var)
-                        || contains_system_var(&arm.value)
+                    arm.patterns.iter().any(contains_system_var) || contains_system_var(&arm.value)
                 })
                 || default.as_ref().is_some_and(|d| contains_system_var(d))
         }

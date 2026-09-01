@@ -2229,7 +2229,10 @@ fn eval_expr_l1_match_expression() {
     let sev = Expr::Match {
         expr: Box::new(Expr::Field(FieldRef::Simple("sev".into()))),
         arms: vec![MatchArm {
-            patterns: vec![Expr::StringLit("crit".into()), Expr::StringLit("alert".into())],
+            patterns: vec![
+                Expr::StringLit("crit".into()),
+                Expr::StringLit("alert".into()),
+            ],
             value: Expr::StringLit("CRITICAL".into()),
         }],
         default: Some(Box::new(Expr::Field(FieldRef::Simple("sev".into())))),

@@ -454,8 +454,7 @@ fn contains_l3_func(expr: &wf_lang::ast::Expr) -> bool {
         } => {
             contains_l3_func(expr)
                 || arms.iter().any(|arm| {
-                    arm.patterns.iter().any(contains_l3_func)
-                        || contains_l3_func(&arm.value)
+                    arm.patterns.iter().any(contains_l3_func) || contains_l3_func(&arm.value)
                 })
                 || default.as_ref().is_some_and(|d| contains_l3_func(d))
         }

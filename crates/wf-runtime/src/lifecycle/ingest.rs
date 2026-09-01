@@ -12,9 +12,9 @@
 //! [`Router::dispatch_parsed`] 对无 mailbox 的窗口走 `commit_window` 内联提交，
 //! 而内联后的源任务本身就是严格有序的，无需再重排。
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;

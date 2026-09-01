@@ -60,10 +60,17 @@ rule r {
 "#;
     let file = parse_wfl(input).unwrap();
     let arg = &file.rules[0].yield_clause.args[0].value;
-    let Expr::Match { expr, arms, default } = arg else {
+    let Expr::Match {
+        expr,
+        arms,
+        default,
+    } = arg
+    else {
         panic!("expected Match, got {arg:?}");
     };
-    assert!(matches!(expr.as_ref(), Expr::Field(FieldRef::Qualified(alias, field)) if alias == "e" && field == "sip"));
+    assert!(
+        matches!(expr.as_ref(), Expr::Field(FieldRef::Qualified(alias, field)) if alias == "e" && field == "sip")
+    );
     assert_eq!(arms.len(), 2);
     assert_eq!(arms[0].patterns.len(), 2, "`|` 拆成两个模式");
     assert!(matches!(arms[0].patterns[0], Expr::StringLit(ref s) if s == "10.0.0.1"));
@@ -115,7 +122,10 @@ rule r {
     let Expr::Match { arms, .. } = arg else {
         panic!("expected Match, got {arg:?}");
     };
-    assert!(matches!(arms[0].patterns[0], Expr::Field(FieldRef::Qualified(_, _))));
+    assert!(matches!(
+        arms[0].patterns[0],
+        Expr::Field(FieldRef::Qualified(_, _))
+    ));
     assert!(matches!(arms[0].value, Expr::FuncCall { ref name, .. } if name == "join_by"));
 }
 

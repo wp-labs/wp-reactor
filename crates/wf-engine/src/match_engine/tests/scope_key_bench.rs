@@ -102,7 +102,10 @@ fn bench_scope_key_single_utf8() {
 
     eprintln!(
         "scope_key 单 key Utf8 (sip):  old={:.1} ns/op   new(列式直读)={:.1} ns/op   delta={:+.1} ns ({:+.1}%)",
-        old_ns, new_ns, new_ns - old_ns, (new_ns - old_ns) / old_ns * 100.0
+        old_ns,
+        new_ns,
+        new_ns - old_ns,
+        (new_ns - old_ns) / old_ns * 100.0
     );
 }
 
@@ -137,7 +140,10 @@ fn bench_scope_key_single_int() {
 
     eprintln!(
         "scope_key 单 key Int64 (dport): old={:.1} ns/op   new(列式直读)={:.1} ns/op   delta={:+.1} ns ({:+.1}%)",
-        old_ns, new_ns, new_ns - old_ns, (new_ns - old_ns) / old_ns * 100.0
+        old_ns,
+        new_ns,
+        new_ns - old_ns,
+        (new_ns - old_ns) / old_ns * 100.0
     );
 }
 
@@ -175,6 +181,9 @@ fn bench_scope_key_pair() {
 
     eprintln!(
         "scope_key 复合 key (sip+dport):  old={:.1} ns/op   new(列式直读)={:.1} ns/op   delta={:+.1} ns ({:+.1}%)",
-        old_ns, new_ns, new_ns - old_ns, (new_ns - old_ns) / old_ns * 100.0
+        old_ns,
+        new_ns,
+        new_ns - old_ns,
+        (new_ns - old_ns) / old_ns * 100.0
     );
 }

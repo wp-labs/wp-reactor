@@ -5,8 +5,8 @@ use std::time::Duration;
 use foldhash::fast::RandomState as FoldRandomState;
 use smol_str::SmolStr;
 
-use crate::match_engine::event_bridge::JoinRow;
 use super::key::{ScopeKey, extract_scope_key_from_row};
+use crate::match_engine::event_bridge::JoinRow;
 use wf_lang::ast::FieldRef;
 use wf_lang::plan::KeyMapPlan;
 

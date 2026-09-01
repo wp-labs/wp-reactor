@@ -918,8 +918,7 @@ fn expr_uses_l3_series(e: &Expr) -> bool {
         } => {
             expr_uses_l3_series(expr)
                 || arms.iter().any(|arm| {
-                    arm.patterns.iter().any(expr_uses_l3_series)
-                        || expr_uses_l3_series(&arm.value)
+                    arm.patterns.iter().any(expr_uses_l3_series) || expr_uses_l3_series(&arm.value)
                 })
                 || default.as_ref().is_some_and(|d| expr_uses_l3_series(d))
         }

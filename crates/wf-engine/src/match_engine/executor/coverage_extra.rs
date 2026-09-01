@@ -5815,19 +5815,31 @@ fn execute_each_match_expr_yield() {
     plan.yield_plan.fields = vec![YieldField {
         name: "sev".into(),
         value: Expr::Match {
-            expr: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "action".into()))),
+            expr: Box::new(Expr::Field(FieldRef::Qualified(
+                "e".into(),
+                "action".into(),
+            ))),
             arms: vec![MatchArm {
-                patterns: vec![Expr::StringLit("crit".into()), Expr::StringLit("alert".into())],
+                patterns: vec![
+                    Expr::StringLit("crit".into()),
+                    Expr::StringLit("alert".into()),
+                ],
                 value: Expr::StringLit("CRITICAL".into()),
             }],
-            default: Some(Box::new(Expr::Field(FieldRef::Qualified("e".into(), "action".into())))),
+            default: Some(Box::new(Expr::Field(FieldRef::Qualified(
+                "e".into(),
+                "action".into(),
+            )))),
         },
     }];
     let exec = RuleExecutor::new(plan);
     // crit | alert → CRITICAL
     let rec = exec
         .execute_each(
-            &event(vec![("sip", str_val("10.0.0.1")), ("action", str_val("crit"))]),
+            &event(vec![
+                ("sip", str_val("10.0.0.1")),
+                ("action", str_val("crit")),
+            ]),
             0,
         )
         .unwrap()
@@ -5836,7 +5848,10 @@ fn execute_each_match_expr_yield() {
     // 未命中 → 默认分支（原值透传）
     let rec = exec
         .execute_each(
-            &event(vec![("sip", str_val("10.0.0.1")), ("action", str_val("info"))]),
+            &event(vec![
+                ("sip", str_val("10.0.0.1")),
+                ("action", str_val("info")),
+            ]),
             0,
         )
         .unwrap()
@@ -5868,7 +5883,10 @@ fn execute_each_match_expr_yield() {
     }];
     let exec = RuleExecutor::new(plan);
     let rec = exec
-        .execute_each(&event(vec![("sip", str_val("10.0.0.1")), ("count", num(2.0))]), 0)
+        .execute_each(
+            &event(vec![("sip", str_val("10.0.0.1")), ("count", num(2.0))]),
+            0,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(rec.yield_fields[0].1, str_val("low"));
@@ -6098,7 +6116,11 @@ fn execute_close_applies_lets() {
     );
     let rec = exec.execute_close(&close).unwrap().unwrap();
     assert_eq!(rec.yield_fields.len(), 1);
-    assert_eq!(rec.yield_fields[0].1, str_val("10.0.0.1_s"), "b = concat(a, _s)");
+    assert_eq!(
+        rec.yield_fields[0].1,
+        str_val("10.0.0.1_s"),
+        "b = concat(a, _s)"
+    );
 }
 
 /// 有 let 的 close 规则必须禁用列式 close 直写（回落行式，apply_lets 注入

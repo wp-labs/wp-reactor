@@ -1141,7 +1141,11 @@ mod tests {
                 ])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![Some(443), Some(80), Some(80)])) as ArrayRef,
                 Arc::new(Float64Array::from(vec![Some(1.5), Some(2.0), Some(0.0)])) as ArrayRef,
-                Arc::new(BooleanArray::from(vec![Some(true), Some(false), Some(true)])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                ])) as ArrayRef,
             ],
         )
         .unwrap();
@@ -1199,10 +1203,7 @@ mod tests {
                 WFL_FIELD_TYPE_OBJECT.to_string(),
             )]),
         );
-        let schema = make_schema(vec![
-            obj_field,
-            Field::new("sip", DataType::Utf8, true),
-        ]);
+        let schema = make_schema(vec![obj_field, Field::new("sip", DataType::Utf8, true)]);
         let batch = RecordBatch::try_new(
             schema,
             vec![
@@ -1218,12 +1219,8 @@ mod tests {
         // 列式直读会给原始 JSON 串——必须回退行式（语义不变）。
         let keys = [FieldRef::Simple("conn_info".into())];
         let col = ColumnarEvent::with_index(&batch, 0, Arc::clone(&index));
-        let expected =
-            extract_key_simple(&events[0], &keys).map(|v| scope_key_from_values(&v));
-        assert_eq!(
-            expected,
-            Some(ScopeKey::Str("[object]".into()))
-        );
+        let expected = extract_key_simple(&events[0], &keys).map(|v| scope_key_from_values(&v));
+        assert_eq!(expected, Some(ScopeKey::Str("[object]".into())));
         assert_eq!(col.extract_scope_key(&keys, None, "c"), expected);
 
         // key_map 别名映射（多事件规则）→ 回退行式
@@ -1267,18 +1264,15 @@ mod tests {
 
         // --- Timestamp(Ns) key ---
         let schema = make_schema(vec![
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
             Field::new("sip", DataType::Utf8, false),
         ]);
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(TimestampNanosecondArray::from(vec![1_700_000_000_000_000_000]))
-                    as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                ])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["10.0.0.1"])) as ArrayRef,
             ],
         )
@@ -1328,7 +1322,10 @@ mod tests {
         let inner = StringArray::from(vec!["cn"]);
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(StructArray::from(vec![(Arc::new(inner_field), Arc::new(inner) as ArrayRef)])) as ArrayRef],
+            vec![Arc::new(StructArray::from(vec![(
+                Arc::new(inner_field),
+                Arc::new(inner) as ArrayRef,
+            )])) as ArrayRef],
         )
         .unwrap();
         let index = build_field_index(&batch);
@@ -1340,10 +1337,7 @@ mod tests {
         );
 
         // --- 空 key 列表 → Empty（shared instance）---
-        assert_eq!(
-            col.extract_scope_key(&[], None, "c"),
-            Some(ScopeKey::Empty)
-        );
+        assert_eq!(col.extract_scope_key(&[], None, "c"), Some(ScopeKey::Empty));
     }
 
     #[test]
@@ -1382,10 +1376,7 @@ mod tests {
         }
 
         // 第二个 key 列为 null（row 1）：快路径与行式均 None
-        let keys = [
-            FieldRef::Simple("a".into()),
-            FieldRef::Simple("b".into()),
-        ];
+        let keys = [FieldRef::Simple("a".into()), FieldRef::Simple("b".into())];
         for (row, row_ev) in events.iter().enumerate() {
             let col = ColumnarEvent::with_index(&batch, row, Arc::clone(&index));
             assert_eq!(

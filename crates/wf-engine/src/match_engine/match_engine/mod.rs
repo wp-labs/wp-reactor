@@ -607,7 +607,12 @@ impl CepStateMachine {
         // O(1) per-instance accounting in insert/remove (exact state growth is
         // corrected by periodic `recalibrate_memory`).
         let new_base = if is_new && self.tracks_memory_bytes() {
-            Some(Instance::base_estimated_bytes(&self.plan, &[], alias, event))
+            Some(Instance::base_estimated_bytes(
+                &self.plan,
+                &[],
+                alias,
+                event,
+            ))
         } else {
             None
         };
@@ -682,7 +687,12 @@ impl CepStateMachine {
                                 }
                                 // Current key will be re-created — account for base cost
                                 if evicting_current && !is_new {
-                                    total += Instance::base_estimated_bytes(&self.plan, &[], alias, event);
+                                    total += Instance::base_estimated_bytes(
+                                        &self.plan,
+                                        &[],
+                                        alias,
+                                        event,
+                                    );
                                 }
                             } else {
                                 // No instances to evict — cannot make room. The

@@ -4060,10 +4060,12 @@ fn contains_selector_checks_penetrate_match() {
     use wf_lang::ast::MatchArm;
 
     // `match x { "a" => <selector>, _ => 0 }`——selector 藏在分支值里。
-    let arms = |value: Expr| vec![MatchArm {
-        patterns: vec![lit("a")],
-        value,
-    }];
+    let arms = |value: Expr| {
+        vec![MatchArm {
+            patterns: vec![lit("a")],
+            value,
+        }]
+    };
     let m = |value: Expr| Expr::Match {
         expr: Box::new(field("sev")),
         arms: arms(value),
@@ -4079,21 +4081,30 @@ fn contains_selector_checks_penetrate_match() {
             args: vec![field("t")],
         }],
     });
-    assert!(contains_stat_selector(&stat), "match 分支里的 stat.* 必须被检测");
+    assert!(
+        contains_stat_selector(&stat),
+        "match 分支里的 stat.* 必须被检测"
+    );
 
     let time = m(Expr::FuncCall {
         qualifier: None,
         name: "now_ns".into(),
         args: vec![],
     });
-    assert!(contains_eval_time_func(&time), "match 分支里的 now 系列必须被检测");
+    assert!(
+        contains_eval_time_func(&time),
+        "match 分支里的 now 系列必须被检测"
+    );
 
     let agg = m(Expr::FuncCall {
         qualifier: None,
         name: "sum".into(),
         args: vec![field("x")],
     });
-    assert!(contains_aggregate_func(&agg), "match 分支里的聚合函数必须被检测");
+    assert!(
+        contains_aggregate_func(&agg),
+        "match 分支里的聚合函数必须被检测"
+    );
 
     let l3 = m(Expr::FuncCall {
         qualifier: None,
@@ -4126,5 +4137,8 @@ fn eval_expr_with_l3_match_branch_time_func() {
     let Some(Value::Number(ns)) = v else {
         panic!("now_ns in match branch should evaluate via L3, got {v:?}");
     };
-    assert!(ns > 1_700_000_000_000_000_000.0, "now_ns 应为当前墙钟（ns）");
+    assert!(
+        ns > 1_700_000_000_000_000_000.0,
+        "now_ns 应为当前墙钟（ns）"
+    );
 }

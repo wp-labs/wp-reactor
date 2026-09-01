@@ -1164,14 +1164,18 @@ impl RuleExecutor {
             .iter()
             .chain(plan.close_steps.iter())
             .flat_map(|s| s.branches.iter())
-            .any(|b| b.guard.as_ref().is_some_and(wf_lang::columnar::expr_is_columnar))
+            .any(|b| {
+                b.guard
+                    .as_ref()
+                    .is_some_and(wf_lang::columnar::expr_is_columnar)
+            })
             || plan.seq.as_ref().is_some_and(|seq| {
                 seq.steps.iter().any(|s| {
-                    s.neg && s
-                        .branch
-                        .guard
-                        .as_ref()
-                        .is_some_and(wf_lang::columnar::expr_is_columnar)
+                    s.neg
+                        && s.branch
+                            .guard
+                            .as_ref()
+                            .is_some_and(wf_lang::columnar::expr_is_columnar)
                 })
             })
     }

@@ -1379,7 +1379,7 @@ async fn route_and_dispatch_records_receiver_metrics() {
 /// 直接订阅 mailbox，断言 `WindowMsg::Append` 的 seq 流。
 #[tokio::test]
 async fn route_and_dispatch_allocates_contiguous_window_seqs() {
-    use wf_engine::window::{WindowMailbox, WindowMsg, WINDOW_CHANNEL_DEPTH};
+    use wf_engine::window::{WINDOW_CHANNEL_DEPTH, WindowMailbox, WindowMsg};
 
     let router = make_multi_stream_router();
     let (tx, mut rx) = mpsc::channel::<WindowMsg>(WINDOW_CHANNEL_DEPTH);
@@ -1417,7 +1417,7 @@ async fn route_and_dispatch_allocates_contiguous_window_seqs() {
 /// （多 handle 共享一个 seq 计数器的源配置互不串号）。
 #[tokio::test]
 async fn route_and_dispatch_per_source_window_seqs_are_independent() {
-    use wf_engine::window::{WindowMailbox, WindowMsg, WINDOW_CHANNEL_DEPTH};
+    use wf_engine::window::{WINDOW_CHANNEL_DEPTH, WindowMailbox, WindowMsg};
 
     let router = make_multi_stream_router();
     let (tx, mut rx) = mpsc::channel::<WindowMsg>(WINDOW_CHANNEL_DEPTH);
@@ -1457,7 +1457,7 @@ async fn route_and_dispatch_per_source_window_seqs_are_independent() {
 /// panic——"一个死 actor 不得阻塞源任务"在源侧内联后必须仍然成立。
 #[tokio::test]
 async fn route_and_dispatch_dead_mailbox_does_not_hang() {
-    use wf_engine::window::{WindowMailbox, WindowMsg, WINDOW_CHANNEL_DEPTH};
+    use wf_engine::window::{WINDOW_CHANNEL_DEPTH, WindowMailbox, WindowMsg};
 
     let (router, parse_seq) = make_parse_router("events");
     let (tx, rx) = mpsc::channel::<WindowMsg>(WINDOW_CHANNEL_DEPTH);
@@ -1534,7 +1534,16 @@ async fn route_and_dispatch_ingest_limiter_throttles() {
     )
     .await;
     let started = std::time::Instant::now();
-    route_and_dispatch(&parse_seq, "src", "events", batch, &router, None, Some(&limiter)).await;
+    route_and_dispatch(
+        &parse_seq,
+        "src",
+        "events",
+        batch,
+        &router,
+        None,
+        Some(&limiter),
+    )
+    .await;
     let elapsed = started.elapsed();
     assert!(
         elapsed >= Duration::from_millis(400),

@@ -243,7 +243,9 @@ fn contains_stat_final_selector(expr: &Expr) -> bool {
                     arm.patterns.iter().any(contains_stat_final_selector)
                         || contains_stat_final_selector(&arm.value)
                 })
-                || default.as_ref().is_some_and(|d| contains_stat_final_selector(d))
+                || default
+                    .as_ref()
+                    .is_some_and(|d| contains_stat_final_selector(d))
         }
         _ => false,
     }

@@ -2668,7 +2668,9 @@ fn expr_references_wfu_meta(expr: &wf_lang::ast::Expr) -> bool {
                     arm.patterns.iter().any(expr_references_wfu_meta)
                         || expr_references_wfu_meta(&arm.value)
                 })
-                || default.as_ref().is_some_and(|d| expr_references_wfu_meta(d))
+                || default
+                    .as_ref()
+                    .is_some_and(|d| expr_references_wfu_meta(d))
         }
         // 保守兜底：未知变体（non_exhaustive）→ 回退全量 build。
         _ => true,

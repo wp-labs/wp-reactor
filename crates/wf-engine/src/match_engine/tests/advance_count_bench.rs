@@ -69,10 +69,7 @@ fn bench_advance_count_rule_sliding_with_limits() {
         disk_provider: None,
         max_disk_bytes: None,
     };
-    run_count_advance(
-        "advance c_sip_3 + limits(512MB/100k, 摊还后)",
-        Some(limits),
-    );
+    run_count_advance("advance c_sip_3 + limits(512MB/100k, 摊还后)", Some(limits));
 }
 
 fn run_count_advance(label: &str, limits: Option<wf_lang::plan::LimitsPlan>) {
@@ -110,15 +107,9 @@ fn run_count_advance(label: &str, limits: Option<wf_lang::plan::LimitsPlan>) {
     let start = Instant::now();
     for row in 100_000..n {
         let ce = ColumnarEvent::with_index(&batch, row, Arc::clone(&index));
-        if let StepResult::Matched(_) = sm.advance_at_with_masks_key(
-            "c",
-            &ce,
-            ts + row as i64,
-            None,
-            row,
-            None,
-            None,
-        ) {
+        if let StepResult::Matched(_) =
+            sm.advance_at_with_masks_key("c", &ce, ts + row as i64, None, row, None, None)
+        {
             matched += 1;
         }
     }

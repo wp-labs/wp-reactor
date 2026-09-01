@@ -259,7 +259,14 @@ fn primary(input: &mut &str) -> ModalResult<Expr> {
             system_var,
             preset_param,
         )),
-        alt((if_expr, case_expr, object_expr, array_expr, paren_expr, ident_primary)),
+        alt((
+            if_expr,
+            case_expr,
+            object_expr,
+            array_expr,
+            paren_expr,
+            ident_primary,
+        )),
     ))
     .context(StrContext::Expected(StrContextValue::Description(
         "expression",
@@ -597,10 +604,7 @@ fn case_expr(input: &mut &str) -> ModalResult<Expr> {
             break;
         }
         // `_` 默认分支（必须最后一个；其后残留内容由 `}` 检查报错）。
-        if opt(literal("_"))
-            .parse_next(input)?
-            .is_some()
-        {
+        if opt(literal("_")).parse_next(input)?.is_some() {
             ws_skip.parse_next(input)?;
             cut_err(literal("=>"))
                 .context(StrContext::Expected(StrContextValue::Description(
