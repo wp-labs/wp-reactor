@@ -75,6 +75,22 @@ rule r {
 }
 
 #[test]
+fn nested_path_match_key_with_index_accepted() {
+    // 嵌套 key 可含数组索引段（`related[0].x`）。
+    let input = r#"
+rule r {
+    events { a : auth_events }
+    match<a.roles_obj.related[0].process.uid:10m> {
+        on event { a | count >= 1; }
+    } -> score(50.0)
+    entity(ip, a.sip)
+    yield out (x = a.sip)
+}
+"#;
+    assert_no_errors(input, &[derived_auth_window(), derived_out_window()]);
+}
+
+#[test]
 fn let_derived_match_key_accepted() {
     // issue #83 验收 1：match key 引用 let 派生字段（纯字段路径定义）。
     let input = r#"

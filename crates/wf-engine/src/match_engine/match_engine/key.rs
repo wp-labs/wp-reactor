@@ -364,7 +364,13 @@ pub(crate) fn extract_key_simple<E: FieldSource + ?Sized>(
                         root_cache.last().map(|(_, v)| v).expect("just pushed")
                     }
                 };
-                result.push(path_tail_walk(root_value, segments)?);
+                let leaf = path_tail_walk(root_value, segments)?;
+                // 叶若仍是结构化值（路径少写了一段，如 `s.roles_obj.attacker`）→
+                // 视为 key 缺失跳过：不让整对象聚到固定的 `[object]` 组。
+                if matches!(leaf, Value::Object(_) | Value::Array(_)) {
+                    return None;
+                }
+                result.push(leaf);
             }
             _ => {
                 let field_name = field_ref_name(key);
@@ -778,6 +784,20 @@ mod tests {
         // 缺其中一个普通 key 字段 → None。
         let ev2 = event_of(roles_fields());
         assert_eq!(extract_key_simple(&ev2, &keys), None);
+    }
+
+    #[test]
+    fn extract_key_path_object_leaf_skips_event() {
+        // 路径少写一段（叶仍是 object）→ 视为 key 缺失跳过，不聚到 [object]。
+        let ev = event_of(roles_fields());
+        let keys = [path(
+            "e",
+            &[
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("attacker".into()),
+            ],
+        )];
+        assert_eq!(extract_key_simple(&ev, &keys), None);
     }
 
     #[test]

@@ -146,6 +146,76 @@ rule r {
     );
 }
 
+/// window 同时含顶层 `attacker_ip` 列与结构化 `roles_obj`——验证 let 同名遮蔽。
+fn shadow_window() -> WindowSchema {
+    make_window(
+        "sec_events",
+        vec!["sec_stream"],
+        vec![
+            ("sip", bt(BaseType::Ip)),
+            ("attacker_ip", bt(BaseType::Chars)),
+            ("roles_obj", crate::schema::FieldType::Object),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    )
+}
+
+#[test]
+fn compile_let_key_shadows_same_name_flat_field() {
+    // schema 有顶层 `attacker_ip`，同时规则定义了同名 let → key 按 let 优先
+    // 解析（与表达式解析一致）→ 编译内联为嵌套路径。
+    let schemas = [shadow_window(), output_window()];
+    let plans = compile_with(
+        r#"
+rule r {
+    events { s : sec_events }
+    let attacker_ip = s.roles_obj.attacker.endpoint.ip
+    match<attacker_ip:5m> {
+        on event { s | count >= 1; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#,
+        &schemas,
+    );
+    assert_eq!(
+        plans[0].match_plan.keys,
+        vec![FieldRef::Path {
+            alias: "s".into(),
+            segments: vec![
+                crate::ast::PathSegment::Field("roles_obj".into()),
+                crate::ast::PathSegment::Field("attacker".into()),
+                crate::ast::PathSegment::Field("endpoint".into()),
+                crate::ast::PathSegment::Field("ip".into()),
+            ],
+        }]
+    );
+}
+
+#[test]
+fn compile_flat_key_untouched_without_let() {
+    // 无 let 时同名字段保持普通顶层 key（不被 let 解析干扰）。
+    let schemas = [shadow_window(), output_window()];
+    let plans = compile_with(
+        r#"
+rule r {
+    events { s : sec_events }
+    match<attacker_ip:5m> {
+        on event { s | count >= 1; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#,
+        &schemas,
+    );
+    assert_eq!(
+        plans[0].match_plan.keys,
+        vec![FieldRef::Simple("attacker_ip".into())]
+    );
+}
+
 // =========================================================================
 // 6b. join-then-key (Path A): key_join compilation
 // =========================================================================

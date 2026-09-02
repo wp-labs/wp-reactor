@@ -1,7 +1,7 @@
 //! M14 core CEP state machine tests (1–11).
 
 use wf_lang::ast::{CmpOp, Expr, FieldRef, FieldSelector, Measure, PathSegment, Transform};
-use wf_lang::plan::{AggPlan, BranchPlan};
+use wf_lang::plan::{AggPlan, BranchPlan, WindowSpec};
 
 use crate::match_engine::match_engine::{CepStateMachine, EngineHashMap, StepResult, Value};
 
@@ -246,6 +246,62 @@ fn nested_path_match_key_missing_root_skips_event() {
         "root 缺失 → 跳过（不 fire、不建实例）"
     );
     assert_eq!(sm.instance_count(), 0);
+}
+
+#[test]
+fn nested_path_key_object_leaf_skips_event() {
+    // 路径少写一段（叶是 object）→ 事件跳过、不建实例（不聚到 [object]）。
+    let plan = simple_plan(
+        vec![FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("attacker".into()),
+            ],
+        }],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+    );
+    let mut sm = CepStateMachine::new("rule_path_key_object_leaf".to_string(), plan, None);
+    let ev = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("roles_obj", obj_roles("k1")),
+    ]);
+    assert_eq!(
+        sm.advance_at("e", &ev, 1_000_000_000),
+        StepResult::Accumulate,
+        "object 叶 → key 缺失跳过"
+    );
+    assert_eq!(sm.instance_count(), 0);
+}
+
+#[test]
+fn nested_path_key_groups_within_fixed_window_bucket() {
+    // fixed 窗口 + 嵌套 key：同桶（桶起点对齐）内同叶事件进入同一实例计数。
+    let mut plan = simple_plan(
+        vec![FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("id".into()),
+            ],
+        }],
+        vec![step(vec![branch("e", count_ge(2.0))])],
+    );
+    plan.window_spec = WindowSpec::Fixed(std::time::Duration::from_secs(10));
+    let mut sm = CepStateMachine::new("rule_path_key_fixed".to_string(), plan, None);
+    let ev = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("roles_obj", obj_roles("k1")),
+    ]);
+    // 桶 [0s,10s)：t=1s 与 t=2s 同桶 → 同实例累积到 2。
+    assert_eq!(
+        sm.advance_at("e", &ev, 1_000_000_000),
+        StepResult::Accumulate
+    );
+    let StepResult::Matched(ctx) = sm.advance_at("e", &ev, 2_000_000_000) else {
+        panic!("同桶第二事件应命中同一实例");
+    };
+    assert_eq!(ctx.scope_key, vec![str_val("k1")]);
 }
 
 #[test]
