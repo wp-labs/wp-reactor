@@ -630,6 +630,14 @@ fn execute_match_yield_can_reference_time_system_vars() {
             name: "rule_window_end".into(),
             value: Expr::SystemVar(SystemVar::WindowEndTime),
         },
+        YieldField {
+            name: "evidence_start_time".into(),
+            value: Expr::SystemVar(SystemVar::EvidenceStartTime),
+        },
+        YieldField {
+            name: "evidence_end_time".into(),
+            value: Expr::SystemVar(SystemVar::EvidenceEndTime),
+        },
     ];
     let exec = RuleExecutor::new(plan);
     let mut matched = default_matched_context();
@@ -637,6 +645,9 @@ fn execute_match_yield_can_reference_time_system_vars() {
     matched.event_last_time_nanos = 3_000_000_000;
     matched.window_start_time_nanos = 500_000_000;
     matched.window_end_time_nanos = 5_500_000_000;
+    // 候选事件跨度与命中证据跨度独立（issue #82 方案 A）。
+    matched.evidence_first_time_nanos = 2_000_000_000;
+    matched.evidence_last_time_nanos = 4_000_000_000;
 
     let alert = exec.execute_match(&matched).unwrap();
 
@@ -651,6 +662,46 @@ fn execute_match_yield_can_reference_time_system_vars() {
     assert_eq!(field("last_seen"), Some(num(3_000.0)));
     assert_eq!(field("rule_window_start"), Some(num(500.0)));
     assert_eq!(field("rule_window_end"), Some(num(5_500.0)));
+    assert_eq!(field("evidence_start_time"), Some(num(2_000.0)));
+    assert_eq!(field("evidence_end_time"), Some(num(4_000.0)));
+}
+
+#[test]
+fn execute_match_yield_can_reference_first_match_time() {
+    // issue #82：@first_match_time 从 MatchedContext（首次命中墙钟）直通输出。
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(70.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    );
+    plan.yield_plan.fields = vec![YieldField {
+        name: "first_match_time".into(),
+        value: Expr::SystemVar(SystemVar::FirstMatchTime),
+    }];
+    let exec = RuleExecutor::new(plan);
+    let mut matched = default_matched_context();
+    // 事件时间（event_time_nanos）与处理墙钟不同——@first_match_time 必须取
+    // 处理墙钟字段，而不是事件/窗口时间。
+    matched.event_first_time_nanos = 1_000_000_000;
+    matched.window_start_time_nanos = 500_000_000;
+    matched.first_match_time_nanos = Some(2_000_000_000);
+
+    let alert = exec.execute_match(&matched).unwrap();
+
+    let field = |name: &str| {
+        alert
+            .yield_fields
+            .iter()
+            .find(|(field_name, _)| &**field_name == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(
+        field("first_match_time"),
+        Some(num(2_000.0)),
+        "@first_match_time = 首次命中处理墙钟（≠ event_first_time 1_000）"
+    );
 }
 
 #[test]
@@ -826,6 +877,9 @@ fn execute_close_yield_can_reference_score() {
         watermark_nanos: 0,
         event_first_time_nanos: 0,
         event_last_time_nanos: 0,
+        first_match_time_nanos: None,
+        evidence_first_time_nanos: 0,
+        evidence_last_time_nanos: 0,
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
@@ -912,6 +966,10 @@ fn execute_close_yield_can_reference_time_system_vars() {
         watermark_nanos: 10_000_000_000,
         event_first_time_nanos: 1_000_000_000,
         event_last_time_nanos: 3_000_000_000,
+        // 候选事件跨度与命中证据跨度独立（issue #82 方案 A）。
+        evidence_first_time_nanos: 2_000_000_000,
+        evidence_last_time_nanos: 4_000_000_000,
+        first_match_time_nanos: None,
         window_start_time_nanos: 500_000_000,
         window_end_time_nanos: 10_000_000_000,
         machine_id: String::new(),
@@ -931,10 +989,74 @@ fn execute_close_yield_can_reference_time_system_vars() {
     };
     assert_eq!(field("first_seen"), Some(num(1_000.0)));
     assert_eq!(field("last_seen"), Some(num(3_000.0)));
-    assert_eq!(field("evidence_start_time"), Some(num(1_000.0)));
-    assert_eq!(field("evidence_end_time"), Some(num(3_000.0)));
+    assert_eq!(field("evidence_start_time"), Some(num(2_000.0)));
+    assert_eq!(field("evidence_end_time"), Some(num(4_000.0)));
     assert_eq!(field("rule_window_start"), Some(num(500.0)));
     assert_eq!(field("rule_window_end"), Some(num(10_000.0)));
+}
+
+#[test]
+fn execute_close_yield_can_reference_first_match_time() {
+    // issue #82：close 输出路径的 @first_match_time 从 CloseOutput 直通输出。
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(70.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    );
+    plan.yield_plan.fields = vec![YieldField {
+        name: "first_match_time".into(),
+        value: Expr::SystemVar(SystemVar::FirstMatchTime),
+    }];
+    let exec = RuleExecutor::new(plan);
+    let close = CloseOutput {
+        rule_name: "r1".into(),
+        scope_key: vec![str_val("10.0.0.1")],
+        close_reason: CloseReason::Timeout,
+        event_ok: true,
+        close_ok: true,
+        close_mode: wf_lang::ast::CloseMode::And,
+        event_emitted: false,
+        event_step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: Some("fail".into()),
+            measure_value: 3.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
+            collected_values: Vec::new(),
+            field_values: EngineHashMap::default(),
+        }],
+        close_step_data: vec![],
+        bind_data: vec![],
+        watermark_nanos: 10_000_000_000,
+        event_first_time_nanos: 1_000_000_000,
+        event_last_time_nanos: 3_000_000_000,
+        first_match_time_nanos: Some(2_000_000_000),
+        evidence_first_time_nanos: 1_000_000_000,
+        evidence_last_time_nanos: 3_000_000_000,
+        window_start_time_nanos: 500_000_000,
+        window_end_time_nanos: 10_000_000_000,
+        machine_id: String::new(),
+        last_event_nanos: 3_000_000_000,
+        row_fields: None,
+        row_field_names: None,
+    };
+
+    let alert = exec.execute_close(&close).unwrap().unwrap();
+
+    let field = |name: &str| {
+        alert
+            .yield_fields
+            .iter()
+            .find(|(field_name, _)| &**field_name == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(
+        field("first_match_time"),
+        Some(num(2_000.0)),
+        "close 输出 @first_match_time = 首次命中处理墙钟"
+    );
 }
 
 #[test]
@@ -1003,6 +1125,9 @@ fn execute_close_yield_can_use_count_label_inside_if_and_concat() {
         watermark_nanos: 0,
         event_first_time_nanos: 0,
         event_last_time_nanos: 0,
+        first_match_time_nanos: None,
+        evidence_first_time_nanos: 0,
+        evidence_last_time_nanos: 0,
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
@@ -1109,6 +1234,9 @@ fn execute_close_yield_can_use_avg_on_field() {
         watermark_nanos: 0,
         event_first_time_nanos: 0,
         event_last_time_nanos: 0,
+        first_match_time_nanos: None,
+        evidence_first_time_nanos: 0,
+        evidence_last_time_nanos: 0,
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
@@ -1240,6 +1368,9 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
         watermark_nanos: 0,
         event_first_time_nanos: 0,
         event_last_time_nanos: 0,
+        first_match_time_nanos: None,
+        evidence_first_time_nanos: 0,
+        evidence_last_time_nanos: 0,
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
@@ -1372,6 +1503,9 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
         event_time_nanos: 0,
         event_first_time_nanos: 0,
         event_last_time_nanos: 0,
+        first_match_time_nanos: None,
+        evidence_first_time_nanos: 0,
+        evidence_last_time_nanos: 0,
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
@@ -1472,6 +1606,9 @@ fn execute_close_yield_can_use_fmt_with_count() {
         watermark_nanos: 0,
         event_first_time_nanos: 0,
         event_last_time_nanos: 0,
+        first_match_time_nanos: None,
+        evidence_first_time_nanos: 0,
+        evidence_last_time_nanos: 0,
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
@@ -2576,6 +2713,9 @@ fn execute_close_missing_optional_float_field_is_omitted_not_fatal() {
         watermark_nanos: 0,
         event_first_time_nanos: 0,
         event_last_time_nanos: 0,
+        first_match_time_nanos: None,
+        evidence_first_time_nanos: 0,
+        evidence_last_time_nanos: 0,
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),

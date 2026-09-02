@@ -217,20 +217,37 @@ fn evaluate_close_step(
 pub(super) fn evaluate_close(
     rule_name: &str,
     plan: &MatchPlan,
-    instance: Instance,
+    mut instance: Instance,
     scope_key: Vec<Value>,
     reason: CloseReason,
     watermark_nanos: i64,
+    wall_nanos: Option<i64>,
 ) -> CloseOutput {
     let (close_ok, close_step_data) =
         evaluate_close_steps(&plan.close_steps, &instance.close_step_states, reason);
+    // first_match（issue #82）：close 若为实例首次完整命中（从未 event-fire，本次
+    // close qualified，即 `close_is_qualified` 语义），记录 close 处理墙钟；已
+    // fire 过则保持首次值。未命中/未 qualified → None。须在 `completed_steps`
+    // 移出前完成（`first_hit_wall` 需要 `&mut instance`）。
+    let qualified_close = match plan.close_mode {
+        CloseMode::And => instance.event_ok && close_ok,
+        CloseMode::Or => close_ok && !close_step_data.is_empty(),
+    };
+    if qualified_close {
+        instance.first_hit_wall(wall_nanos);
+    }
+    let first_match_time_nanos = instance.first_hit_wall_nanos;
+    // 候选事件跨度（issue #82 方案 A，`@event_first_time`/`@event_last_time`）：
+    // 必须在 `completed_steps` 移出前取（读 instance 字段）。
+    let event_span = instance.event_span(instance.last_event_nanos);
+    let last_event_nanos = instance.last_event_nanos;
     let event_step_data = instance.completed_steps;
     let evidence_range = match plan.close_mode {
         CloseMode::And => evidence_time_range(event_step_data.iter().chain(close_step_data.iter())),
         CloseMode::Or => evidence_time_range(close_step_data.iter()),
     };
     let (evidence_first, evidence_last) =
-        evidence_range.unwrap_or((instance.last_event_nanos, instance.last_event_nanos));
+        evidence_range.unwrap_or((last_event_nanos, last_event_nanos));
     CloseOutput {
         rule_name: rule_name.to_string(),
         scope_key,
@@ -244,13 +261,16 @@ pub(super) fn evaluate_close(
         close_step_data,
         bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
         watermark_nanos,
-        last_event_nanos: instance.last_event_nanos,
+        last_event_nanos,
         row_fields: None,
         row_field_names: None,
-        event_first_time_nanos: evidence_first,
-        event_last_time_nanos: evidence_last,
+        event_first_time_nanos: event_span.0,
+        event_last_time_nanos: event_span.1,
+        evidence_first_time_nanos: evidence_first,
+        evidence_last_time_nanos: evidence_last,
         window_start_time_nanos: instance.created_at,
         window_end_time_nanos: watermark_nanos,
+        first_match_time_nanos,
     }
 }
 

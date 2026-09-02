@@ -2,7 +2,18 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [2.0.12] -- latest
+## [2.0.13] -- latest
+
+### Added
+
+- **wf-lang / wf-engine: `@first_match_time`（issue #82）**——窗口实例首次完整命中（match/close 结果）的引擎处理墙钟；accu 重复输出保持首次值、新窗口重算、未命中无值；
+- **wf-lang / wf-engine: `@event_*` 与 `@evidence_*` 时间语义分离（issue #82）**——`@event_first_time` / `@event_last_time` 表达窗口候选事件跨度（first_seen / last_seen），`@evidence_start_time` / `@evidence_end_time` 表达命中证据跨度，不再互为别名；
+
+### Changed
+
+- **docs: 时间系统变量语义更新**——区分事件 / 证据 / 窗口 / 处理时钟四类时间。
+
+## [2.0.12]
 
 ### Added
 

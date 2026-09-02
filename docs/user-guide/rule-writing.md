@@ -187,11 +187,12 @@ yield security_alerts (
 
 ### 1.5 输出证据时间和窗口时间
 
-安全告警通常需要同时输出三类时间：
+安全告警通常需要同时输出四类时间：
 
-- 证据时间：本次命中的首尾事件时间。
+- 事件时间：窗口内该实体的候选事件（进入实例的被接受事件）首尾——`first_seen` / `last_seen` 用 `@event_first_time` / `@event_last_time`。
+- 证据时间：本次命中实际依据的事件跨度——用 `@evidence_start_time` / `@evidence_end_time`。
 - 窗口时间：规则窗口的开始和结束时间。
-- 分析时间：本次告警输出的时间。
+- 分析时间：本次告警输出的时间（`@emit_time`）与首次命中处理时刻（`@first_match_time`）。
 
 建议把这些字段作为业务字段写入输出 window：
 

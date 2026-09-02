@@ -314,7 +314,7 @@ WFL 采用固定主执行链，阶段顺序不可变（`entity(...)` 为 YIELD �
   - `and close { ... }`：AND 模式，事件路径与关闭路径**同时满足**才在关闭时触发单次告警。
 - `on each alias [where expr] -> score(...)` 为逐条无状态规则：对别名 `alias` 的每条输入独立求值一次，不创建 match instance，不参与窗口关闭/超时扫描。
 - `yield` 可引用当前规则的系统值 `@score`，用于把 `-> score(expr)` 的结果映射到业务字段；`@score` 仅在 `yield` 中合法，并且可像普通数值一样继续参与 `yield` 表达式计算。
-- `yield` 时间系统变量采用明确语义命名：`@event_first_time` / `@event_last_time` 表示本次命中证据事件的首尾时间；`@evidence_start_time` / `@evidence_end_time` 是对应语义别名；`@window_start_time` / `@window_end_time` 表示规则窗口边界；`@emit_time` 表示本次输出记录的稳定产出时间。它们类型均为 `time`，且只允许出现在 `yield` 表达式中。
+- `yield` 时间系统变量采用明确语义命名：`@event_first_time` / `@event_last_time` 表示窗口内候选事件（进入实例的被接受事件）的首尾时间；`@evidence_start_time` / `@evidence_end_time` 表示本次命中证据事件的首尾时间；`@first_match_time` 表示实例首次完整命中的引擎处理墙钟；`@window_start_time` / `@window_end_time` 表示规则窗口边界；`@emit_time` 表示本次输出记录的稳定产出时间。它们类型均为 `time`，且只允许出现在 `yield` 表达式中。
 - `derive { ... }` 为规划中的特征派生块；当前解析器不接受该语法。
 - `entity(type, id_expr)` 为实体建模一等语法，禁止再依赖 `yield` 手工拼 `entity_type/entity_id`。
 - 推荐每条规则声明 `limits { ... }` 资源预算；省略时编译器发出 Warning（未来版本可能升级为错误）。当前运行时会执行声明的预算，但尚未产出独立 `CostPlan`。
@@ -499,8 +499,8 @@ if_expr       = "if" , expr , "then" , expr , "else" , expr ;                  (
 system_var    = "@score"
               | "@event_first_time"      (* 命中证据首条事件时间 *)
               | "@event_last_time"       (* 命中证据末条事件时间 *)
-              | "@evidence_start_time"   (* @event_first_time 的语义别名 *)
-              | "@evidence_end_time"     (* @event_last_time 的语义别名 *)
+              | "@evidence_start_time"   (* 命中证据跨度起点 *)
+              | "@evidence_end_time"     (* 命中证据跨度终点 *)
               | "@window_start_time"     (* 规则窗口开始时间 *)
               | "@window_end_time"       (* 规则窗口结束时间 *)
               | "@emit_time" ;           (* 稳定输出时间 *)
@@ -527,7 +527,7 @@ ANY           = ? any unicode char ? ;
 - `_in`：`|>` 后续 stage 的隐式输入别名，编译器注入，用户必须以此名引用前级输出。
 - `@score`：当前规则 score 系统值，只能在允许系统变量的表达式上下文中使用。
 - `@event_first_time` / `@event_last_time`：命中证据首尾事件时间，只允许在 `yield` 中使用。
-- `@evidence_start_time` / `@evidence_end_time`：语义别名，分别等价于 `@event_first_time` / `@event_last_time`。
+- `@evidence_start_time` / `@evidence_end_time`：本次命中所用证据（被接受为命中依据的事件）的跨度起点/终点；`@event_first_time` / `@event_last_time` 表达窗口内候选事件的首尾（二者不是别名）。
 - `@window_start_time` / `@window_end_time`：规则窗口边界时间，只允许在 `yield` 中使用。
 - `@emit_time`：稳定输出时间；同一条输出记录内多次引用必须取同一个值。
 - `@name`：规划中的 `derive` 派生项引用前缀；当前解析器除 `@score` 外不接受任意 `@name`。

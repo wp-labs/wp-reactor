@@ -175,6 +175,7 @@ fn yield_allows_time_system_vars_for_time_fields() {
             ("rule_window_start", bt(BaseType::Time)),
             ("rule_window_end", bt(BaseType::Time)),
             ("latest_analysis_time", bt(BaseType::Time)),
+            ("first_match_time", bt(BaseType::Time)),
         ],
     );
     let input = r#"
@@ -189,7 +190,8 @@ rule r {
         evidence_end_time = @evidence_end_time,
         rule_window_start = @window_start_time,
         rule_window_end = @window_end_time,
-        latest_analysis_time = @emit_time
+        latest_analysis_time = @emit_time,
+        first_match_time = @first_match_time
     )
 }
 "#;

@@ -58,11 +58,17 @@ pub(super) fn materialize_system_vars(
         Expr::StringLit(s) => Some(Expr::StringLit(s.clone())),
         Expr::Bool(b) => Some(Expr::Bool(*b)),
         Expr::SystemVar(SystemVar::Score) => Some(Expr::Number(score.score?)),
-        Expr::SystemVar(SystemVar::EventFirstTime | SystemVar::EvidenceStartTime) => {
+        Expr::SystemVar(SystemVar::EventFirstTime) => {
             Some(utils::time_nanos_to_expr(score.event_first_time_nanos?))
         }
-        Expr::SystemVar(SystemVar::EventLastTime | SystemVar::EvidenceEndTime) => {
+        Expr::SystemVar(SystemVar::EventLastTime) => {
             Some(utils::time_nanos_to_expr(score.event_last_time_nanos?))
+        }
+        Expr::SystemVar(SystemVar::EvidenceStartTime) => {
+            Some(utils::time_nanos_to_expr(score.evidence_first_time_nanos?))
+        }
+        Expr::SystemVar(SystemVar::EvidenceEndTime) => {
+            Some(utils::time_nanos_to_expr(score.evidence_last_time_nanos?))
         }
         Expr::SystemVar(SystemVar::WindowStartTime) => {
             Some(utils::time_nanos_to_expr(score.window_start_time_nanos?))
@@ -72,6 +78,9 @@ pub(super) fn materialize_system_vars(
         }
         Expr::SystemVar(SystemVar::EmitTime) => {
             Some(utils::time_nanos_to_expr(score.emit_time_nanos?))
+        }
+        Expr::SystemVar(SystemVar::FirstMatchTime) => {
+            Some(utils::time_nanos_to_expr(score.first_match_time_nanos?))
         }
         Expr::WfuMeta(field) => match score.resolve_wfu_meta(*field)? {
             Value::Number(n) => Some(Expr::Number(n)),

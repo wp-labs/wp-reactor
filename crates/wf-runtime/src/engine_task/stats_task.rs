@@ -1190,8 +1190,11 @@ fn build_stats_close_output(
         last_event_nanos: window_end,
         event_first_time_nanos: window_start,
         event_last_time_nanos: window_end,
+        evidence_first_time_nanos: window_start,
+        evidence_last_time_nanos: window_end,
         window_start_time_nanos: window_start,
         window_end_time_nanos: window_end,
+        first_match_time_nanos: None,
     }
 }
 

@@ -751,7 +751,8 @@ rule r {
         evidence_end_time = @evidence_end_time,
         rule_window_start = @window_start_time,
         rule_window_end = @window_end_time,
-        latest_analysis_time = @emit_time
+        latest_analysis_time = @emit_time,
+        first_hit_time = @first_match_time
     )
 }
 "#;
@@ -772,6 +773,7 @@ rule r {
             &Expr::SystemVar(SystemVar::WindowStartTime),
             &Expr::SystemVar(SystemVar::WindowEndTime),
             &Expr::SystemVar(SystemVar::EmitTime),
+            &Expr::SystemVar(SystemVar::FirstMatchTime),
         ]
     );
 }

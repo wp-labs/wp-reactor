@@ -116,6 +116,11 @@ pub struct CepStateMachine {
     memory_grows_per_event: bool,
     /// Chain semantics (`within` / `not` / `consec`) precomputed from the plan.
     seq_meta: Option<SeqRuntime>,
+    /// 引擎处理墙钟（issue #82，`@first_match_time`）：由驱动方（rule_task 每批/
+    /// 每次扫收口前）通过 [`Self::set_processing_wall`] 注入，首次命中实例时记入
+    /// `Instance::first_hit_wall_nanos`。None = 未注入（单测/测试驱动）→
+    /// `@first_match_time` 无值，与 `@emit_time` 未提供时行为一致。
+    processing_wall_nanos: Option<i64>,
 }
 
 /// Max expiry candidates processed per `scan_expired_at` call (incremental
@@ -179,6 +184,7 @@ impl CepStateMachine {
             estimated_memory_bytes: 0,
             memory_grows_per_event,
             seq_meta,
+            processing_wall_nanos: None,
         }
     }
 
@@ -211,6 +217,7 @@ impl CepStateMachine {
             estimated_memory_bytes: 0,
             memory_grows_per_event,
             seq_meta,
+            processing_wall_nanos: None,
         }
     }
 
@@ -245,7 +252,14 @@ impl CepStateMachine {
             estimated_memory_bytes: 0,
             memory_grows_per_event,
             seq_meta,
+            processing_wall_nanos: None,
         }
+    }
+
+    /// 设置引擎处理墙钟（issue #82，`@first_match_time` 语义）——每次驱动批次/
+    /// 扫收口前由驱动方（rule_task）调用，供实例首次完整命中时记录处理时钟。
+    pub fn set_processing_wall(&mut self, wall_nanos: i64) {
+        self.processing_wall_nanos = Some(wall_nanos);
     }
 
     /// Switch this shard to raw-conv mode (P2c): close output is emitted raw to
@@ -958,14 +972,21 @@ impl CepStateMachine {
                 let (evidence_first, evidence_last) =
                     evidence_time_range(instance.completed_steps.iter())
                         .unwrap_or((now_nanos, now_nanos));
+                // first_match_time（issue #82）：实例首次完整命中墙钟——首次 fire
+                // 赋值，accu rearm 保持、reset 清空。墙钟由驱动方按批注入（`@emit_time` 同源）。
+                let (event_first_nanos, event_last_nanos) = instance.event_span(evidence_first);
+                let first_match_time_nanos = instance.first_hit_wall(self.processing_wall_nanos);
                 let ctx = MatchedContext {
                     rule_name: self.rule_name.clone(),
                     scope_key: flatten_scope_values(skey),
                     step_data: instance.completed_steps.clone(),
                     bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
                     event_time_nanos: now_nanos,
-                    event_first_time_nanos: evidence_first,
-                    event_last_time_nanos: evidence_last,
+                    event_first_time_nanos: event_first_nanos,
+                    event_last_time_nanos: event_last_nanos,
+                    evidence_first_time_nanos: evidence_first,
+                    evidence_last_time_nanos: evidence_last,
+                    first_match_time_nanos,
                     window_start_time_nanos: instance.created_at,
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, instance),
                     machine_id: instance.machine_id.clone(),
@@ -1178,14 +1199,21 @@ impl CepStateMachine {
                 let (evidence_first, evidence_last) =
                     evidence_time_range(instance.completed_steps.iter())
                         .unwrap_or((now_nanos, now_nanos));
+                // first_match_time（issue #82）：实例首次完整命中墙钟——首次 fire
+                // 赋值，accu rearm 保持、reset 清空。墙钟由驱动方按批注入（`@emit_time` 同源）。
+                let (event_first_nanos, event_last_nanos) = instance.event_span(evidence_first);
+                let first_match_time_nanos = instance.first_hit_wall(self.processing_wall_nanos);
                 let ctx = MatchedContext {
                     rule_name: self.rule_name.clone(),
                     scope_key: flatten_scope_values(skey),
                     step_data: instance.completed_steps.clone(),
                     bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
                     event_time_nanos: now_nanos,
-                    event_first_time_nanos: evidence_first,
-                    event_last_time_nanos: evidence_last,
+                    event_first_time_nanos: event_first_nanos,
+                    event_last_time_nanos: event_last_nanos,
+                    evidence_first_time_nanos: evidence_first,
+                    evidence_last_time_nanos: evidence_last,
+                    first_match_time_nanos,
                     window_start_time_nanos: instance.created_at,
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, instance),
                     machine_id: instance.machine_id.clone(),
@@ -1242,14 +1270,21 @@ impl CepStateMachine {
                 let (evidence_first, evidence_last) =
                     evidence_time_range(instance.completed_steps.iter())
                         .unwrap_or((now_nanos, now_nanos));
+                // first_match_time（issue #82）：实例首次完整命中墙钟——首次 fire
+                // 赋值，accu rearm 保持、reset 清空。墙钟由驱动方按批注入（`@emit_time` 同源）。
+                let (event_first_nanos, event_last_nanos) = instance.event_span(evidence_first);
+                let first_match_time_nanos = instance.first_hit_wall(self.processing_wall_nanos);
                 let ctx = MatchedContext {
                     rule_name: self.rule_name.clone(),
                     scope_key: flatten_scope_values(skey),
                     step_data: instance.completed_steps.clone(),
                     bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
                     event_time_nanos: now_nanos,
-                    event_first_time_nanos: evidence_first,
-                    event_last_time_nanos: evidence_last,
+                    event_first_time_nanos: event_first_nanos,
+                    event_last_time_nanos: event_last_nanos,
+                    evidence_first_time_nanos: evidence_first,
+                    evidence_last_time_nanos: evidence_last,
+                    first_match_time_nanos,
                     window_start_time_nanos: instance.created_at,
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, instance),
                     machine_id: instance.machine_id.clone(),
@@ -1320,6 +1355,7 @@ impl CepStateMachine {
             instance_key.scope_key_values(),
             reason,
             self.watermark_nanos,
+            self.processing_wall_nanos,
         );
         self.rate_limit_close(&mut output, self.watermark_nanos);
         Some(output)
@@ -1432,6 +1468,7 @@ impl CepStateMachine {
                     key.scope_key_values(),
                     CloseReason::Timeout,
                     current_expire,
+                    self.processing_wall_nanos,
                 );
                 self.rate_limit_close(&mut output, current_expire);
                 results.push(output);
@@ -1603,6 +1640,7 @@ impl CepStateMachine {
                     key.scope_key_values(),
                     reason,
                     wm,
+                    self.processing_wall_nanos,
                 );
                 self.rate_limit_close(&mut output, wm);
                 results.push(output);

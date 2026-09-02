@@ -184,9 +184,9 @@ selector 参数是静态符号，不加引号。详细规则见 [规则编写指
 
 告警输出不要依赖内部 `__wfu_*` 元字段来表达业务时间。需要首尾事件时间、窗口边界或分析时间时，在输出 window 中声明普通 `time` 字段，并在 `yield` 中显式赋值：
 
-- `first_seen = @event_first_time`：本次命中证据的第一条事件时间
-- `last_seen = @event_last_time`：本次命中证据的最后一条事件时间
-- `evidence_start_time = @evidence_start_time` / `evidence_end_time = @evidence_end_time`：证据范围起止时间
+- `first_seen = @event_first_time`：窗口内候选事件（进入实例的被接受事件）的第一条事件时间
+- `last_seen = @event_last_time`：候选事件的最后一条事件时间
+- `evidence_start_time = @evidence_start_time` / `evidence_end_time = @evidence_end_time`：本次命中证据（命中依据事件）的范围起止时间
 - `rule_window_start = @window_start_time` / `rule_window_end = @window_end_time`：规则窗口边界
 - `latest_analysis_time = @emit_time`：本条输出记录的稳定产出时间
 

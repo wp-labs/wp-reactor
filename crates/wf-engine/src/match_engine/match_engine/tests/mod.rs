@@ -6,6 +6,7 @@
 mod coverage_extra;
 mod coverage_more;
 mod coverage_r4;
+mod first_match_time;
 
 use super::*;
 
@@ -37,6 +38,9 @@ fn conv_close(label: &str, measure: f64, scope: Vec<Value>) -> CloseOutput {
         machine_id: "".into(),
         event_first_time_nanos: 0,
         event_last_time_nanos: 0,
+        first_match_time_nanos: None,
+        evidence_first_time_nanos: 0,
+        evidence_last_time_nanos: 0,
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         last_event_nanos: 0,

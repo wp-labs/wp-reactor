@@ -2776,9 +2776,12 @@ impl RuleExecutor {
             summary: Some(&**summary),
             event_first_time_nanos: Some(event_time_nanos),
             event_last_time_nanos: Some(event_time_nanos),
+            evidence_first_time_nanos: Some(event_time_nanos),
+            evidence_last_time_nanos: Some(event_time_nanos),
             window_start_time_nanos: Some(event_time_nanos),
             window_end_time_nanos: Some(event_time_nanos),
             emit_time_nanos: Some(emit_time_nanos),
+            first_match_time_nanos: Some(emit_time_nanos),
             time_format: Some(self.output_config().time_format.as_str()),
         }
     }
@@ -2810,9 +2813,12 @@ impl RuleExecutor {
             summary: None,
             event_first_time_nanos: Some(event_time_nanos),
             event_last_time_nanos: Some(event_time_nanos),
+            evidence_first_time_nanos: Some(event_time_nanos),
+            evidence_last_time_nanos: Some(event_time_nanos),
             window_start_time_nanos: Some(event_time_nanos),
             window_end_time_nanos: Some(event_time_nanos),
             emit_time_nanos: Some(event_time_nanos),
+            first_match_time_nanos: Some(event_time_nanos),
             time_format: Some(self.output_config().time_format.as_str()),
         }
     }
