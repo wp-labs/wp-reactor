@@ -8,7 +8,7 @@ use arrow::array::{Array, ArrayAccessor, Int64Array, StringArray, TimestampNanos
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use smol_str::SmolStr;
-use wf_lang::ast::{BinOp, Expr, FieldRef, JoinMode};
+use wf_lang::ast::{BinOp, Expr, FieldRef, JoinMode, PathSegment};
 
 use crate::alert::{AlertColumnBuilder, EachRowCells};
 use crate::alert::{AlertOrigin, OutputRecord};
@@ -819,7 +819,27 @@ impl RuleExecutor {
             .all(|field| match &field.value {
                 Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => true,
                 Expr::Field(fr) => {
-                    out_shape_ok(fr)
+                    // 无活 join：flat 或 list-index（`c.tags[0]`，gap-5
+                    // 2026-09-02，编译 ListIndex cvec）；有活 join 保持限定。
+                    let shape_ok = if self.live_joins.is_empty() {
+                        out_shape_ok(fr) || wf_lang::columnar::field_ref_is_list_index(fr)
+                    } else {
+                        out_shape_ok(fr)
+                    };
+                    // list-index root 引用 let（`x[0]`）→ 拒绝：列式无 let 视图，
+                    // 编译 root 列缺失 → 全 null 静默失真（与行式 let 值分叉）。
+                    let root_is_let = wf_lang::columnar::field_ref_is_list_index(fr)
+                        && matches!(
+                            fr,
+                            FieldRef::Path { segments, .. }
+                                if matches!(
+                                    segments.first(),
+                                    Some(PathSegment::Field(root))
+                                        if let_names.contains(root.as_str())
+                                )
+                        );
+                    shape_ok
+                        && !root_is_let
                         && !matches!(fr, FieldRef::Simple(name) if let_names.contains(name.as_str()))
                 }
                 // 列式输出函数（fmt/strftime/count_char，参数为字面量/flat 字段）
@@ -1118,6 +1138,11 @@ impl RuleExecutor {
                 Expr::Number(n) => YieldKind::Lit(Value::Number(*n)),
                 Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
                 Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
+                // list-index 字段（`c.tags[0]`，gap-5 2026-09-02）：Field 快
+                // 通道只读 flat 列——索引元素走 General cvec（ListIndex）。
+                Expr::Field(fr) if wf_lang::columnar::field_ref_is_list_index(fr) => {
+                    YieldKind::General
+                }
                 Expr::Field(_) => YieldKind::Field,
                 // 列式输出函数（fmt/strftime/count_char）→ General：批量 cell
                 // 求值（general_cvecs），编译失败（结构化列参数）行式回退。

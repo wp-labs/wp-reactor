@@ -277,7 +277,7 @@ loop {
 | 2 | **within/interval join** | q8 | **大**（列式 interval-join 结构） | ✅ **2026-09-02 收口**（同上；区间过滤本就列式，剩余是驱动行物化） |
 | 3 | each + 后置 `where`（无 join 时 where 非空） | q15/q16/q17 形态 | 中 | ✅ **2026-09-02 收口**——无活 join + 可列式驱动列 where（批级守卫掩码；真实可达形状 = 死 join + 驱动列 where） |
 | 4 | each filter / bind filter 非列式 | 通用 | 中 | ✅ **2026-09-02 收口**——非列式 each filter 逐行 `passes_each_filter` 回退；非列式 bind filter 命中循环逐行 `event_matches_alias`（不再 `hit.fill(true)` 丢 filter） |
-| 5 | 输出字段非 flat / 非限定引用（有 join） | 通用 | 中 | 开放 |
+| 5 | **list-index 输出字段**（`c.tags[0]`，Path=[Field,Index]） | qradar 形态（tags/categories 下标） | 小-中 | ✅ **2026-09-02 收口**——无活 join 时编译 ListIndex cvec（Field 快通道 `value_at` 只读 flat 列，索引元素需 offset 读；root 引用 let 拒绝）；**有活 join 的非限定/歧义裸名仍行式**（门控 out_shape 保持限定，残项） |
 | 6 | score 非「常量 \| 常量×flat 字段」 | 通用 | 小-中 | 开放 |
 | 7 | entity 非字面量 / flat 字段 | 通用 | 小 | 开放 |
 | 8 | yield 非字面量 / flat / 列式输出函数（有 join 更严） | 通用 | 中 | 开放 |
@@ -324,6 +324,19 @@ loop {
 > `each_columnar_nonexpr_filter_and_bind_matches_row_path`（executor 层）+
 > `each_noncolumnar_bind_filter_columnar_hit_matches_row_path`（引擎层：
 > columnar 命中循环 vs 行式 event_matches_alias）。
+>
+> **gap 5 已收口（2026-09-02）**：无活 join 的 list-index 输出字段（`c.tags[0]`，
+> Path=[Field,Index]）不再让整条规则回退行式——`compile_yield_cvec` 对 list-index
+> Field 编译 `ListIndex` cvec（快通道 `value_at` 只读 flat 列，索引元素需 offset
+> 读），yield 分类从 `YieldKind::Field` 改 `YieldKind::General`（批级槽位取 cell，
+> 编译失败逐行 `to_event` 回退与行式一致）。gate 只放行**无活 join**（有活 join
+> 的 out_shape 限定不变）；root 引用 let（`x[0]`）拒绝（列式无 let 视图，编译
+> root 缺失 → 全 null 静默失真）。矩阵断言 gap 5 从 `EagerRows` 翻转为
+> `ColumnarEach`（+ 有活 join / let-root 负向边界仍 `EagerRows`）。对拍：
+> `each_columnar_list_index_yield_matches_row_path`（原生 List，含 null 元素/
+> 空列表/越界）+ `each_columnar_list_index_json_array_yield_matches_row_path`
+> （JsonArray-metadata Utf8 = qradar 帧 `array/…` 真实存储形态，含 null-drop
+> 探针 `["a",null,"b"][1]`→"b"）。
 
 1. **判据 = 生产路径是否还走行式**（不再看性能收益）：每收一项，该类规则的生产执行轨
    切换为列式，行式路径保留为测试对拍 golden（从“生产实现”变“测试参考”）；
@@ -353,6 +366,7 @@ loop {
 |---|---|
 | `deferred_exec.rs` `DeferredPending.left` 每行 Event | ✅ gap 1/2：`DeferredLeft`（`JoinRow::Columnar` + 投影遮蔽；有 let 回退物化一次） |
 | each + 无活 join where 的 eager 物化 | ✅ gap 3：批级 `where_cvec` 守卫掩码 |
+| each list-index 输出字段（`c.tags[0]`）的整条回退 | ✅ gap 5：`compile_yield_cvec` 编译 `ListIndex` cvec + yield 分类 `General` |
 
 受控「反物化」（emit/到期时**按命中行**物化，非全批——保留，属输出路径）：
 `DeferredLeft::to_event` / `ColumnarEvent::to_event` / `JoinRow::to_event` / `RowEvent::to_event`。
@@ -360,9 +374,10 @@ loop {
 转换核心（代码保留，测试 golden + 回退）：`event_bridge.rs` `batch_to_events[_with]` /
 `materialize_rows[_with]`；`ColumnarEvent` / `JoinRow::Columnar` 为反物化的现成方案。
 
-> 与 §11.2 缺口对应：gap 5-8（each 输出字段非 flat、score/entity/yield 非列式
-> 形状）→ 触 #2（each 侧）/ #1（match 侧）；stats 行式回退 → #4。（gap 1/2/3/4
-> 已收口：deferred pending / each where / 非列式 filter 均已列式或逐行解释回退。）
+> 与 §11.2 缺口对应：gap 6-8（score/entity 非列式、yield 非列式表达式）→ 触
+> #2（each 侧）/ #1（match 侧）；stats 行式回退 → #4。（gap 1/2/3/4/5 已收口：
+> deferred pending / each where / 非列式 filter / list-index 输出均已列式或逐行
+> 解释回退。）
 > 终点判定（§11.3-3）不变：`batch_to_events` / `materialize_rows` /
 > `OnceLock` 调用点归零（仅测试引用）。
 

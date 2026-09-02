@@ -367,6 +367,19 @@ mod tests {
             args: vec![Expr::Field(FieldRef::Simple("sip".into()))],
         });
         assert_path(&plan, ExecutionPath::ColumnarEach);
+
+        // gap-5（2026-09-02 收口）：无活 join + list-index 输出字段
+        // （`e.tags[0]`，Path=[Field,Index]）→ 编译 ListIndex cvec
+        // （Field 快通道只读 flat 列）→ 列式（行式 Path 下标对拍锁定）。
+        let mut plan = each_base();
+        plan.yield_plan.fields = vec![YieldField {
+            name: "tag0".into(),
+            value: Expr::Field(FieldRef::Path {
+                alias: "e".into(),
+                segments: vec![PathSegment::Field("tags".into()), PathSegment::Index(0)],
+            }),
+        }];
+        assert_path(&plan, ExecutionPath::ColumnarEach);
     }
 
     #[test]
@@ -495,6 +508,53 @@ mod tests {
             alias: "e".into(),
             filter: Some(Expr::Bool(true)),
         });
+        assert_path(&plan, ExecutionPath::EagerRows);
+
+        // gap-5 负向边界（2026-09-02）：list-index 输出字段 + **活 join** →
+        // out_shape 仍拒（无活 join 才放行）→ 行式。
+        let mut plan = each_base();
+        plan.joins = vec![JoinPlan {
+            right_window: "person_events".into(),
+            mode: JoinMode::Snapshot,
+            conds: vec![JoinCondPlan {
+                left: FieldRef::Qualified("e".into(), "sip".into()),
+                right: FieldRef::Qualified("person_events".into(), "id".into()),
+            }],
+            within: None,
+            reduce: None,
+            emit_at: None,
+        }];
+        plan.r#where = Some(Expr::BinOp {
+            op: BinOp::Eq,
+            left: Box::new(Expr::Field(FieldRef::Qualified(
+                "person_events".into(),
+                "id".into(),
+            ))),
+            right: Box::new(Expr::Number(5.0)),
+        });
+        plan.yield_plan.fields = vec![YieldField {
+            name: "tag0".into(),
+            value: Expr::Field(FieldRef::Path {
+                alias: "e".into(),
+                segments: vec![PathSegment::Field("tags".into()), PathSegment::Index(0)],
+            }),
+        }];
+        assert_path(&plan, ExecutionPath::EagerRows);
+
+        // gap-5 负向边界：list-index 输出字段 root 引用 **let**（`x[0]`）→
+        // 列式无 let 视图（编译 root 缺失 → 全 null 静默失真）→ 行式。
+        let mut plan = each_base();
+        plan.lets = vec![LetPlan {
+            name: "x".into(),
+            expr: Expr::Field(FieldRef::Qualified("e".into(), "tags".into())),
+        }];
+        plan.yield_plan.fields = vec![YieldField {
+            name: "tag0".into(),
+            value: Expr::Field(FieldRef::Path {
+                alias: "e".into(),
+                segments: vec![PathSegment::Field("x".into()), PathSegment::Index(0)],
+            }),
+        }];
         assert_path(&plan, ExecutionPath::EagerRows);
 
         // 5. 输出字段非 flat（有 join 时的歧义裸名）——out_shape 拒绝。

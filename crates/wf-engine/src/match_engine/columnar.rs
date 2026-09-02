@@ -479,7 +479,11 @@ pub(crate) fn compile_yield_cvec(
         std::borrow::Cow::Owned(inline_lets(&field.value, lets, &mut Vec::new()))
     };
     match &*value {
-        Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) | Expr::Field(_) => None,
+        Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => None,
+        // flat Field 走各自快通道（不编译）；list-index 字段（`c.tags[0]`，
+        // gap-5 2026-09-02）编译为 ListIndex cvec——快通道 `value_at` 只读
+        // flat 列，索引元素需 offset 读。
+        Expr::Field(fr) if !wf_lang::columnar::field_ref_is_list_index(fr) => None,
         other if wf_lang::columnar::expr_is_columnar(other) => {
             compile_guard(other, view).map(|plan| plan.eval_vec(view, n))
         }

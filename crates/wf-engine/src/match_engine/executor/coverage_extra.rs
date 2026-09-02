@@ -38,6 +38,7 @@ use crate::match_engine::{
     DeferredLeft, DeferredPending, FieldSource, JoinRow, RuleExecutor, batch_to_events,
     batch_to_events_filtered, build_field_index,
 };
+use wp_model_core::model::DataRecord;
 
 // ---------------------------------------------------------------------------
 // Helpers (local copies — `tests::helpers` is not reachable from this module)
@@ -4635,6 +4636,176 @@ fn each_columnar_where_inlist_strftime_stay_row_path() {
 }
 
 // ---------------------------------------------------------------------------
+// P4 gap-5（2026-09-02）：无活 join 的 list-index 输出字段（`c.tags[0]`）
+// 列式化——编译 ListIndex cvec（Field 快通道只读 flat 列）vs 行式 Path
+// 数组下标逐位对拍（含 null / 空列表 / 越界行 / null-drop）。
+// ---------------------------------------------------------------------------
+
+/// gap-5 对拍夹具：同一批上执行行式/列式 each 直接批路径，yield 唯一字段
+/// `tags[i]`（alias=e，列名 tag0，Chars），返回 (行式输出, 列式输出)。
+/// 内部断言两条路径逐位一致 + appended/rejected 相同。
+fn gap5_list_index_parity(batch: &RecordBatch, index: usize) -> (Vec<DataRecord>, Vec<DataRecord>) {
+    let mut plan = simple_rule_plan(
+        "gap5_list_index",
+        simple_plan(vec![], vec![]),
+        Expr::Number(5.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "tag0".into(),
+        value: Expr::Field(FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![PathSegment::Field("tags".into()), PathSegment::Index(index)],
+        }),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([("tag0".into(), FieldType::Base(BaseType::Chars))]),
+    );
+    assert!(
+        exec.each_plan_columnar_safe(),
+        "gap-5：无活 join + list-index 输出字段必须放行"
+    );
+    let t = 1_700_000_000_000_000_000i64;
+    let events = crate::match_engine::event_bridge::batch_to_events(batch);
+    let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let col_events: Vec<ColumnarEvent> = (0..batch.num_rows())
+        .map(|r| ColumnarEvent::new(batch, r))
+        .collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+    let out_col: Vec<_> = b_col
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(sr.appended, out_row.len(), "行式 appended");
+    assert_eq!(sc.appended, out_col.len(), "列式 appended");
+    assert_eq!(sr.rejected, sc.rejected, "拒绝数一致");
+    assert_eq!(app_row, app_col, "appended 索引一致");
+    assert_eq!(out_row, out_col, "list-index yield 输出逐位对拍");
+    (out_row, out_col)
+}
+
+/// 读输出记录的 `tag0` 标签（Char 字段值或空串）。
+fn gap5_tag0_label(r: &DataRecord) -> String {
+    r.fields()
+        .find(|f| f.get_name() == "tag0")
+        .and_then(|f| match f.get_value() {
+            wp_model_core::model::Value::Chars(v) => Some(v.to_string()),
+            _ => None,
+        })
+        .expect("tag0 field")
+}
+
+#[test]
+fn each_columnar_list_index_yield_matches_row_path() {
+    use arrow::array::ListArray;
+    use arrow::buffer::OffsetBuffer;
+    // tags: 原生 List<Utf8>——行 0 = ["prod","edge"]；1 = [null]；2 = []；
+    // 3 = ["dmz"]。
+    let values = StringArray::from(vec![Some("prod"), Some("edge"), None, Some("dmz")]);
+    let tags = ListArray::try_new(
+        Arc::new(ArrowField::new("item", DataType::Utf8, true)),
+        OffsetBuffer::new(vec![0i32, 2, 3, 3, 4].into()),
+        Arc::new(values) as ArrayRef,
+        None,
+    )
+    .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new(
+            "tags",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+            true,
+        ),
+        ArrowField::new("sip", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(tags) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("b"),
+                Some("c"),
+                Some("d"),
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let (_, out_col) = gap5_list_index_parity(&batch, 0);
+    // tags[0]：行 0 → "prod"；行 1（[null]）→ null → 空串；行 2（[]）→ 越界 →
+    // 空串；行 3 → "dmz"。全部 append（无 filter 拒绝）。
+    assert_eq!(gap5_tag0_label(&out_col[0]), "prod");
+    assert_eq!(gap5_tag0_label(&out_col[1]), "", "[null] 行索引 0 → 空串");
+    assert_eq!(gap5_tag0_label(&out_col[2]), "", "空列表越界 → 空串");
+    assert_eq!(gap5_tag0_label(&out_col[3]), "dmz");
+}
+
+#[test]
+fn each_columnar_list_index_json_array_yield_matches_row_path() {
+    // tags: JsonArray-metadata Utf8（`wf.wfl.field_type = "array"`——qradar 帧
+    // 的 array/… 字段真实存储形态）——行 0 = ["a",null,"b"]（null-drop 探针：
+    // 解释器 json_to_value 丢弃 null 元素，index 1 → "b"）；1 = ["edge"]；
+    // 2 = []；3 = null cell。
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("tags", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                crate::match_engine::WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                crate::match_engine::WFL_FIELD_TYPE_ARRAY.to_string(),
+            )]),
+        ),
+        ArrowField::new("sip", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some(r#"["a",null,"b"]"#),
+                Some(r#"["edge"]"#),
+                Some("[]"),
+                None,
+            ])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("b"),
+                Some("c"),
+                Some("d"),
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let (_, out_col) = gap5_list_index_parity(&batch, 1);
+    assert_eq!(
+        gap5_tag0_label(&out_col[0]),
+        "b",
+        "null 元素被丢弃，[1] → b"
+    );
+    assert_eq!(gap5_tag0_label(&out_col[1]), "", "越界 → 空串");
+    assert_eq!(gap5_tag0_label(&out_col[2]), "", "空数组越界 → 空串");
+    assert_eq!(gap5_tag0_label(&out_col[3]), "", "null cell → 空串");
+}
+
+// ---------------------------------------------------------------------------
 // P4 gap-4（2026-09-02）：非列式 each filter / bind filter → 列式路径逐行
 // 解释回退——行式/列式逐位对拍（filter 语义不丢：each filter 经 to_event +
 // passes_each_filter；bind filter 经 process_batch 命中循环 event_matches_alias）。
@@ -6531,7 +6702,8 @@ fn deferred_pending_columnar_matches_eager() {
 
 #[test]
 fn deferred_columnar_projection_shadows_unprojected_fields() {
-    let exec = RuleExecutor::new(deferred_join_plan(None));
+    // 构造冒烟（exec 本身不参与断言，只验证计划可建）。
+    let _exec = RuleExecutor::new(deferred_join_plan(None));
     let batch = deferred_auction_batch();
     let index = build_field_index(&batch);
     let projection: HashSet<String> = ["id", "dateTime", "expires"]
