@@ -21,10 +21,10 @@ pub use types::{EngineHashMap, EngineHashSet};
 pub(crate) use eval::eval_expr;
 pub use eval::values_equal;
 pub use key::{ScopeKey, field_ref_name};
-#[allow(unused_imports)] // test-only（key.rs 内部用全限定路径，lib 构建无人消费）
+#[allow(unused_imports)] // key.rs 内部用全限定路径；重导出由 executor::eval 等模块消费
 pub(crate) use key::{
-    eval_field_value, extract_key_simple, extract_scope_key_from_row, push_i64_exact_decimal,
-    scope_key_from_values, scope_key_shard_index, value_to_string,
+    eval_field_value, eval_field_value_src, extract_key_simple, extract_scope_key_from_row,
+    push_i64_exact_decimal, scope_key_from_values, scope_key_shard_index, value_to_string,
 };
 
 pub use conv::apply_conv;

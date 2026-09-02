@@ -1,26 +1,37 @@
-use super::{Event, Value};
+use smol_str::SmolStr;
 
-pub(super) fn flatten_bind_series(ctx: &Event, arg: Option<&wf_lang::ast::Expr>) -> Vec<Value> {
+use super::{FieldSource, Value};
+
+/// Step/bind history accessors for the L3/aggregate eval family.
+///
+/// The eval context is a [`FieldSource`] (today the synthetic `Event` built by
+/// `build_eval_context`; M3 adds a non-`Event` composite ctx). All history is
+/// read through the trait's name protocol (`field_value` / `field_names`) —
+/// synthetic `_step_{i}_*` / `_bind_{alias}_*` entries are resolved by name,
+/// never by map-typed access, so any source that honours the same name protocol
+/// (M2 §11.6) serves byte-identical results.
+pub(super) fn flatten_bind_series(
+    ctx: &dyn FieldSource,
+    arg: Option<&wf_lang::ast::Expr>,
+) -> Vec<Value> {
     let Some((alias, field_name)) = arg.and_then(extract_bind_field_ref) else {
         return Vec::new();
     };
-    get_bind_field_values(ctx, alias, field_name)
-        .map(|values| values.to_vec())
-        .unwrap_or_default()
+    get_bind_field_values(ctx, alias, field_name).unwrap_or_default()
 }
 
-pub(super) fn flatten_step_values(ctx: &Event, step_indices: &[usize]) -> Vec<Value> {
+pub(super) fn flatten_step_values(ctx: &dyn FieldSource, step_indices: &[usize]) -> Vec<Value> {
     let mut out = Vec::new();
     for idx in step_indices {
         if let Some(values) = get_step_values(ctx, *idx) {
-            out.extend_from_slice(values);
+            out.extend(values);
         }
     }
     out
 }
 
 pub(super) fn flatten_step_series(
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     step_indices: &[usize],
     arg: Option<&wf_lang::ast::Expr>,
 ) -> Vec<Value> {
@@ -34,20 +45,23 @@ pub(super) fn flatten_step_series(
 }
 
 pub(super) fn flatten_step_field_values(
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     step_indices: &[usize],
     field_name: &str,
 ) -> Vec<Value> {
     let mut out = Vec::new();
     for idx in step_indices {
         if let Some(values) = get_step_field_values(ctx, *idx, field_name) {
-            out.extend_from_slice(values);
+            out.extend(values);
         }
     }
     out
 }
 
-pub(super) fn resolve_step_indices(ctx: &Event, arg: Option<&wf_lang::ast::Expr>) -> Vec<usize> {
+pub(super) fn resolve_step_indices(
+    ctx: &dyn FieldSource,
+    arg: Option<&wf_lang::ast::Expr>,
+) -> Vec<usize> {
     let all = step_indices(ctx);
     if all.is_empty() {
         return all;
@@ -57,12 +71,12 @@ pub(super) fn resolve_step_indices(ctx: &Event, arg: Option<&wf_lang::ast::Expr>
     };
     all.iter()
         .copied()
-        .filter(|idx| get_step_source(ctx, *idx).is_some_and(|s| s == alias))
+        .filter(|idx| get_step_source(ctx, *idx).is_some_and(|s| s.as_str() == alias))
         .collect()
 }
 
 pub(super) fn resolve_aggregate_step_indices(
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     arg: Option<&wf_lang::ast::Expr>,
 ) -> Vec<usize> {
     let all = step_indices(ctx);
@@ -75,7 +89,7 @@ pub(super) fn resolve_aggregate_step_indices(
     let by_source: Vec<usize> = all
         .iter()
         .copied()
-        .filter(|idx| get_step_source(ctx, *idx).is_some_and(|s| s == step_ref))
+        .filter(|idx| get_step_source(ctx, *idx).is_some_and(|s| s.as_str() == step_ref))
         .collect();
     if !by_source.is_empty() {
         return prefer_close_steps(ctx, by_source);
@@ -83,16 +97,16 @@ pub(super) fn resolve_aggregate_step_indices(
     let by_label: Vec<usize> = all
         .iter()
         .copied()
-        .filter(|idx| get_step_label(ctx, *idx).is_some_and(|label| label == step_ref))
+        .filter(|idx| get_step_label(ctx, *idx).is_some_and(|label| label.as_str() == step_ref))
         .collect();
     prefer_close_steps(ctx, by_label)
 }
 
-fn prefer_close_steps(ctx: &Event, indices: Vec<usize>) -> Vec<usize> {
+fn prefer_close_steps(ctx: &dyn FieldSource, indices: Vec<usize>) -> Vec<usize> {
     let close_only: Vec<usize> = indices
         .iter()
         .copied()
-        .filter(|idx| matches!(get_step_stage(ctx, *idx), Some("close")))
+        .filter(|idx| get_step_stage(ctx, *idx).is_some_and(|s| s.as_str() == "close"))
         .collect();
     if close_only.is_empty() {
         indices
@@ -101,10 +115,10 @@ fn prefer_close_steps(ctx: &Event, indices: Vec<usize>) -> Vec<usize> {
     }
 }
 
-fn step_indices(ctx: &Event) -> Vec<usize> {
+fn step_indices(ctx: &dyn FieldSource) -> Vec<usize> {
     let mut out: Vec<usize> = ctx
-        .fields
-        .keys()
+        .field_names()
+        .into_iter()
         .filter_map(|k| parse_step_field_index(k, "_values"))
         .collect();
     out.sort_unstable();
@@ -117,74 +131,78 @@ fn parse_step_field_index(key: &str, suffix: &str) -> Option<usize> {
     body.parse::<usize>().ok()
 }
 
-pub(super) fn get_step_values(ctx: &Event, step_idx: usize) -> Option<&[Value]> {
+/// Owned collected values for a step (`_step_{i}_values`), moved out of the
+/// source's `Value::Array`. FieldSource reads are owned, so callers never hold
+/// a borrow into the source (the pre-M2 `&[Value]` borrows died with the
+/// map-typed ctx).
+pub(super) fn get_step_values(ctx: &dyn FieldSource, step_idx: usize) -> Option<Vec<Value>> {
     let field_name = format!("_step_{}_values", step_idx);
-    match ctx.fields.get(field_name.as_str()) {
-        Some(Value::Array(arr)) => Some(arr.as_slice()),
+    match ctx.field_value(&field_name) {
+        Some(Value::Array(arr)) => Some(arr),
         _ => None,
     }
 }
 
-pub(super) fn get_step_field_values<'a>(
-    ctx: &'a Event,
+pub(super) fn get_step_field_values(
+    ctx: &dyn FieldSource,
     step_idx: usize,
     field_name: &str,
-) -> Option<&'a [Value]> {
+) -> Option<Vec<Value>> {
     let field_name = format!("_step_{}_field_{}", step_idx, field_name);
-    match ctx.fields.get(field_name.as_str()) {
-        Some(Value::Array(arr)) => Some(arr.as_slice()),
+    match ctx.field_value(&field_name) {
+        Some(Value::Array(arr)) => Some(arr),
         _ => None,
     }
 }
 
-pub(super) fn get_step_source(ctx: &Event, step_idx: usize) -> Option<&str> {
+pub(super) fn get_step_source(ctx: &dyn FieldSource, step_idx: usize) -> Option<SmolStr> {
     let field_name = format!("_step_{}_source", step_idx);
-    match ctx.fields.get(field_name.as_str()) {
-        Some(Value::Str(s)) => Some(s.as_str()),
+    match ctx.field_value(&field_name) {
+        Some(Value::Str(s)) => Some(s),
         _ => None,
     }
 }
 
-pub(super) fn get_step_label(ctx: &Event, step_idx: usize) -> Option<&str> {
+pub(super) fn get_step_label(ctx: &dyn FieldSource, step_idx: usize) -> Option<SmolStr> {
     let field_name = format!("_step_{}_label", step_idx);
-    match ctx.fields.get(field_name.as_str()) {
-        Some(Value::Str(s)) => Some(s.as_str()),
+    match ctx.field_value(&field_name) {
+        Some(Value::Str(s)) => Some(s),
         _ => None,
     }
 }
 
-pub(super) fn get_step_measure(ctx: &Event, step_idx: usize) -> Option<f64> {
+pub(super) fn get_step_measure(ctx: &dyn FieldSource, step_idx: usize) -> Option<f64> {
     let field_name = format!("_step_{}_measure", step_idx);
-    match ctx.fields.get(field_name.as_str()) {
-        Some(Value::Number(n)) => Some(*n),
+    match ctx.field_value(&field_name) {
+        Some(Value::Number(n)) => Some(n),
         _ => None,
     }
 }
 
-pub(super) fn get_step_stage(ctx: &Event, step_idx: usize) -> Option<&str> {
+pub(super) fn get_step_stage(ctx: &dyn FieldSource, step_idx: usize) -> Option<SmolStr> {
     let field_name = format!("_step_{}_stage", step_idx);
-    match ctx.fields.get(field_name.as_str()) {
-        Some(Value::Str(s)) => Some(s.as_str()),
+    match ctx.field_value(&field_name) {
+        Some(Value::Str(s)) => Some(s),
         _ => None,
     }
 }
 
-pub(super) fn get_bind_count(ctx: &Event, alias: &str) -> Option<f64> {
+pub(super) fn get_bind_count(ctx: &dyn FieldSource, alias: &str) -> Option<f64> {
     let field_name = format!("_bind_{}_count", alias);
-    match ctx.fields.get(field_name.as_str()) {
-        Some(Value::Number(n)) => Some(*n),
+    match ctx.field_value(&field_name) {
+        Some(Value::Number(n)) => Some(n),
         _ => None,
     }
 }
 
-pub(super) fn get_bind_field_values<'a>(
-    ctx: &'a Event,
+pub(super) fn get_bind_field_values(
+    ctx: &dyn FieldSource,
     alias: &str,
     field_name: &str,
-) -> Option<&'a [Value]> {
+) -> Option<Vec<Value>> {
     let field_name = format!("_bind_{}_field_{}", alias, field_name);
-    match ctx.fields.get(field_name.as_str()) {
-        Some(Value::Array(arr)) => Some(arr.as_slice()),
+    match ctx.field_value(&field_name) {
+        Some(Value::Array(arr)) => Some(arr),
         _ => None,
     }
 }

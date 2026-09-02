@@ -407,7 +407,7 @@ loop {
 > 终点判定（§11.3-3）不变：`batch_to_events` / `materialize_rows` /
 > `OnceLock` 调用点归零（仅测试引用）。
 
-### 11.6 终态通用机制：按读集物化 → FieldSource 直读（M1 已落 2026-09-02）
+### 11.6 终态通用机制：按读集物化 → FieldSource 直读（M1/M2 已落 2026-09-02）
 
 **动机（实测）**：qradar rules 段 CPU 采样 + census 显示——376 条 match 规则**全走
 deferred 列式路径**（无行式整批物化），但 138 条（36%）`trigger_event_needed=true`、
@@ -435,10 +435,24 @@ rule_task RowEvent 投影选择。对拍：`fire_trigger_projection_narrows_to_r
 untrackable`（合成字段 → All → None）。实测 qradar rules 段 serde_json 权重
 -98%（to_event 不再解析未引用结构化列）。
 
-**终态后续（M2/M3，未开始）**：M2 = `executor::eval` 泛型化（`&Event` →
-`&dyn RowCtx`，Event 实现之；含 L3 `_step_*` 枚举语义 trait 化）；M3 =
-`MatchedContext.trigger_event: Arc<Event>` → 列式行引用（owned Arc batch + row +
-needed），ctx 直读列。M2+M3 到达 §11.3 终点（生产路径 `Event` 归零）。
+**终态后续（M2 已落 2026-09-02；M3 未开始）**：M2 = `executor::eval` 泛型化——
+L3/输出 eval 族（`eval_yield_expr*` / `eval_bool_expr` / `eval_expr_with_l3` /
+`eval_score` / `eval_entity_id` + builtins/step_data/utils）ctx 从 `&Event` 改
+`&dyn FieldSource`（FieldSource 名协议：`field_value` / `field_names`）：
+
+- step/bind 历史访问器（step_data.rs）与 stat 标签读取全部走
+  `field_value`（owned），`step_indices` 枚举改 `field_names()`——eval 不再
+  依赖具体 `Event` map（`_step_*` / `_bind_*` 合成字段协议保留为**名称解析
+  契约**：任何按同一协议实现 FieldSource 的 ctx 字节一致）；
+- `Expr::Field` 改 `eval_field_value_src`（与 map 版逐字节同构，key.rs）；
+- owned 读取代价：series 访问每次多一次中间 `Vec` 拷贝（原借用+逐元素 clone
+  → clone + 移动），仅 per-fire 输出路径、量级与既有 to_event/ctx 构建同阶；
+- 对拍：`coverage_m2` 三件套——非-Event `RowSource`（镜像 Event 名协议）逐
+  表达式/入口字节一致；`RowOnlySource`（裸行，无合成条目）= 无合成条目的
+  Event（L3 空历史语义）；field_names 枚举契约锁。
+
+M3 = `MatchedContext.trigger_event: Arc<Event>` → 列式行引用（owned Arc batch
++ row + needed），ctx 直读列。M2+M3 到达 §11.3 终点（生产路径 `Event` 归零）。
 
 ### 11.5 与 merge 的关系
 

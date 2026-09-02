@@ -553,7 +553,7 @@ impl RuleExecutor {
             None => {
                 // ctx-free gate 要求 score 常量；非常量分支仅 Full 模式可达。
                 assert!(!free, "ctx-free 路径不允许非常量 score");
-                let ResolveCtx::Full(ctx) = resolve else {
+                let &ResolveCtx::Full(ctx) = resolve else {
                     unreachable!()
                 };
                 eval_score(&self.plan.score_plan.expr, ctx)?
@@ -571,7 +571,7 @@ impl RuleExecutor {
             _ => {
                 // ctx-free gate 要求 entity 为 Field；复杂表达式仅 Full 模式。
                 assert!(!free, "ctx-free 路径不允许非 Field entity");
-                let ResolveCtx::Full(ctx) = resolve else {
+                let &ResolveCtx::Full(ctx) = resolve else {
                     unreachable!()
                 };
                 eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?
@@ -640,7 +640,7 @@ impl RuleExecutor {
                     YieldKind::General => {
                         // ctx-free gate 排除 General 表达式（需要完整 ctx）。
                         assert!(!free, "ctx-free 路径不允许 General yield 表达式");
-                        let ResolveCtx::Full(ctx) = resolve else {
+                        let &ResolveCtx::Full(ctx) = resolve else {
                             unreachable!()
                         };
                         eval_yield_expr_with_meta(&field.value, ctx, yield_meta)

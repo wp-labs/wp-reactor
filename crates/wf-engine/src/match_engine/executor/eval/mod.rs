@@ -2,9 +2,12 @@ use std::cell::Cell;
 
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::match_engine::{
-    EngineHashMap, Event, FieldSource, Value, WindowLookup, eval_expr, eval_expr_ext,
-    eval_field_value, value_to_string, values_equal,
+    EngineHashMap, FieldSource, Value, WindowLookup, eval_expr, eval_expr_ext,
+    eval_field_value_src, value_to_string, values_equal,
 };
+
+#[cfg(test)]
+pub(super) use crate::match_engine::match_engine::Event;
 
 mod builtins;
 #[cfg(test)]
@@ -13,6 +16,8 @@ mod builtins_more;
 mod builtins_r4;
 #[cfg(test)]
 mod coverage_extra;
+#[cfg(test)]
+mod coverage_m2;
 #[cfg(test)]
 mod coverage_more;
 #[cfg(test)]
@@ -33,7 +38,7 @@ use self::utils::time_nanos_to_value;
 /// L3 functions (collect_set, collect_list, first, last, stddev, percentile)
 /// need access to the collected values from step execution. These values are
 /// stored in `_step_{i}_values` and `_step_{i}_source` fields in the eval context.
-pub(super) fn eval_yield_expr(expr: &wf_lang::ast::Expr, ctx: &Event) -> Option<Value> {
+pub(super) fn eval_yield_expr(expr: &wf_lang::ast::Expr, ctx: &dyn FieldSource) -> Option<Value> {
     eval_yield_expr_with_score(expr, ctx, None)
 }
 
@@ -120,7 +125,7 @@ pub(super) fn with_yield_eval_scope<T>(f: impl FnOnce() -> T) -> T {
 
 pub(super) fn eval_yield_expr_with_score(
     expr: &wf_lang::ast::Expr,
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     score: Option<f64>,
 ) -> Option<Value> {
     eval_yield_expr_with_meta(
@@ -135,7 +140,7 @@ pub(super) fn eval_yield_expr_with_score(
 
 pub(super) fn eval_yield_expr_with_meta(
     expr: &wf_lang::ast::Expr,
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     meta: YieldMeta,
 ) -> Option<Value> {
     // For yield expressions, fall back to empty string when a field is missing
@@ -146,7 +151,7 @@ pub(super) fn eval_yield_expr_with_meta(
     })
 }
 
-pub(super) fn eval_bool_expr(expr: &wf_lang::ast::Expr, ctx: &Event) -> Option<bool> {
+pub(super) fn eval_bool_expr(expr: &wf_lang::ast::Expr, ctx: &dyn FieldSource) -> Option<bool> {
     match eval_expr_with_l3(expr, ctx, YieldMeta::default()) {
         Some(Value::Bool(result)) => Some(result),
         _ => None,
@@ -167,7 +172,7 @@ pub(super) fn eval_bool_expr_with_lookup(
 
 pub(super) fn eval_expr_with_l3(
     expr: &wf_lang::ast::Expr,
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     meta: YieldMeta<'_>,
 ) -> Option<Value> {
     use wf_lang::ast::{BinOp, Expr, SystemVar};
@@ -193,7 +198,7 @@ pub(super) fn eval_expr_with_l3(
         }
         Expr::SystemVar(SystemVar::EmitTime) => meta.emit_time_nanos.map(time_nanos_to_value),
         Expr::WfuMeta(field) => meta.resolve_wfu_meta(*field),
-        Expr::Field(fr) => eval_field_value(&ctx.fields, fr),
+        Expr::Field(fr) => eval_field_value_src(ctx, fr),
         Expr::Object(items) => {
             let mut map = EngineHashMap::default();
             for item in items {
@@ -352,7 +357,7 @@ pub(super) fn eval_expr_with_l3(
 fn eval_logic_and_with_l3(
     left: &wf_lang::ast::Expr,
     right: &wf_lang::ast::Expr,
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     score: YieldMeta,
 ) -> Option<Value> {
     let lv = eval_expr_with_l3(left, ctx, score);
@@ -367,7 +372,7 @@ fn eval_logic_and_with_l3(
 fn eval_logic_or_with_l3(
     left: &wf_lang::ast::Expr,
     right: &wf_lang::ast::Expr,
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     score: YieldMeta,
 ) -> Option<Value> {
     let lv = eval_expr_with_l3(left, ctx, score);
@@ -606,7 +611,7 @@ fn contains_aggregate_func(expr: &wf_lang::ast::Expr) -> bool {
 
 /// Evaluate the score expression and clamp to `[0, 100]`.
 ///
-pub(super) fn eval_score(expr: &wf_lang::ast::Expr, ctx: &Event) -> CoreResult<f64> {
+pub(super) fn eval_score(expr: &wf_lang::ast::Expr, ctx: &dyn FieldSource) -> CoreResult<f64> {
     let val = eval_yield_expr(expr, ctx);
     let raw = match val {
         Some(Value::Number(n)) => n,
@@ -633,7 +638,10 @@ fn clamp_score(v: f64) -> f64 {
 
 /// Evaluate the entity_id expression.
 ///
-pub(super) fn eval_entity_id(expr: &wf_lang::ast::Expr, ctx: &Event) -> CoreResult<String> {
+pub(super) fn eval_entity_id(
+    expr: &wf_lang::ast::Expr,
+    ctx: &dyn FieldSource,
+) -> CoreResult<String> {
     let val = eval_yield_expr(expr, ctx);
     match val {
         Some(v) => Ok(value_to_string(&v)),

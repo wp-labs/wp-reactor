@@ -1,8 +1,8 @@
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use sha2::{Digest, Sha256};
 
-use super::{Event, Value, YieldMeta, eval_expr_with_l3, get_or_init_eval_time_nanos};
-use crate::match_engine::match_engine::value_to_string;
+use super::{Value, YieldMeta, eval_expr_with_l3, get_or_init_eval_time_nanos};
+use crate::match_engine::match_engine::{FieldSource, value_to_string};
 use crate::time::epoch_nanos_to_millis;
 
 pub(super) fn normalize_index(index: i64, len: usize) -> Option<usize> {
@@ -112,7 +112,7 @@ pub(super) fn current_time_nanos() -> Option<i64> {
 
 pub(super) fn eval_single_string_arg_with_l3(
     args: &[wf_lang::ast::Expr],
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     score: YieldMeta,
 ) -> Option<String> {
     if args.len() != 1 {
