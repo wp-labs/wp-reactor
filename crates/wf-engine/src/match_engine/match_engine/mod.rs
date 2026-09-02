@@ -771,15 +771,27 @@ impl CepStateMachine {
         // 各 early return 无需归还（借用自动结束），新实例入场时统一记一次
         // base_cost（见下）。语义不变：Occupied 借用原实例，Vacant 构造并插入。
         // 旧 take_instance/put_instance 已随此优化删除（2026-08-24）。
+        // 2026-09-02 摊还（qradar rules 段逐事件开销归因）：steady（非新实例 +
+        // 非 memory_grows_per_event）时，两 limits 块（max_instances 门 is_new、
+        // max_memory 门 is_new||grows）在探针后不可能改 map——`get_mut` 免每事件
+        // `instance_key.clone()`（entry 需要 owned key，占用高频 case 纯浪费）；
+        // 新实例/增长规则（distinct 等，DropOldest 可能驱逐当前 key）仍走 entry
+        // 重建语义不变。
         let tracks_memory = self.tracks_memory_bytes();
-        let instance = match self.instances.entry(instance_key.clone()) {
-            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-            std::collections::hash_map::Entry::Vacant(v) => {
-                let created = window_start.unwrap_or(now_nanos);
-                let machine_id = Self::extract_event_str(event, MACHINE_ID);
-                let mut inst = Instance::new_at(&self.plan, machine_id, created);
-                inst.base_cost = new_base.unwrap_or(0);
-                v.insert(inst)
+        let instance = if !is_new && !self.memory_grows_per_event {
+            self.instances
+                .get_mut(&instance_key)
+                .expect("probed non-new && no limits mutation between probe and fetch")
+        } else {
+            match self.instances.entry(instance_key.clone()) {
+                std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    let created = window_start.unwrap_or(now_nanos);
+                    let machine_id = Self::extract_event_str(event, MACHINE_ID);
+                    let mut inst = Instance::new_at(&self.plan, machine_id, created);
+                    inst.base_cost = new_base.unwrap_or(0);
+                    v.insert(inst)
+                }
             }
         };
         if is_new {
