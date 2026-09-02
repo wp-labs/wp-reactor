@@ -278,7 +278,7 @@ loop {
 | 3 | each + 后置 `where`（无 join 时 where 非空） | q15/q16/q17 形态 | 中 | ✅ **2026-09-02 收口**——无活 join + 可列式驱动列 where（批级守卫掩码；真实可达形状 = 死 join + 驱动列 where） |
 | 4 | each filter / bind filter 非列式 | 通用 | 中 | ✅ **2026-09-02 收口**——非列式 each filter 逐行 `passes_each_filter` 回退；非列式 bind filter 命中循环逐行 `event_matches_alias`（不再 `hit.fill(true)` 丢 filter） |
 | 5 | **list-index 输出字段**（`c.tags[0]`，Path=[Field,Index]） | qradar 形态（tags/categories 下标） | 小-中 | ✅ **2026-09-02 收口**——无活 join 时编译 ListIndex cvec（Field 快通道 `value_at` 只读 flat 列，索引元素需 offset 读；root 引用 let 拒绝）；**有活 join 的非限定/歧义裸名仍行式**（门控 out_shape 保持限定，残项） |
-| 6 | score 非「常量 \| 常量×flat 字段」（裸 flat 字段 / 字段×字段 / 复合算数） | 通用 | 小-中 | ✅ **2026-09-02 收口**——无活 join 的可列式 score 编译批级 score_cvec（逐行 cell → Number → clamp；读结构化列/编译失败逐行 eval_score 回退；非数值/缺失 → 整行 failed 与行式一致）；活 join 仍只允许常量 |
+| 6 | score 非「常量 \| 常量×flat 字段」（裸 flat 字段 / 字段×字段 / 复合算数 / 常量×list-index） | 通用 | 小-中 | ✅ **2026-09-02 收口**——无活 join 的可列式 score 编译批级 score_cvec（逐行 cell → Number → clamp；读结构化列/编译失败逐行 eval_score 回退；非数值/缺失 → 整行 failed 与行式一致）；活 join 仍只允许常量 |
 | 7 | entity 非字面量 / flat 字段（list-index / flat 组件复合表达式） | 通用 | 小 | ✅ **2026-09-02 收口**——无活 join 的可列式 entity 编译批级 entity_cvec（cell → Value → `value_to_string`，与快通道 Generic 渲染同源；编译失败逐行 eval_entity_id 回退）；**非列式（对象/数组嵌套 Path）仍行式** |
 | 8 | yield 非字面量 / flat / 列式输出函数（有 join 更严） | 通用 | 中 | 开放 |
 
@@ -353,6 +353,15 @@ loop {
 > 操作数 failed 行）/ `_null_and_bad_cells_...`（裸字段 null cell、Utf8 非数值
 > 全 failed、schema 外字段全 failed）/ `each_columnar_general_entity_...`
 > （list-index 原生 List null/空/越界 + 复合 Add 的 number_to_string 渲染）。
+> **review 补测（2026-09-02）**：常量×list-index score（`2.0*c.tags[0]`）原被
+> `score_shape` 归 MulConst 而 gate 只放行 flat 字段 → 未单轨；且执行器原以
+> 「ScorePlan 存在」判快通道，一旦放行会对 list-index 跑 value_at（读整列而非
+> 元素）。已修：`score_is_general` 以 field 是否 flat 分类（MulConst×list-index
+> 归一般 cvec），gate/执行器/prepare 同 key。补测：`each_columnar_score_const_
+> times_list_index_matches_row_path` / `each_columnar_general_score_nested_arith_
+> matches_row_path`（`a*b+c` 复合）/ `each_columnar_entity_list_index_json_array_
+> fallback_matches_row_path`（JsonArray-metadata entity → 逐行 eval_entity_id
+> 回退路径）+ 矩阵/ gate 分支断言。
 
 1. **判据 = 生产路径是否还走行式**（不再看性能收益）：每收一项，该类规则的生产执行轨
    切换为列式，行式路径保留为测试对拍 golden（从“生产实现”变“测试参考”）；

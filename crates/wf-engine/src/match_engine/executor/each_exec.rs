@@ -108,24 +108,33 @@ impl ScorePlan {
     }
 }
 
-/// score 是否为「一般列式表达式」（非 常量 / 常量×flat 快通道形状）——gate 的
-/// score_ok 与列式执行器的 score_cvec 槽位共用同一分类（gap-6 2026-09-02）。
+/// flat FieldRef（Simple/Qualified/Bracketed）——score/entity 快通道字段定义
+/// （无活 join 时 out_shape_ok 的字段形状；本执行器只服务无活 join 的
+/// each-direct 列式路径）。
+fn is_flat_field(field: &FieldRef) -> bool {
+    matches!(
+        field,
+        FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
+    )
+}
+
+/// score 是否为「一般列式表达式」（非 常量 / 常量×**flat** 快通道形状）——gate
+/// 的 score_ok 与列式执行器的 score_cvec 槽位共用同一分类（gap-6 2026-09-02）。
+/// 常量×list-index 字段（`0.5 * c.tags[0]`）**不是**快通道形状：快车道
+/// `value_at` 只读 flat 列，索引元素需 offset 读 → 归一般（编译
+/// ListIndex × 常量 cvec）。
 fn score_is_general(expr: &Expr) -> bool {
-    score_shape(expr).is_none()
+    match score_shape(expr) {
+        Some(ScoreShape::Const(_)) => false,
+        Some(ScoreShape::MulConst { field, .. }) => !is_flat_field(field),
+        None => true,
+    }
 }
 
 /// entity 是否为「一般列式表达式」（非 StringLit / flat Field 快通道形状）——
-/// gate 放行与执行器 entity_cvec 槽位共用同一分类（gap-7 2026-09-02）。flat =
-/// Simple/Qualified/Bracketed（无活 join 时 out_shape_ok 的定义；本执行器只
-/// 服务无活 join 的 each-direct 列式路径）。
+/// gate 放行与执行器 entity_cvec 槽位共用同一分类（gap-7 2026-09-02）。
 fn entity_is_general(expr: &Expr) -> bool {
-    !matches!(expr, Expr::StringLit(_))
-        && !matches!(
-            expr,
-            Expr::Field(
-                FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
-            )
-        )
+    !matches!(expr, Expr::StringLit(_)) && !matches!(expr, Expr::Field(fr) if is_flat_field(fr))
 }
 
 // L3 batched write (now unconditional): collect a segment's column values and
@@ -823,7 +832,13 @@ impl RuleExecutor {
         let score_ok = match score_shape(&self.plan.score_plan.expr) {
             Some(ScoreShape::Const(_)) => true,
             Some(ScoreShape::MulConst { field, .. }) => {
-                self.live_joins.is_empty() && out_shape_ok(field)
+                if self.live_joins.is_empty() {
+                    // 常量×flat（快通道）或常量×list-index（`0.5*c.tags[0]`，
+                    // gap-6 2026-09-02 review 发现：归一般 cvec——ListIndex × 常量）
+                    out_shape_ok(field) || wf_lang::columnar::field_ref_is_list_index(field)
+                } else {
+                    false
+                }
             }
             None => {
                 self.live_joins.is_empty()
@@ -1405,20 +1420,27 @@ impl RuleExecutor {
                 None
             };
             // -- score（与行式 `eval_score` 严格一致：非数值/缺失 → 整行跳过）--
-            // 快通道：常量 / 常量×flat 走 `ScorePlan::eval`；一般列式表达式
-            // （gap-6 2026-09-02）从批级 score_cvec 取 cell → Number → clamp；
-            // 槽位 None（编译失败 / 读结构化列）→ 逐行 eval_score 回退（Event
-            // 视图，行式语义）。
-            let score = match (score_plan.as_ref(), prepared.score_cvec.as_ref()) {
-                (Some(p), _) => p.eval(event, score_idx),
-                (None, Some(cvec)) => match cvec.scalar_at(event.row()) {
-                    Some(s) => match cscalar_to_value(&s) {
-                        Value::Number(n) => Some(n.clamp(0.0, 100.0)),
-                        _ => None,
+            // 一般列式表达式（gap-6 2026-09-02，含 常量×list-index 字段）：批级
+            // score_cvec cell → Number → clamp；槽位 None（编译失败 / 读结构化
+            // 列）→ 逐行 eval_score 回退（Event 视图，行式语义）。快通道（常量 /
+            // 常量×flat）：`ScorePlan::eval` value_at 直读。分类统一以
+            // `score_is_general` 为 key（与 gate/prepare 同源）。
+            let score = if score_is_general(&self.plan.score_plan.expr) {
+                match &prepared.score_cvec {
+                    Some(cvec) => match cvec.scalar_at(event.row()) {
+                        Some(s) => match cscalar_to_value(&s) {
+                            Value::Number(n) => Some(n.clamp(0.0, 100.0)),
+                            _ => None,
+                        },
+                        None => None,
                     },
-                    None => None,
-                },
-                (None, None) => eval_score(&self.plan.score_plan.expr, &event.to_event()).ok(),
+                    None => eval_score(&self.plan.score_plan.expr, &event.to_event()).ok(),
+                }
+            } else {
+                score_plan
+                    .as_ref()
+                    .expect("非一般 score → ScorePlan 解析必然成功")
+                    .eval(event, score_idx)
             };
             let Some(score) = score else {
                 stats.failed += 1;

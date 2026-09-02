@@ -2489,6 +2489,42 @@ fn each_plan_columnar_safe_gate_branches() {
     };
     assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
 
+    // 常量×list-index 字段（`2.0 * e.tags[0]`）→ 可列式（gap-6 review
+    // 2026-09-02：MulConst 快通道 value_at 只读 flat 列 → 归一般 cvec）。
+    let list_index = || {
+        Expr::Field(FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![PathSegment::Field("tags".into()), PathSegment::Index(0)],
+        })
+    };
+    let mut plan = base();
+    plan.score_plan = ScorePlan {
+        expr: Expr::BinOp {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Number(2.0)),
+            right: Box::new(list_index()),
+        },
+    };
+    assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
+
+    // 常量×深嵌套 Path（`2.0 * e.obj.x[0]`，非列式）→ false。
+    let mut plan = base();
+    plan.score_plan = ScorePlan {
+        expr: Expr::BinOp {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Number(2.0)),
+            right: Box::new(Expr::Field(FieldRef::Path {
+                alias: "e".into(),
+                segments: vec![
+                    PathSegment::Field("obj".into()),
+                    PathSegment::Field("x".into()),
+                    PathSegment::Index(0),
+                ],
+            })),
+        },
+    };
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+
     // 常量×字段 + 活 join → false（join 列式路径 score 仅允许常量）。
     let mut plan = base();
     plan.score_plan = ScorePlan {
@@ -2496,6 +2532,25 @@ fn each_plan_columnar_safe_gate_branches() {
             op: BinOp::Mul,
             left: Box::new(Expr::Number(0.908)),
             right: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
+        },
+    };
+    plan.joins = vec![JoinPlan {
+        right_window: "w".into(),
+        mode: JoinMode::Inner,
+        conds: vec![],
+        within: None,
+        reduce: None,
+        emit_at: None,
+    }];
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+
+    // 常量×list-index + 活 join → false（list-index score 只无活 join 放行）。
+    let mut plan = base();
+    plan.score_plan = ScorePlan {
+        expr: Expr::BinOp {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Number(2.0)),
+            right: Box::new(list_index()),
         },
     };
     plan.joins = vec![JoinPlan {
@@ -5084,6 +5139,153 @@ fn each_columnar_general_entity_matches_row_path() {
     assert_eq!(gap67_entity(&out_col[0]), "5");
     assert_eq!(gap67_entity(&out_col[1]), "22");
     assert_eq!(gap67_entity(&out_col[2]), "0");
+}
+
+#[test]
+fn each_columnar_score_const_times_list_index_matches_row_path() {
+    use arrow::array::ListArray;
+    use arrow::buffer::OffsetBuffer;
+    // gap-6 review 补测（2026-09-02）：score = 常量×list-index 字段
+    // （`2.0 * e.tags[0]`，原生 List<Int64>）——MulConst 快通道 value_at 只读
+    // flat 列，索引元素归一般 cvec（ListIndex × 常量）。clamp + 空列表（越界
+    // → failed 行）。
+    let values = Int64Array::from(vec![Some(3), Some(50), Some(1000)]);
+    let tags = ListArray::try_new(
+        Arc::new(ArrowField::new("item", DataType::Int64, true)),
+        OffsetBuffer::new(vec![0i32, 1, 2, 3, 3].into()),
+        Arc::new(values) as ArrayRef,
+        None,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            ArrowField::new(
+                "tags",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Int64, true))),
+                true,
+            ),
+            ArrowField::new("id", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(tags) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let exec = gap67_plan(
+        "gap6_score_const_x_list_index",
+        Expr::BinOp {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Number(2.0)),
+            right: Box::new(Expr::Field(FieldRef::Path {
+                alias: "e".into(),
+                segments: vec![PathSegment::Field("tags".into()), PathSegment::Index(0)],
+            })),
+        },
+        Expr::Field(FieldRef::Qualified("e".into(), "id".into())),
+    );
+    assert!(
+        exec.each_plan_columnar_safe(),
+        "常量×list-index score 必须放行（归一般 cvec）"
+    );
+    let (_, out_col) = gap67_parity(&exec, &batch);
+    assert_eq!(out_col.len(), 3, "空列表行 failed 丢弃");
+    assert_eq!(gap67_score(&out_col[0]), 6.0);
+    assert_eq!(gap67_score(&out_col[1]), 100.0, "2×50 → 100");
+    assert_eq!(gap67_score(&out_col[2]), 100.0, "2×1000 → 2000 clamp 100");
+}
+
+#[test]
+fn each_columnar_entity_list_index_json_array_fallback_matches_row_path() {
+    // gap-7 review 补测：list-index entity 读 **JsonArray-metadata** Utf8 列
+    // （qradar 帧 array/… 形态）→ arg_reads_structured → entity_cvec = None →
+    // 逐行 eval_entity_id 回退（行式语义，null-drop/越界/null cell → 空串）。
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("tags", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                crate::match_engine::WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                crate::match_engine::WFL_FIELD_TYPE_ARRAY.to_string(),
+            )]),
+        ),
+        ArrowField::new("id", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some(r#"["prod","edge"]"#),
+                Some(r#"["x"]"#),
+                Some("[]"),
+                None,
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let exec = gap67_plan(
+        "gap7_entity_json_array",
+        Expr::Number(50.0),
+        Expr::Field(FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![PathSegment::Field("tags".into()), PathSegment::Index(0)],
+        }),
+    );
+    assert!(exec.each_plan_columnar_safe());
+    let (_, out_col) = gap67_parity(&exec, &batch);
+    assert_eq!(out_col.len(), 4, "entity 不拒行（空串也 append）");
+    assert_eq!(gap67_entity(&out_col[0]), "prod");
+    assert_eq!(gap67_entity(&out_col[1]), "x");
+    assert_eq!(gap67_entity(&out_col[2]), "", "空数组越界 → 空串");
+    assert_eq!(gap67_entity(&out_col[3]), "", "null cell → 空串");
+}
+
+#[test]
+fn each_columnar_general_score_nested_arith_matches_row_path() {
+    // gap-6 review 补测：嵌套算数 score（`e.a * e.b + e.c`）→ 算数树编译 +
+    // clamp——覆盖复合表达式（非单 BinOp）路径。
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("id", DataType::Int64, true),
+        ArrowField::new("a", DataType::Int64, true),
+        ArrowField::new("b", DataType::Int64, true),
+        ArrowField::new("c", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(2),
+                Some(10),
+                Some(-5),
+                Some(100),
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(3), Some(10), Some(2), Some(3)])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(1), Some(0), Some(5), Some(2)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let exec = gap67_plan(
+        "gap6_score_nested",
+        Expr::BinOp {
+            op: BinOp::Add,
+            left: Box::new(Expr::BinOp {
+                op: BinOp::Mul,
+                left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "a".into()))),
+                right: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "b".into()))),
+            }),
+            right: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "c".into()))),
+        },
+        Expr::Field(FieldRef::Qualified("e".into(), "id".into())),
+    );
+    assert!(exec.each_plan_columnar_safe());
+    let (_, out_col) = gap67_parity(&exec, &batch);
+    // 2*3+1=7；10*10+0=100（clamp 上限）；-5*2+5=-5 → 0（clamp 下限）；
+    // 100*3+2=302 → 100。
+    assert_eq!(out_col.len(), 4);
+    assert_eq!(gap67_score(&out_col[0]), 7.0);
+    assert_eq!(gap67_score(&out_col[1]), 100.0);
+    assert_eq!(gap67_score(&out_col[2]), 0.0);
+    assert_eq!(gap67_score(&out_col[3]), 100.0);
 }
 
 // ---------------------------------------------------------------------------

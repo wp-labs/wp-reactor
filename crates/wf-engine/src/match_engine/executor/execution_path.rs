@@ -393,6 +393,21 @@ mod tests {
         };
         assert_path(&plan, ExecutionPath::ColumnarEach);
 
+        // gap-6 review（2026-09-02）：常量×list-index 字段（`2.0 * e.tags[0]`）
+        // 归一般 cvec（MulConst 快通道 value_at 只读 flat 列）→ 列式。
+        let mut plan = each_base();
+        plan.score_plan = ScorePlan {
+            expr: Expr::BinOp {
+                op: BinOp::Mul,
+                left: Box::new(Expr::Number(2.0)),
+                right: Box::new(Expr::Field(FieldRef::Path {
+                    alias: "e".into(),
+                    segments: vec![PathSegment::Field("tags".into()), PathSegment::Index(0)],
+                })),
+            },
+        };
+        assert_path(&plan, ExecutionPath::ColumnarEach);
+
         // gap-7（2026-09-02 收口）：entity 非字面量/flat 的可列式表达式
         // （list-index `e.tags[0]`、flat 组件 Add）→ 批级 entity_cvec → 列式。
         let mut plan = each_base();
@@ -612,6 +627,23 @@ mod tests {
                 qualifier: None,
                 name: "upper".into(),
                 args: vec![Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))],
+            },
+        };
+        assert_path(&plan, ExecutionPath::EagerRows);
+        // 常量×深嵌套 Path（`2.0 * e.obj.x[0]`，非列式）→ 仍行式。
+        let mut plan = each_base();
+        plan.score_plan = ScorePlan {
+            expr: Expr::BinOp {
+                op: BinOp::Mul,
+                left: Box::new(Expr::Number(2.0)),
+                right: Box::new(Expr::Field(FieldRef::Path {
+                    alias: "e".into(),
+                    segments: vec![
+                        PathSegment::Field("obj".into()),
+                        PathSegment::Field("x".into()),
+                        PathSegment::Index(0),
+                    ],
+                })),
             },
         };
         assert_path(&plan, ExecutionPath::EagerRows);
