@@ -8100,3 +8100,154 @@ fn fire_trigger_projection_none_when_ctx_untrackable() {
         "All（合成字段引用）→ 无规则级投影"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M1 review ①（2026-09-02 审计）：multi-alias / Path 读集与 fire 投影——
+// field_ref_name 剥 alias、Path 取 root，Named 含跨 alias 裸名；单窗批上
+// to_event 只物化本批列。三不变式：
+//   1) Named ⊇ eval 从 ctx 读的每个裸名（visit_expr_fields 穷尽 + force_all 兜底）；
+//   2) 跨窗/跨 alias 裸名若不在驱动窗批 schema → 不幻影物化（to_event 跳过）；
+//   3) 同名折叠成单裸名（集合语义），投影恒为超集方向（不会漏读）。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_close_ctx_fields_multi_alias_and_path_collapse_to_bare_roots() {
+    use super::{CloseCtxFields, plan_close_ctx_fields};
+
+    // 多 alias + 深 Path + 同名两读：entity=auction（alias b）、yield1=
+    // `b.obj.x[0]`（Path root=obj）、yield2/3=`c.sip` 与 `e2.sip`（同裸名两 alias）。
+    let mut plan = simple_rule_plan(
+        "alias_path_audit",
+        simple_plan(vec![], vec![]),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan.binds[0].alias = "c".into();
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "deep".into(),
+            value: Expr::Field(FieldRef::Path {
+                alias: "b".into(),
+                segments: vec![
+                    PathSegment::Field("obj".into()),
+                    PathSegment::Field("x".into()),
+                    PathSegment::Index(0),
+                ],
+            }),
+        },
+        YieldField {
+            name: "sip_out".into(),
+            value: Expr::Field(FieldRef::Qualified("c".into(), "sip".into())),
+        },
+        YieldField {
+            name: "sip_again".into(),
+            value: Expr::Field(FieldRef::Qualified("e2".into(), "sip".into())),
+        },
+    ];
+
+    let fields = plan_close_ctx_fields(&plan);
+    match &fields {
+        CloseCtxFields::Named(set) => {
+            // 裸名/root 入集：Path root=obj（非 alias b、非叶子 x），Qualified
+            // 剥 alias（auction/sip）。
+            assert!(set.contains("auction"), "entity 裸名入集");
+            assert!(set.contains("obj"), "Path root 入集（读集需物化整列）");
+            assert!(set.contains("sip"), "Qualified 剥 alias 入集");
+            // 不误收：alias、Path 中间/叶子段、未引用列。
+            assert!(!set.contains("b"), "alias 不入集");
+            assert!(!set.contains("c"), "alias 不入集");
+            assert!(!set.contains("e2"), "alias 不入集");
+            assert!(!set.contains("x"), "Path 非 root 段不入集");
+            assert!(!set.contains("tags"), "未引用列不入集");
+            assert_eq!(set.len(), 3, "同名跨 alias 折叠：{{obj, sip, auction}}");
+        }
+        _ => panic!("无函数/合成字段引用应窄化为 Named，got {fields:?}"),
+    }
+}
+
+#[test]
+fn fire_projection_multi_window_bare_names_no_phantom_and_path_root_materialized() {
+    use crate::match_engine::{WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY};
+
+    // 读集含跨窗裸名（b.bcol：非驱动窗列）+ Path root（b.obj）+ 驱动窗列
+    // （c.sip）；entity=auction。fire 投影 = 该 Named 集。
+    let mut plan = simple_rule_plan(
+        "m1_multiwin",
+        simple_plan(vec![], vec![]),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan.binds[0].alias = "c".into();
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "deep".into(),
+            value: Expr::Field(FieldRef::Path {
+                alias: "b".into(),
+                segments: vec![PathSegment::Field("obj".into())],
+            }),
+        },
+        YieldField {
+            name: "sip_out".into(),
+            value: Expr::Field(FieldRef::Qualified("c".into(), "sip".into())),
+        },
+        YieldField {
+            name: "other".into(),
+            value: Expr::Field(FieldRef::Qualified("b".into(), "bcol".into())),
+        },
+    ];
+    let exec = RuleExecutor::new(plan);
+    let proj = exec
+        .fire_trigger_projection()
+        .expect("Named 窄化 match 规则必须带规则级 fire 投影");
+    assert!(proj.contains("obj") && proj.contains("sip") && proj.contains("bcol"));
+
+    // 驱动窗批：sip/obj/auction + 未读 tags（array 结构化列）。bcol 不在本批。
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("sip", DataType::Utf8, true),
+        ArrowField::new("obj", DataType::Utf8, true),
+        ArrowField::new("auction", DataType::Utf8, true),
+        ArrowField::new("tags", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                WFL_FIELD_TYPE_ARRAY.to_string(),
+            )]),
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![Some("1.1.1.1")])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some(r#"{"x":[7]}"#)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("99")])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some(r#"["prod"]"#)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let ev = ColumnarEvent::with_index_projected(
+        &batch,
+        0,
+        build_field_index(&batch),
+        Some(Arc::clone(&proj)),
+    );
+    let materialized = ev.to_event();
+
+    // 不变式 2/3：本批读集列物化（含 Path root obj）；跨窗裸名 bcol 不是本批
+    // 列 → 不幻影物化；未读列 tags 不解析。
+    assert_eq!(materialized.fields.len(), 3, "只物化本批读集列");
+    assert_eq!(materialized.fields.get("sip"), Some(&str_val("1.1.1.1")));
+    assert_eq!(
+        materialized.fields.get("obj"),
+        Some(&str_val(r#"{"x":[7]}"#)),
+        "Path root 整列物化（JSON 文本；深度解析由 eval 按需）"
+    );
+    assert!(
+        !materialized.fields.contains_key("bcol"),
+        "跨窗裸名非本批列 → 无幻影键"
+    );
+    assert!(
+        !materialized.fields.contains_key("tags"),
+        "未引用结构化列不解析"
+    );
+}

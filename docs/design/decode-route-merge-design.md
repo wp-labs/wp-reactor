@@ -435,6 +435,20 @@ rule_task RowEvent 投影选择。对拍：`fire_trigger_projection_narrows_to_r
 untrackable`（合成字段 → All → None）。实测 qradar rules 段 serde_json 权重
 -98%（to_event 不再解析未引用结构化列）。
 
+> **M1 review ① 审计（2026-09-02，结论=不破 produce）**：multi-alias/Path 读集
+> 正确性。`field_ref_name` 剥 alias、Path 取 root → Named 含跨 alias 裸名，疑点
+> 是「跨窗裸名投影是否错物化/漏物化」。实证三不变式成立：
+> (1) 触发行 `RowEvent::Columnar` 的 batch 恒为**单窗**（`DeferredRows.batch`），
+> to_event 遍历该批 FieldIndex——任何投影只物化本批列；
+> (2) Named ⊇ eval 从 ctx 读的每个裸名（visit_expr_fields 穷尽 + 函数/合成
+> 字段 force_all 兜底）→ 被投影裁掉的列必然不可读；
+> (3) All/Named 决策在 build_eval_context 注入门控与 fire 投影间同源（None ↔ All）。
+> 对拍：`plan_close_ctx_fields_multi_alias_and_path_collapse_to_bare_roots`（剥
+> alias/Path root/同名折叠入集，不误收 alias/叶子段）/
+> `fire_projection_multi_window_bare_names_no_phantom_and_path_root_materialized`
+> （跨窗裸名非本批列 → to_event 无幻影键；Path root 整列物化；未读结构化列
+> 不解析）。
+
 **终态后续（M2 已落 2026-09-02；M3 未开始）**：M2 = `executor::eval` 泛型化——
 L3/输出 eval 族（`eval_yield_expr*` / `eval_bool_expr` / `eval_expr_with_l3` /
 `eval_score` / `eval_entity_id` + builtins/step_data/utils）ctx 从 `&Event` 改
