@@ -172,6 +172,9 @@ fn synthetic_close(rule_name: &str, values: &[f64], labels: &[String]) -> CloseO
         row_field_names: None,
         event_first_time_nanos: 0,
         event_last_time_nanos: 1_799_000_000_000,
+        first_match_time_nanos: None,
+        evidence_first_time_nanos: 0,
+        evidence_last_time_nanos: 1_799_000_000_000,
         window_start_time_nanos: 0,
         window_end_time_nanos: 1_800_000_000_000,
     }

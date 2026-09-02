@@ -25,7 +25,8 @@ pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
             | SystemVar::EvidenceEndTime
             | SystemVar::WindowStartTime
             | SystemVar::WindowEndTime
-            | SystemVar::EmitTime,
+            | SystemVar::EmitTime
+            | SystemVar::FirstMatchTime,
         ) => Some(ValType::Base(BaseType::Time)),
         Expr::WfuMeta(field) => Some(ValType::Base(field.base_type())),
         Expr::Field(fref) => match fref {

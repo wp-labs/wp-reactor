@@ -585,13 +585,20 @@ rule alert_entity_rule {
 
 | 变量 | 类型 | 语义 |
 |------|------|------|
-| `@event_first_time` | `time` | 本次命中证据里的第一条事件时间 |
-| `@event_last_time` | `time` | 本次命中证据里的最后一条事件时间 |
-| `@evidence_start_time` | `time` | 语义别名，等价于 `@event_first_time` |
-| `@evidence_end_time` | `time` | 语义别名，等价于 `@event_last_time` |
+| `@event_first_time` | `time` | 窗口实例**候选事件**跨度起点：进入该实例的第一条被接受事件的时间（fixed 窗口 ≠ 桶起点） |
+| `@event_last_time` | `time` | 候选事件跨度终点：进入该实例的最后一条被接受事件的时间 |
+| `@evidence_start_time` | `time` | 本次命中所用**证据**（被接受为命中依据的事件）跨度起点 |
+| `@evidence_end_time` | `time` | 证据跨度终点（例如阈值规则下触发命中那条事件的时间） |
+| `@first_match_time` | `time` | 实例首次完整命中（产生 match/close 结果）的引擎处理墙钟；accu 重复输出保持首次值 |
 | `@window_start_time` | `time` | 规则窗口开始时间 |
 | `@window_end_time` | `time` | 规则窗口结束时间 |
 | `@emit_time` | `time` | 本次输出记录的稳定产出时间 |
+
+时间语义区分（issue #82）：
+
+- **候选事件跨度**（`@event_first_time` / `@event_last_time`）：窗口内进入该实例的全部被接受事件的首尾——适合 `first_seen` / `last_seen` 一类“该实体在窗口内何时开始/最后出现”的字段。
+- **证据跨度**（`@evidence_start_time` / `@evidence_end_time`）：实际构成这次命中的事件跨度。对阈值规则，若窗口里还有更多事件尚未达到触发即到达（或 guard 拒绝），证据终点可能早于候选终点；两类规则一致时两组相等。
+- **事件时间**来自输入事件字段，**处理墙钟**（`@first_match_time`）来自引擎处理时刻，不应混用。
 
 推荐在输出 window 中显式声明业务字段：
 
@@ -630,7 +637,7 @@ yield security_alerts (
 - 这些变量只允许在 `yield` 表达式里使用。
 - 这些变量在表达式里的数值表示为 epoch milliseconds；写入 `time` 字段时会按时间类型输出。
 - `@emit_time` 在同一条输出记录内必须保持稳定，多次引用取同一个值。
-- `@event_first_time` / `@event_last_time` 表达证据事件时间；`@window_start_time` / `@window_end_time` 表达规则窗口边界，不应混用。
+- `@event_first_time` / `@event_last_time` 表达窗口内候选事件的首尾；`@evidence_start_time` / `@evidence_end_time` 表达本次命中的证据跨度；`@window_start_time` / `@window_end_time` 表达规则窗口边界，不应混用。
 
 #### 稳定统计上下文
 

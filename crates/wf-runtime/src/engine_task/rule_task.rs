@@ -1294,6 +1294,11 @@ impl RuleTask {
         // (nanos, formatted) pair — the executor caches the formatted string
         // and Arc-shares it across every record it builds this batch.
         let batch_emit_nanos = self.cached_wall_nanos.load(Ordering::Relaxed) as i64;
+        // 注入批次墙钟（issue #82：`@first_match_time` 语义）——该批内实例首次
+        // 命中时记录的引擎处理时钟与输出 emit_time 同源（批次级一次 now()）。
+        if let Some(machine) = self.machine.as_mut() {
+            machine.set_processing_wall(batch_emit_nanos);
+        }
         // On-each columnar fast path: skip the per-row loop entirely. Hit rows
         // come from the (absent-or-columnar) bind-filter masks — with the gate
         // in `each_plan_columnar_safe`, a `None` mask means no filter (every
@@ -2603,6 +2608,9 @@ impl RuleTask {
         let (rule_name, closes, routed) = {
             let machine = self.machine.as_mut().expect("checked above");
             let rule_name = machine.rule_name().to_string();
+            // 注入本次扫描的处理墙钟（issue #82）——与 cached_wall_nanos 同源
+            // （闭置后的墙钟兜底扫描也刚刷新过它）。
+            machine.set_processing_wall(self.cached_wall_nanos.load(Ordering::Relaxed) as i64);
             if self.conv_sink.is_some() {
                 // Timeout scan runs off the event hot path (pipeline idle), so it
                 // uses the **unbounded** expiry budget: fixed-window rules whose
@@ -2847,6 +2855,9 @@ impl RuleTask {
         let (rule_name, closes, routed) = {
             let machine = self.machine.as_mut().expect("checked above");
             let rule_name = machine.rule_name().to_string();
+            // 注入本次 flush 的处理墙钟（issue #82）——收口 close 首次命中的
+            // 处理时钟与 emit 侧 cached_wall_nanos 同源。
+            machine.set_processing_wall(self.cached_wall_nanos.load(Ordering::Relaxed) as i64);
             // 2026-08-23 q11 修复（分片尾部边界）：机器水位 = 本 shard 最后
             // 处理行，分片下落后全局数据末尾（尾部几行 bid 的 bidder 在其它
             // shard）——尾部会话 `last_event+gap ≤ 全局末尾` 的会被 close_all

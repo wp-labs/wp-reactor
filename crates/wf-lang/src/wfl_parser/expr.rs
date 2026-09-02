@@ -300,6 +300,7 @@ fn system_var(input: &mut &str) -> ModalResult<Expr> {
         "window_start_time" => Ok(Expr::SystemVar(SystemVar::WindowStartTime)),
         "window_end_time" => Ok(Expr::SystemVar(SystemVar::WindowEndTime)),
         "emit_time" => Ok(Expr::SystemVar(SystemVar::EmitTime)),
+        "first_match_time" => Ok(Expr::SystemVar(SystemVar::FirstMatchTime)),
         _ => crate::wfu_meta::WfuMetaField::from_name(name)
             .filter(|field| field.available_in_yield())
             .map(Expr::WfuMeta)

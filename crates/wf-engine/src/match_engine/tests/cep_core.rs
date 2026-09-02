@@ -138,7 +138,12 @@ fn evidence_time_ignores_events_not_consumed_by_current_step() {
         panic!("expected multi-step match");
     };
 
-    assert_eq!(ctx.event_first_time_nanos, 10_000_000_000);
+    // 证据跨度（issue #82 方案 A）：只含被 step 消费的事件——step1(fail)
+    // 之前的 scan@1s 未消费，不计入证据。
+    assert_eq!(ctx.evidence_first_time_nanos, 10_000_000_000);
+    assert_eq!(ctx.evidence_last_time_nanos, 20_000_000_000);
+    // 候选事件跨度：scan@1s 已进入实例（作为 step2 的早期事件）→ 计入。
+    assert_eq!(ctx.event_first_time_nanos, 1_000_000_000);
     assert_eq!(ctx.event_last_time_nanos, 20_000_000_000);
 }
 
@@ -184,7 +189,14 @@ fn evidence_time_ignores_guard_rejected_events() {
         panic!("expected guarded match");
     };
 
-    assert_eq!(ctx.event_first_time_nanos, 10_000_000_000);
+    // 证据跨度（issue #82 方案 A）：branch guard 拒绝的事件（success@1s）
+    // 不计入证据——证据只含 guard 通过并被接受的事件。
+    assert_eq!(ctx.evidence_first_time_nanos, 10_000_000_000);
+    assert_eq!(ctx.evidence_last_time_nanos, 20_000_000_000);
+    // 候选事件跨度：success@1s 已推进到状态机（生产管道中 bind/guard 过滤在
+    // alias_accepts 层提前进行，不会到状态机；此处直接 advance 驱动反映的是
+    // 状态机收到即候选的口径）。
+    assert_eq!(ctx.event_first_time_nanos, 1_000_000_000);
     assert_eq!(ctx.event_last_time_nanos, 20_000_000_000);
 }
 

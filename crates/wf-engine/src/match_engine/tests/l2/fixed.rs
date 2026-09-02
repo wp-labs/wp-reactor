@@ -159,8 +159,13 @@ fn fixed_close_evidence_time_ignores_guard_rejected_events() {
 
     let expired = sm.scan_expired_at(10_000_000_000);
     assert_eq!(expired.len(), 1);
+    // 证据跨度（issue #82 方案 A）：close 步 guard 拒绝的 success@9s 不计入
+    // 证据；And 模式证据 = event 步 + close 步被接受事件的跨度 [req@1s, fail@5s]。
+    assert_eq!(expired[0].evidence_first_time_nanos, 1_000_000_000);
+    assert_eq!(expired[0].evidence_last_time_nanos, 5_000_000_000);
+    // 候选事件跨度：success@9s 也推进到实例 → 候选末 = last_event_nanos。
     assert_eq!(expired[0].event_first_time_nanos, 1_000_000_000);
-    assert_eq!(expired[0].event_last_time_nanos, 5_000_000_000);
+    assert_eq!(expired[0].event_last_time_nanos, 9_000_000_000);
     assert_eq!(expired[0].last_event_nanos, 9_000_000_000);
     assert_eq!(expired[0].window_end_time_nanos, 10_000_000_000);
 }
@@ -182,8 +187,11 @@ fn fixed_or_close_evidence_time_uses_close_path_only() {
     let StepResult::Matched(ctx) = sm.advance_at("req", &e, 1_000_000_000) else {
         panic!("expected OR event-path match");
     };
+    // fire 时点：候选只有 req@1s → 候选跨度 = [1s,1s]，证据同为 [1s,1s]。
     assert_eq!(ctx.event_first_time_nanos, 1_000_000_000);
     assert_eq!(ctx.event_last_time_nanos, 1_000_000_000);
+    assert_eq!(ctx.evidence_first_time_nanos, 1_000_000_000);
+    assert_eq!(ctx.evidence_last_time_nanos, 1_000_000_000);
 
     sm.advance_at("fail", &e, 8_000_000_000);
 
@@ -192,7 +200,11 @@ fn fixed_or_close_evidence_time_uses_close_path_only() {
     assert!(expired[0].event_emitted);
     assert!(expired[0].close_ok);
     assert_eq!(expired[0].close_mode, CloseMode::Or);
-    assert_eq!(expired[0].event_first_time_nanos, 8_000_000_000);
+    // Or 模式 close 证据只取 close 路径（fail@8s）→ 证据跨度 [8s,8s]。
+    assert_eq!(expired[0].evidence_first_time_nanos, 8_000_000_000);
+    assert_eq!(expired[0].evidence_last_time_nanos, 8_000_000_000);
+    // 候选事件跨度：req@1s（首）+ fail@8s（末）。
+    assert_eq!(expired[0].event_first_time_nanos, 1_000_000_000);
     assert_eq!(expired[0].event_last_time_nanos, 8_000_000_000);
     assert_eq!(expired[0].last_event_nanos, 8_000_000_000);
 }

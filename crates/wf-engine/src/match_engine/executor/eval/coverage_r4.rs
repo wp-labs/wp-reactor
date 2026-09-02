@@ -71,9 +71,12 @@ fn full_meta() -> YieldMeta<'static> {
         summary: Some("s"),
         event_first_time_nanos: Some(1_700_000_000_000_000_000),
         event_last_time_nanos: Some(1_700_000_000_001_000_000),
+        evidence_first_time_nanos: Some(1_700_000_000_000_000_000),
+        evidence_last_time_nanos: Some(1_700_000_000_001_000_000),
         window_start_time_nanos: Some(1_700_000_000_000_000_000),
         window_end_time_nanos: Some(1_700_000_000_060_000_000),
         emit_time_nanos: Some(1_700_000_000_002_000_000),
+        first_match_time_nanos: None,
         time_format: Some("%Y-%m-%d"),
     }
 }

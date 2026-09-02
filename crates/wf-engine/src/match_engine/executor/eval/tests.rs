@@ -3579,6 +3579,53 @@ fn l3_expression_system_and_wfu_vars() {
         ),
         Some(Value::Number(1_700_000_000_000.0))
     );
+    // first_match_time system var（issue #82）→ 引擎处理墙钟（毫秒）
+    assert_eq!(
+        eval_expr_with_l3(
+            &Expr::SystemVar(SystemVar::FirstMatchTime),
+            &ctx,
+            YieldMeta {
+                first_match_time_nanos: Some(1_700_000_000_123_000_000),
+                ..YieldMeta::default()
+            },
+        ),
+        Some(Value::Number(1_700_000_000_123.0))
+    );
+    // event 与 evidence 槽独立（issue #82 方案 A）：@evidence_* 读自己的槽，
+    // 不再是 @event_* 的别名。
+    assert_eq!(
+        eval_expr_with_l3(
+            &Expr::SystemVar(SystemVar::EvidenceStartTime),
+            &ctx,
+            YieldMeta {
+                event_first_time_nanos: Some(1_700_000_000_000_000_000),
+                evidence_first_time_nanos: Some(1_700_000_000_500_000_000),
+                ..YieldMeta::default()
+            },
+        ),
+        Some(Value::Number(1_700_000_000_500.0))
+    );
+    assert_eq!(
+        eval_expr_with_l3(
+            &Expr::SystemVar(SystemVar::EvidenceEndTime),
+            &ctx,
+            YieldMeta {
+                event_last_time_nanos: Some(1_700_000_000_000_000_000),
+                evidence_last_time_nanos: Some(1_700_000_000_600_000_000),
+                ..YieldMeta::default()
+            },
+        ),
+        Some(Value::Number(1_700_000_000_600.0))
+    );
+    // 未注入 first_match 墙钟 → None（空值，不参与求值）
+    assert_eq!(
+        eval_expr_with_l3(
+            &Expr::SystemVar(SystemVar::FirstMatchTime),
+            &ctx,
+            YieldMeta::default(),
+        ),
+        None
+    );
     // wfu meta fields
     let meta = YieldMeta {
         wfx_id: Some("wx-1"),
@@ -3903,6 +3950,9 @@ fn materialize_system_vars_rewrites() {
         window_start_time_nanos: Some(1_700_000_000_000_000_000),
         window_end_time_nanos: Some(1_700_000_000_000_000_000),
         emit_time_nanos: Some(1_700_000_000_000_000_000),
+        evidence_first_time_nanos: Some(1_700_000_000_000_000_000),
+        evidence_last_time_nanos: Some(1_700_000_000_000_000_000),
+        first_match_time_nanos: Some(1_700_000_000_000_000_000),
         wfx_id: Some("wx"),
         ..YieldMeta::default()
     };
@@ -3938,6 +3988,26 @@ fn materialize_system_vars_rewrites() {
     assert_eq!(
         materialize_system_vars(&Expr::SystemVar(SystemVar::EmitTime), score),
         Some(Expr::Number(1_700_000_000_000.0))
+    );
+    // event 与 evidence 槽独立（issue #82 方案 A）。
+    assert_eq!(
+        materialize_system_vars(&Expr::SystemVar(SystemVar::EvidenceStartTime), score),
+        Some(Expr::Number(1_700_000_000_000.0))
+    );
+    assert_eq!(
+        materialize_system_vars(&Expr::SystemVar(SystemVar::FirstMatchTime), score),
+        Some(Expr::Number(1_700_000_000_000.0))
+    );
+    // 未注入 first_match 墙钟（None）→ 不可物化（与 emit_time 同口径）。
+    assert_eq!(
+        materialize_system_vars(
+            &Expr::SystemVar(SystemVar::FirstMatchTime),
+            YieldMeta {
+                emit_time_nanos: Some(1_700_000_000_000_000_000),
+                ..YieldMeta::default()
+            }
+        ),
+        None
     );
     // wfu meta: string / number / bool values
     assert_eq!(

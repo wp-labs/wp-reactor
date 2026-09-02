@@ -481,9 +481,12 @@ impl RuleExecutor {
                                     summary: Some(&summary),
                                     event_first_time_nanos: Some(m.event_first_time_nanos),
                                     event_last_time_nanos: Some(m.event_last_time_nanos),
+                                    evidence_first_time_nanos: Some(m.evidence_first_time_nanos),
+                                    evidence_last_time_nanos: Some(m.evidence_last_time_nanos),
                                     window_start_time_nanos: Some(m.window_start_time_nanos),
                                     window_end_time_nanos: Some(m.window_end_time_nanos),
                                     emit_time_nanos: Some(emit_time_nanos),
+                                    first_match_time_nanos: m.first_match_time_nanos,
                                     time_format: Some(self.output_config().time_format.as_str()),
                                 };
                                 with_yield_eval_scope(|| {
@@ -608,9 +611,12 @@ impl RuleExecutor {
                 summary: Some(&summary),
                 event_first_time_nanos: Some(matched.event_first_time_nanos),
                 event_last_time_nanos: Some(matched.event_last_time_nanos),
+                evidence_first_time_nanos: Some(matched.evidence_first_time_nanos),
+                evidence_last_time_nanos: Some(matched.evidence_last_time_nanos),
                 window_start_time_nanos: Some(matched.window_start_time_nanos),
                 window_end_time_nanos: Some(matched.window_end_time_nanos),
                 emit_time_nanos: Some(emit_time_nanos),
+                first_match_time_nanos: matched.first_match_time_nanos,
                 time_format: Some(self.output_config().time_format.as_str()),
             };
             // 预分配：yield 字段数静态已知——`Vec::from_iter` 对 filter_map

@@ -89,6 +89,9 @@ pub enum SystemVar {
     WindowStartTime,
     WindowEndTime,
     EmitTime,
+    /// 实例首次完整命中的引擎处理墙钟（issue #82）：accu 重复 fire 保持不变、
+    /// 新实例/新窗口重置、未命中无值。
+    FirstMatchTime,
 }
 
 pub use crate::wfu_meta::WfuMetaField;

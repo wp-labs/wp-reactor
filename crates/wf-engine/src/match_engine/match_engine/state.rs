@@ -124,6 +124,13 @@ pub(super) struct Instance {
     pub(super) machine_id: String,
     pub(super) created_at: i64,
     pub(super) last_event_nanos: i64,
+    /// 实例内首条被接受（推进到实例）事件的事件时间（issue #82 方案 A）：
+    /// 候选事件跨度起点 `@event_first_time`。fixed 窗口下独立于桶起点
+    /// `created_at`（桶内首事件可能晚于桶起点）。None = 尚未收到事件。
+    pub(super) first_event_nanos: Option<i64>,
+    /// 实例首次完整命中（match/close 输出）的引擎处理墙钟（issue #82）：
+    /// 首次命中时赋值，accu rearm 保持、reset 清空；未命中为 None。
+    pub(super) first_hit_wall_nanos: Option<i64>,
     pub(super) current_step: usize,
     pub(super) event_ok: bool,
     pub(super) event_emitted: bool,
@@ -168,6 +175,8 @@ impl Instance {
             machine_id,
             created_at,
             last_event_nanos: created_at,
+            first_event_nanos: None,
+            first_hit_wall_nanos: None,
             current_step: 0,
             event_ok: false,
             event_emitted: false,
@@ -286,6 +295,8 @@ impl Instance {
     pub(super) fn reset(&mut self, plan: &MatchPlan, created_at: i64) {
         self.created_at = created_at;
         self.last_event_nanos = created_at;
+        // 新实例周期（issue #82 方案 A）：候选事件跨度随实例重置。
+        self.first_event_nanos = None;
         self.current_step = 0;
         self.event_ok = false;
         self.event_emitted = false;
@@ -304,6 +315,8 @@ impl Instance {
         self.baselines.clear();
         self.neg_violated = false;
         self.satisfied_flags = vec![false; plan.event_steps.len()];
+        // 新实例周期（issue #82）：first_match 随实例重置。
+        self.first_hit_wall_nanos = None;
     }
 
     /// `on event<accu>` — after firing, reset only the "fired" state so the step
@@ -317,14 +330,38 @@ impl Instance {
         self.completed_steps.clear();
         self.neg_violated = false;
         self.satisfied_flags = vec![false; plan.event_steps.len()];
-        // Kept: created_at, last_event_nanos, step_states, close_step_states,
-        // alias_states, baselines, machine_id.
+        // Kept: created_at, last_event_nanos, first_event_nanos, step_states,
+        // close_step_states, alias_states, baselines, machine_id,
+        // first_hit_wall_nanos (issue #82: accu 保持候选事件跨度与首次命中墙钟
+        // 不变)。
     }
 
     pub(super) fn observe_seen_event_time(&mut self, event_time_nanos: i64) {
+        // 候选事件跨度（issue #82 方案 A）：first = 到达序首条被接受事件。
+        if self.first_event_nanos.is_none() {
+            self.first_event_nanos = Some(event_time_nanos);
+        }
         if event_time_nanos > self.last_event_nanos {
             self.last_event_nanos = event_time_nanos;
         }
+    }
+
+    /// 窗口实例候选事件跨度（issue #82 方案 A，`@event_first_time`/
+    /// `@event_last_time`）：first 为实例内首条被接受事件时间（无事件时回退
+    /// `fallback_first`），last 为最后一条被接受事件时间（`observe` 已并入当前
+    /// 触发事件，故 ≥ 当前事件时间）。
+    pub(super) fn event_span(&self, fallback_first: i64) -> (i64, i64) {
+        let first = self.first_event_nanos.unwrap_or(fallback_first);
+        (first, self.last_event_nanos)
+    }
+
+    /// 返回实例首次命中墙钟（issue #82）：已记录则保持首次值；未记录时写入
+    /// `wall_nanos`（None = 当前驱动未提供处理墙钟，保持未命中状态）。
+    pub(super) fn first_hit_wall(&mut self, wall_nanos: Option<i64>) -> Option<i64> {
+        if self.first_hit_wall_nanos.is_none() {
+            self.first_hit_wall_nanos = wall_nanos;
+        }
+        self.first_hit_wall_nanos
     }
 }
 

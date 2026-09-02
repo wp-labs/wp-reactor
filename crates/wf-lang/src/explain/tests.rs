@@ -375,6 +375,10 @@ fn format_expr_extra_variants() {
         format_expr(&Expr::SystemVar(SystemVar::EmitTime)),
         "@emit_time"
     );
+    assert_eq!(
+        format_expr(&Expr::SystemVar(SystemVar::FirstMatchTime)),
+        "@first_match_time"
+    );
 }
 
 #[test]

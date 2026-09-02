@@ -226,7 +226,7 @@ yield security_alerts (
 )
 ```
 
-这些字段通常在输出 window 中声明为 `time`。`@event_first_time` / `@event_last_time` 表达本次命中证据的首尾事件时间，`@window_start_time` / `@window_end_time` 表达规则窗口边界，`@emit_time` 表达本条输出记录的稳定产出时间。
+这些字段通常在输出 window 中声明为 `time`。`@event_first_time` / `@event_last_time` 表达窗口内候选事件（进入实例的被接受事件）的首尾时间，`@evidence_start_time` / `@evidence_end_time` 表达本次命中证据的首尾事件时间，`@window_start_time` / `@window_end_time` 表达规则窗口边界，`@emit_time` 表达本条输出记录的稳定产出时间。
 
 输出规则触发原因时，优先使用稳定统计上下文，而不是依赖内部字段名或临时聚合表达式：
 

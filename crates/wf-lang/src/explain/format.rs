@@ -120,6 +120,7 @@ fn format_system_var(var: SystemVar) -> &'static str {
         SystemVar::WindowStartTime => "@window_start_time",
         SystemVar::WindowEndTime => "@window_end_time",
         SystemVar::EmitTime => "@emit_time",
+        SystemVar::FirstMatchTime => "@first_match_time",
     }
 }
 

@@ -51,9 +51,12 @@ pub(super) struct YieldMeta<'a> {
     pub(super) summary: Option<&'a str>,
     pub(super) event_first_time_nanos: Option<i64>,
     pub(super) event_last_time_nanos: Option<i64>,
+    pub(super) evidence_first_time_nanos: Option<i64>,
+    pub(super) evidence_last_time_nanos: Option<i64>,
     pub(super) window_start_time_nanos: Option<i64>,
     pub(super) window_end_time_nanos: Option<i64>,
     pub(super) emit_time_nanos: Option<i64>,
+    pub(super) first_match_time_nanos: Option<i64>,
     pub(super) time_format: Option<&'a str>,
 }
 
@@ -179,11 +182,17 @@ pub(super) fn eval_expr_with_l3(
         Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
         Expr::Bool(b) => Some(Value::Bool(*b)),
         Expr::SystemVar(SystemVar::Score) => meta.score.map(Value::Number),
-        Expr::SystemVar(SystemVar::EventFirstTime | SystemVar::EvidenceStartTime) => {
+        Expr::SystemVar(SystemVar::EventFirstTime) => {
             meta.event_first_time_nanos.map(time_nanos_to_value)
         }
-        Expr::SystemVar(SystemVar::EventLastTime | SystemVar::EvidenceEndTime) => {
+        Expr::SystemVar(SystemVar::EventLastTime) => {
             meta.event_last_time_nanos.map(time_nanos_to_value)
+        }
+        Expr::SystemVar(SystemVar::EvidenceStartTime) => {
+            meta.evidence_first_time_nanos.map(time_nanos_to_value)
+        }
+        Expr::SystemVar(SystemVar::EvidenceEndTime) => {
+            meta.evidence_last_time_nanos.map(time_nanos_to_value)
         }
         Expr::SystemVar(SystemVar::WindowStartTime) => {
             meta.window_start_time_nanos.map(time_nanos_to_value)
@@ -192,6 +201,9 @@ pub(super) fn eval_expr_with_l3(
             meta.window_end_time_nanos.map(time_nanos_to_value)
         }
         Expr::SystemVar(SystemVar::EmitTime) => meta.emit_time_nanos.map(time_nanos_to_value),
+        Expr::SystemVar(SystemVar::FirstMatchTime) => {
+            meta.first_match_time_nanos.map(time_nanos_to_value)
+        }
         Expr::WfuMeta(field) => meta.resolve_wfu_meta(*field),
         Expr::Field(fr) => eval_field_value(&ctx.fields, fr),
         Expr::Object(items) => {

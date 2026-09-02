@@ -186,8 +186,22 @@ pub struct MatchedContext {
     pub step_data: Vec<StepData>,
     pub bind_data: Vec<BindData>,
     pub event_time_nanos: i64,
+    /// 窗口实例**候选事件**跨度起点（issue #82 方案 A）：实例内第一条被接受
+    /// 事件的事件时间；fixed 窗口下 ≠ 桶起点（created_at）。yield 的
+    /// `@event_first_time` 读取。
     pub event_first_time_nanos: i64,
+    /// 窗口实例候选事件跨度终点（issue #82 方案 A）：实例内最后一条被接受
+    /// 事件的事件时间（`last_event_nanos`）。yield 的 `@event_last_time` 读取。
     pub event_last_time_nanos: i64,
+    /// 命中**证据**跨度起点（issue #82 方案 A）：构成这次 match 的证据事件
+    /// （completed steps）首条事件时间。yield 的 `@evidence_start_time` 读取。
+    pub evidence_first_time_nanos: i64,
+    /// 命中证据跨度终点。yield 的 `@evidence_end_time` 读取。
+    pub evidence_last_time_nanos: i64,
+    /// 实例首次完整命中的引擎处理墙钟（issue #82）：accu 重复 fire 保持首次值；
+    /// 新实例/新窗口 reset 后为 None；未命中的实例无值。yield 的
+    /// `@first_match_time` 读取。
+    pub first_match_time_nanos: Option<i64>,
     pub window_start_time_nanos: i64,
     pub window_end_time_nanos: i64,
     pub machine_id: String,
@@ -262,10 +276,20 @@ pub struct CloseOutput {
     pub bind_data: Vec<BindData>,
     pub watermark_nanos: i64,
     pub machine_id: String,
+    /// 窗口实例候选事件跨度起点（issue #82 方案 A）：`@event_first_time`。
     pub event_first_time_nanos: i64,
+    /// 窗口实例候选事件跨度终点（issue #82 方案 A）：`@event_last_time`
+    /// （= `last_event_nanos`）。
     pub event_last_time_nanos: i64,
+    /// 命中证据跨度起点（issue #82 方案 A）：`@evidence_start_time`。
+    pub evidence_first_time_nanos: i64,
+    /// 命中证据跨度终点（issue #82 方案 A）：`@evidence_end_time`。
+    pub evidence_last_time_nanos: i64,
     pub window_start_time_nanos: i64,
     pub window_end_time_nanos: i64,
+    /// 实例首次完整命中（match 或 close）的引擎处理墙钟（issue #82）：
+    /// accu 重复输出保持首次值；未命中实例为 None。
+    pub first_match_time_nanos: Option<i64>,
     /// The timestamp of the last event processed by this instance.
     /// Used as the asof join time in the close path to avoid
     /// matching against right-table rows that appeared after the
