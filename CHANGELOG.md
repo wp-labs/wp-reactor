@@ -2,7 +2,14 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [2.0.13] -- latest
+## [2.0.14] -- latest
+
+### Added
+
+- **wf-lang / wf-engine: `match` 分组 key 支持 let 派生字段与多层嵌套路径（issue #83）**——`match<attacker_ip:1d:fixed>`（引用 `let` 派生）与 `match<s.extensions_obj.obj.id:1d:fixed>`（多层嵌套路径）均可作为窗口分组 key，事件按派生叶值进入实例；直接嵌套路径与等价 `let` key 聚合结果一致；缺失/空值与现有 key 缺失行为一致；
+  - v1 边界：派生 key 仅支持纯字段路径形态的 `let`、单事件源规则；与 `rule_shards > 1` 分片、`conv` 组合暂不支持；
+
+## [2.0.13]
 
 ### Added
 
