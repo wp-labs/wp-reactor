@@ -1,3 +1,4 @@
+use winnow::ascii::dec_uint;
 use winnow::combinator::{alt, cut_err, opt, separated};
 use winnow::error::{AddContext, ContextError, ErrMode, StrContext, StrContextValue};
 use winnow::prelude::*;
@@ -299,13 +300,46 @@ fn key_block(input: &mut &str) -> ModalResult<Vec<KeyMapItem>> {
     Ok(items)
 }
 
-/// Parse a field reference for match keys: `ident`, `ident.ident`, or `ident["string"]`
+/// Parse a field reference for match keys: `ident`, `ident.ident`, a multi-level
+/// nested path `ident.a.b.c` / `ident.obj[0].name` (issue #83), or `ident["string"]`.
+///
+/// 与表达式上下文（`expr.rs` 字段解析）同构：单层限定 → `Qualified`（向后兼容），
+/// 更深 → `Path`；段可含 `[index]`。
 fn field_ref(input: &mut &str) -> ModalResult<FieldRef> {
     ws_skip.parse_next(input)?;
     let first = ident.parse_next(input)?;
     if opt(literal(".")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
         let second = cut_err(ident).parse_next(input)?;
-        Ok(FieldRef::Qualified(first.to_string(), second.to_string()))
+        ws_skip.parse_next(input)?;
+        // Consume further segments: `.ident` members and `[integer]` indices.
+        let mut segments = vec![PathSegment::Field(second.to_string())];
+        loop {
+            if opt(literal(".")).parse_next(input)?.is_some() {
+                ws_skip.parse_next(input)?;
+                let seg = cut_err(ident).parse_next(input)?;
+                ws_skip.parse_next(input)?;
+                segments.push(PathSegment::Field(seg.to_string()));
+            } else if opt(literal("[")).parse_next(input)?.is_some() {
+                ws_skip.parse_next(input)?;
+                let idx: usize = cut_err(dec_uint).parse_next(input)?;
+                ws_skip.parse_next(input)?;
+                cut_err(literal("]")).parse_next(input)?;
+                ws_skip.parse_next(input)?;
+                segments.push(PathSegment::Index(idx));
+            } else {
+                break;
+            }
+        }
+        // Single level → backward-compatible Qualified; deeper → Path.
+        Ok(if segments.len() == 1 {
+            FieldRef::Qualified(first.to_string(), second.to_string())
+        } else {
+            FieldRef::Path {
+                alias: first.to_string(),
+                segments,
+            }
+        })
     } else if opt(literal("[")).parse_next(input)?.is_some() {
         ws_skip.parse_next(input)?;
         let key = cut_err(quoted_string).parse_next(input)?;

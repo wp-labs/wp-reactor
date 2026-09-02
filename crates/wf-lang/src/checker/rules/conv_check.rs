@@ -1,8 +1,25 @@
-use crate::ast::{RuleDecl, WindowMode};
+use crate::ast::{FieldRef, RuleDecl, WindowMode};
 
 use crate::checker::{CheckError, Severity};
 
 pub fn check_conv(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckError>) {
+    // conv 自动聚合窗按 match key 建字段（类型取 schema 字段）；派生/嵌套路径
+    // key（issue #83）的值由事件域表达式产生、conv 窗 schema 无法静态定字段名/
+    // 类型 → v1 拒绝组合。
+    if rule.conv.is_some() {
+        for key in &rule.match_clause.keys {
+            let derived = matches!(key, FieldRef::Path { .. })
+                || matches!(key, FieldRef::Simple(name) if rule.lets.iter().any(|l| &l.name == name));
+            if derived {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "conv block 与派生/嵌套路径 match key 不能组合使用（v1）；请先用顶层字段 key，或在接入层把嵌套值上提".to_string(),
+                });
+            }
+        }
+    }
     // conv 消费 close 收口批：fixed 桶与 hop 窗口的 close 均按窗口边界成批
     // （hop 在 slide 对齐时刻收口），语义成立；sliding/session 的 close 时机
     // 由首事件/会话决定，无固定批边界，仍拒绝。

@@ -140,6 +140,7 @@ impl JoinKey {
 /// Outcome of feeding one event into the state machine.
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
 #[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
+#[allow(clippy::large_enum_variant)] // MatchedContext 携带 step/时间元数据；Box 化会给热路径加分配
 pub enum StepResult {
     /// Event was consumed but no step boundary was crossed.
     Accumulate,

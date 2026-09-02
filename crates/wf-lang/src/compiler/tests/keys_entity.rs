@@ -50,6 +50,103 @@ rule compound {
 }
 
 // =========================================================================
+// 6c. issue #83 — 派生（let）/嵌套路径 key 编译
+// =========================================================================
+
+/// security window with a structured `roles_obj` object field.
+fn structured_window() -> WindowSchema {
+    make_window(
+        "sec_events",
+        vec!["sec_stream"],
+        vec![
+            ("sip", bt(BaseType::Ip)),
+            ("roles_obj", crate::schema::FieldType::Object),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    )
+}
+
+#[test]
+fn compile_let_derived_key_inlines_to_field_ref() {
+    // match key 引用 let（纯字段路径定义）→ 编译内联为等值 FieldRef::Path。
+    let schemas = [structured_window(), output_window()];
+    let plans = compile_with(
+        r#"
+rule r {
+    events { s : sec_events }
+    let attacker_ip = s.roles_obj.attacker.endpoint.ip
+    match<attacker_ip:5m> {
+        on event { s | count >= 1; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#,
+        &schemas,
+    );
+    let keys = &plans[0].match_plan.keys;
+    assert_eq!(keys.len(), 1);
+    assert_eq!(
+        keys[0],
+        FieldRef::Path {
+            alias: "s".into(),
+            segments: vec![
+                crate::ast::PathSegment::Field("roles_obj".into()),
+                crate::ast::PathSegment::Field("attacker".into()),
+                crate::ast::PathSegment::Field("endpoint".into()),
+                crate::ast::PathSegment::Field("ip".into()),
+            ],
+        }
+    );
+}
+
+#[test]
+fn compile_nested_path_key_equals_inlined_let_key() {
+    // 直接嵌套路径 key 与等价 let key 编译产物一致（issue #83 验收：聚合结果一致）。
+    let schemas = [structured_window(), output_window()];
+    let direct = compile_with(
+        r#"
+rule r {
+    events { s : sec_events }
+    match<s.roles_obj.attacker.endpoint.ip:5m> {
+        on event { s | count >= 1; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#,
+        &schemas,
+    );
+    let via_let = compile_with(
+        r#"
+rule r {
+    events { s : sec_events }
+    let attacker_ip = s.roles_obj.attacker.endpoint.ip
+    match<attacker_ip:5m> {
+        on event { s | count >= 1; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#,
+        &schemas,
+    );
+    assert_eq!(direct[0].match_plan.keys, via_let[0].match_plan.keys);
+    assert_eq!(
+        direct[0].match_plan.keys,
+        vec![FieldRef::Path {
+            alias: "s".into(),
+            segments: vec![
+                crate::ast::PathSegment::Field("roles_obj".into()),
+                crate::ast::PathSegment::Field("attacker".into()),
+                crate::ast::PathSegment::Field("endpoint".into()),
+                crate::ast::PathSegment::Field("ip".into()),
+            ],
+        }]
+    );
+}
+
+// =========================================================================
 // 6b. join-then-key (Path A): key_join compilation
 // =========================================================================
 

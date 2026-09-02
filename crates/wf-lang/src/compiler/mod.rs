@@ -246,6 +246,20 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
     let yield_plan = compile_yield(&rule.yield_clause, file, &labels);
     let binds = compile_binds(&rule.events);
     let mut match_plan = compile_match(&rule.match_clause, false, &binds, &rule.joins, schemas);
+    // issue #83：派生 key（match key 引用 let 派生字段）内联为等值字段引用。
+    // checker 已限定此类 let 定义为纯字段/嵌套路径形态，内联后 keys 仍是
+    // `Vec<FieldRef>`（Path 形态由引擎按嵌套路径求值），无需额外派生表，且
+    // 与直接写嵌套路径 key 的聚合结果一致。key_mapping 的 logical key 不内联。
+    if match_plan.key_map.is_none() {
+        for key in &mut match_plan.keys {
+            if let FieldRef::Simple(name) = key
+                && let Some(decl) = rule.lets.iter().find(|l| l.name.as_str() == name.as_str())
+                && let Expr::Field(fr) = &decl.expr
+            {
+                *key = fr.clone();
+            }
+        }
+    }
     let bind_tracking = collect_rule_bind_tracking(
         &score_plan.expr,
         &entity_plan.entity_id_expr,

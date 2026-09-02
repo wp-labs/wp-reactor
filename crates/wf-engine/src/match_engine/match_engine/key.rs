@@ -322,15 +322,56 @@ pub(super) fn extract_key<E: FieldSource + ?Sized>(
     Some(result)
 }
 
+/// 在已取出的 root `Value` 上沿 `segments[1..]`（首段为 root 成员名）行走，
+/// 返回叶值（借用查找、叶 clone）；缺成员/越界/类型不符 → None。
+fn path_tail_walk(value: &Value, segments: &[PathSegment]) -> Option<Value> {
+    let mut value = value;
+    for segment in segments.iter().skip(1) {
+        match segment {
+            PathSegment::Field(name) => match value {
+                Value::Object(map) => value = map.get(name.as_str())?,
+                _ => return None,
+            },
+            PathSegment::Index(idx) => match value {
+                Value::Array(items) => value = items.get(*idx)?,
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    Some(value.clone())
+}
+
 pub(crate) fn extract_key_simple<E: FieldSource + ?Sized>(
     event: &E,
     keys: &[FieldRef],
 ) -> Option<Vec<Value>> {
     let mut result = Vec::with_capacity(keys.len());
+    // 结构化 root 解析缓存（issue #83）：同一事件多条嵌套 key 共享同一 root 的
+    // 一次 `field_value`（列式下 = 一次 JSON parse），随后借用缓存 walk。
+    let mut root_cache: Vec<(String, Value)> = Vec::new();
     for key in keys {
-        let field_name = field_ref_name(key);
-        let val = event.field_value(field_name)?;
-        result.push(val);
+        match key {
+            FieldRef::Path { segments, .. } => {
+                let Some(PathSegment::Field(root)) = segments.first() else {
+                    return None;
+                };
+                let root_value = match root_cache.iter().position(|(r, _)| r == root) {
+                    Some(i) => &root_cache[i].1,
+                    None => {
+                        let v = event.field_value(root.as_str())?;
+                        root_cache.push((root.clone(), v.clone()));
+                        root_cache.last().map(|(_, v)| v).expect("just pushed")
+                    }
+                };
+                result.push(path_tail_walk(root_value, segments)?);
+            }
+            _ => {
+                let field_name = field_ref_name(key);
+                let val = event.field_value(field_name)?;
+                result.push(val);
+            }
+        }
     }
     Some(result)
 }
@@ -388,25 +429,11 @@ pub(crate) fn eval_field_value(
     let FieldRef::Path { segments, .. } = fr else {
         return fields.get(field_ref_name(fr)).cloned();
     };
-    let mut iter = segments.iter();
-    let Some(PathSegment::Field(root)) = iter.next() else {
+    let Some(PathSegment::Field(root)) = segments.first() else {
         return None;
     };
-    let mut value = fields.get(root.as_str())?.clone();
-    for segment in iter {
-        match segment {
-            PathSegment::Field(name) => match value {
-                Value::Object(map) => value = map.get(name.as_str())?.clone(),
-                _ => return None,
-            },
-            PathSegment::Index(idx) => match value {
-                Value::Array(items) => value = items.get(*idx)?.clone(),
-                _ => return None,
-            },
-            _ => return None,
-        }
-    }
-    Some(value)
+    let value = fields.get(root.as_str())?;
+    path_tail_walk(value, segments)
 }
 
 /// [`eval_field_value`] over a [`FieldSource`] (eager `Event` or columnar
@@ -417,25 +444,11 @@ pub(crate) fn eval_field_value_src(src: &dyn FieldSource, fr: &FieldRef) -> Opti
     let FieldRef::Path { segments, .. } = fr else {
         return src.field_value(field_ref_name(fr));
     };
-    let mut iter = segments.iter();
-    let Some(PathSegment::Field(root)) = iter.next() else {
+    let Some(PathSegment::Field(root)) = segments.first() else {
         return None;
     };
-    let mut value = src.field_value(root.as_str())?;
-    for segment in iter {
-        match segment {
-            PathSegment::Field(name) => match value {
-                Value::Object(map) => value = map.get(name.as_str())?.clone(),
-                _ => return None,
-            },
-            PathSegment::Index(idx) => match value {
-                Value::Array(items) => value = items.get(*idx)?.clone(),
-                _ => return None,
-            },
-            _ => return None,
-        }
-    }
-    Some(value)
+    let value = src.field_value(root.as_str())?;
+    path_tail_walk(&value, segments)
 }
 
 /// Append `v` as a plain decimal integer — byte-identical to
@@ -530,6 +543,7 @@ fn number_to_string(n: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::match_engine::match_engine::types::Event;
     use wf_lang::ast::PathSegment;
 
     fn fields(pairs: &[(&str, Value)]) -> EngineHashMap<smol_str::SmolStr, Value> {
@@ -642,6 +656,128 @@ mod tests {
             eval_field_value(&f, &FieldRef::Qualified("e".into(), "sip".into())),
             Some(Value::Str("10.0.0.1".into()))
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // issue #83 — extract_key_simple：嵌套路径 key / 同 root 缓存 / 混合 key
+    // ---------------------------------------------------------------------
+
+    /// roles_obj{ attacker{endpoint{ip}}, category } 双层嵌套值。
+    fn roles_fields() -> EngineHashMap<smol_str::SmolStr, Value> {
+        fields(&[(
+            "roles_obj",
+            Value::Object(EngineHashMap::<smol_str::SmolStr, Value>::from_iter([
+                (
+                    "attacker".into(),
+                    Value::Object(EngineHashMap::<smol_str::SmolStr, Value>::from_iter([(
+                        "endpoint".into(),
+                        Value::Object(EngineHashMap::<smol_str::SmolStr, Value>::from_iter([(
+                            "ip".into(),
+                            Value::Str("10.0.0.1".into()),
+                        )])),
+                    )])),
+                ),
+                ("category".into(), Value::Str("brute".into())),
+            ])),
+        )])
+    }
+
+    fn event_of(f: EngineHashMap<smol_str::SmolStr, Value>) -> Event {
+        Event { fields: f }
+    }
+
+    #[test]
+    fn extract_key_path_walks_to_leaf() {
+        let ev = event_of(roles_fields());
+        let keys = [path(
+            "e",
+            &[
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("attacker".into()),
+                PathSegment::Field("endpoint".into()),
+                PathSegment::Field("ip".into()),
+            ],
+        )];
+        assert_eq!(
+            extract_key_simple(&ev, &keys),
+            Some(vec![Value::Str("10.0.0.1".into())])
+        );
+    }
+
+    #[test]
+    fn extract_key_path_missing_leaf_skips_event() {
+        let ev = event_of(roles_fields());
+        let keys = [path(
+            "e",
+            &[
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("attacker".into()),
+                PathSegment::Field("missing".into()),
+            ],
+        )];
+        assert_eq!(extract_key_simple(&ev, &keys), None);
+        // root 缺失同样 None（与普通 key 缺失一致）。
+        let ev2 = event_of(fields(&[("sip", Value::Str("x".into()))]));
+        assert_eq!(extract_key_simple(&ev2, &keys), None);
+    }
+
+    #[test]
+    fn extract_key_shared_root_cache_yields_each_leaf() {
+        // 同一 root 的两条嵌套 key：结果与独立求值一致（缓存共享不改变语义）。
+        let ev = event_of(roles_fields());
+        let keys = vec![
+            path(
+                "e",
+                &[
+                    PathSegment::Field("roles_obj".into()),
+                    PathSegment::Field("attacker".into()),
+                    PathSegment::Field("endpoint".into()),
+                    PathSegment::Field("ip".into()),
+                ],
+            ),
+            path(
+                "e",
+                &[
+                    PathSegment::Field("roles_obj".into()),
+                    PathSegment::Field("category".into()),
+                ],
+            ),
+        ];
+        assert_eq!(
+            extract_key_simple(&ev, &keys),
+            Some(vec![
+                Value::Str("10.0.0.1".into()),
+                Value::Str("brute".into())
+            ])
+        );
+    }
+
+    #[test]
+    fn extract_key_mixes_flat_and_path() {
+        // 普通 key + 嵌套 key 混用：顺序一致、任一缺失即 None。
+        let mut f = roles_fields();
+        f.insert("sip".into(), Value::Str("9.9.9.9".into()));
+        let ev = event_of(f);
+        let keys = vec![
+            FieldRef::Simple("sip".into()),
+            path(
+                "e",
+                &[
+                    PathSegment::Field("roles_obj".into()),
+                    PathSegment::Field("category".into()),
+                ],
+            ),
+        ];
+        assert_eq!(
+            extract_key_simple(&ev, &keys),
+            Some(vec![
+                Value::Str("9.9.9.9".into()),
+                Value::Str("brute".into())
+            ])
+        );
+        // 缺其中一个普通 key 字段 → None。
+        let ev2 = event_of(roles_fields());
+        assert_eq!(extract_key_simple(&ev2, &keys), None);
     }
 
     #[test]

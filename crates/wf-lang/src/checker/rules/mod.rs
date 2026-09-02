@@ -103,6 +103,8 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
                 &rule.joins,
                 &base_scope,
                 schemas,
+                &rule.lets,
+                true,
                 name,
                 errors,
             );
@@ -174,6 +176,8 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
                     &stage.joins,
                     &stage_scope,
                     schemas,
+                    &[],
+                    false,
                     name,
                     errors,
                 );
@@ -198,6 +202,8 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
                 &stage.joins,
                 &stage_scope,
                 schemas,
+                &[],
+                false,
                 name,
                 errors,
             );
@@ -221,6 +227,8 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
             &rule.joins,
             &final_scope,
             schemas,
+            &[],
+            false,
             name,
             errors,
         );
@@ -432,15 +440,26 @@ fn collect_expr_field_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a FieldRef>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_stage(
     match_clause: &MatchClause,
     joins_list: &[crate::ast::JoinClause],
     scope: &Scope<'_>,
     schemas: &[WindowSchema],
+    lets: &[crate::ast::LetDecl],
+    derived_ok: bool,
     rule_name: &str,
     errors: &mut Vec<CheckError>,
 ) {
-    keys::check_match_keys_clause(match_clause, joins_list, scope, rule_name, errors);
+    keys::check_match_keys_clause(
+        match_clause,
+        joins_list,
+        scope,
+        lets,
+        derived_ok,
+        rule_name,
+        errors,
+    );
     keys::check_session_gap_clause(match_clause, rule_name, errors);
     keys::check_key_mapping_clause(match_clause, scope, rule_name, errors);
 

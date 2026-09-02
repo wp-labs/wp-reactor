@@ -1,9 +1,9 @@
-use crate::ast::{FieldRef, JoinMode, MatchClause, WindowMode};
+use crate::ast::{Expr, FieldRef, JoinMode, MatchClause, PathSegment, WindowMode};
 
 use crate::checker::scope::{self, Scope};
 use crate::checker::types::{ValType, compatible};
 use crate::checker::{CheckError, Severity};
-use crate::schema::BaseType;
+use crate::schema::{BaseType, FieldType};
 
 pub fn check_session_gap_clause(
     match_clause: &MatchClause,
@@ -26,6 +26,8 @@ pub fn check_match_keys_clause(
     match_clause: &MatchClause,
     joins_list: &[crate::ast::JoinClause],
     scope: &Scope<'_>,
+    lets: &[crate::ast::LetDecl],
+    derived_ok: bool,
     rule_name: &str,
     errors: &mut Vec<CheckError>,
 ) {
@@ -33,9 +35,74 @@ pub fn check_match_keys_clause(
     // (join-then-key). Records `(key field, join index)` when one is found.
     let mut join_key: Option<(String, usize)> = None;
 
+    // 派生/嵌套路径 key（issue #83）：v1 仅支持单事件源（driver）规则——派生
+    // key 按事件在事件域上求值，多源规则的事件域不唯一。
+    let driver_count = scope.aliases.len().saturating_sub(scope.join_windows.len());
+    let derived_error = |key_desc: &str, errors: &mut Vec<CheckError>| {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!(
+                "match key `{key_desc}` 是派生/嵌套路径 key，仅支持单事件源规则（v1）；多事件源规则请用各源共有的顶层字段或 key mapping",
+            ),
+        });
+    };
+
     for key in &match_clause.keys {
         match key {
             FieldRef::Simple(field) => {
+                // 派生 key：`let` 绑定优先于事件源字段（与表达式解析一致）。
+                if lets.iter().any(|l| &l.name == field) {
+                    if !derived_ok {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "match key `{field}` 引用 let 派生字段，pipeline stage 暂不支持（v1）"
+                            ),
+                        });
+                        continue;
+                    }
+                    let desc = field.clone();
+                    if driver_count != 1 {
+                        derived_error(&desc, errors);
+                        continue;
+                    }
+                    // let 定义必须是纯字段引用（Field/Path 形态），保证 key 值可由
+                    // 单条事件字段直接求值（v1：不接受函数/字面量派生 key）。
+                    let Some(decl) = lets.iter().find(|l| &l.name == field) else {
+                        continue; // 防御：let_types 来源同 rule.lets，不可达
+                    };
+                    if !matches!(decl.expr, Expr::Field(_)) {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "match key `{field}`：let 定义必须为纯字段/嵌套路径表达式，函数/字面量派生暂不能作为窗口 key（v1）"
+                            ),
+                        });
+                        continue;
+                    }
+                    // key 值类型必须是可哈希标量（float 排除，与现有 key 一致）。
+                    match scope.let_types.get(field.as_str()) {
+                        Some(vt) if val_type_is_key_scalar(vt) => {}
+                        Some(_) => {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                test: None,
+                                message: format!(
+                                    "match key `{field}`：let 派生值必须是标量 key 类型（digit/chars/bool/time/ip/hex；float/object/array 除外）"
+                                ),
+                            });
+                        }
+                        None => {}
+                    }
+                    continue;
+                }
                 // K1: unqualified key must exist in ALL event sources (skip join windows)
                 let driver_missing: Vec<(&str, &crate::schema::WindowSchema)> = scope
                     .aliases
@@ -199,13 +266,93 @@ pub fn check_match_keys_clause(
                     });
                 }
             }
-            FieldRef::Path { .. } => {
-                errors.push(CheckError {
-                    severity: Severity::Error,
-                    rule: Some(rule_name.to_string()),
-                    test: None,
-                    message: "nested field path not supported in match key".to_string(),
-                });
+            FieldRef::Path { alias, segments } => {
+                // issue #83：多层嵌套路径作为分组 key。v1 范围：单事件源规则、
+                // root 字段存在且为结构化（object/array）；更深的段无 schema，
+                // 缺失/类型不符由运行期按现有 key 缺失语义跳过。
+                let desc = crate::explain::format_expr(&Expr::Field(key.clone()));
+                if !derived_ok {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "match key `{desc}`：嵌套路径 key，pipeline stage 暂不支持（v1）"
+                        ),
+                    });
+                    continue;
+                }
+                if !scope.aliases.contains_key(alias.as_str()) {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("match key `{desc}` references unknown alias `{alias}`"),
+                    });
+                    continue;
+                }
+                if scope.join_windows.contains(&alias.as_str()) {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "match key `{desc}` references join window `{alias}`; join-side keys \
+                             must be unqualified"
+                        ),
+                    });
+                    continue;
+                }
+                if driver_count != 1 {
+                    derived_error(&desc, errors);
+                    continue;
+                }
+                let Some(PathSegment::Field(root)) = segments.first() else {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "match key `{desc}`：嵌套路径必须以成员名开始（不支持裸索引路径）"
+                        ),
+                    });
+                    continue;
+                };
+                let root_exists = scope
+                    .aliases
+                    .get(alias.as_str())
+                    .is_some_and(|s| s.fields.iter().any(|f| f.name == *root));
+                if !root_exists {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("match key `{desc}`: field `{root}` not found in window",),
+                    });
+                    continue;
+                }
+                let root_is_structured = scope
+                    .aliases
+                    .get(alias.as_str())
+                    .and_then(|s| s.fields.iter().find(|f| f.name == *root))
+                    .is_some_and(|fd| {
+                        matches!(
+                            fd.field_type,
+                            FieldType::Object | FieldType::ArrayAny | FieldType::Array(_)
+                        )
+                    });
+                if !root_is_structured {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "match key `{desc}`: field `{root}` is not an object/array; use a flat \
+                             top-level key or `let` over a structured field",
+                        ),
+                    });
+                    continue;
+                }
             }
         }
     }
@@ -452,6 +599,21 @@ pub(super) fn is_scalar_key_type(ft: &crate::schema::FieldType) -> bool {
                 | BaseType::Ip
                 | BaseType::Hex
         )
+    )
+}
+
+/// let 派生 key 的值类型必须是可哈希标量（float/object/array 排除）。
+pub(super) fn val_type_is_key_scalar(vt: &ValType) -> bool {
+    matches!(
+        vt,
+        ValType::Base(
+            BaseType::Digit
+                | BaseType::Chars
+                | BaseType::Bool
+                | BaseType::Time
+                | BaseType::Ip
+                | BaseType::Hex,
+        ) | ValType::Bool
     )
 }
 
