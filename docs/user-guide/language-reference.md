@@ -598,6 +598,8 @@ rule alert_entity_rule {
 
 - **候选事件跨度**（`@event_first_time` / `@event_last_time`）：窗口内进入该实例的全部被接受事件的首尾——适合 `first_seen` / `last_seen` 一类“该实体在窗口内何时开始/最后出现”的字段。
 - **证据跨度**（`@evidence_start_time` / `@evidence_end_time`）：实际构成这次命中的事件跨度。对阈值规则，若窗口里还有更多事件尚未达到触发即到达（或 guard 拒绝），证据终点可能早于候选终点；两类规则一致时两组相等。
+- `on event<accu>` 规则：分支证据状态跨 rearm 累积（`collect_set` 等证据逐条递增）→ 证据起点通常就是窗口首条证据事件，候选与证据随窗口共同推进。
+- 乱序到达（事件时间回退）：候选 `first` 取到达序首条事件、`last` 取事件时间最大；证据 `start/end` 取分支记录的事件时间 min/max。
 - **事件时间**来自输入事件字段，**处理墙钟**（`@first_match_time`）来自引擎处理时刻，不应混用。
 
 推荐在输出 window 中显式声明业务字段：

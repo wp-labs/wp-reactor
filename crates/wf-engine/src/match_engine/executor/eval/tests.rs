@@ -3950,8 +3950,9 @@ fn materialize_system_vars_rewrites() {
         window_start_time_nanos: Some(1_700_000_000_000_000_000),
         window_end_time_nanos: Some(1_700_000_000_000_000_000),
         emit_time_nanos: Some(1_700_000_000_000_000_000),
-        evidence_first_time_nanos: Some(1_700_000_000_000_000_000),
-        evidence_last_time_nanos: Some(1_700_000_000_000_000_000),
+        // 与 event 槽取不同值：锁定 @evidence_* 独立读取自己的槽（非别名）。
+        evidence_first_time_nanos: Some(1_700_000_000_500_000_000),
+        evidence_last_time_nanos: Some(1_700_000_000_600_000_000),
         first_match_time_nanos: Some(1_700_000_000_000_000_000),
         wfx_id: Some("wx"),
         ..YieldMeta::default()
@@ -3989,10 +3990,14 @@ fn materialize_system_vars_rewrites() {
         materialize_system_vars(&Expr::SystemVar(SystemVar::EmitTime), score),
         Some(Expr::Number(1_700_000_000_000.0))
     );
-    // event 与 evidence 槽独立（issue #82 方案 A）。
+    // event 与 evidence 槽独立（issue #82 方案 A）——各自读自己的值。
     assert_eq!(
         materialize_system_vars(&Expr::SystemVar(SystemVar::EvidenceStartTime), score),
-        Some(Expr::Number(1_700_000_000_000.0))
+        Some(Expr::Number(1_700_000_000_500.0))
+    );
+    assert_eq!(
+        materialize_system_vars(&Expr::SystemVar(SystemVar::EvidenceEndTime), score),
+        Some(Expr::Number(1_700_000_000_600.0))
     );
     assert_eq!(
         materialize_system_vars(&Expr::SystemVar(SystemVar::FirstMatchTime), score),

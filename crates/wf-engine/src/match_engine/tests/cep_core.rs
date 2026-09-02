@@ -148,6 +148,31 @@ fn evidence_time_ignores_events_not_consumed_by_current_step() {
 }
 
 #[test]
+fn event_span_tracks_arrival_order_first_and_time_max_last() {
+    // issue #82 方案 A：候选跨度 = 到达序首条事件时间 + 时间序最大。乱序到达
+    // （先 9s 后 3s）时 event_first=9s（首条到达）、event_last=9s（时间 max）；
+    // 证据跨度按 branch 记录的时间 min/max = [3s, 9s]——两组独立可辨。
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(2.0))])],
+    );
+    let mut sm = CepStateMachine::new("rule_out_of_order".to_string(), plan, None);
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+
+    assert_eq!(
+        sm.advance_at("fail", &e, 9_000_000_000),
+        StepResult::Accumulate
+    );
+    let StepResult::Matched(ctx) = sm.advance_at("fail", &e, 3_000_000_000) else {
+        panic!("expected match on second (out-of-order) event");
+    };
+    assert_eq!(ctx.event_first_time_nanos, 9_000_000_000);
+    assert_eq!(ctx.event_last_time_nanos, 9_000_000_000);
+    assert_eq!(ctx.evidence_first_time_nanos, 3_000_000_000);
+    assert_eq!(ctx.evidence_last_time_nanos, 9_000_000_000);
+}
+
+#[test]
 fn evidence_time_ignores_guard_rejected_events() {
     let guard = Expr::BinOp {
         op: wf_lang::ast::BinOp::Eq,
