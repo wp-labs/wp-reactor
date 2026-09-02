@@ -407,6 +407,39 @@ loop {
 > 终点判定（§11.3-3）不变：`batch_to_events` / `materialize_rows` /
 > `OnceLock` 调用点归零（仅测试引用）。
 
+### 11.6 终态通用机制：按读集物化 → FieldSource 直读（M1 已落 2026-09-02）
+
+**动机（实测）**：qradar rules 段 CPU 采样 + census 显示——376 条 match 规则**全走
+deferred 列式路径**（无行式整批物化），但 138 条（36%）`trigger_event_needed=true`、
+其 fires 占 40.1%；每 fire `ColumnarEvent::to_event()` 按**窗口并集**投影物化全行
+（conn_events 的 `conn_info: object`/`tags: array` JSON 解析），而 ctx 只读
+`close_ctx_fields::Named` 读集 → 未引用结构化列的 JSON 解析是纯浪费（采样：
+serde_json 2.4k → 46 权重，-98%）。
+
+**机制 = 三件套（已存在，M1 参数化到规则粒度）**：
+1. 编译期读集：`plan_close_ctx_fields`（Named 窄化，覆盖 score/entity/yield/lets/
+   join 左字段/where）；
+2. 物化投影：`ColumnarEvent.projection`（`to_event` 只遍历投影列；`field_value`
+   不看投影 → step/guard 逐事件读列不受影响）；
+3. 运行时接线：rule_task 的 match 行 `RowEvent::Columnar` 用
+   `RuleExecutor::fire_trigger_projection()`（= Named 集）替代窗口并集
+   `materialize_fields`；All（含 `_step_*`/合成字段引用）→ 回退窗口并集（现状）。
+
+字节一致由构造保证：ctx 从 trigger Event 只读 Named 集（`build_eval_context` 按
+`needed.wants` 过滤；ctx-free 快路径直读的 entity/yield 字段也在 Named 内）→
+投影到 Named = 求值需要的全集。
+
+**M1 落地**：`RuleExecutor.fire_trigger_projection`（executor 字段+访问器）、
+rule_task RowEvent 投影选择。对拍：`fire_trigger_projection_narrows_to_rule_read_set`
+（读集入投影/未引用不入 + 结构化列批上 to_event 只物化读集）/`_none_when_ctx_
+untrackable`（合成字段 → All → None）。实测 qradar rules 段 serde_json 权重
+-98%（to_event 不再解析未引用结构化列）。
+
+**终态后续（M2/M3，未开始）**：M2 = `executor::eval` 泛型化（`&Event` →
+`&dyn RowCtx`，Event 实现之；含 L3 `_step_*` 枚举语义 trait 化）；M3 =
+`MatchedContext.trigger_event: Arc<Event>` → 列式行引用（owned Arc batch + row +
+needed），ctx 直读列。M2+M3 到达 §11.3 终点（生产路径 `Event` 归零）。
+
 ### 11.5 与 merge 的关系
 
 - merge（P1-P3）把 route 并入源任务后，非 defer 窗口的物化仍在源任务执行（每批一次、Arc 共享）——

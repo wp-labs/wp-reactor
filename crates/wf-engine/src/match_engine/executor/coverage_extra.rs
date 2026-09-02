@@ -8014,3 +8014,89 @@ fn fire_keeps_trigger_event_when_non_key_yield() {
         .map(|(_, v)| v.clone());
     assert_eq!(action, Some(Value::Str("failed".into())));
 }
+
+// ---------------------------------------------------------------------------
+// M1（P4 终态机制 2026-09-02）：规则级 fire 投影——to_event 只物化 ctx 读的
+// Named 字段（消除窗口并集里未引用结构化列的每 fire JSON 解析）。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fire_trigger_projection_narrows_to_rule_read_set() {
+    use crate::match_engine::{WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY};
+    // key≠读集 的规则形态（c_dip_3 式）：entity=yield 读 sip，key=dip。
+    let mut plan = simple_rule_plan(
+        "m1_proj",
+        simple_plan(vec![], vec![]),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("c".into(), "sip".into())),
+    );
+    plan.binds[0].alias = "c".into();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "dip_out".into(),
+        value: Expr::Field(FieldRef::Qualified("c".into(), "dip".into())),
+    }];
+    let exec = RuleExecutor::new(plan);
+    let proj = exec
+        .fire_trigger_projection()
+        .expect("Named 窄化 match 规则必须带规则级 fire 投影");
+    assert!(proj.contains("sip") && proj.contains("dip"), "读集入投影");
+    assert!(!proj.contains("tags"), "未引用字段不入投影");
+
+    // 投影实际生效：含结构化列的批上 to_event 只物化读集，跳过 tags JSON。
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("sip", DataType::Utf8, true),
+        ArrowField::new("dip", DataType::Utf8, true),
+        ArrowField::new("tags", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                WFL_FIELD_TYPE_ARRAY.to_string(),
+            )]),
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![Some("1.1.1.1")])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("2.2.2.2")])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some(r#"["prod","edge"]"#)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let ev = ColumnarEvent::with_index_projected(
+        &batch,
+        0,
+        build_field_index(&batch),
+        Some(Arc::clone(&proj)),
+    );
+    let materialized = ev.to_event();
+    assert_eq!(materialized.fields.len(), 2, "只物化读集字段");
+    assert_eq!(materialized.fields.get("sip"), Some(&str_val("1.1.1.1")));
+    assert_eq!(materialized.fields.get("dip"), Some(&str_val("2.2.2.2")));
+    assert!(
+        !materialized.fields.contains_key("tags"),
+        "tags 不入 fire 物化"
+    );
+}
+
+#[test]
+fn fire_trigger_projection_none_when_ctx_untrackable() {
+    // `_step_*`/合成字段引用 → close_ctx_fields=All → 无法窄化 → 投影 None
+    // （调用方回退窗口 materialize_fields，行为与现状一致）。
+    let mut plan = simple_rule_plan(
+        "m1_all",
+        simple_plan(vec![], vec![]),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("c".into(), "sip".into())),
+    );
+    plan.yield_plan.fields = vec![YieldField {
+        name: "measure".into(),
+        value: Expr::Field(FieldRef::Simple("_step_0_measure".into())),
+    }];
+    let exec = RuleExecutor::new(plan);
+    assert!(
+        exec.fire_trigger_projection().is_none(),
+        "All（合成字段引用）→ 无规则级投影"
+    );
+}

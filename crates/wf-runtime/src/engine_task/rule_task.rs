@@ -1553,11 +1553,19 @@ impl RuleTask {
                     (hit_cursor < d.hit_indices.len() && d.hit_indices[hit_cursor] as usize == i)
                         .then(|| {
                             hit_cursor += 1;
+                            // M1（P4 终态机制 2026-09-02）：fire `to_event` 用**规则
+                            // 读集**投影（ctx 只读该集）而非窗口并集——消除未引用结构化
+                            // 列的每 fire JSON 解析。无法窄化（All）→ 回退窗口投影。
+                            // 仅影响 to_event；step/guard 的 field_value 直读不看投影。
+                            let proj = self
+                                .executor
+                                .fire_trigger_projection()
+                                .or_else(|| d.projection.clone());
                             RowEvent::Columnar(ColumnarEvent::with_index_projected(
                                 d.batch,
                                 row_index,
                                 Arc::clone(&d.index),
-                                d.projection.clone(),
+                                proj,
                             ))
                         })
                 } else {
