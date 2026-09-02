@@ -37,6 +37,7 @@ const SIDE_ROWS: usize = 10_000;
 fn simple_match_plan() -> MatchPlan {
     MatchPlan {
         keys: vec![],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::ZERO),

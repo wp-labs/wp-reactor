@@ -174,6 +174,7 @@ fn bare_plan() -> wf_lang::plan::RulePlan {
         lets: vec![],
         match_plan: wf_lang::plan::MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: wf_lang::plan::WindowSpec::Sliding(Duration::from_secs(60)),

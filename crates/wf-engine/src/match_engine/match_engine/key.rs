@@ -1,7 +1,8 @@
 use smol_str::{SmolStr, SmolStrBuilder};
-use wf_lang::ast::{FieldRef, PathSegment};
+use wf_lang::ast::{Expr, FieldRef, PathSegment};
 
-use super::types::{EngineHashMap, FieldSource, Value};
+use super::eval::eval_expr_ext;
+use super::types::{EngineHashMap, FieldSource, RollingStats, Value};
 
 // ---------------------------------------------------------------------------
 // Value key — typed, hashable key for distinct-like state
@@ -393,6 +394,66 @@ pub(crate) fn extract_scope_key_from_row<E: FieldSource + ?Sized>(
     alias: &str,
 ) -> Option<ScopeKey> {
     extract_key(source, keys, key_map, alias).map(|values| scope_key_from_values(&values))
+}
+
+/// 混合 scope-key 提取（issue #80）：`keys` 与 `key_exprs` 逐位对齐——
+/// `key_exprs[i] = Some(expr)` 的键位对**触发事件**求表达式（let 派生 key），
+/// `None` 的键位按 `keys[i]` 作事件字段/嵌套路径提取。任一键缺失/求值失败
+/// → `None`（事件跳过，与普通 key 缺失语义一致）。
+///
+/// 仅在存在表达式键位时使用（全 None 走 `extract_scope_key_from_row` 快速
+/// 路径）；事件源统一走 `FieldSource`（Event 行式 / ColumnarEvent 列读逐行），
+/// 表达式求值结果经 `ScopeKey::from_value` 与字段键同构进 typed key。
+pub(crate) fn extract_scope_key_mixed<E: FieldSource>(
+    source: &E,
+    keys: &[FieldRef],
+    key_exprs: &[Option<Expr>],
+    // 无 key_map 时别名不参与提取（与 extract_key_simple 一致），签名保留以
+    // 与 extract_scope_key_from_row 对称（调用方统一传 alias）。
+    _alias: &str,
+) -> Option<ScopeKey> {
+    debug_assert_eq!(
+        keys.len(),
+        key_exprs.len(),
+        "keys 与 key_exprs 必须逐位对齐（编译器装配保证）"
+    );
+    let mut values = Vec::with_capacity(keys.len());
+    for (key, expr) in keys.iter().zip(key_exprs.iter()) {
+        let v = match expr {
+            Some(expr) => {
+                let mut baselines: EngineHashMap<String, RollingStats> = EngineHashMap::default();
+                let v = eval_expr_ext(expr, source, None, &mut baselines)?;
+                // 表达式结果为结构化值 → 与嵌套路径 key 叶为 object/array 一致：
+                // 视为 key 缺失跳过（不让其坍缩到固定 [object] 桶）。
+                if matches!(v, Value::Object(_) | Value::Array(_)) {
+                    return None;
+                }
+                v
+            }
+            None => match key {
+                FieldRef::Path { segments, .. } => {
+                    let Some(PathSegment::Field(root)) = segments.first() else {
+                        return None;
+                    };
+                    let root_value = source.field_value(root.as_str())?;
+                    let leaf = path_tail_walk(&root_value, segments)?;
+                    if matches!(leaf, Value::Object(_) | Value::Array(_)) {
+                        return None;
+                    }
+                    leaf
+                }
+                _ => {
+                    let name = field_ref_name(key);
+                    if name.is_empty() {
+                        return None;
+                    }
+                    source.field_value(name)?
+                }
+            },
+        };
+        values.push(v);
+    }
+    Some(scope_key_from_values(&values))
 }
 
 pub fn field_ref_name(fr: &FieldRef) -> &str {

@@ -84,6 +84,7 @@ fn step(branches: Vec<BranchPlan>) -> StepPlan {
 fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
     MatchPlan {
         keys,
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -108,6 +109,7 @@ fn plan_with_close(
 ) -> MatchPlan {
     MatchPlan {
         keys,
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),

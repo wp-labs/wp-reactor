@@ -123,6 +123,7 @@ fn q5_plan(window_spec: WindowSpec) -> MatchPlan {
     };
     MatchPlan {
         keys: vec![FieldRef::Simple("auction".to_string())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec,

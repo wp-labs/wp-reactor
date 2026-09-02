@@ -139,6 +139,7 @@ fn make_provider_join_task(
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::ZERO),
@@ -342,6 +343,7 @@ fn snapshot_join_buffer_target_gets_retention_pin() {
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::ZERO),

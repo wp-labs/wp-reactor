@@ -345,6 +345,7 @@ fn make_task_inner(
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -522,6 +523,7 @@ fn make_pipeline_stage_task_opts(
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -659,6 +661,7 @@ fn make_each_task_with_bind_filter(
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
@@ -748,6 +751,7 @@ fn make_filtered_match_task() -> (
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -862,6 +866,7 @@ fn make_filtered_close_config() -> (
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -1011,6 +1016,7 @@ fn make_filtered_each_task() -> (
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
@@ -1114,6 +1120,7 @@ fn make_intermediate_each_task() -> (
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
@@ -1242,6 +1249,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
@@ -1355,6 +1363,7 @@ fn make_intermediate_score_tasks() -> (
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
@@ -1440,6 +1449,7 @@ fn make_intermediate_score_tasks() -> (
 
     let downstream_match = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(1)),
@@ -1622,6 +1632,7 @@ fn make_intermediate_score_band_tasks() -> (
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
@@ -1707,6 +1718,7 @@ fn make_intermediate_score_band_tasks() -> (
 
     let downstream_match = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(1)),
@@ -1930,6 +1942,7 @@ fn make_filtered_bind_alias_match_task() -> (
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -2110,6 +2123,7 @@ fn make_window_has_match_task() -> (
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -3233,6 +3247,7 @@ fn make_sharded_match_tasks(
     for shard_index in 0..shard_count {
         let match_plan = MatchPlan {
             keys: vec![FieldRef::Simple("sip".into())],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -3444,6 +3459,7 @@ async fn round_robin_pulls_whole_batch_despite_foreign_window_sharding() {
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Fixed(std::time::Duration::ZERO),
@@ -3579,6 +3595,7 @@ async fn round_robin_shard_acks_processed_not_read_position() {
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Fixed(std::time::Duration::ZERO),
@@ -4165,6 +4182,7 @@ async fn port_scan_rule_triggers_close_alert() {
     // port_scan-like MatchPlan
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Qualified("c".into(), "sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(10)),
@@ -4510,6 +4528,7 @@ fn make_conv_sink_task() -> (
     let (win_arc, notify_arc) = make_window("auth_events", &schema, usize::MAX);
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(60)),
@@ -4692,6 +4711,7 @@ async fn conv_stage_emits_sealed_close_to_sink() {
     init_tracing();
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(60)),
@@ -4832,6 +4852,7 @@ async fn conv_stage_emits_sealed_close_to_sink() {
 fn conv_stage_test_executor() -> RuleExecutor {
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(60)),

@@ -687,6 +687,7 @@ mod tests {
             lets: Vec::new(),
             match_plan: MatchPlan {
                 keys: vec![],
+                key_exprs: Vec::new(),
                 key_map: None,
                 key_join: None,
                 window_spec: WindowSpec::Sliding(Duration::from_secs(60)),

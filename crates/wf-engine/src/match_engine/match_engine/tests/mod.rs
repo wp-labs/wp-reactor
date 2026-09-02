@@ -6,6 +6,7 @@
 mod coverage_extra;
 mod coverage_more;
 mod coverage_r4;
+mod derived_key;
 mod first_match_time;
 
 use super::*;

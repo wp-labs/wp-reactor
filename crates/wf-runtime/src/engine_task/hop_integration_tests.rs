@@ -119,6 +119,7 @@ fn make_hop_task(
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Qualified("c".into(), "sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Hop {

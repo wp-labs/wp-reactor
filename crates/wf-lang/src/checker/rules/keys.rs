@@ -70,23 +70,14 @@ pub fn check_match_keys_clause(
                         derived_error(&desc, errors);
                         continue;
                     }
-                    // let 定义必须是纯字段引用（Field/Path 形态），保证 key 值可由
-                    // 单条事件字段直接求值（v1：不接受函数/字面量派生 key）。
-                    let Some(decl) = lets.iter().find(|l| &l.name == field) else {
-                        continue; // 防御：let_types 来源同 rule.lets，不可达
-                    };
-                    if !matches!(decl.expr, Expr::Field(_)) {
-                        errors.push(CheckError {
-                            severity: Severity::Error,
-                            rule: Some(rule_name.to_string()),
-                            test: None,
-                            message: format!(
-                                "match key `{field}`：let 定义必须为纯字段/嵌套路径表达式，函数/字面量派生暂不能作为窗口 key（v1）"
-                            ),
-                        });
-                        continue;
-                    }
+                    // key 派生定义（issue #80）：不再限定纯字段/路径形态——
+                    // 任意 let 表达式（coalesce/concat/case/字面量等）只要类型
+                    // 可推断为标量 key 类型即可作 match key。checker 在下方
+                    // 已保证 let 定义本身通过 check_expr_type（scope_build），
+                    // 此处只要求最终派生值为可哈希标量。
                     // key 值类型必须是可哈希标量（float 排除，与现有 key 一致）。
+                    // infer 为 None（嵌套路径叶等运行时类型）→ 引擎按运行时值
+                    // 判定（结构化叶跳过，见 key.rs path walk），静默放行。
                     match scope.let_types.get(field.as_str()) {
                         Some(vt) if val_type_is_key_scalar(vt) => {}
                         Some(_) => {
@@ -100,6 +91,25 @@ pub fn check_match_keys_clause(
                             });
                         }
                         None => {}
+                    }
+                    // review 3：派生表达式必须**无状态纯事件**可求值——引擎对触发
+                    // 事件逐事件 eval（无窗口/history/baseline/时间上下文）。窗口统计
+                    // /查询类函数（first/last/collect_*/stddev/percentile、has、
+                    // baseline）混入会静默失效（求值 None → 事件全跳；now* 同理）。
+                    if lets
+                        .iter()
+                        .find(|l| &l.name == field)
+                        .is_some_and(|decl| key_expr_has_state_dependent_func(&decl.expr))
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "match key `{field}`：let 派生表达式含窗口/状态依赖函数（first/last/collect_set/collect_list/stddev/percentile/has/baseline/now*）；key 按触发事件逐事件求值，仅支持无状态纯事件函数/字段/字面量"
+                            ),
+                        });
+                        continue;
                     }
                     continue;
                 }
@@ -725,5 +735,78 @@ pub fn check_key_mapping_clause(
                 logical_types.insert(&item.logical_name, (vt, format!("{}.{}", alias, field)));
             }
         }
+    }
+}
+
+/// review 3（issue #80）：派生 key 表达式是否含**窗口/状态依赖**函数。
+///
+/// key 表达式由引擎在**触发事件**上逐事件求值（`extract_scope_key_mixed` →
+/// `eval_expr_ext`，无窗口查找/history/baseline/求值墙钟上下文）。以下函数在
+/// 该路径上要么求值为 None（事件按 key 缺失跳过 → 规则永不触发），要么依赖
+/// 全局状态产生无意义分组：
+///
+/// - 窗口统计/历史：first / last / collect_set / collect_list / stddev /
+///   percentile（需 instance 历史或窗口收集）；
+/// - 窗口事件查询：has()（需 window lookup）；
+/// - rolling 基线：baseline()（需跨事件 RollingStats 状态）。
+///
+/// 递归检查嵌套调用（concat/case/… 参数内部命中同样拒绝）。
+fn key_expr_has_state_dependent_func(expr: &Expr) -> bool {
+    const STATE_DEPENDENT: &[&str] = &[
+        "first",
+        "last",
+        "collect_set",
+        "collect_list",
+        "stddev",
+        "percentile",
+        "has",
+        "baseline",
+    ];
+    match expr {
+        Expr::FuncCall { name, args, .. } => {
+            STATE_DEPENDENT.contains(&name.as_str())
+                || args.iter().any(key_expr_has_state_dependent_func)
+        }
+        Expr::BinOp { left, right, .. } => {
+            key_expr_has_state_dependent_func(left) || key_expr_has_state_dependent_func(right)
+        }
+        Expr::Neg(inner) | Expr::Not(inner) => key_expr_has_state_dependent_func(inner),
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            key_expr_has_state_dependent_func(cond)
+                || key_expr_has_state_dependent_func(then_expr)
+                || key_expr_has_state_dependent_func(else_expr)
+        }
+        Expr::Match {
+            expr: subject,
+            arms,
+            default,
+        } => {
+            key_expr_has_state_dependent_func(subject)
+                || arms.iter().any(|arm| {
+                    key_expr_has_state_dependent_func(&arm.value)
+                        || arm.patterns.iter().any(key_expr_has_state_dependent_func)
+                })
+                || default
+                    .as_deref()
+                    .is_some_and(key_expr_has_state_dependent_func)
+        }
+        Expr::Object(items) => items
+            .iter()
+            .any(|it| key_expr_has_state_dependent_func(&it.value)),
+        Expr::Array(items) => items.iter().any(key_expr_has_state_dependent_func),
+        Expr::InList {
+            expr: target,
+            list,
+            negated: _,
+        } => {
+            key_expr_has_state_dependent_func(target)
+                || list.iter().any(key_expr_has_state_dependent_func)
+        }
+        // 叶子与其余变体：无函数调用。
+        _ => false,
     }
 }

@@ -58,6 +58,7 @@ fn step(branches: Vec<BranchPlan>) -> wf_lang::plan::StepPlan {
 fn simple_plan(mode: MatchMode, accu: bool) -> MatchPlan {
     MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(60)),
@@ -80,6 +81,7 @@ fn simple_plan(mode: MatchMode, accu: bool) -> MatchPlan {
 fn plan_with_close_mode(close_mode: CloseMode) -> MatchPlan {
     MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(60)),
@@ -105,6 +107,7 @@ fn plan_with_close() -> MatchPlan {
 fn plan_seq_fixed_accu() -> MatchPlan {
     MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(10)),
@@ -126,6 +129,7 @@ fn plan_seq_fixed_accu() -> MatchPlan {
 fn plan_seq_accu_with_throttle() -> MatchPlan {
     MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(60)),

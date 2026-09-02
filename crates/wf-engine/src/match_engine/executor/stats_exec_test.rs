@@ -3352,6 +3352,7 @@ fn stats_close_columnar_resolves_key_fields_in_entity_and_yield() {
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(86400)),

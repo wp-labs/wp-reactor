@@ -91,6 +91,12 @@ pub fn compute_window_field_usage(plans: &[RulePlan]) -> WindowFieldUsage {
         for key in &m.keys {
             global.insert(field_ref_name(key).to_string());
         }
+        // issue #80：表达式派生 key（key_exprs 槽位）引用的真实事件字段也必须
+        // 物化——引擎对每事件求值表达式按列读字段（src/dst…），缺失列 →
+        // key 缺失 → 该事件被跳。
+        for slot in m.key_exprs.iter().flatten() {
+            collect_expr_fields(slot, &mut global);
+        }
         if let Some(key_map) = &m.key_map {
             for entry in key_map {
                 global.insert(entry.logical_name.clone());
@@ -398,6 +404,7 @@ mod tests {
             Vec::new(),
             MatchPlan {
                 keys: vec![],
+                key_exprs: Vec::new(),
                 key_map: None,
                 key_join: None,
                 window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
@@ -440,6 +447,7 @@ mod tests {
             Vec::new(),
             MatchPlan {
                 keys: vec![],
+                key_exprs: Vec::new(),
                 key_map: None,
                 key_join: None,
                 window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
@@ -532,6 +540,7 @@ mod tests {
         };
         let match_plan = MatchPlan {
             keys: vec![field_ref("auction")],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
@@ -567,6 +576,7 @@ mod tests {
             Vec::new(),
             MatchPlan {
                 keys: vec![field_ref("tenant_id")],
+                key_exprs: Vec::new(),
                 key_map: None,
                 key_join: None,
                 window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
@@ -613,6 +623,7 @@ mod tests {
         };
         let match_plan = MatchPlan {
             keys: vec![field_ref("auction")],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
@@ -686,6 +697,7 @@ mod tests {
 
         let match_plan = MatchPlan {
             keys: vec![field_ref("auction")],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
@@ -729,6 +741,7 @@ mod tests {
         };
         let match_plan = MatchPlan {
             keys: vec![field_ref("auction")],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
@@ -772,6 +785,7 @@ mod tests {
             vec![bind],
             MatchPlan {
                 keys: vec![],
+                key_exprs: Vec::new(),
                 key_map: None,
                 key_join: None,
                 window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
@@ -820,6 +834,7 @@ mod tests {
     fn minimal_match_plan() -> MatchPlan {
         MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
@@ -921,6 +936,27 @@ mod tests {
         assert!(usage.global_fields.contains("sip"));
         assert!(usage.global_fields.contains("user_id"));
         assert!(usage.global_fields.contains("user"));
+    }
+
+    #[test]
+    fn expr_derived_key_slot_fields_are_materialized() {
+        // issue #80：表达式派生 key（concat(src, ":", dst)）槽位引用的真实
+        // 事件字段必须物化——引擎逐事件按列读字段求值，缺失列 → key 缺失 →
+        // 整窗口事件被跳过。逻辑名（pair）保留与否无妨，真实字段必须出现。
+        let mut plan = make_rule(Vec::new(), minimal_match_plan());
+        plan.match_plan.keys = vec![field_ref("pair")];
+        plan.match_plan.key_exprs = vec![Some(Expr::FuncCall {
+            qualifier: None,
+            name: "concat".into(),
+            args: vec![
+                Expr::Field(FieldRef::Qualified("s".into(), "src".into())),
+                Expr::StringLit(":".into()),
+                Expr::Field(FieldRef::Qualified("s".into(), "dst".into())),
+            ],
+        })];
+        let usage = compute_window_field_usage(&[plan]);
+        assert!(usage.global_fields.contains("src"));
+        assert!(usage.global_fields.contains("dst"));
     }
 
     #[test]

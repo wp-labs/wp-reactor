@@ -59,6 +59,7 @@ fn stats_rule_plan() -> wf_lang::plan::RulePlan {
         lets: vec![],
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Fixed(Duration::from_secs(10)),
