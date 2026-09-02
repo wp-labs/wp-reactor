@@ -1334,6 +1334,12 @@ impl RuleTask {
             let batch = batch.expect("columnar each requires the raw batch");
             let num_rows = batch.num_rows();
             let mut hit = vec![false; num_rows];
+            // 非列式 bind filter 的批级视图索引（逐行解释用，免 per-call
+            // schema 线性扫）；无非列式 filter 时不构建。
+            let needs_row_filter = aliases.iter().any(|alias| {
+                !columnar_masks.contains_key(alias) && self.executor.bind_filter_present(alias)
+            });
+            let row_index = needs_row_filter.then(|| build_field_index(batch));
             for alias in aliases.iter() {
                 match columnar_masks.get(alias) {
                     Some(Some(mask)) => {
@@ -1342,7 +1348,31 @@ impl RuleTask {
                         }
                     }
                     _ => {
-                        hit.fill(true);
+                        if self.executor.bind_filter_present(alias) {
+                            // 非列式 bind filter（gap-4 2026-09-02）：逐行
+                            // `event_matches_alias` 解释（ColumnarEvent 视图直读
+                            // 列，与行式路径字节一致）——不再 hit.fill(true)
+                            // 静默丢过滤子集。index 缺失（防御）= 无视图，
+                            // 走无 index 直读（schema 线性扫，正确性不变）。
+                            let index = row_index.as_ref();
+                            for (row, h) in hit.iter_mut().enumerate() {
+                                if !*h {
+                                    let ev = match index {
+                                        Some(index) => {
+                                            ColumnarEvent::with_index(batch, row, Arc::clone(index))
+                                        }
+                                        None => ColumnarEvent::new(batch, row),
+                                    };
+                                    *h = self.executor.event_matches_alias(
+                                        alias,
+                                        &ev,
+                                        Some(&lookup),
+                                    );
+                                }
+                            }
+                        } else {
+                            hit.fill(true); // 无 filter：全放行（与 event_matches_alias 无 filter 一致）
+                        }
                     }
                 }
             }

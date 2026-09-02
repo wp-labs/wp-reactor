@@ -633,6 +633,19 @@ fn make_each_task() -> (
     Arc<Window>,
     Arc<Notify>,
 ) {
+    make_each_task_with_bind_filter(None)
+}
+
+/// make_each_task 的参数化：自定义 bind filter（gap-4 非列式 bind filter 对拍
+/// 用——columnar_each 命中循环逐行解释 vs 行式 event_matches_alias）。
+fn make_each_task_with_bind_filter(
+    bind_filter: Option<Expr>,
+) -> (
+    rule_task::RuleTask,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
+    Arc<Window>,
+    Arc<Notify>,
+) {
     let schema = test_schema();
     let (win_arc, notify_arc) = make_window("auth_events", &schema, usize::MAX);
     let rule_plan = RulePlan {
@@ -641,7 +654,7 @@ fn make_each_task() -> (
         binds: vec![BindPlan {
             alias: "e".into(),
             window: "auth_events".into(),
-            filter: None,
+            filter: bind_filter,
         }],
         lets: Vec::new(),
         match_plan: MatchPlan {
@@ -663,11 +676,9 @@ fn make_each_task() -> (
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
-            filter: Some(Expr::BinOp {
-                op: BinOp::Eq,
-                left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
-                right: Box::new(Expr::StringLit("10.0.0.1".into())),
-            }),
+            // 无 each filter——被测的是 bind filter（gap-4）；保留 each filter
+            // 会与测试数据冲突（原 make_each_task 的 sip==10.0.0.1 过滤器）。
+            filter: None,
         }),
         stats_plan: None,
         joins: vec![],
@@ -2529,6 +2540,67 @@ async fn deferred_materialization_matches_eager_path() {
 
     assert_eq!(deferred_ids, eager_ids);
     assert_eq!(deferred_ids, vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
+async fn each_noncolumnar_bind_filter_columnar_hit_matches_row_path() {
+    // gap-4（2026-09-02）：非列式 bind filter 的 each 规则——columnar_each
+    // 命中循环逐行 `event_matches_alias`（ColumnarEvent 视图直读列）vs 行式
+    // eager 路径（Event 物化 + 同函数解释），输出必须一致（filter 拒绝的行
+    // 不再被 hit.fill(true) 静默放行）。
+    init_tracing();
+    let bind_filter = Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::FuncCall {
+            qualifier: None,
+            name: "upper".into(),
+            args: vec![Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))],
+        }),
+        right: Box::new(Expr::StringLit("ABC".into())),
+    };
+    let schema = test_schema();
+    let ts = 1_700_000_000_000_000_000i64;
+    let batch = make_batch(&schema, &["abc", "AB", "xyz", "abc"], ts);
+
+    // 列式路径：push raw batch（columnar_each → 命中循环逐行解释）。
+    let (mut task, mut alert_rx, _win, _notify) =
+        make_each_task_with_bind_filter(Some(bind_filter.clone()));
+    task.process_push(RulePush {
+        window_name: "auth_events".into(),
+        events: None,
+        batch: Some(Arc::new(batch.clone())),
+        materialize_fields: None,
+        shard_rows: None,
+        seq: u64::MAX,
+    })
+    .await;
+    let columnar_ids = drain_alert_entity_ids(&mut alert_rx);
+
+    // 行式路径：push materialized events（eager，无 batch → event_matches_alias
+    // 解释于 Event）。
+    let events = Arc::new(
+        batch_to_events(&batch)
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>(),
+    );
+    let (mut task2, mut alert_rx2, _win2, _notify2) =
+        make_each_task_with_bind_filter(Some(bind_filter));
+    task2
+        .process_push(RulePush {
+            window_name: "auth_events".into(),
+            events: Some(events),
+            batch: None,
+            materialize_fields: None,
+            shard_rows: None,
+            seq: u64::MAX,
+        })
+        .await;
+    let row_ids = drain_alert_entity_ids(&mut alert_rx2);
+
+    // upper(sip)=="ABC" → 行 0/3（"abc"）过；行 1（"AB"）、行 2（"xyz"）拒。
+    assert_eq!(columnar_ids, row_ids, "列式命中循环必须与行式 filter 一致");
+    assert_eq!(columnar_ids, vec!["abc".to_string(), "abc".to_string()]);
 }
 
 #[tokio::test]

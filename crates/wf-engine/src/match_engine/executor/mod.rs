@@ -1013,6 +1013,14 @@ impl RuleExecutor {
         }
     }
 
+    /// 该 alias 是否声明了 bind filter。列式掩码缺失（`None`）时区分「无
+    /// filter → 全放行」与「非列式 filter → 需逐行解释」（gap-4 2026-09-02：
+    /// columnar_each 块对非列式 bind filter 逐行 `event_matches_alias`，不
+    /// 再静默全放行丢过滤子集）。
+    pub fn bind_filter_present(&self, alias: &str) -> bool {
+        self.bind_filter(alias).is_some()
+    }
+
     /// Columnar evaluation of `alias`'s bind filter over a whole batch.
     ///
     /// Returns `None` when there is no filter (nothing to reject) or the filter

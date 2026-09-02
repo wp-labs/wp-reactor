@@ -346,6 +346,27 @@ mod tests {
             ExecutionPath::ColumnarEach,
             "each→pipe + 列式 where 必须走 pipe 列式"
         );
+
+        // gap-4（2026-09-02 收口）：非列式 each filter → 逐行解释回退，仍列式。
+        let mut plan = each_base();
+        plan.each_plan = Some(EachPlan {
+            alias: "e".into(),
+            filter: Some(Expr::FuncCall {
+                qualifier: None,
+                name: "upper".into(),
+                args: vec![Expr::Field(FieldRef::Simple("sip".into()))],
+            }),
+        });
+        assert_path(&plan, ExecutionPath::ColumnarEach);
+
+        // gap-4：非列式 bind filter → 列式路径逐行 event_matches_alias 解释。
+        let mut plan = each_base();
+        plan.binds[0].filter = Some(Expr::FuncCall {
+            qualifier: None,
+            name: "upper".into(),
+            args: vec![Expr::Field(FieldRef::Simple("sip".into()))],
+        });
+        assert_path(&plan, ExecutionPath::ColumnarEach);
     }
 
     #[test]
@@ -414,7 +435,7 @@ mod tests {
 
     #[test]
     fn eight_gap_shapes_still_take_row_path() {
-        // --- 剩余缺口（§11.2 下表 3-8 项，非 deferred each 形态）→ 行式 ---
+        // --- 剩余缺口（§11.2 下表 5-8 项 + 非列式残项）→ 行式 ---
         // 3（残）. each + 后置 where（无 join、**非列式**）→ 仍行式。
         let mut plan = each_base();
         plan.r#where = Some(Expr::BinOp {
@@ -428,8 +449,12 @@ mod tests {
         });
         assert_path(&plan, ExecutionPath::EagerRows);
 
-        // 4. each filter / bind filter 非列式（函数调用不在列式清单）。
+        // 4（pipe 变体）. each→pipe + 非列式 filter → pipe 门控仍拒（未接
+        // filter 处理）→ 行式。
+        let mut pctx = ctx();
+        pctx.each_direct = false;
         let mut plan = each_base();
+        plan.yield_plan.target = "pipe_win".into();
         plan.each_plan = Some(EachPlan {
             alias: "e".into(),
             filter: Some(Expr::FuncCall {
@@ -438,14 +463,37 @@ mod tests {
                 args: vec![Expr::Field(FieldRef::Simple("sip".into()))],
             }),
         });
-        assert_path(&plan, ExecutionPath::EagerRows);
+        assert_eq!(
+            RuleExecutor::new(plan).execution_path(&pctx),
+            ExecutionPath::EagerRows,
+            "each→pipe + 非列式 filter → 行式"
+        );
 
-        // 4（续）. bind filter 非列式 → each 列式门控拒绝。
+        // 4（活 join 变体）. 列式 each filter + 活 join → 列式 join 富化路径未接
+        // filter 求值 → 行式。where 引用右窗让 join 存活。
         let mut plan = each_base();
-        plan.binds[0].filter = Some(Expr::FuncCall {
-            qualifier: None,
-            name: "upper".into(),
-            args: vec![Expr::Field(FieldRef::Simple("sip".into()))],
+        plan.joins = vec![JoinPlan {
+            right_window: "person_events".into(),
+            mode: JoinMode::Snapshot,
+            conds: vec![JoinCondPlan {
+                left: FieldRef::Qualified("e".into(), "sip".into()),
+                right: FieldRef::Qualified("person_events".into(), "id".into()),
+            }],
+            within: None,
+            reduce: None,
+            emit_at: None,
+        }];
+        plan.r#where = Some(Expr::BinOp {
+            op: BinOp::Eq,
+            left: Box::new(Expr::Field(FieldRef::Qualified(
+                "person_events".into(),
+                "id".into(),
+            ))),
+            right: Box::new(Expr::Number(5.0)),
+        });
+        plan.each_plan = Some(EachPlan {
+            alias: "e".into(),
+            filter: Some(Expr::Bool(true)),
         });
         assert_path(&plan, ExecutionPath::EagerRows);
 

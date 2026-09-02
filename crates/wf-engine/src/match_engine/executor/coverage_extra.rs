@@ -2399,7 +2399,8 @@ fn each_plan_columnar_safe_gate_branches() {
             args: vec![Expr::Field(FieldRef::Simple("sip".into()))],
         }),
     });
-    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+    // gap-4（2026-09-02）：非列式 each filter → 放行（逐行解释回退）。
+    assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
 
     // 列式 each filter + 活 join → false（列式 join 富化路径未接 filter 求值）。
     let mut plan = base();
@@ -2417,13 +2418,22 @@ fn each_plan_columnar_safe_gate_branches() {
     });
     assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
 
-    // Non-columnar bind filter → false.
+    // gap-4：非列式 bind filter → 放行（列式路径逐行 event_matches_alias）。
     let mut plan = base();
     plan.binds[0].filter = Some(Expr::FuncCall {
         qualifier: None,
         name: "upper".into(),
         args: vec![Expr::Field(FieldRef::Simple("sip".into()))],
     });
+    assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
+
+    // bind filter 引用 let 变量 → 仍拒绝（列式视图无 let 覆盖）。
+    let mut plan = base();
+    plan.lets = vec![LetPlan {
+        name: "x".into(),
+        expr: Expr::Number(1.0),
+    }];
+    plan.binds[0].filter = Some(Expr::Field(FieldRef::Simple("x".into())));
     assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
 
     // Non-constant score → false.
@@ -4580,7 +4590,7 @@ fn each_columnar_pipe_where_matches_row_path() {
     );
 }
 
-/// gap-3 gate 拒绝：InList / strftime 不在守卫列式清单（expr_is_columnar
+/// gap-4 gate 拒绝：InList / strftime 不在守卫列式清单（expr_is_columnar
 /// false）→ 保持行式（这些形状行式 where_ok 语义不变）。
 #[test]
 fn each_columnar_where_inlist_strftime_stay_row_path() {
@@ -4622,6 +4632,184 @@ fn each_columnar_where_inlist_strftime_stay_row_path() {
             "InList/strftime where 必须保持行式（{i}）"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// P4 gap-4（2026-09-02）：非列式 each filter / bind filter → 列式路径逐行
+// 解释回退——行式/列式逐位对拍（filter 语义不丢：each filter 经 to_event +
+// passes_each_filter；bind filter 经 process_batch 命中循环 event_matches_alias）。
+// ---------------------------------------------------------------------------
+
+/// gap-4 对拍夹具：批 + 非列式 each filter，行式/列式双路输出逐位一致。
+#[test]
+fn each_columnar_nonexpr_each_filter_matches_row_path() {
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("sip", DataType::Utf8, true),
+        ArrowField::new("category", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("abc"),
+                Some("AB"),
+                Some("xyz"),
+                None,
+                Some("abc"),
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut plan = simple_rule_plan(
+        "gap4_each_filter",
+        simple_plan(vec![], vec![]),
+        Expr::Number(5.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    // 非列式 each filter：upper(sip) == "ABC"（upper 不在守卫列式清单）。
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: Some(Expr::BinOp {
+            op: BinOp::Eq,
+            left: Box::new(Expr::FuncCall {
+                qualifier: None,
+                name: "upper".into(),
+                args: vec![Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))],
+            }),
+            right: Box::new(Expr::StringLit("ABC".into())),
+        }),
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "sip_out".into(),
+        value: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+    }];
+    let exec = RuleExecutor::new(plan);
+    assert!(
+        exec.each_plan_columnar_safe(),
+        "gap-4：非列式 each filter 必须放行（逐行解释回退）"
+    );
+    let t = 1_700_000_000_000_000_000i64;
+    let events = crate::match_engine::event_bridge::batch_to_events(&batch);
+    let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let col_events: Vec<ColumnarEvent> = (0..batch.num_rows())
+        .map(|r| ColumnarEvent::new(&batch, r))
+        .collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+    let out_col: Vec<_> = b_col
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // upper(sip)=="ABC" → 行 0/4（"abc"）过；行 1（"AB"）、行 2（"xyz"）、
+    // 行 3（null → upper null → filter None）拒。
+    assert_eq!(sr.appended, 2, "行式 appended");
+    assert_eq!(sr.rejected, 3, "行式 rejected");
+    assert_eq!(sc.appended, 2, "列式 appended");
+    assert_eq!(sc.rejected, 3, "列式 rejected");
+    assert_eq!(app_row, vec![0usize, 4], "行式 appended 索引");
+    assert_eq!(app_col, vec![0usize, 4], "列式 appended 索引");
+    assert_eq!(out_row, out_col, "非列式 each filter 输出逐位对拍");
+}
+
+/// gap-4 组合：非列式 each filter + 非列式 bind filter 同规则——列式路径
+/// （each filter 逐行解释 + bind filter 命中循环解释）== 行式路径。
+#[test]
+fn each_columnar_nonexpr_filter_and_bind_matches_row_path() {
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("sip", DataType::Utf8, true),
+        ArrowField::new("category", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("abc"),
+                Some("AB"),
+                Some("abc"),
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut plan = simple_rule_plan(
+        "gap4_both",
+        simple_plan(vec![], vec![]),
+        Expr::Number(5.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    // 非列式 bind filter：category 非偶数（函数不在守卫清单）。
+    plan.binds[0].filter = Some(Expr::FuncCall {
+        qualifier: None,
+        name: "mod".into(),
+        args: vec![
+            Expr::Field(FieldRef::Qualified("e".into(), "category".into())),
+            Expr::Number(2.0),
+        ],
+    });
+    // 非列式 each filter：upper(sip) == "ABC"。
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: Some(Expr::BinOp {
+            op: BinOp::Eq,
+            left: Box::new(Expr::FuncCall {
+                qualifier: None,
+                name: "upper".into(),
+                args: vec![Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))],
+            }),
+            right: Box::new(Expr::StringLit("ABC".into())),
+        }),
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "sip_out".into(),
+        value: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+    }];
+    let exec = RuleExecutor::new(plan);
+    assert!(exec.each_plan_columnar_safe(), "gap-4 组合必须放行");
+    let t = 1_700_000_000_000_000_000i64;
+    let events = crate::match_engine::event_bridge::batch_to_events(&batch);
+    let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let col_events: Vec<ColumnarEvent> = (0..batch.num_rows())
+        .map(|r| ColumnarEvent::new(&batch, r))
+        .collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+    // bind filter 由调用方（process_batch 命中循环）应用——executor 层双路都
+    // 全行进（bind 过滤不在此处）；断言 each filter 双路一致（bind 过滤的
+    // 对拍由引擎层测试 each_noncolumnar_bind_filter_* 覆盖）。
+    assert_eq!(sr.appended, sc.appended, "appended 一致");
+    assert_eq!(sr.rejected, sc.rejected, "rejected 一致（each filter）");
+    assert_eq!(app_row, app_col, "appended 索引一致（each filter）");
 }
 
 /// Q14 变体：fmt 的 IfThenElse 分支 / count_char 参数含 OBJECT 元数据字段。

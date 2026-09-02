@@ -753,25 +753,22 @@ impl RuleExecutor {
         } else {
             self.each_join_plan.is_some()
         };
-        // each filter：无活 join 时允许列式 filter（`expr_is_columnar`，Q14 价格
-        // 区间 `0.908*price in (1M, 50M)`）；有活 join 时列式 join 富化路径未接
-        // 入 filter 求值 → 保守回退行式。非列式 filter 同样回退（解释求值路径
-        // 不复制）。
+        // each filter：无活 join 时任意形状放行（gap-4 2026-09-02）——可列式
+        // 走批级掩码（Q14 `0.908*price in (1M, 50M)`），非列式走 execute 行
+        // 循环逐行 `passes_each_filter` 解释回退（与行式路径字节一致，仅不
+        // 物化整批）；有活 join 时列式 join 富化路径未接入 filter 求值 →
+        // 保守回退行式。
         let filter_ok = match &each_plan.filter {
             None => true,
-            Some(f) if self.live_joins.is_empty() => wf_lang::columnar::expr_is_columnar(f),
+            Some(_) if self.live_joins.is_empty() => true,
             Some(_) => false,
         };
         if !join_ok || !filter_ok {
             return false;
         }
-        if !self.plan.binds.iter().all(|b| {
-            b.filter
-                .as_ref()
-                .is_none_or(wf_lang::columnar::expr_is_columnar)
-        }) {
-            return false;
-        }
+        // binds 无需形状检查（gap-4 2026-09-02）：filter 可列式（掩码）或
+        // 非列式（process_batch 的 columnar_each 块逐行 `event_matches_alias`
+        // 解释兜底）；引用 let 的 filter 已在上面统一拒绝（列式视图无 let 覆盖）。
         // 无 join 时的字段形状（Simple/Qualified/Bracketed flat）；有 join 时
         // 输出字段来源已被 `parse_each_join_columnar` 校验（左窗/右窗限定）。
         let flat = |fr: &FieldRef| {

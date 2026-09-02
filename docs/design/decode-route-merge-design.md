@@ -276,7 +276,7 @@ loop {
 | 1 | **reduce maxrow join**（非 Snapshot） | q4/q9 | **大**（新执行器：右窗 per-key 窗口化归约 + 输出整行） | ✅ **2026-09-02 收口**——deferred 驱动列式挂起（`DeferredPending.left` → `DeferredLeft`） |
 | 2 | **within/interval join** | q8 | **大**（列式 interval-join 结构） | ✅ **2026-09-02 收口**（同上；区间过滤本就列式，剩余是驱动行物化） |
 | 3 | each + 后置 `where`（无 join 时 where 非空） | q15/q16/q17 形态 | 中 | ✅ **2026-09-02 收口**——无活 join + 可列式驱动列 where（批级守卫掩码；真实可达形状 = 死 join + 驱动列 where） |
-| 4 | each filter / bind filter 非列式 | 通用 | 中 | 开放 |
+| 4 | each filter / bind filter 非列式 | 通用 | 中 | ✅ **2026-09-02 收口**——非列式 each filter 逐行 `passes_each_filter` 回退；非列式 bind filter 命中循环逐行 `event_matches_alias`（不再 `hit.fill(true)` 丢 filter） |
 | 5 | 输出字段非 flat / 非限定引用（有 join） | 通用 | 中 | 开放 |
 | 6 | score 非「常量 \| 常量×flat 字段」 | 通用 | 小-中 | 开放 |
 | 7 | entity 非字面量 / flat 字段 | 通用 | 小 | 开放 |
@@ -312,6 +312,18 @@ loop {
 > `each_columnar_where_matches_row_path` / `_after_filter` /
 > `_missing_column_rejects_all_parity`。矩阵断言 gap 3 从 `EagerRows` 翻转
 > 为 `ColumnarEach`。
+>
+> **gap 4 已收口（2026-09-02）**：非列式 each filter / bind filter 不再让整条
+> 规则回退行式——each filter 经 `execute_*_batch_columnar` 的 `filter_cvec=None`
+> 分支逐行 `passes_each_filter` 解释（与行式字节一致）；**bind filter 是关键修复**：
+> process_batch 的 columnar_each 命中循环对非列式 bind filter 原 `hit.fill(true)`
+> 全放行（静默丢过滤子集）——改为逐行 `event_matches_alias` 解释（ColumnarEvent
+> 视图直读列，批级 FieldIndex，语义与行式一致）。矩阵断言 gap 4 从 `EagerRows`
+> 翻转为 `ColumnarEach`（pipe + filter / 活 join + filter 残项仍 `EagerRows`）。
+> 对拍：`each_columnar_nonexpr_each_filter_matches_row_path` /
+> `each_columnar_nonexpr_filter_and_bind_matches_row_path`（executor 层）+
+> `each_noncolumnar_bind_filter_columnar_hit_matches_row_path`（引擎层：
+> columnar 命中循环 vs 行式 event_matches_alias）。
 
 1. **判据 = 生产路径是否还走行式**（不再看性能收益）：每收一项，该类规则的生产执行轨
    切换为列式，行式路径保留为测试对拍 golden（从“生产实现”变“测试参考”）；
@@ -323,16 +335,36 @@ loop {
 3. **终点判定**：生产执行路径 `batch_to_events` / `materialize_rows` / 窗口惰性 `OnceLock`
    调用点归零（仅测试引用）；`Event` 类型只存在于测试对拍与 hot-reload 兜底。
 
-### 11.4 物化代码现状（2026-09-01 盘点）
+### 11.4 物化代码现状（2026-09-02 盘点，gap 1/2/3 收口后）
 
-| 位置 | 路径 | 状态 |
-|---|---|---|
-| `router.rs` route_parse L361-380 | 非 defer 窗口全批 `batch_to_events[_filtered]` | 生产热路径（merge 后在源任务） |
-| `rule_task.rs` eager 兜底 | 非 defer / 非 columnar each / 非 deferred-pending 的 `batch_to_events` | 生产热路径（**2026-09-02 收窄**：deferred join 规则已改走列式挂起，免 eager 物化） |
-| `deferred_exec.rs` `DeferredPending.left` | **已列式化**（`DeferredLeft`：`JoinRow::Columnar` + 投影遮蔽；有 let 回退 Event 物化一次） | ✅ 2026-09-02（gap 1/2） |
-| `event_bridge.rs` L117/L166 | `batch_to_events_with` / `materialize_rows_with` | 转换核心 |
-| `event_bridge.rs` L403/L623 | `ColumnarEvent` / `JoinRow::Columnar` | **反物化的现成方案**（列式 facade） |
-| 窗口 log `OnceLock`（buffer/mod.rs L844） | 惰性物化兜底 | hot-reload 新订阅者，生产 pull 已不用 |
+生产热路径物化点（按触发条件）：
+
+| # | 位置 | 触发条件 | 量级 | 状态/对应缺口 |
+|---|---|---|---|---|
+| 1 | `router.rs` route_parse L361-380 | 窗口 `defer_materialization=false`（有规则走行式）且非分片 | 全批 `batch_to_events[_filtered]` | **剩余面**：gap 4-8 的 match 侧 + 行式 stats 窗口（qradar 全 defer → 不触发） |
+| 2 | `rule_task.rs` L1249 eager 兜底 | `ExecutionPath::EagerRows`（非 deferred / 非 columnar each / 非 deferred-pending） | 全批 | **剩余面**：gap 4-8 的 each 侧 + debug 模式（2026-09-02 已收窄：deferred join 免 eager） |
+| 3 | `rule_task.rs` L4610 `PipeBatchStager::take_events` | pipe flush 且目标有 Single/Sharded（**row-path 中间窗消费者**）订阅 | 每批一次 | **条件物化**：纯列式消费者（q4b stats 从窗口读、无事件订阅）→ `take_batch` 不物化；row-path 消费者存在时才物化 |
+| 4 | `stats_task.rs` L411 | stats 列式段 `process_batch_rows` 返回 false（where 非列式 / distinct 不支持等）→ 行式回退 | 行域内行 | **剩余面**：stats 行式回退（主路径 q15-q19 已列式，回退是 rare） |
+| 5 | 窗口 log `OnceLock`（buffer/mod.rs L844） | route_parse 预置 events 的窗口；hot-reload 新订阅者 `events_since()` | 惰性 | hot-reload 兜底，生产 pull 已不用 |
+
+已退役（gap 收口移除）：
+
+| 位置 | 状态 |
+|---|---|
+| `deferred_exec.rs` `DeferredPending.left` 每行 Event | ✅ gap 1/2：`DeferredLeft`（`JoinRow::Columnar` + 投影遮蔽；有 let 回退物化一次） |
+| each + 无活 join where 的 eager 物化 | ✅ gap 3：批级 `where_cvec` 守卫掩码 |
+
+受控「反物化」（emit/到期时**按命中行**物化，非全批——保留，属输出路径）：
+`DeferredLeft::to_event` / `ColumnarEvent::to_event` / `JoinRow::to_event` / `RowEvent::to_event`。
+
+转换核心（代码保留，测试 golden + 回退）：`event_bridge.rs` `batch_to_events[_with]` /
+`materialize_rows[_with]`；`ColumnarEvent` / `JoinRow::Columnar` 为反物化的现成方案。
+
+> 与 §11.2 缺口对应：gap 5-8（each 输出字段非 flat、score/entity/yield 非列式
+> 形状）→ 触 #2（each 侧）/ #1（match 侧）；stats 行式回退 → #4。（gap 1/2/3/4
+> 已收口：deferred pending / each where / 非列式 filter 均已列式或逐行解释回退。）
+> 终点判定（§11.3-3）不变：`batch_to_events` / `materialize_rows` /
+> `OnceLock` 调用点归零（仅测试引用）。
 
 ### 11.5 与 merge 的关系
 
