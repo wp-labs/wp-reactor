@@ -4,8 +4,10 @@ use sha1::Digest as Sha1Digest;
 use sha1::Sha1;
 use sha2::Sha256;
 
-use super::{Event, Value, YieldMeta, eval_expr_with_l3, step_data, utils};
-use crate::match_engine::match_engine::{EngineHashMap, value_to_string, values_equal};
+use super::{Value, YieldMeta, eval_expr_with_l3, step_data, utils};
+use crate::match_engine::match_engine::{
+    EngineHashMap, FieldSource, value_to_string, values_equal,
+};
 use crate::time::{normalize_epoch_timestamp_float_nanos, positive_interval_seconds_to_nanos};
 
 pub(super) fn contains_system_var(expr: &wf_lang::ast::Expr) -> bool {
@@ -176,7 +178,7 @@ pub(super) fn materialize_system_vars(
 pub(super) fn eval_builtin_func_with_l3(
     name: &str,
     args: &[wf_lang::ast::Expr],
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     score: YieldMeta,
 ) -> Option<Value> {
     match name {
@@ -1077,7 +1079,11 @@ pub(super) fn eval_builtin_func_with_l3(
     }
 }
 
-fn eval_merge_arg(arg: &wf_lang::ast::Expr, ctx: &Event, score: YieldMeta<'_>) -> Option<Value> {
+fn eval_merge_arg(
+    arg: &wf_lang::ast::Expr,
+    ctx: &dyn FieldSource,
+    score: YieldMeta<'_>,
+) -> Option<Value> {
     eval_expr_with_l3(arg, ctx, score)
 }
 
@@ -1099,22 +1105,22 @@ pub(super) fn is_stat_selector_func(name: &str) -> bool {
 pub(super) fn eval_stat_func(
     name: &str,
     args: &[wf_lang::ast::Expr],
-    ctx: &Event,
+    ctx: &dyn FieldSource,
 ) -> Option<Value> {
     if args.len() != 1 {
         return None;
     }
     let selector = parse_stat_selector(&args[0])?;
     match (name, selector) {
-        ("count", StatSelector::WindowEvent(alias)) => ctx
-            .fields
-            .get(format!("_bind_{alias}_count").as_str())
-            .and_then(number_value),
+        ("count", StatSelector::WindowEvent(alias)) => {
+            let field = format!("_bind_{alias}_count");
+            ctx.field_value(&field).as_ref().and_then(number_value)
+        }
         ("count", StatSelector::MatchEvent(label) | StatSelector::MatchDistinct(label)) => {
-            ctx.fields.get(label).and_then(number_value)
+            ctx.field_value(label).as_ref().and_then(number_value)
         }
         ("value", StatSelector::Trigger(label) | StatSelector::Final(label)) => {
-            ctx.fields.get(label).and_then(number_value)
+            ctx.field_value(label).as_ref().and_then(number_value)
         }
         _ => None,
     }
@@ -1155,7 +1161,7 @@ fn number_value(value: &Value) -> Option<Value> {
 pub(super) fn eval_l3_func(
     name: &str,
     args: &[wf_lang::ast::Expr],
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     score: YieldMeta,
 ) -> Option<Value> {
     if args.is_empty() {
@@ -1247,7 +1253,7 @@ pub(super) fn eval_l3_func(
 pub(super) fn eval_aggregate_func(
     name: &str,
     args: &[wf_lang::ast::Expr],
-    ctx: &Event,
+    ctx: &dyn FieldSource,
 ) -> Option<Value> {
     if args.len() != 1 {
         return None;
@@ -1300,7 +1306,7 @@ fn scalar_value_to_string(value: &Value) -> Option<String> {
 
 fn eval_join_arg_with_l3(
     arg: &wf_lang::ast::Expr,
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     score: YieldMeta,
 ) -> Option<String> {
     match eval_expr_with_l3(arg, ctx, score) {

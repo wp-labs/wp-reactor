@@ -25,7 +25,7 @@ use crate::match_engine::executor::{CloseCtxFields, build_eval_context, execute_
 use crate::match_engine::match_engine::BindData;
 use crate::match_engine::{
     AsofLookup, CepStateMachine, EngineHashMap, Event, JoinRow, MatchedContext, RuleExecutor,
-    StepData, StepResult, Value, WindowLookup,
+    StepData, StepResult, TriggerEvent, Value, WindowLookup,
 };
 
 use super::helpers::{branch, count_ge, simple_key, simple_plan, simple_rule_plan, step};
@@ -152,7 +152,7 @@ fn matched_context(trigger: Arc<Event>) -> MatchedContext {
         window_start_time_nanos: NOW - 600_000_000_000,
         window_end_time_nanos: NOW + 600_000_000_000,
         machine_id: String::new(),
-        trigger_event: Some(trigger),
+        trigger_event: Some(TriggerEvent::from_event(trigger)),
     }
 }
 
@@ -268,6 +268,7 @@ fn q22_match_pipeline_components() {
     let bind_data: Vec<BindData> = vec![];
     let trigger = Arc::new(bid_event(1, 1));
     let matched = matched_context(Arc::clone(&trigger));
+    let trigger_event = TriggerEvent::from_event(Arc::clone(&trigger));
 
     // build_eval_context
     let start = Instant::now();
@@ -278,7 +279,7 @@ fn q22_match_pipeline_components() {
             &step_data,
             &bind_data,
             &step_plans,
-            Some(&trigger),
+            Some(&trigger_event),
             &CloseCtxFields::All,
             None,
         );
@@ -298,7 +299,7 @@ fn q22_match_pipeline_components() {
         &step_data,
         &bind_data,
         &step_plans,
-        Some(&trigger),
+        Some(&trigger_event),
         &CloseCtxFields::All,
         None,
     );

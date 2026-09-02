@@ -236,48 +236,264 @@ loop {
 
 ---
 
-## 11. 物化列式化路线图（P4，独立于 merge）
+## 11. 物化单轨化路线图（P4，独立于 merge）
 
-> 前情：`route_parse` 里的 `batch_to_events`（Arrow → `Event`）只对**非 defer 窗口**执行
-> （`compute_window_field_usage`，wf-lang/field_usage.rs）。它的存在 = **列式引擎未覆盖面的清单**。
-> qradar 已全 defer（实测 p=2 伤即 route 无活）；真正触发物化的是 join 类查询
-> （nexmark q3 的 post-join where / q13 等 deferred reduce）。
-> 本路线图与 merge（P1-P3）正交：merge 不依赖它，它也不依赖 merge。
+> 前情（2026-09-01 基线实测后重定向）：`batch_to_events`（Arrow → `Event`）的存在 =
+> **列式引擎未覆盖面的清单**。**动机从性能改为一致性**：
+> 1. **已存在语义分歧**：`>2^53` 整数 / 纳秒时间戳，列式路径原生 i64 精确、行式路径
+>    `Value::Number(f64)` 丢精度（CHANGELOG 1.1.0 "documented semantic divergence"——
+>    同一查询两条路径可能给出不同结果，`2^53 == 2^53+1` 列式 false / 行式 true）；
+> 2. **双路径对拍约束**：`ColumnarEvent` 处处背 "byte-identical to eager path"——维护负担 + 漂移风险；
+> 3. **新功能双实现**：新增表达式构造要列式编译 + 行式解释各做一遍（触发面 8 门控即双实现清单）。
+> 性能基线否定（nexmark 10m 墙梯）：q4/q9（each+reduce join，回退 eager）rules 增量
+> +60~108ns/事件，但 q4 为等墙（CPU 14%、RSS 5.3GB 堆积）——**列式化对吞吐无收益**。
+> 故本路线图以**一致性**为判据：生产只保留一条执行路径。
 
-### 11.1 目标终态
+### 11.1 目标终态：生产单轨化（非“删行式解释器”）
 
-端到端纯列式：`Row batch → Arrow 列 → 列式过滤/状态机/输出`，`Event` / `batch_to_events` /
-窗口 log 的惰性 `OnceLock` 物化全部退役。物化不再是"可选环节"，而是不存在的环节。
+```
+生产路径：全列式（ColumnarEvent / 列式 join / 列式 let）——唯一执行轨
+行式解释器：保留，降级为「测试对拍 golden」——只活在测试里，不进生产
+```
 
-### 11.2 覆盖清单（物化触发源 → 列式化项）
+一致性由**构造**保证（一条数据一种读法、一个结果），不再靠 "byte-identical 约束 + 对拍" 维持。
+`Event` / `batch_to_events` / 窗口 log 惰性 `OnceLock` 从生产路径退役（代码可保留为测试参考）。
 
-窗口能否 defer 的判定（field_usage.rs L109-116 的局部变量 `plan_defer_safe`，非独立函数）：
-`each 规则 || match 有 event/close/seq 步骤 || 全部 bind filter 列式`。
-非 defer 触发源 = 需要行级 eval context 的表达式：
+### 11.2 覆盖清单（触发面分析结论，2026-09-01）
 
-| 触发源 | 当前实现 | 列式化 | 量级 | 注 |
+已列式（无需动）：
+
+| 形态 | 证据 |
+|---|---|
+| match 规则（P3 FieldView 列式喂状态机） | qradar 376 条全走此路径，无物化 |
+| each + **Snapshot** join（q13b/q20） | `parse_each_join_columnar` + `emit_each_direct_batch_columnar_join` |
+| each + **let**（q22：split/mvindex/concat） | 2026-08-25 层 2：let RHS 列式编译 + yield 引用内联 |
+
+剩余缺口（生产仍走行式）——each 门控 `each_plan_columnar_safe()`（each_exec.rs L695-827）的 8 条件：
+
+| # | 缺口 | 触发查询 | 量级 | 状态 |
 |---|---|---|---|---|
-| bind filter | 部分列式（scope-key 直读 `0c989f7`） | 剩余 case 逐个覆盖 | 小 | qradar 已全 defer |
-| entity_id / score / yield 表达式 | eval context 逐行 eval | 每批对命中行算输出列 | 小-中 | qradar 的 `score(50.0)` 常量 + `entity(c.sip)` 字段引用很轻 |
-| join 后 `where`（读 join 侧字段） | join lookup 产生行级 Event | join 结果列式化 | **大** | q3 回归记录（field_usage L161-165） |
-| deferred join（`emit at`）reduce 字段 | eval context | 与上同源 | **大** | L481-500 测试 |
-| MACHINE_ID | 已是列字段 | — | ✅ | |
+| 1 | **reduce maxrow join**（非 Snapshot） | q4/q9 | **大**（新执行器：右窗 per-key 窗口化归约 + 输出整行） | ✅ **2026-09-02 收口**——deferred 驱动列式挂起（`DeferredPending.left` → `DeferredLeft`） |
+| 2 | **within/interval join** | q8 | **大**（列式 interval-join 结构） | ✅ **2026-09-02 收口**（同上；区间过滤本就列式，剩余是驱动行物化） |
+| 3 | each + 后置 `where`（无 join 时 where 非空） | q15/q16/q17 形态 | 中 | ✅ **2026-09-02 收口**——无活 join + 可列式驱动列 where（批级守卫掩码；真实可达形状 = 死 join + 驱动列 where） |
+| 4 | each filter / bind filter 非列式 | 通用 | 中 | ✅ **2026-09-02 收口**——非列式 each filter 逐行 `passes_each_filter` 回退；非列式 bind filter 命中循环逐行 `event_matches_alias`（不再 `hit.fill(true)` 丢 filter） |
+| 5 | **list-index 输出字段**（`c.tags[0]`，Path=[Field,Index]） | qradar 形态（tags/categories 下标） | 小-中 | ✅ **2026-09-02 收口**——无活 join 时编译 ListIndex cvec（Field 快通道 `value_at` 只读 flat 列，索引元素需 offset 读；root 引用 let 拒绝）；**有活 join 的非限定/歧义裸名仍行式**（门控 out_shape 保持限定，残项） |
+| 6 | score 非「常量 \| 常量×flat 字段」（裸 flat 字段 / 字段×字段 / 复合算数 / 常量×list-index） | 通用 | 小-中 | ✅ **2026-09-02 收口**——无活 join 的可列式 score 编译批级 score_cvec（逐行 cell → Number → clamp；读结构化列/编译失败逐行 eval_score 回退；非数值/缺失 → 整行 failed 与行式一致）；活 join 仍只允许常量 |
+| 7 | entity 非字面量 / flat 字段（list-index / flat 组件复合表达式） | 通用 | 小 | ✅ **2026-09-02 收口**——无活 join 的可列式 entity 编译批级 entity_cvec（cell → Value → `value_to_string`，与快通道 Generic 渲染同源；编译失败逐行 eval_entity_id 回退）；**非列式（对象/数组嵌套 Path）仍行式** |
+| 8 | yield 非字面量 / flat / 列式输出函数（有 join 更严） | 通用 | 中 | 开放 |
 
 ### 11.3 排序与验证口径
 
-1. **按量级从小到大推进**：bind filter 剩余 case → entity/score/yield → join 侧 eval（最后，最大）;
+> 状态（2026-09-02）：**断言基座已落地**——生产路径判定抽为单一事实源
+> `RuleExecutor::execution_path`（`executor/execution_path.rs`），`process_batch`
+> 是唯一消费方（断言的路径 ≡ 执行的路径）；矩阵测试按下表逐形状断言
+> `DeferredMachine / DeferredPending / ColumnarEach / EagerRows`，缺口收敛时
+> 翻转向量即可回归。
+>
+> **gap 1/2 已收口（2026-09-02）**：deferred join（q4/q8/q9）驱动事件列式
+> 挂起——`DeferredPending.left` 从 `Event`（每驱动行 HashMap 物化）降为
+> `DeferredLeft::Columnar`（`JoinRow::Columnar`：Arc batch + 行号 + 索引 +
+> 投影，同批共享），挂起队列与注入期分配随之下降。有 let 绑定回退物化一次
+> （字节一致由构造保证）。`execution_path` 新增 `DeferredPending` 变体（无
+> machine + 有 emit_at join + raw batch + 非 DEBUG），矩阵断言 gap 1/2 真实
+> 形态（reduce/within + emit at）翻转为 `DeferredPending`；对拍测试
+> `deferred_pending_columnar_matches_eager` / `execute_columnar_matches_eager_output`
+> / `columnar_projection_shadows_unprojected_fields` / `multi_cond_recheck` /
+> `with_lets_materializes_once` 锁定列式 == eager 字节一致。
+>
+> **gap 3 已收口（2026-09-02）**：each + 后置 `where`（无活 join）列式化——
+> `EachBatchVecs.where_cvec`（批级守卫掩码，compile_guard 同 filter 机制，
+> 编译失败/结构化参数逐行 `where_ok` 回退）；gate 放行「无活 join + where
+> 可列式」（真实可达形状 = 死 join + 驱动列 where——checker 要求 where 必须
+> 有 ≥1 join，where 只读驱动列 → join 死消除）。**顺带修复行式批路径 latent
+> bug**：`execute_each_direct_batch` 的借用短路（`live_joins 空 && lets 空`）
+> 会静默跳过 `where_ok`——死 join 形状下生产 batched 路径 where 失效（与
+> 逐事件/oracle 的 plan.joins 判定分叉），已补 `where.is_none()` 前提。对拍：
+> `each_columnar_where_matches_row_path` / `_after_filter` /
+> `_missing_column_rejects_all_parity`。矩阵断言 gap 3 从 `EagerRows` 翻转
+> 为 `ColumnarEach`。
+>
+> **gap 4 已收口（2026-09-02）**：非列式 each filter / bind filter 不再让整条
+> 规则回退行式——each filter 经 `execute_*_batch_columnar` 的 `filter_cvec=None`
+> 分支逐行 `passes_each_filter` 解释（与行式字节一致）；**bind filter 是关键修复**：
+> process_batch 的 columnar_each 命中循环对非列式 bind filter 原 `hit.fill(true)`
+> 全放行（静默丢过滤子集）——改为逐行 `event_matches_alias` 解释（ColumnarEvent
+> 视图直读列，批级 FieldIndex，语义与行式一致）。矩阵断言 gap 4 从 `EagerRows`
+> 翻转为 `ColumnarEach`（pipe + filter / 活 join + filter 残项仍 `EagerRows`）。
+> 对拍：`each_columnar_nonexpr_each_filter_matches_row_path` /
+> `each_columnar_nonexpr_filter_and_bind_matches_row_path`（executor 层）+
+> `each_noncolumnar_bind_filter_columnar_hit_matches_row_path`（引擎层：
+> columnar 命中循环 vs 行式 event_matches_alias）。
+>
+> **gap 5 已收口（2026-09-02）**：无活 join 的 list-index 输出字段（`c.tags[0]`，
+> Path=[Field,Index]）不再让整条规则回退行式——`compile_yield_cvec` 对 list-index
+> Field 编译 `ListIndex` cvec（快通道 `value_at` 只读 flat 列，索引元素需 offset
+> 读），yield 分类从 `YieldKind::Field` 改 `YieldKind::General`（批级槽位取 cell，
+> 编译失败逐行 `to_event` 回退与行式一致）。gate 只放行**无活 join**（有活 join
+> 的 out_shape 限定不变）；root 引用 let（`x[0]`）拒绝（列式无 let 视图，编译
+> root 缺失 → 全 null 静默失真）。矩阵断言 gap 5 从 `EagerRows` 翻转为
+> `ColumnarEach`（+ 有活 join / let-root 负向边界仍 `EagerRows`）。对拍：
+> `each_columnar_list_index_yield_matches_row_path`（原生 List，含 null 元素/
+> 空列表/越界）+ `each_columnar_list_index_json_array_yield_matches_row_path`
+> （JsonArray-metadata Utf8 = qradar 帧 `array/…` 真实存储形态，含 null-drop
+> 探针 `["a",null,"b"][1]`→"b"）。
+>
+> **gap 6/7 已收口（2026-09-02）**：score / entity 的非「常量/常量×flat」/非
+> 字面量-flat 形态不再整条回退行式——无活 join 的可列式 score / entity 表达式
+> 编译批级 `score_cvec` / `entity_cvec`（`each_batch_prepare` 与 where/filter
+> 同机制，读结构化列不编译——列式读原始 JSON 文本 vs 解释器解析可分叉），逐
+> 行 cell 求值：score → Number → clamp（非数值/缺失 → 整行 failed，与行式
+> `eval_score` Err 一致）；entity → Value → `value_to_string`（null/缺失 → 空
+> 串，不拒行）。快通道保留：score 常量 / 常量×flat（f64 直读）、entity
+> StringLit / flat Field（typed 列 lane）。编译失败 → 逐行 eval_score /
+> eval_entity_id（Event 视图）回退。矩阵断言 gap 6（字段×字段、裸 flat 字段
+> score）与 gap 7（list-index / Add 复合 entity）翻转为 `ColumnarEach`（非列式
+> upper() score / 对象嵌套 Path entity 负向边界仍 `EagerRows`）。对拍：
+> `each_columnar_general_score_matches_row_path`（int×int clamp 上下界 + null
+> 操作数 failed 行）/ `_null_and_bad_cells_...`（裸字段 null cell、Utf8 非数值
+> 全 failed、schema 外字段全 failed）/ `each_columnar_general_entity_...`
+> （list-index 原生 List null/空/越界 + 复合 Add 的 number_to_string 渲染）。
+> **review 补测（2026-09-02）**：常量×list-index score（`2.0*c.tags[0]`）原被
+> `score_shape` 归 MulConst 而 gate 只放行 flat 字段 → 未单轨；且执行器原以
+> 「ScorePlan 存在」判快通道，一旦放行会对 list-index 跑 value_at（读整列而非
+> 元素）。已修：`score_is_general` 以 field 是否 flat 分类（MulConst×list-index
+> 归一般 cvec），gate/执行器/prepare 同 key。补测：`each_columnar_score_const_
+> times_list_index_matches_row_path` / `each_columnar_general_score_nested_arith_
+> matches_row_path`（`a*b+c` 复合）/ `each_columnar_entity_list_index_json_array_
+> fallback_matches_row_path`（JsonArray-metadata entity → 逐行 eval_entity_id
+> 回退路径）+ 矩阵/ gate 分支断言。
+
+1. **判据 = 生产路径是否还走行式**（不再看性能收益）：每收一项，该类规则的生产执行轨
+   切换为列式，行式路径保留为测试对拍 golden（从“生产实现”变“测试参考”）；
 2. **每完成一项**：
-   - `compute_window_field_usage` 的非 defer 集合应**收缩**（新增断言：某窗口从 needs_all/非 defer 落入 defer_materialization）;
-   - 对应正确性测试（q3/q13 join 对拍、deferred 归并）全绿;
-   - perf-diag 实测该形态窗口不再是墙（`decode→floor` 增量随物化消失而下降）;
-3. **终点判定**：全仓 `defer_materialization` 集合 = 所有被消费窗口；`batch_to_events`/`OnceLock` 死代码删除。
+   - 该形状规则的**生产执行路径断言为列式**（`execution_path` 矩阵测试翻转向量：
+     对应断言从 `EagerRows` 改为 `DeferredMachine` / `ColumnarEach`）;
+   - 行式/列式对拍测试**保留**（行式变 golden，继续锁定语义）;
+   - `compute_window_field_usage` 的非 defer 集合收缩断言;
+3. **终点判定**：生产执行路径 `batch_to_events` / `materialize_rows` / 窗口惰性 `OnceLock`
+   调用点归零（仅测试引用）；`Event` 类型只存在于测试对拍与 hot-reload 兜底。
 
-### 11.4 与 merge 的关系
+### 11.4 物化代码现状（2026-09-02 盘点，gap 1/2/3 收口后）
 
-- merge（P1-P3）把 route 并入源任务后，**物化仍在源任务执行**（每批一次、Arc 共享、跨连接并行）——
+生产热路径物化点（按触发条件）：
+
+| # | 位置 | 触发条件 | 量级 | 状态/对应缺口 |
+|---|---|---|---|---|
+| 1 | `router.rs` route_parse L361-380 | 窗口 `defer_materialization=false`（有规则走行式）且非分片 | 全批 `batch_to_events[_filtered]` | **剩余面**：gap 4-8 的 match 侧 + 行式 stats 窗口（qradar 全 defer → 不触发） |
+| 2 | `rule_task.rs` L1249 eager 兜底 | `ExecutionPath::EagerRows`（非 deferred / 非 columnar each / 非 deferred-pending） | 全批 | **剩余面**：gap 4-8 的 each 侧 + debug 模式（2026-09-02 已收窄：deferred join 免 eager） |
+| 3 | `rule_task.rs` L4610 `PipeBatchStager::take_events` | pipe flush 且目标有 Single/Sharded（**row-path 中间窗消费者**）订阅 | 每批一次 | **条件物化**：纯列式消费者（q4b stats 从窗口读、无事件订阅）→ `take_batch` 不物化；row-path 消费者存在时才物化 |
+| 4 | `stats_task.rs` L411 | stats 列式段 `process_batch_rows` 返回 false（where 非列式 / distinct 不支持等）→ 行式回退 | 行域内行 | **剩余面**：stats 行式回退（主路径 q15-q19 已列式，回退是 rare） |
+| 5 | 窗口 log `OnceLock`（buffer/mod.rs L844） | route_parse 预置 events 的窗口；hot-reload 新订阅者 `events_since()` | 惰性 | hot-reload 兜底，生产 pull 已不用 |
+
+已退役（gap 收口移除）：
+
+| 位置 | 状态 |
+|---|---|
+| `deferred_exec.rs` `DeferredPending.left` 每行 Event | ✅ gap 1/2：`DeferredLeft`（`JoinRow::Columnar` + 投影遮蔽；有 let 回退物化一次） |
+| each + 无活 join where 的 eager 物化 | ✅ gap 3：批级 `where_cvec` 守卫掩码 |
+| each list-index 输出字段（`c.tags[0]`）的整条回退 | ✅ gap 5：`compile_yield_cvec` 编译 `ListIndex` cvec + yield 分类 `General` |
+| each 非快通道 score / entity 的 eager 物化 | ✅ gap 6/7：批级 `score_cvec` / `entity_cvec`（编译失败逐行解释回退，不整批物化） |
+
+受控「反物化」（emit/到期时**按命中行**物化，非全批——保留，属输出路径）：
+`DeferredLeft::to_event` / `ColumnarEvent::to_event` / `JoinRow::to_event` / `RowEvent::to_event`。
+
+转换核心（代码保留，测试 golden + 回退）：`event_bridge.rs` `batch_to_events[_with]` /
+`materialize_rows[_with]`；`ColumnarEvent` / `JoinRow::Columnar` 为反物化的现成方案。
+
+> 与 §11.2 缺口对应：gap 8（yield 非列式函数/表达式）→ 触 #2（each 侧）/
+> #1（match 侧）；stats 行式回退 → #4。（gap 1-7 已收口：deferred pending /
+> each where / 非列式 filter / list-index 输出 / 一般 score·entity 均已列式或
+> 逐行解释回退。）
+> 终点判定（§11.3-3）不变：`batch_to_events` / `materialize_rows` /
+> `OnceLock` 调用点归零（仅测试引用）。
+
+### 11.6 终态通用机制：按读集物化 → FieldSource 直读（M1/M2/M3 已落 2026-09-02）
+
+**动机（实测）**：qradar rules 段 CPU 采样 + census 显示——376 条 match 规则**全走
+deferred 列式路径**（无行式整批物化），但 138 条（36%）`trigger_event_needed=true`、
+其 fires 占 40.1%；每 fire `ColumnarEvent::to_event()` 按**窗口并集**投影物化全行
+（conn_events 的 `conn_info: object`/`tags: array` JSON 解析），而 ctx 只读
+`close_ctx_fields::Named` 读集 → 未引用结构化列的 JSON 解析是纯浪费（采样：
+serde_json 2.4k → 46 权重，-98%）。
+
+**机制 = 三件套（已存在，M1 参数化到规则粒度）**：
+1. 编译期读集：`plan_close_ctx_fields`（Named 窄化，覆盖 score/entity/yield/lets/
+   join 左字段/where）；
+2. 物化投影：`ColumnarEvent.projection`（`to_event` 只遍历投影列；`field_value`
+   不看投影 → step/guard 逐事件读列不受影响）；
+3. 运行时接线：rule_task 的 match 行 `RowEvent::Columnar` 用
+   `RuleExecutor::fire_trigger_projection()`（= Named 集）替代窗口并集
+   `materialize_fields`；All（含 `_step_*`/合成字段引用）→ 回退窗口并集（现状）。
+
+字节一致由构造保证：ctx 从 trigger Event 只读 Named 集（`build_eval_context` 按
+`needed.wants` 过滤；ctx-free 快路径直读的 entity/yield 字段也在 Named 内）→
+投影到 Named = 求值需要的全集。
+
+**M1 落地**：`RuleExecutor.fire_trigger_projection`（executor 字段+访问器）、
+rule_task RowEvent 投影选择。对拍：`fire_trigger_projection_narrows_to_rule_read_set`
+（读集入投影/未引用不入 + 结构化列批上 to_event 只物化读集）/`_none_when_ctx_
+untrackable`（合成字段 → All → None）。实测 qradar rules 段 serde_json 权重
+-98%（to_event 不再解析未引用结构化列）。
+
+> **M1 review ① 审计（2026-09-02，结论=不破 produce）**：multi-alias/Path 读集
+> 正确性。`field_ref_name` 剥 alias、Path 取 root → Named 含跨 alias 裸名，疑点
+> 是「跨窗裸名投影是否错物化/漏物化」。实证三不变式成立：
+> (1) 触发行 `RowEvent::Columnar` 的 batch 恒为**单窗**（`DeferredRows.batch`），
+> to_event 遍历该批 FieldIndex——任何投影只物化本批列；
+> (2) Named ⊇ eval 从 ctx 读的每个裸名（visit_expr_fields 穷尽 + 函数/合成
+> 字段 force_all 兜底）→ 被投影裁掉的列必然不可读；
+> (3) All/Named 决策在 build_eval_context 注入门控与 fire 投影间同源（None ↔ All）。
+> 对拍：`plan_close_ctx_fields_multi_alias_and_path_collapse_to_bare_roots`（剥
+> alias/Path root/同名折叠入集，不误收 alias/叶子段）/
+> `fire_projection_multi_window_bare_names_no_phantom_and_path_root_materialized`
+> （跨窗裸名非本批列 → to_event 无幻影键；Path root 整列物化；未读结构化列
+> 不解析）。
+
+**M2 已落 2026-09-02**：`executor::eval` 泛型化——L3/输出 eval 族
+（`eval_yield_expr*` / `eval_bool_expr` / `eval_expr_with_l3` /
+`eval_score` / `eval_entity_id` + builtins/step_data/utils）ctx 从 `&Event` 改
+`&dyn FieldSource`（FieldSource 名协议：`field_value` / `field_names`）：
+
+- step/bind 历史访问器（step_data.rs）与 stat 标签读取全部走
+  `field_value`（owned），`step_indices` 枚举改 `field_names()`——eval 不再
+  依赖具体 `Event` map（`_step_*` / `_bind_*` 合成字段协议保留为**名称解析
+  契约**：任何按同一协议实现 FieldSource 的 ctx 字节一致）；
+- `Expr::Field` 改 `eval_field_value_src`（与 map 版逐字节同构，key.rs）；
+- owned 读取代价：series 访问每次多一次中间 `Vec` 拷贝（原借用+逐元素 clone
+  → clone + 移动），仅 per-fire 输出路径、量级与既有 to_event/ctx 构建同阶；
+- 对拍：`coverage_m2` 三件套——非-Event `RowSource`（镜像 Event 名协议）逐
+  表达式/入口字节一致；`RowOnlySource`（裸行，无合成条目）= 无合成条目的
+  Event（L3 空历史语义）；field_names 枚举契约锁。
+
+**M3 已落 2026-09-02；§11.3 终点达成**：`MatchedContext.trigger_event`
+`Option<Arc<Event>>` → `Option<TriggerEvent>`（owned 列式行引用：`Event` 变体
+= row-mode/回退物化；`Columnar` 变体 = Arc batch + row + FieldIndex + 投影）：
+
+- `TriggerEvent` 实现 `FieldSource`（field_value 直读列，field_names 尊重
+  投影，to_event 复用 ColumnarEvent 物化语义）——M2 的 FieldSource 化消费方
+  （build_eval_context / ctx-free resolve_field / resolve_match_field）零改读；
+- 机器捕获外置：`advance_at_with_masks_key_capture` 带 owned trigger capture
+  （deferred 路径 = rule_task 每命中行预建列式快照，Arc clone×3，仅
+  trigger_event_needed 时）；默认 None 回退机器内 `event.to_event()`（row-mode
+  / 测试不变）；
+- rule_task deferred 命中行：`DeferredRows` 携每批 `batch_arc`，命中行构造
+  快照直接入机器——**fire 不再 to_event**（HashMap + 结构化列 JSON 解析归零），
+  ctx 按需经 field_value 直读列（结构化字段仍按读集解析一次）；
+- 行为零变化保证：投影一致性（快照投影 == M1 fire 投影/窗口并集）、读集
+  闭合（输出 Field 读名 ⊆ Named ⊆ 投影 → 快照/物化 map 无分歧）、null/缺失
+  语义一致；对拍：`trigger_event_columnar_matches_event_fieldsource_and_
+  projection`（双变体 field_value/to_event/投影窄化字节一致）/
+  `machine_capture_trigger_columnar_skips_fire_materialization`（捕获路径
+  ctx 携 Columnar 变体、回退路径仍 Event 变体，两者 to_event 一致）。
+
+M2+M3 到达 §11.3 终点（生产路径每 fire `Event` 物化归零——deferred 列式
+匹配路径不再有任何逐事件 HashMap/JSON 解析）。
+
+### 11.5 与 merge 的关系
+
+- merge（P1-P3）把 route 并入源任务后，非 defer 窗口的物化仍在源任务执行（每批一次、Arc 共享）——
   不构成 merge 的阻塞项;
-- P4 完成后 merge 后的 route 分支进一步收敛为纯路由 + 分片（都无物化分支），
-  但两者可独立合并/独立验证。
+- P4 与 merge 可独立合并/独立验证；P4 完成后 merge 后的 route 分支收敛为纯路由 + 分片。
 
 ---
 

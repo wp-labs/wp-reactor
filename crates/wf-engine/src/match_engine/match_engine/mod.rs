@@ -21,10 +21,10 @@ pub use types::{EngineHashMap, EngineHashSet};
 pub(crate) use eval::eval_expr;
 pub use eval::values_equal;
 pub use key::{ScopeKey, field_ref_name};
-#[allow(unused_imports)] // test-only（key.rs 内部用全限定路径，lib 构建无人消费）
+#[allow(unused_imports)] // key.rs 内部用全限定路径；重导出由 executor::eval 等模块消费
 pub(crate) use key::{
-    eval_field_value, extract_key_simple, extract_scope_key_from_row, push_i64_exact_decimal,
-    scope_key_from_values, scope_key_shard_index, value_to_string,
+    eval_field_value, eval_field_value_src, extract_key_simple, extract_scope_key_from_row,
+    push_i64_exact_decimal, scope_key_from_values, scope_key_shard_index, value_to_string,
 };
 
 pub use conv::apply_conv;
@@ -51,6 +51,7 @@ use wf_lang::plan::{
 };
 
 use crate::match_engine::columnar::GuardMasks;
+use crate::match_engine::event_bridge::TriggerEvent;
 pub(crate) use close::accumulate_close_steps;
 use close::{evaluate_close, evidence_time_range};
 use key::{InstanceKey, flatten_scope_values};
@@ -358,8 +359,10 @@ impl CepStateMachine {
         row: usize,
         masks: Option<&GuardMasks>,
     ) -> StepResult {
-        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, row, masks, false, None)
-            .result
+        self.advance_at_with_diagnostics(
+            alias, event, now_nanos, windows, row, masks, false, None, None,
+        )
+        .result
     }
 
     /// [`Self::advance_at_with_masks`] with a batch-precomputed join-then-key
@@ -380,6 +383,35 @@ impl CepStateMachine {
         masks: Option<&GuardMasks>,
         key_override: Option<&Option<Vec<Value>>>,
     ) -> StepResult {
+        self.advance_at_with_masks_key_capture(
+            alias,
+            event,
+            now_nanos,
+            windows,
+            row,
+            masks,
+            key_override,
+            None,
+        )
+    }
+
+    /// [`Self::advance_at_with_masks_key`] plus an owned trigger-row capture
+    /// (M3 §11.6): when a fire needs a trigger event, use the caller's
+    /// prebuilt [`TriggerEvent`] (deferred path = owned columnar snapshot, no
+    /// per-fire `to_event()`) instead of materializing from `event`. `None` =
+    /// fall back to materializing `event.to_event()` (row-mode / tests).
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_at_with_masks_key_capture<E: FieldSource>(
+        &mut self,
+        alias: &str,
+        event: &E,
+        now_nanos: i64,
+        windows: Option<&dyn WindowLookup>,
+        row: usize,
+        masks: Option<&GuardMasks>,
+        key_override: Option<&Option<Vec<Value>>>,
+        trigger: Option<&TriggerEvent>,
+    ) -> StepResult {
         self.advance_at_with_diagnostics(
             alias,
             event,
@@ -389,6 +421,7 @@ impl CepStateMachine {
             masks,
             false,
             key_override,
+            trigger,
         )
         .result
     }
@@ -402,7 +435,9 @@ impl CepStateMachine {
         now_nanos: i64,
         windows: Option<&dyn WindowLookup>,
     ) -> StepOutcome {
-        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, 0, None, true, None)
+        self.advance_at_with_diagnostics(
+            alias, event, now_nanos, windows, 0, None, true, None, None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -420,6 +455,9 @@ impl CepStateMachine {
         // 每事件 lookup）；`Some(None)` = 该行预解析 miss（跳过，同内部 miss）；
         // `None` = 无预解析（走原逻辑，含 key_join / extract_key）。
         key_override: Option<&Option<Vec<Value>>>,
+        // M3 §11.6：owned trigger-row capture（deferred 列式快照）。None =
+        // fire 时回退 `event.to_event()`（row-mode / 测试）。
+        trigger: Option<&TriggerEvent>,
     ) -> StepOutcome {
         // FailRule: once the rule has failed, reject all future events.
         // P2b: with shared limits, a FailRule latch on any shard fails the rule.
@@ -491,6 +529,7 @@ impl CepStateMachine {
                         capture_progress,
                         &skey,
                         Some(k * slide_ns),
+                        trigger,
                     );
                     best = Some(match best {
                         Some(prev) => merge_step_outcome(prev, out),
@@ -511,6 +550,7 @@ impl CepStateMachine {
                     capture_progress,
                     &skey,
                     Some(bucket_start),
+                    trigger,
                 ));
             }
             WindowSpec::Sliding(_) | WindowSpec::Session(_) => {
@@ -524,6 +564,7 @@ impl CepStateMachine {
                     capture_progress,
                     &skey,
                     None,
+                    trigger,
                 ));
             }
         }
@@ -546,6 +587,8 @@ impl CepStateMachine {
         capture_progress: bool,
         skey: &ScopeKey,
         window_start: Option<i64>,
+        // M3 §11.6：owned trigger capture（deferred 列式快照），None → 物化回退。
+        trigger: Option<&TriggerEvent>,
     ) -> StepOutcome {
         let instance_key = match window_start {
             Some(ws) => InstanceKey::fixed(skey, ws),
@@ -742,15 +785,27 @@ impl CepStateMachine {
         // 各 early return 无需归还（借用自动结束），新实例入场时统一记一次
         // base_cost（见下）。语义不变：Occupied 借用原实例，Vacant 构造并插入。
         // 旧 take_instance/put_instance 已随此优化删除（2026-08-24）。
+        // 2026-09-02 摊还（qradar rules 段逐事件开销归因）：steady（非新实例 +
+        // 非 memory_grows_per_event）时，两 limits 块（max_instances 门 is_new、
+        // max_memory 门 is_new||grows）在探针后不可能改 map——`get_mut` 免每事件
+        // `instance_key.clone()`（entry 需要 owned key，占用高频 case 纯浪费）；
+        // 新实例/增长规则（distinct 等，DropOldest 可能驱逐当前 key）仍走 entry
+        // 重建语义不变。
         let tracks_memory = self.tracks_memory_bytes();
-        let instance = match self.instances.entry(instance_key.clone()) {
-            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-            std::collections::hash_map::Entry::Vacant(v) => {
-                let created = window_start.unwrap_or(now_nanos);
-                let machine_id = Self::extract_event_str(event, MACHINE_ID);
-                let mut inst = Instance::new_at(&self.plan, machine_id, created);
-                inst.base_cost = new_base.unwrap_or(0);
-                v.insert(inst)
+        let instance = if !is_new && !self.memory_grows_per_event {
+            self.instances
+                .get_mut(&instance_key)
+                .expect("probed non-new && no limits mutation between probe and fetch")
+        } else {
+            match self.instances.entry(instance_key.clone()) {
+                std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    let created = window_start.unwrap_or(now_nanos);
+                    let machine_id = Self::extract_event_str(event, MACHINE_ID);
+                    let mut inst = Instance::new_at(&self.plan, machine_id, created);
+                    inst.base_cost = new_base.unwrap_or(0);
+                    v.insert(inst)
+                }
             }
         };
         if is_new {
@@ -940,7 +995,12 @@ impl CepStateMachine {
                     // 不需要时跳过 per-fire `event.to_event()` 全量 clone——
                     // Q5/Q7/Q12/Q13 每事件命中 fire 的热路径（2026-08）。
                     trigger_event: if plan.trigger_event_needed {
-                        Some(std::sync::Arc::new(event.to_event()))
+                        // M3（2026-09-02）：机器内不再每 fire 物化——预捕获列式快照
+                        // 直接携带；None 回退 to_event（row-mode / 测试）。
+                        Some(match trigger {
+                            Some(t) => t.clone(),
+                            None => TriggerEvent::Event(std::sync::Arc::new(event.to_event())),
+                        })
                     } else {
                         None
                     },
@@ -1162,7 +1222,10 @@ impl CepStateMachine {
                     // 不需要时跳过 per-fire `event.to_event()` 全量 clone——
                     // Q5/Q7/Q12/Q13 每事件命中 fire 的热路径（2026-08）。
                     trigger_event: if plan.trigger_event_needed {
-                        Some(std::sync::Arc::new(event.to_event()))
+                        Some(match trigger {
+                            Some(t) => t.clone(),
+                            None => TriggerEvent::Event(std::sync::Arc::new(event.to_event())),
+                        })
                     } else {
                         None
                     },
@@ -1230,7 +1293,10 @@ impl CepStateMachine {
                     // 不需要时跳过 per-fire `event.to_event()` 全量 clone——
                     // Q5/Q7/Q12/Q13 每事件命中 fire 的热路径（2026-08）。
                     trigger_event: if plan.trigger_event_needed {
-                        Some(std::sync::Arc::new(event.to_event()))
+                        Some(match trigger {
+                            Some(t) => t.clone(),
+                            None => TriggerEvent::Event(std::sync::Arc::new(event.to_event())),
+                        })
                     } else {
                         None
                     },

@@ -465,6 +465,80 @@ fn memory_limit_non_growable_drop_oldest_admission() {
 }
 
 #[test]
+fn steady_instance_state_accumulates_across_events_get_mut() {
+    // 2026-09-02 get_mut 摊还：steady（非新实例 + 非 memory_grows_per_event）
+    // 事件走 get_mut——同一实例跨事件累积 count 1→…→5，不重复建实例、不 panic
+    // （get_mut 的 expect 不变量：探针后无 limits 变更 → 键必在）。带 limits
+    // 配置（真实 qradar 形态）但 steady 时两 limits 块均跳过。
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("e", count_ge(5.0))])],
+    );
+    let mut sm = CepStateMachine::with_limits(
+        "r".into(),
+        plan,
+        None,
+        limits(ExceedAction::Throttle, Some(1000), Some(1 << 20)),
+    );
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    // 前 4 个事件在同一实例上累积（count 1..4）→ Accumulate；
+    // 第 5 个触发 count 5 → Matched；全程单实例。
+    for t in [0, 1_000, 2_000, 3_000] {
+        assert_eq!(sm.advance_at("e", &e, t), StepResult::Accumulate, "t={t}");
+        assert_eq!(
+            sm.instance_count(),
+            1,
+            "t={t} 同一 key 恒单实例（get_mut 复用）"
+        );
+    }
+    assert!(matches!(
+        sm.advance_at("e", &e, 4_000),
+        StepResult::Matched(_)
+    ));
+    assert_eq!(
+        sm.instance_count(),
+        1,
+        "reset 后实例仍在 map（后续事件复用）"
+    );
+    // 再累积一轮，确认 reset 后的稳态仍正常推进（get_mut 二次稳态）。
+    assert_eq!(sm.advance_at("e", &e, 5_000), StepResult::Accumulate);
+    assert_eq!(sm.instance_count(), 1);
+}
+
+#[test]
+fn growing_rule_memory_drop_oldest_evicts_current_without_get_mut() {
+    // 2026-09-02 get_mut 摊还的保底：memory_grows_per_event（多步）规则逐事件
+    // max_memory 检查仍走 entry 路径——共享预算被（模拟的其他 shard）抬高后，
+    // 本机唯一实例（当前 key）在 DropOldest 下被逐出且无法重建（预算仍超）→
+    // Accumulate + 0 实例。若误把 steady 分支的 get_mut（expect）用于增长规则
+    // 会在此 panic——本测试锁定 entry 分支选择。
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![
+            step(vec![branch("e", count_ge(1.0))]),
+            step(vec![branch("e", count_ge(1.0))]),
+        ],
+    );
+    let shared = SharedLimits::new();
+    let mut sm = CepStateMachine::with_limits_shared(
+        "r".into(),
+        plan,
+        None,
+        limits(ExceedAction::DropOldest, None, Some(2000)),
+        Arc::clone(&shared),
+    );
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    // step1 命中 → Advance（实例 A 入场，base << 2000）。
+    assert_eq!(sm.advance_at("e", &e, 0), StepResult::Advance);
+    assert_eq!(sm.instance_count(), 1);
+    // 抬高共享预算到必然超限 → 下一事件（增长规则，非新实例）逐出最旧（=A 自身，
+    // evicting_current）且预算仍超 → 放弃重建（N2 槽位归还），Accumulate + 0。
+    shared.add_memory(2000);
+    assert_eq!(sm.advance_at("e", &e, 1_000), StepResult::Accumulate);
+    assert_eq!(sm.instance_count(), 0);
+}
+
+#[test]
 fn memory_limit_amortized_shared_admission() {
     // 2026-08-31 limits 摊还 + shared（P2b）：单步 count（不可增长）规则在
     // 摊还后仍通过共享镜像做**准入**控制——shard B 的新 key 在共享总量

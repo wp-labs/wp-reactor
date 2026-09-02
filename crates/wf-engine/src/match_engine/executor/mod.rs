@@ -11,9 +11,11 @@ pub(crate) use context::{enrich_join_row, enrich_join_row_bare, in_interval, row
 #[cfg(test)]
 pub(crate) use deferred_exec::select_reduce_row;
 mod deferred_exec;
-pub use deferred_exec::DeferredPending;
+pub use deferred_exec::{DeferredLeft, DeferredPending};
 mod each_exec;
 mod eval;
+mod execution_path;
+pub use execution_path::{ExecutionPath, ExecutionPathContext};
 mod match_exec;
 mod stats_exec;
 
@@ -691,6 +693,13 @@ pub struct RuleExecutor {
     /// (see [`plan_close_ctx_fields`] — `All` for rules whose expressions
     /// can't be statically narrowed).
     close_ctx_fields: CloseCtxFields,
+    /// M1（P4 终态机制，2026-09-02）：规则级 fire 投影——match 行 ColumnarEvent
+    /// 的 `to_event` 只物化本规则输出 ctx 实际读取的字段（= `close_ctx_fields`
+    /// 的 Named 集；ctx 只读该集，字节一致由构造保证）。消除窗口并集/全列
+    /// 物化里的结构化列 JSON 解析（qradar 40% trigger fires 每发都解析
+    /// conn_info/tags 的问题）。`None` = 非 match / All（无法静态窄化）→ 回退
+    /// 窗口 materialize_fields（现状）。
+    fire_trigger_projection: Option<std::sync::Arc<std::collections::HashSet<String>>>,
     /// Whether the rule can observe a `reduce ... as label` object, gating the
     /// deferred-join label materialization (see [`plan_reduce_label_reads`]).
     reduce_label_reads: ReduceLabelReads,
@@ -742,6 +751,7 @@ impl Clone for RuleExecutor {
             output_static: self.output_static.clone(),
             emit_time_cache: Mutex::new((0, Arc::from(""))),
             close_ctx_fields: self.close_ctx_fields.clone(),
+            fire_trigger_projection: self.fire_trigger_projection.clone(),
             reduce_label_reads: self.reduce_label_reads.clone(),
             compiled_guards: Mutex::new(std::collections::HashMap::new()),
         }
@@ -787,6 +797,29 @@ impl RuleExecutor {
     }
 
     pub fn new_with_options(plan: RulePlan, options: RuleExecutorOptions) -> Self {
+        // 临时诊断（WFU_RULE_CENSUS=1）：每规则一条 census——trigger_event_needed
+        // 决定 fire 是否物化 trigger Event（to_event + 结构化列 JSON 解析）。
+        // 与 metrics 的每规则 matches_total/emitted_total 外联可得每规则 fire 量。
+        if std::env::var_os("WFU_RULE_CENSUS").is_some() {
+            let kind = if plan.each_plan.is_some() {
+                "each"
+            } else if plan.stats_plan.is_some() {
+                "stats"
+            } else {
+                "match"
+            };
+            eprintln!(
+                "WFU_CENSUS rule={} kind={} trigger_event_needed={} nkeys={} nbind_filters={} njoins={} nlets={} nsteps={}",
+                plan.name,
+                kind,
+                plan.match_plan.trigger_event_needed,
+                plan.match_plan.keys.len(),
+                plan.binds.iter().filter(|b| b.filter.is_some()).count(),
+                plan.joins.len(),
+                plan.lets.len(),
+                plan.match_plan.event_steps.len(),
+            );
+        }
         let live_joins = compute_live_joins(&plan);
         let each_join_plan = parse_each_join_columnar(&plan, &live_joins);
         let bind_filters = plan
@@ -847,6 +880,16 @@ impl RuleExecutor {
         let close_ctx_fields = plan_close_ctx_fields(&plan);
         let reduce_label_reads = plan_reduce_label_reads(&plan);
         let match_ctx_free = compute_match_ctx_free(&plan, &live_joins, &yield_kinds);
+        // M1：规则级 fire 投影（Named 窄化集）——`to_event` 只物化 ctx 读的字段；
+        // All（无法静态窄化）→ None（回退窗口 materialize_fields）。非 match 规则
+        // （each/stats 不消费 RowEvent 投影）无影响。
+        let fire_trigger_projection: Option<std::sync::Arc<std::collections::HashSet<String>>> =
+            match &close_ctx_fields {
+                CloseCtxFields::Named(set) if !set.is_empty() => {
+                    Some(std::sync::Arc::new(set.clone()))
+                }
+                _ => None,
+            };
         Self {
             output_static: OutputStatic {
                 rule_name: Arc::from(plan.name.as_str()),
@@ -869,9 +912,18 @@ impl RuleExecutor {
             bind_filters,
             emit_time_cache: Mutex::new((0, Arc::from(""))),
             close_ctx_fields,
+            fire_trigger_projection,
             reduce_label_reads,
             compiled_guards: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// 规则级 fire 投影（M1）：match 行 `to_event` 只物化 ctx 读取的 Named 字段。
+    /// `None` = 无法窄化（All）/非 match → 调用方回退窗口 materialize_fields。
+    pub fn fire_trigger_projection(
+        &self,
+    ) -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
+        self.fire_trigger_projection.clone()
     }
 
     /// Formatted emit time for `nanos`, cached: consecutive calls with the
@@ -1009,6 +1061,14 @@ impl RuleExecutor {
         } else {
             self.bind_filters.get(alias).and_then(|f| f.as_ref())
         }
+    }
+
+    /// 该 alias 是否声明了 bind filter。列式掩码缺失（`None`）时区分「无
+    /// filter → 全放行」与「非列式 filter → 需逐行解释」（gap-4 2026-09-02：
+    /// columnar_each 块对非列式 bind filter 逐行 `event_matches_alias`，不
+    /// 再静默全放行丢过滤子集）。
+    pub fn bind_filter_present(&self, alias: &str) -> bool {
+        self.bind_filter(alias).is_some()
     }
 
     /// Columnar evaluation of `alias`'s bind filter over a whole batch.

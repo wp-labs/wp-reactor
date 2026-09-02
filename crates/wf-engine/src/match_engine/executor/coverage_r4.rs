@@ -23,8 +23,6 @@ use wf_lang::plan::{
 use wf_lang::{BaseType, FieldType};
 
 use crate::alert::AlertColumnBuilder;
-use crate::match_engine::JoinRow;
-use crate::match_engine::RuleExecutor;
 use crate::match_engine::executor::context::{
     build_eval_context, enrich_join_row, execute_joins, in_interval,
 };
@@ -32,6 +30,7 @@ use crate::match_engine::match_engine::{
     BindData, CloseOutput, CloseReason, EngineHashMap, Event, MatchedContext, StepData, Value,
     WindowLookup,
 };
+use crate::match_engine::{JoinRow, RuleExecutor, TriggerEvent};
 
 // ---------------------------------------------------------------------------
 // Helpers (local copies — `tests::helpers` is not reachable from this module)
@@ -830,7 +829,7 @@ fn build_eval_context_narrow_and_all() {
         std::slice::from_ref(&sd),
         std::slice::from_ref(&bind),
         &step_plans,
-        Some(&trigger),
+        Some(&TriggerEvent::from_event(Arc::new(trigger.clone()))),
         &narrow,
         None,
     );
@@ -1705,7 +1704,10 @@ fn execute_match_with_joins_hit_miss_and_where() {
 
     // Join miss (no right rows) → Ok(None).
     let mut matched = matched_context(str_val("10.0.0.1"), step_data(Some("fail"), 1.0));
-    matched.trigger_event = Some(Arc::new(event(vec![("bidder", num(1.0))])));
+    matched.trigger_event = Some(TriggerEvent::from_event(Arc::new(event(vec![(
+        "bidder",
+        num(1.0),
+    )]))));
     assert!(
         exec.execute_match_with_joins(&matched, &RowsLookup::new(vec![]))
             .unwrap()
@@ -1721,10 +1723,10 @@ fn execute_match_with_joins_hit_miss_and_where() {
 
     // with_joins_at with a trigger event and where true → record.
     let mut matched2 = matched_context(str_val("10.0.0.1"), step_data(Some("fail"), 1.0));
-    matched2.trigger_event = Some(Arc::new(event(vec![
+    matched2.trigger_event = Some(TriggerEvent::from_event(Arc::new(event(vec![
         ("bidder", num(1.0)),
         ("flag", Value::Bool(true)),
-    ])));
+    ]))));
     let rec = exec
         .execute_match_with_joins_at(&matched2, &lookup, 1234)
         .unwrap()
@@ -1837,7 +1839,7 @@ fn ctx_free_match_output_matches_full_ctx_bytes() {
         window_start_time_nanos: NOW - 600_000_000_000,
         window_end_time_nanos: NOW,
         machine_id: String::new(),
-        trigger_event: Some(Arc::new(trigger.clone())),
+        trigger_event: Some(TriggerEvent::from_event(Arc::new(trigger.clone()))),
     };
 
     // Full 路径：手动构造窄化 ctx（键字段 + trigger_event 字段——同
@@ -1984,11 +1986,11 @@ fn columnar_match_output_matches_row_path() {
         window_start_time_nanos: NOW - 600_000_000_000,
         window_end_time_nanos: NOW,
         machine_id: String::new(),
-        trigger_event: Some(Arc::new(event(vec![
+        trigger_event: Some(TriggerEvent::from_event(Arc::new(event(vec![
             ("auction", num(auction)),
             ("price", num(300.0)),
             ("bidder", num(5.0)),
-        ]))),
+        ])))),
     };
     let m1 = mk(1001.0, 20.0);
     let m2 = mk(1002.0, 21.0);
@@ -2109,7 +2111,7 @@ fn columnar_match_general_fmt_matches_row_path() {
         window_start_time_nanos: NOW - 600_000_000_000,
         window_end_time_nanos: NOW,
         machine_id: String::new(),
-        trigger_event: Some(Arc::new(event(vec![
+        trigger_event: Some(TriggerEvent::from_event(Arc::new(event(vec![
             ("auction", num(auction)),
             ("bidder", num(5.0)),
             (
@@ -2119,7 +2121,7 @@ fn columnar_match_general_fmt_matches_row_path() {
                     None => Value::Str("".into()),
                 },
             ),
-        ]))),
+        ])))),
     };
     let m1 = mk(1001.0, 20.0, Some(300.0));
     let m2 = mk(1002.0, 21.0, None); // price 缺失 → fmt 空串（解释 None→""）
@@ -2222,10 +2224,10 @@ fn columnar_match_general_materialize_fail_falls_back_matches_row_path() {
         window_start_time_nanos: NOW - 600_000_000_000,
         window_end_time_nanos: NOW,
         machine_id: String::new(),
-        trigger_event: Some(Arc::new(event(vec![
+        trigger_event: Some(TriggerEvent::from_event(Arc::new(event(vec![
             ("auction", num(auction)),
             ("price", price),
-        ]))),
+        ])))),
     };
     // price 跨行类型不一致（Number vs Str）→ 物化失败 → 整批回退逐行。
     let m1 = mk(1001.0, 20.0, num(300.0));

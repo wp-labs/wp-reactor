@@ -18,10 +18,79 @@ use crate::error::CoreResult;
 use crate::match_engine::match_engine::{
     EngineHashMap, Event, Value, WindowLookup, eval_expr, field_ref_name,
 };
+use crate::match_engine::{FieldSource, JoinRow};
 use crate::time::normalize_epoch_timestamp_float_nanos;
 
 use super::RuleExecutor;
 use super::context::{enrich_join_row_bare, eval_interval_bound, in_interval, row_matches_conds};
+
+/// deferred 驱动（左）行的读取门面。
+///
+/// P4 gap-1（q4/q8/q9）：驱动事件从 [`Event`]（每行 HashMap 物化）降为列式视图
+/// [`JoinRow::Columnar`]（Arc batch + 行号，同批共享），挂起队列的内存与注入期
+/// 分配随之下降。`Event` 变体保留为回退（无原始 batch / 有 let 绑定时的解释路径
+/// ——见 [`RuleExecutor::deferred_pending_for`]）。
+#[derive(Clone)]
+pub enum DeferredLeft {
+    /// 列式视图（无 let 规则的默认形态）。
+    Columnar(JoinRow),
+    /// 预物化 Event（有 let 绑定 / 无原始 batch 的回退形态）。
+    Event(Event),
+}
+
+impl FieldSource for DeferredLeft {
+    fn field_value(&self, name: &str) -> Option<Value> {
+        match self {
+            DeferredLeft::Columnar(row) => {
+                // 投影遮蔽：与 `batch_to_events_filtered` 的裁剪语义字节一致——
+                // 投影外的字段读 None（而非返回原始列值），对齐 eager 路径的
+                // 裁剪 Event（字段不在 map 里 → 引用读空）。
+                if let JoinRow::Columnar { projection, .. } = row
+                    && projection.as_ref().is_some_and(|p| !p.contains(name))
+                {
+                    return None;
+                }
+                row.field_value(name)
+            }
+            DeferredLeft::Event(ev) => ev.fields.get(name).cloned(),
+        }
+    }
+
+    fn field_names(&self) -> Vec<&str> {
+        match self {
+            DeferredLeft::Columnar(row) => row.field_names(),
+            DeferredLeft::Event(ev) => ev.fields.keys().map(|k| k.as_str()).collect(),
+        }
+    }
+
+    fn to_event(&self) -> Event {
+        match self {
+            DeferredLeft::Columnar(row) => {
+                let mut fields = EngineHashMap::default();
+                for name in row.field_names() {
+                    if let Some(value) = row.field_value(name) {
+                        fields.insert(name.into(), value);
+                    }
+                }
+                Event { fields }
+            }
+            DeferredLeft::Event(ev) => ev.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for DeferredLeft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeferredLeft::Columnar(row) => write!(
+                f,
+                "DeferredLeft::Columnar(fields={})",
+                row.field_names().len()
+            ),
+            DeferredLeft::Event(_) => write!(f, "DeferredLeft::Event(..)"),
+        }
+    }
+}
 
 /// 一个挂起的 deferred join 实例：驱动（左）行 + 预计算的区间与触发点。
 ///
@@ -41,30 +110,42 @@ pub struct DeferredPending {
     pub hi_open: bool,
     /// `emit at` 触发点 = 到期 watermark（也是输出 `fired_at`）。
     pub expiry_nanos: i64,
-    /// 左行字段（entity/score/yield/join 条件复核/界求值来源）。
-    pub left: Event,
+    /// 左行字段（entity/score/yield/join 条件复核/界求值来源）。无 let 规则为
+    /// 列式视图（`JoinRow::Columnar`），有 let 为预物化 Event（见
+    /// [`DeferredLeft`]）。
+    pub left: DeferredLeft,
 }
 
 impl RuleExecutor {
     /// 驱动事件到达时的挂起求值：提取 join 键 + 区间界 + `emit at` 触发点。
     ///
     /// 返回 `None` 表示该事件无法挂起（无 emit_at / 无 within / 键或界求值失败）。
+    /// `left` 为列式视图时且规则有 let 绑定 → 自动物化 + 注入绑定（回退语义）；
+    /// 无 let 时保持列式（零物化）。
     pub fn deferred_pending_for(
         &self,
         join_idx: usize,
-        event: &Event,
+        left: &DeferredLeft,
         event_time_nanos: i64,
     ) -> Option<DeferredPending> {
         let join = self.plan.joins.get(join_idx)?;
         let emit_at = join.emit_at.as_ref()?;
         let wspec = join.within.as_ref()?;
-        // `let` 绑定先注入（界/触发点/yield 可能引用裸名绑定），再求值挂起
-        let mut ctx = event.clone();
-        self.apply_lets(&mut ctx);
-        let (key_field, key) = first_join_key_local(&ctx, &join.conds)?;
-        let lo_ns = eval_interval_bound(&wspec.lo, &ctx, event_time_nanos)?;
-        let hi_ns = eval_interval_bound(&wspec.hi, &ctx, event_time_nanos)?;
-        let expiry_nanos = eval_expr(emit_at, &ctx).and_then(|v| match v {
+        // `let` 绑定注入：列式视图 + 有 let → 物化 Event 后注入（字节一致由
+        // `to_event`（batch_to_events 语义）保证）；无 let 保持列式零物化。
+        // `Event` 变体 = 旧路径 clone + apply_lets。
+        let left = match left {
+            DeferredLeft::Columnar(_) if self.plan.lets.is_empty() => left.clone(),
+            other => {
+                let mut ctx = other.to_event();
+                self.apply_lets(&mut ctx);
+                DeferredLeft::Event(ctx)
+            }
+        };
+        let (key_field, key) = first_join_key_local(&left, &join.conds)?;
+        let lo_ns = eval_interval_bound(&wspec.lo, &left, event_time_nanos)?;
+        let hi_ns = eval_interval_bound(&wspec.hi, &left, event_time_nanos)?;
+        let expiry_nanos = eval_expr(emit_at, &left).and_then(|v| match v {
             Value::Number(n) => normalize_epoch_timestamp_float_nanos(n),
             _ => None,
         })?;
@@ -76,7 +157,7 @@ impl RuleExecutor {
             lo_open: wspec.lo.open,
             hi_open: wspec.hi.open,
             expiry_nanos,
-            left: ctx,
+            left,
         })
     }
 
@@ -144,8 +225,9 @@ impl RuleExecutor {
             return Ok(None);
         }
 
-        // 输出 ctx = 左行 + 富化/注入
-        let mut out_ctx = pending.left.clone();
+        // 输出 ctx = 左行 + 富化/注入（列式视图在此物化——仅到期评估的实例
+        // 才物化，挂起队列全程保持列式）
+        let mut out_ctx = pending.left.to_event();
         match &join.reduce {
             Some(rc) => {
                 let Some(row) = select_reduce_row(matched, &rc.measure) else {
@@ -206,11 +288,11 @@ impl RuleExecutor {
     }
 }
 
-/// 按 key 过滤前的 join 键提取（本模块局部副本：deferred 挂起时 ctx 就是驱动事件）。
-fn first_join_key_local(ctx: &Event, conds: &[JoinCondPlan]) -> Option<(String, Value)> {
+/// 按 key 过滤前的 join 键提取（deferred 挂起时读取驱动行视图）。
+fn first_join_key_local(left: &dyn FieldSource, conds: &[JoinCondPlan]) -> Option<(String, Value)> {
     let cond = conds.first()?;
     let left_name = field_ref_name(&cond.left);
-    let val = ctx.fields.get(left_name)?.clone();
+    let val = left.field_value(left_name)?;
     Some((field_ref_name(&cond.right).to_string(), val))
 }
 

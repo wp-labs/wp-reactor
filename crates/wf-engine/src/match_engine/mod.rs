@@ -14,17 +14,18 @@ mod tests;
 
 pub use columnar::{GuardMasks, mask_to_indices};
 pub use event_bridge::{
-    ColumnarEvent, FieldIndex, JoinRow, WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY,
-    WFL_FIELD_TYPE_OBJECT, batch_event_time_nanos, batch_event_time_nanos_at, batch_raw_ts_nanos,
-    batch_time_col_index, batch_to_events, batch_to_events_filtered, batch_to_timestamped_rows,
-    build_field_index, column_scalar_string, columnar_join_rows, columnar_timestamped_join_rows,
-    is_wfl_structured_field, materialize_rows, materialize_rows_filtered,
-    wfl_structured_field_kind,
+    ColumnarEvent, FieldIndex, JoinRow, TriggerEvent, WFL_FIELD_TYPE_ARRAY,
+    WFL_FIELD_TYPE_METADATA_KEY, WFL_FIELD_TYPE_OBJECT, batch_event_time_nanos,
+    batch_event_time_nanos_at, batch_raw_ts_nanos, batch_time_col_index, batch_to_events,
+    batch_to_events_filtered, batch_to_timestamped_rows, build_field_index, column_scalar_string,
+    columnar_join_rows, columnar_timestamped_join_rows, is_wfl_structured_field, materialize_rows,
+    materialize_rows_filtered, wfl_structured_field_kind,
 };
 pub use executor::{
-    DeferredPending, DistinctKey, DistinctSet, EachDirectBatchStats, PipeEachRow, PipeRowSink,
-    RowFieldLayout, RowFields, RuleExecutor, RuleExecutorOptions, StatsAccum, StatsBucketAccs,
-    StatsExecutor, StatsMaskCache, StatsWindowState,
+    DeferredLeft, DeferredPending, DistinctKey, DistinctSet, EachDirectBatchStats, ExecutionPath,
+    ExecutionPathContext, PipeEachRow, PipeRowSink, RowFieldLayout, RowFields, RuleExecutor,
+    RuleExecutorOptions, StatsAccum, StatsBucketAccs, StatsExecutor, StatsMaskCache,
+    StatsWindowState,
 };
 pub use match_engine::apply_conv;
 pub use match_engine::close_is_qualified;

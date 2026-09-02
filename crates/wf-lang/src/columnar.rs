@@ -242,6 +242,14 @@ fn field_ref_is_columnar(field: &FieldRef) -> bool {
     }
 }
 
+/// `root[i]` 形态（Path segments = `[Field(root), Index(i)]`）——列式 offset 读。
+pub fn field_ref_is_list_index(field: &FieldRef) -> bool {
+    matches!(
+        field,
+        FieldRef::Path { segments, .. } if path_is_list_index(segments)
+    )
+}
+
 /// `root[i]` — a root field followed by exactly one constant array index.
 /// Anything deeper (`a.b[0]`, `a[0].b`, `a[0][1]`) falls back to the
 /// interpreted per-row object/array traversal.

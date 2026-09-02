@@ -331,3 +331,116 @@ fn fieldsource_field_value_matches_event() {
     assert_eq!(col.field_value_str("sip"), event.field_value_str("sip"));
     assert_eq!(col.field_value("missing"), event.field_value("missing"));
 }
+
+// ---------------------------------------------------------------------------
+// M3（P4 终态机制 2026-09-02）：owned `TriggerEvent`——deferred 命中行 fire 免
+// `to_event()` 物化（机器经 `advance_at_with_masks_key_capture` 直接携带列式快照，
+// ctx 经 FieldSource 按需直读列）。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trigger_event_columnar_matches_event_fieldsource_and_projection() {
+    use crate::match_engine::{TriggerEvent, Value};
+
+    let batch = sip_batch(&[
+        ("10.0.0.1", Some("blocked"), Some(80), 0),
+        ("10.0.0.1", None, None, 1),
+    ]);
+    let events = batch_to_events(&batch);
+    let index = build_field_index(&batch);
+    let batch_arc = Arc::new(batch.clone());
+
+    for (row, event) in events.iter().enumerate() {
+        let materialized = TriggerEvent::Event(std::sync::Arc::new(event.clone()));
+        let col_view =
+            TriggerEvent::columnar(Arc::clone(&batch_arc), row, Arc::clone(&index), None);
+        // Field reads byte-identical to the materialized trigger (same
+        // `extract_field_value` conversions; null / missing → None).
+        for name in ["sip", "action", "dport", "missing"] {
+            assert_eq!(
+                col_view.field_value(name),
+                materialized.field_value(name),
+                "row {row} [{name}]"
+            );
+        }
+        assert_eq!(col_view.to_event(), *event, "row {row} to_event");
+    }
+
+    // Projection narrows field_names / to_event to the read set (the M1
+    // read-set columns) — a ctx built over the snapshot sees exactly what the
+    // projected eager trigger map carried.
+    let proj = Arc::new(std::collections::HashSet::from([
+        "sip".to_string(),
+        "dport".to_string(),
+    ]));
+    let col_view =
+        TriggerEvent::columnar(Arc::clone(&batch_arc), 0, Arc::clone(&index), Some(proj));
+    let names = col_view.field_names();
+    assert!(names.contains(&"sip") && names.contains(&"dport"));
+    assert!(!names.contains(&"action"));
+    let materialized = col_view.to_event();
+    assert_eq!(materialized.fields.len(), 2);
+    assert_eq!(
+        materialized.fields.get("sip"),
+        Some(&Value::Str("10.0.0.1".into()))
+    );
+}
+
+#[test]
+fn machine_capture_trigger_columnar_skips_fire_materialization() {
+    use crate::match_engine::{StepResult, TriggerEvent, Value};
+
+    // Rule whose fires need a trigger event (output reads a non-key field).
+    let mut plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("a", count_ge(1.0))])],
+    );
+    plan.trigger_event_needed = true;
+
+    let batch = sip_batch(&[("10.0.0.1", Some("login"), Some(443), 7)]);
+    let events = batch_to_events(&batch);
+    let index = build_field_index(&batch);
+    let batch_arc = Arc::new(batch.clone());
+    let row = 0;
+    let col = ColumnarEvent::with_index(&batch, row, Arc::clone(&index));
+
+    // Deferred-capture path: the caller hands the machine an owned columnar
+    // snapshot (M3) — the fire carries it directly, no per-fire to_event.
+    let capture = TriggerEvent::columnar(Arc::clone(&batch_arc), row, Arc::clone(&index), None);
+    let mut sm = CepStateMachine::new("r".into(), plan.clone(), Some("ts".into()));
+    let StepResult::Matched(ctx) =
+        sm.advance_at_with_masks_key_capture("a", &col, 7, None, row, None, None, Some(&capture))
+    else {
+        panic!("single-step rule must fire");
+    };
+    // The snapshot is carried as-is (columnar variant, no materialization)…
+    assert!(
+        matches!(ctx.trigger_event, Some(TriggerEvent::Columnar { .. })),
+        "capture path must carry the columnar snapshot"
+    );
+    // …and consumers read fields lazily through FieldSource, byte-identical
+    // to the eager materialized trigger.
+    let trigger = ctx.trigger_event.as_ref().expect("trigger attached");
+    assert_eq!(
+        trigger.field_value("action"),
+        Some(Value::Str("login".into()))
+    );
+    assert_eq!(trigger.field_value("dport"), Some(Value::Number(443.0)));
+    assert_eq!(trigger.to_event(), events[0]);
+
+    // Fallback path (capture = None): the machine materializes the row — the
+    // pre-M3 behavior, byte-identical to the snapshot's to_event.
+    let mut sm2 = CepStateMachine::new("r".into(), plan, Some("ts".into()));
+    let StepResult::Matched(ctx2) =
+        sm2.advance_at_with_masks_key_capture("a", &col, 7, None, row, None, None, None)
+    else {
+        panic!("single-step rule must fire");
+    };
+    let ev = ctx2.trigger_event.as_ref().expect("trigger attached");
+    assert!(
+        matches!(ev, TriggerEvent::Event(_)),
+        "fallback materializes"
+    );
+    assert_eq!(ev.field_value("sip"), Some(Value::Str("10.0.0.1".into())));
+    assert_eq!(ev.to_event(), events[0]);
+}

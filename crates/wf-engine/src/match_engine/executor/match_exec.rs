@@ -6,8 +6,10 @@ use wf_lang::ast::{Expr, FieldRef};
 use crate::alert::{AlertColumnBuilder, AlertOrigin, EachRowCells, OutputRecord};
 use crate::error::CoreResult;
 use crate::match_engine::columnar::cscalar_to_value;
+use crate::match_engine::event_bridge::TriggerEvent;
 use crate::match_engine::match_engine::{
-    Event, MatchedContext, Value, WindowLookup, eval_field_value, field_ref_name, value_to_string,
+    Event, FieldSource, MatchedContext, Value, WindowLookup, eval_field_value, field_ref_name,
+    value_to_string,
 };
 
 use super::close_exec::CloseBatchVecs;
@@ -30,7 +32,7 @@ enum ResolveCtx<'a> {
     Free {
         keys: &'a [FieldRef],
         scope_key: &'a [Value],
-        trigger_event: Option<&'a Event>,
+        trigger_event: Option<&'a TriggerEvent>,
     },
 }
 
@@ -49,7 +51,7 @@ impl ResolveCtx<'_> {
                     .zip(scope_key.iter())
                     .find(|(k, _)| field_ref_name(k) == name)
                     .map(|(_, v)| v.clone())
-                    .or_else(|| trigger_event.and_then(|ev| ev.fields.get(name).cloned()))
+                    .or_else(|| trigger_event.and_then(|ev| ev.field_value(name)))
             }
         }
     }
@@ -81,7 +83,7 @@ impl RuleExecutor {
             &matched.step_data,
             &matched.bind_data,
             &step_plans,
-            matched.trigger_event.as_deref(),
+            matched.trigger_event.as_ref(),
             &self.close_ctx_fields,
             None,
         );
@@ -127,7 +129,7 @@ impl RuleExecutor {
             &matched.step_data,
             &matched.bind_data,
             &step_plans,
-            matched.trigger_event.as_deref(),
+            matched.trigger_event.as_ref(),
             &self.close_ctx_fields,
             None,
         );
@@ -179,7 +181,7 @@ impl RuleExecutor {
         let resolve = ResolveCtx::Free {
             keys: &self.plan.match_plan.keys,
             scope_key: &matched.scope_key,
-            trigger_event: matched.trigger_event.as_deref(),
+            trigger_event: matched.trigger_event.as_ref(),
         };
         self.build_match_alert_inner(matched, &resolve, emit_time_nanos)
     }
@@ -366,7 +368,7 @@ impl RuleExecutor {
             let resolve = ResolveCtx::Free {
                 keys,
                 scope_key: &m.scope_key,
-                trigger_event: m.trigger_event.as_deref(),
+                trigger_event: m.trigger_event.as_ref(),
             };
             let entity_id = match &entity_const {
                 Some(s) => s.clone(),
@@ -462,7 +464,7 @@ impl RuleExecutor {
                                         &m.step_data,
                                         &m.bind_data,
                                         &step_plans,
-                                        m.trigger_event.as_deref(),
+                                        m.trigger_event.as_ref(),
                                         &self.close_ctx_fields,
                                         None,
                                     )
@@ -556,7 +558,7 @@ impl RuleExecutor {
             None => {
                 // ctx-free gate 要求 score 常量；非常量分支仅 Full 模式可达。
                 assert!(!free, "ctx-free 路径不允许非常量 score");
-                let ResolveCtx::Full(ctx) = resolve else {
+                let &ResolveCtx::Full(ctx) = resolve else {
                     unreachable!()
                 };
                 eval_score(&self.plan.score_plan.expr, ctx)?
@@ -574,7 +576,7 @@ impl RuleExecutor {
             _ => {
                 // ctx-free gate 要求 entity 为 Field；复杂表达式仅 Full 模式。
                 assert!(!free, "ctx-free 路径不允许非 Field entity");
-                let ResolveCtx::Full(ctx) = resolve else {
+                let &ResolveCtx::Full(ctx) = resolve else {
                     unreachable!()
                 };
                 eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?
@@ -646,7 +648,7 @@ impl RuleExecutor {
                     YieldKind::General => {
                         // ctx-free gate 排除 General 表达式（需要完整 ctx）。
                         assert!(!free, "ctx-free 路径不允许 General yield 表达式");
-                        let ResolveCtx::Full(ctx) = resolve else {
+                        let &ResolveCtx::Full(ctx) = resolve else {
                             unreachable!()
                         };
                         eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
@@ -701,10 +703,10 @@ fn resolve_match_field(m: &MatchedContext, keys: &[FieldRef], name: &str) -> Opt
             return Some(v.clone());
         }
     }
-    if let Some(ev) = m.trigger_event.as_deref()
-        && let Some(v) = ev.fields.get(name)
+    if let Some(ev) = m.trigger_event.as_ref()
+        && let Some(v) = ev.field_value(name)
     {
-        return Some(v.clone());
+        return Some(v);
     }
     for sd in &m.step_data {
         if let Some(label) = &sd.label
