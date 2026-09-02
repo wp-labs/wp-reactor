@@ -728,14 +728,18 @@ fn each_join_columnar_gate_rejects_unsupported_shapes() {
         plan
     };
 
-    // where 引用**左窗**字段（非右窗）→ 不支持（列式 where 只吃右窗字段）。
+    // where 引用**左窗**字段（驱动列，gap-3 2026-09-02）→ 列式放行：死
+    // join 消除（where 不引用右窗）→ live_joins 空 → where 走驱动列守卫掩码。
     let mut plan = base();
     plan.r#where = Some(Expr::BinOp {
         op: BinOp::Gt,
         left: Box::new(Expr::Field(FieldRef::Qualified("b".into(), "price".into()))),
         right: Box::new(Expr::Number(5.0)),
     });
-    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+    assert!(
+        RuleExecutor::new(plan).each_plan_columnar_safe(),
+        "gap-3：无活 join + 可列式驱动列 where 必须放行"
+    );
 
     // where 为复合表达式（函数）→ 不支持。
     let mut plan = base();

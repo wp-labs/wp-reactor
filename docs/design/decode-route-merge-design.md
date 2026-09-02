@@ -275,7 +275,7 @@ loop {
 |---|---|---|---|---|
 | 1 | **reduce maxrow join**（非 Snapshot） | q4/q9 | **大**（新执行器：右窗 per-key 窗口化归约 + 输出整行） | ✅ **2026-09-02 收口**——deferred 驱动列式挂起（`DeferredPending.left` → `DeferredLeft`） |
 | 2 | **within/interval join** | q8 | **大**（列式 interval-join 结构） | ✅ **2026-09-02 收口**（同上；区间过滤本就列式，剩余是驱动行物化） |
-| 3 | each + 后置 `where`（无 join 时 where 非空） | q15/q16/q17 形态 | 中 | 开放 |
+| 3 | each + 后置 `where`（无 join 时 where 非空） | q15/q16/q17 形态 | 中 | ✅ **2026-09-02 收口**——无活 join + 可列式驱动列 where（批级守卫掩码；真实可达形状 = 死 join + 驱动列 where） |
 | 4 | each filter / bind filter 非列式 | 通用 | 中 | 开放 |
 | 5 | 输出字段非 flat / 非限定引用（有 join） | 通用 | 中 | 开放 |
 | 6 | score 非「常量 \| 常量×flat 字段」 | 通用 | 小-中 | 开放 |
@@ -287,8 +287,8 @@ loop {
 > 状态（2026-09-02）：**断言基座已落地**——生产路径判定抽为单一事实源
 > `RuleExecutor::execution_path`（`executor/execution_path.rs`），`process_batch`
 > 是唯一消费方（断言的路径 ≡ 执行的路径）；矩阵测试按下表逐形状断言
-> `DeferredMachine / DeferredPending / ColumnarEach / EagerRows`（已列式 + 结构
-> 前置共 25 断言），缺口收敛时翻转向量即可回归。
+> `DeferredMachine / DeferredPending / ColumnarEach / EagerRows`，缺口收敛时
+> 翻转向量即可回归。
 >
 > **gap 1/2 已收口（2026-09-02）**：deferred join（q4/q8/q9）驱动事件列式
 > 挂起——`DeferredPending.left` 从 `Event`（每驱动行 HashMap 物化）降为
@@ -300,6 +300,18 @@ loop {
 > `deferred_pending_columnar_matches_eager` / `execute_columnar_matches_eager_output`
 > / `columnar_projection_shadows_unprojected_fields` / `multi_cond_recheck` /
 > `with_lets_materializes_once` 锁定列式 == eager 字节一致。
+>
+> **gap 3 已收口（2026-09-02）**：each + 后置 `where`（无活 join）列式化——
+> `EachBatchVecs.where_cvec`（批级守卫掩码，compile_guard 同 filter 机制，
+> 编译失败/结构化参数逐行 `where_ok` 回退）；gate 放行「无活 join + where
+> 可列式」（真实可达形状 = 死 join + 驱动列 where——checker 要求 where 必须
+> 有 ≥1 join，where 只读驱动列 → join 死消除）。**顺带修复行式批路径 latent
+> bug**：`execute_each_direct_batch` 的借用短路（`live_joins 空 && lets 空`）
+> 会静默跳过 `where_ok`——死 join 形状下生产 batched 路径 where 失效（与
+> 逐事件/oracle 的 plan.joins 判定分叉），已补 `where.is_none()` 前提。对拍：
+> `each_columnar_where_matches_row_path` / `_after_filter` /
+> `_missing_column_rejects_all_parity`。矩阵断言 gap 3 从 `EagerRows` 翻转
+> 为 `ColumnarEach`。
 
 1. **判据 = 生产路径是否还走行式**（不再看性能收益）：每收一项，该类规则的生产执行轨
    切换为列式，行式路径保留为测试对拍 golden（从“生产实现”变“测试参考”）；

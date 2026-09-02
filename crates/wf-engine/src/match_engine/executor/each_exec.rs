@@ -545,8 +545,14 @@ impl RuleExecutor {
             }
             // Rules without joins or `let` bindings never mutate the event —
             // borrow instead of cloning (same optimization as the per-event
-            // path).
-            let ctx: Cow<'_, Event> = if self.live_joins.is_empty() && self.plan.lets.is_empty() {
+            // path). 2026-09-02 gap-3 修复：**无 where** 也是借用前提——死 join
+            // 形状（plan.joins 非空、live_joins 空）下 where 只读驱动列，借用
+            // 短路会静默跳过 `where_ok`（与逐事件 execute_each_direct / oracle
+            // 的 plan.joins 判定分叉，实测 batched 生产路径 where 失效）。
+            let ctx: Cow<'_, Event> = if self.live_joins.is_empty()
+                && self.plan.lets.is_empty()
+                && self.plan.r#where.is_none()
+            {
                 Cow::Borrowed::<Event>(*event)
             } else {
                 let mut ctx = Cow::<Event>::Owned((**event).clone());
@@ -687,11 +693,13 @@ impl RuleExecutor {
 
     /// Whether the on-each plan can run the columnar fast path: no joins, no
     /// each filter, constant score, entity = field/const, yield values =
-    /// literal/field (flat refs only), and every bind filter absent or
-    /// columnar (a non-columnar bind filter falls back to the per-event
-    /// interpreted `event_matches_alias`, which the columnar branch does not
-    /// replicate). Anything else falls back to the Event-based path, keeping
-    /// both paths byte-identical by construction.
+    /// literal/field (flat refs only), a post-`where` that is absent or
+    /// columnar (gap-3 2026-09-02：无活 join 时批级守卫掩码，行式 where_ok
+    /// 严格语义对拍锁定), and every bind filter absent or columnar (a
+    /// non-columnar bind filter falls back to the per-event interpreted
+    /// `event_matches_alias`, which the columnar branch does not replicate).
+    /// Anything else falls back to the Event-based path, keeping both paths
+    /// byte-identical by construction.
     pub fn each_plan_columnar_safe(&self) -> bool {
         let Some(each_plan) = &self.plan.each_plan else {
             return false;
@@ -731,13 +739,17 @@ impl RuleExecutor {
         {
             return false;
         }
-        // 无活 join：形状检查走无 join 列式路径（后置 where 列式不执行——bind
-        // filter 已下推为事件过滤，plan.r#where 非空 → 回退行式）。单活 join：
-        // 必须满足列式 join 形状（each_join_plan 非 None）——where/输出字段的
-        // 限定来源由 `parse_each_join_columnar` 一并校验。多 join / 活 join
-        // 不满足形状 → 回退行式。
+        // 无活 join：形状检查走无 join 列式路径。后置 `where`（gap-3 列式化
+        // 2026-09-02）：无 join 时 where 只读驱动列 → 可列式（expr_is_columnar）
+        // 时放行（批级守卫掩码，行式 where_ok 严格语义对拍锁定）；非列式
+        // where → 回退行式。单活 join：必须满足列式 join 形状（each_join_plan
+        // 非 None）——where/输出字段的限定来源由 `parse_each_join_columnar`
+        // 一并校验。多 join / 活 join 不满足形状 → 回退行式。
         let join_ok = if self.live_joins.is_empty() {
-            self.plan.r#where.is_none()
+            self.plan
+                .r#where
+                .as_ref()
+                .is_none_or(wf_lang::columnar::expr_is_columnar)
         } else {
             self.each_join_plan.is_some()
         };
@@ -840,10 +852,16 @@ impl RuleExecutor {
         let Some(each_plan) = &self.plan.each_plan else {
             return false;
         };
-        if !self.plan.lets.is_empty()
-            || !self.live_joins.is_empty()
-            || self.plan.r#where.is_some()
-            || each_plan.filter.is_some()
+        if !self.plan.lets.is_empty() || !self.live_joins.is_empty() || each_plan.filter.is_some() {
+            return false;
+        }
+        // gap-3（2026-09-02）：无 join 时允许**可列式**的 post-join where
+        // （批级守卫掩码，逐行 where_ok 语义一致）；非列式 where → 回退行式。
+        if self
+            .plan
+            .r#where
+            .as_ref()
+            .is_some_and(|w| !wf_lang::columnar::expr_is_columnar(w))
         {
             return false;
         }
@@ -913,6 +931,9 @@ pub(crate) fn fmt_identity_field(expr: &Expr) -> Option<&FieldRef> {
 pub struct EachBatchVecs {
     general_cvecs: Vec<Option<CVec>>,
     filter_cvec: Option<CVec>,
+    /// post-join `where` 掩码（无 join 时仅驱动列；gap-3 列式化 2026-09-02）：
+    /// `None` = 无 where / 编译失败（结构化参数等）→ 逐行 `where_ok` 回退。
+    where_cvec: Option<CVec>,
     /// Prepared batch row count + address — `debug_assert!` that the executor's
     /// segment rows read the same batch (misuse would index the wrong cvecs).
     num_rows: usize,
@@ -979,9 +1000,21 @@ impl RuleExecutor {
             .filter(|f| !crate::match_engine::columnar::arg_reads_structured(&view, f))
             .and_then(|f| compile_guard(f, &view))
             .map(|plan| plan.eval_vec(&view, n));
+        // post-join `where`（P4 gap-3，2026-09-02）：无 join 时仅驱动列，与
+        // bind/each filter 同机制编译为批级守卫掩码（行式 `where_ok` 严格语义
+        // ——false/缺失抑制输出）。结构化字段同样不编译（逐行 where_ok 回退，
+        // 见 execute 行循环）。
+        let where_cvec = self
+            .plan
+            .r#where
+            .as_ref()
+            .filter(|w| !crate::match_engine::columnar::arg_reads_structured(&view, w))
+            .and_then(|w| compile_guard(w, &view))
+            .map(|plan| plan.eval_vec(&view, n));
         EachBatchVecs {
             general_cvecs,
             filter_cvec,
+            where_cvec,
             num_rows: n,
             batch_ptr: batch as *const RecordBatch as usize,
         }
@@ -1266,6 +1299,19 @@ impl RuleExecutor {
                 stats.rejected += 1;
                 continue;
             }
+            // -- post-join `where`（P4 gap-3，无 join 时仅驱动列）---------
+            // 与行式 `where_ok` 严格语义一致：false/缺失（None）抑制输出。
+            // 列式掩码：null/非布尔 cell → 拒绝；掩码缺失（无 where / 编译
+            // 失败兜底）→ 解释逐行 where_ok（与 filter 同一回退模式）。
+            let where_pass = match (&self.plan.r#where, &prepared.where_cvec) {
+                (None, _) => true,
+                (Some(_), Some(cvec)) => cvec.bool_at(event.row()).unwrap_or(false),
+                (Some(_), None) => self.where_ok(&event.to_event()),
+            };
+            if !where_pass {
+                stats.rejected += 1;
+                continue;
+            }
             // -- Per-row system values (identical to the Event-based path) ---
             let t_entity = if prof.enabled() {
                 Some(Instant::now())
@@ -1535,8 +1581,9 @@ impl RuleExecutor {
     ///
     /// 行语义与 `execute_each_with_joins` → `PipeBatchStager::push_record`
     /// 字节一致（对拍测试钉死）。Caller must gate on
-    /// [`Self::each_pipe_columnar_safe`]（无 filter/join/let/where → 无每行
-    /// 拒绝，全行 append）；`prepared` 必须来自 rows 同一批。
+    /// [`Self::each_pipe_columnar_safe`]（无 filter/join/let；可列式 where
+    /// gap-3 2026-09-02 → 逐行拒绝；其余全行 append）；`prepared` 必须来自
+    /// rows 同一批。
     pub fn execute_each_pipe_batch_columnar(
         &self,
         rows: &[(&ColumnarEvent<'_>, i64)],
@@ -1642,6 +1689,18 @@ impl RuleExecutor {
         let mut values: Vec<Option<Value>> = Vec::with_capacity(self.plan.yield_plan.fields.len());
         let mut entity_scratch = String::with_capacity(24);
         for (event, event_time_nanos) in rows {
+            // post-join `where`（P4 gap-3，2026-09-02，无 join 时仅驱动列）：
+            // 与行式 `where_ok` 严格语义一致（false/缺失抑制输出）；掩码缺失
+            // （无 where / 编译失败）→ 解释逐行 where_ok。
+            let where_pass = match (&self.plan.r#where, &prepared.where_cvec) {
+                (None, _) => true,
+                (Some(_), Some(cvec)) => cvec.bool_at(event.row()).unwrap_or(false),
+                (Some(_), None) => self.where_ok(&event.to_event()),
+            };
+            if !where_pass {
+                stats.rejected += 1;
+                continue;
+            }
             entity_scratch.clear();
             match &entity_const {
                 Some(s) => entity_scratch.push_str(s),

@@ -320,6 +320,16 @@ mod tests {
             },
         };
         assert_path(&plan, ExecutionPath::ColumnarEach);
+
+        // gap-3（2026-09-02 收口）：each + 后置 where（无 join、可列式）→
+        // 列式（批级守卫掩码，行式 where_ok 严格语义对拍锁定）。
+        let mut plan = each_base();
+        plan.r#where = Some(Expr::BinOp {
+            op: BinOp::Eq,
+            left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
+            right: Box::new(Expr::StringLit("10.0.0.1".into())),
+        });
+        assert_path(&plan, ExecutionPath::ColumnarEach);
     }
 
     #[test]
@@ -389,11 +399,15 @@ mod tests {
     #[test]
     fn eight_gap_shapes_still_take_row_path() {
         // --- 剩余缺口（§11.2 下表 3-8 项，非 deferred each 形态）→ 行式 ---
-        // 3. each + 后置 where（无 join）——join_ok 要求 where 为空。
+        // 3（残）. each + 后置 where（无 join、**非列式**）→ 仍行式。
         let mut plan = each_base();
         plan.r#where = Some(Expr::BinOp {
             op: BinOp::Eq,
-            left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
+            left: Box::new(Expr::FuncCall {
+                qualifier: None,
+                name: "upper".into(),
+                args: vec![Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))],
+            }),
             right: Box::new(Expr::StringLit("10.0.0.1".into())),
         });
         assert_path(&plan, ExecutionPath::EagerRows);
