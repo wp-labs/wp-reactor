@@ -4,6 +4,7 @@ use wf_lang::ast::{BoundVal, FieldRef, JoinMode};
 use wf_lang::plan::{JoinCondPlan, JoinPlan, StepPlan};
 
 use crate::match_engine::JoinRow;
+use crate::match_engine::event_bridge::TriggerEvent;
 use crate::match_engine::match_engine::{
     AsofLookup, BindData, EngineHashMap, Event, FieldSource, StepData, Value, WindowLookup,
     eval_expr, field_ref_name, values_equal,
@@ -61,7 +62,7 @@ pub(crate) fn build_eval_context(
     step_data: &[StepData],
     bind_data: &[BindData],
     step_plans: &[&StepPlan],
-    trigger_event: Option<&Event>,
+    trigger_event: Option<&TriggerEvent>,
     needed: &CloseCtxFields,
     // stats last/top 行字段引用（2026-08-26 q18 close 内存）: Named 窄化下
     // `field_values` 不注入行字段, 由 CloseOutput.row_fields 携带——按需
@@ -101,9 +102,15 @@ pub(crate) fn build_eval_context(
     // price/channel/url/...）从不被输出路径读取，逐字段注入是 per-fire 热路径
     // 的纯浪费（Q13 每事件 8 字段 → 1 字段，27.6M 事件 × 7 次 HashMap insert）。
     if let Some(ev) = trigger_event {
-        for (name, value) in &ev.fields {
-            if (all || needed.wants(name.as_str())) && !fields.contains_key(name.as_str()) {
-                fields.insert(name.clone(), value.clone());
+        // M3 §11.6：trigger 是 owned 列式快照或物化 Event——统一走 FieldSource
+        // 名协议（field_names × field_value）。Event: 键集 == 非空 map；列式:
+        // 投影列含 null → field_value None 跳过——与 batch_to_events 逐位一致。
+        for name in ev.field_names() {
+            if (all || needed.wants(name))
+                && !fields.contains_key(name)
+                && let Some(value) = ev.field_value(name)
+            {
+                fields.insert(name.into(), value);
             }
         }
     }

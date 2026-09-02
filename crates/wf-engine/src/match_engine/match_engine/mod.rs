@@ -51,6 +51,7 @@ use wf_lang::plan::{
 };
 
 use crate::match_engine::columnar::GuardMasks;
+use crate::match_engine::event_bridge::TriggerEvent;
 pub(crate) use close::accumulate_close_steps;
 use close::{evaluate_close, evidence_time_range};
 use key::{InstanceKey, flatten_scope_values};
@@ -344,8 +345,10 @@ impl CepStateMachine {
         row: usize,
         masks: Option<&GuardMasks>,
     ) -> StepResult {
-        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, row, masks, false, None)
-            .result
+        self.advance_at_with_diagnostics(
+            alias, event, now_nanos, windows, row, masks, false, None, None,
+        )
+        .result
     }
 
     /// [`Self::advance_at_with_masks`] with a batch-precomputed join-then-key
@@ -366,6 +369,35 @@ impl CepStateMachine {
         masks: Option<&GuardMasks>,
         key_override: Option<&Option<Vec<Value>>>,
     ) -> StepResult {
+        self.advance_at_with_masks_key_capture(
+            alias,
+            event,
+            now_nanos,
+            windows,
+            row,
+            masks,
+            key_override,
+            None,
+        )
+    }
+
+    /// [`Self::advance_at_with_masks_key`] plus an owned trigger-row capture
+    /// (M3 §11.6): when a fire needs a trigger event, use the caller's
+    /// prebuilt [`TriggerEvent`] (deferred path = owned columnar snapshot, no
+    /// per-fire `to_event()`) instead of materializing from `event`. `None` =
+    /// fall back to materializing `event.to_event()` (row-mode / tests).
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_at_with_masks_key_capture<E: FieldSource>(
+        &mut self,
+        alias: &str,
+        event: &E,
+        now_nanos: i64,
+        windows: Option<&dyn WindowLookup>,
+        row: usize,
+        masks: Option<&GuardMasks>,
+        key_override: Option<&Option<Vec<Value>>>,
+        trigger: Option<&TriggerEvent>,
+    ) -> StepResult {
         self.advance_at_with_diagnostics(
             alias,
             event,
@@ -375,6 +407,7 @@ impl CepStateMachine {
             masks,
             false,
             key_override,
+            trigger,
         )
         .result
     }
@@ -388,7 +421,9 @@ impl CepStateMachine {
         now_nanos: i64,
         windows: Option<&dyn WindowLookup>,
     ) -> StepOutcome {
-        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, 0, None, true, None)
+        self.advance_at_with_diagnostics(
+            alias, event, now_nanos, windows, 0, None, true, None, None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -406,6 +441,9 @@ impl CepStateMachine {
         // 每事件 lookup）；`Some(None)` = 该行预解析 miss（跳过，同内部 miss）；
         // `None` = 无预解析（走原逻辑，含 key_join / extract_key）。
         key_override: Option<&Option<Vec<Value>>>,
+        // M3 §11.6：owned trigger-row capture（deferred 列式快照）。None =
+        // fire 时回退 `event.to_event()`（row-mode / 测试）。
+        trigger: Option<&TriggerEvent>,
     ) -> StepOutcome {
         // FailRule: once the rule has failed, reject all future events.
         // P2b: with shared limits, a FailRule latch on any shard fails the rule.
@@ -477,6 +515,7 @@ impl CepStateMachine {
                         capture_progress,
                         &skey,
                         Some(k * slide_ns),
+                        trigger,
                     );
                     best = Some(match best {
                         Some(prev) => merge_step_outcome(prev, out),
@@ -497,6 +536,7 @@ impl CepStateMachine {
                     capture_progress,
                     &skey,
                     Some(bucket_start),
+                    trigger,
                 ));
             }
             WindowSpec::Sliding(_) | WindowSpec::Session(_) => {
@@ -510,6 +550,7 @@ impl CepStateMachine {
                     capture_progress,
                     &skey,
                     None,
+                    trigger,
                 ));
             }
         }
@@ -532,6 +573,8 @@ impl CepStateMachine {
         capture_progress: bool,
         skey: &ScopeKey,
         window_start: Option<i64>,
+        // M3 §11.6：owned trigger capture（deferred 列式快照），None → 物化回退。
+        trigger: Option<&TriggerEvent>,
     ) -> StepOutcome {
         let instance_key = match window_start {
             Some(ws) => InstanceKey::fixed(skey, ws),
@@ -919,7 +962,12 @@ impl CepStateMachine {
                     // 不需要时跳过 per-fire `event.to_event()` 全量 clone——
                     // Q5/Q7/Q12/Q13 每事件命中 fire 的热路径（2026-08）。
                     trigger_event: if plan.trigger_event_needed {
-                        Some(std::sync::Arc::new(event.to_event()))
+                        // M3（2026-09-02）：机器内不再每 fire 物化——预捕获列式快照
+                        // 直接携带；None 回退 to_event（row-mode / 测试）。
+                        Some(match trigger {
+                            Some(t) => t.clone(),
+                            None => TriggerEvent::Event(std::sync::Arc::new(event.to_event())),
+                        })
                     } else {
                         None
                     },
@@ -1134,7 +1182,10 @@ impl CepStateMachine {
                     // 不需要时跳过 per-fire `event.to_event()` 全量 clone——
                     // Q5/Q7/Q12/Q13 每事件命中 fire 的热路径（2026-08）。
                     trigger_event: if plan.trigger_event_needed {
-                        Some(std::sync::Arc::new(event.to_event()))
+                        Some(match trigger {
+                            Some(t) => t.clone(),
+                            None => TriggerEvent::Event(std::sync::Arc::new(event.to_event())),
+                        })
                     } else {
                         None
                     },
@@ -1195,7 +1246,10 @@ impl CepStateMachine {
                     // 不需要时跳过 per-fire `event.to_event()` 全量 clone——
                     // Q5/Q7/Q12/Q13 每事件命中 fire 的热路径（2026-08）。
                     trigger_event: if plan.trigger_event_needed {
-                        Some(std::sync::Arc::new(event.to_event()))
+                        Some(match trigger {
+                            Some(t) => t.clone(),
+                            None => TriggerEvent::Event(std::sync::Arc::new(event.to_event())),
+                        })
                     } else {
                         None
                     },

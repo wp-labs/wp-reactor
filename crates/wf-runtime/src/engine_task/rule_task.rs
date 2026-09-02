@@ -15,8 +15,8 @@ use wf_engine::alert::{AlertColumnBatch, AlertColumnBuilder, OutputRecord};
 use wf_engine::match_engine::{
     CepStateMachine, CloseReason, ColumnarEvent, DeferredLeft, Event, ExecutionPath,
     ExecutionPathContext, FieldIndex, FieldSource, GuardMasks, JoinRow, RuleExecutor, StepResult,
-    batch_event_time_nanos_at, batch_time_col_index, batch_to_events, batch_to_events_filtered,
-    build_field_index, close_is_qualified,
+    TriggerEvent, batch_event_time_nanos_at, batch_time_col_index, batch_to_events,
+    batch_to_events_filtered, build_field_index, close_is_qualified,
 };
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
@@ -98,6 +98,10 @@ struct DeferredRows<'a> {
     times: Vec<i64>,
     hit_indices: Vec<u32>,
     batch: &'a RecordBatch,
+    /// Owned batch snapshot (M3 §11.6): fire capture builds an owned columnar
+    /// [`TriggerEvent`] from it — no per-fire `to_event()`. Arc clone per batch
+    /// is a cheap refcount (+ column-vec clone); shares arrays with `batch`.
+    batch_arc: Arc<RecordBatch>,
     index: Arc<FieldIndex>,
     /// The window's `materialize_fields` read-set projection: the columnar
     /// `to_event()` materializes only these fields on emit, matching the eager
@@ -1228,6 +1232,7 @@ impl RuleTask {
                 times,
                 hit_indices,
                 batch,
+                batch_arc: Arc::new(batch.clone()),
                 index,
                 projection,
             })
@@ -1549,29 +1554,49 @@ impl RuleTask {
                 // (P3 FieldView — no HashMap materialization), else the eager
                 // event. Debug and defer are mutually exclusive, so the Eager arm
                 // is the only one that appears with debug detail enabled.
-                let row_event: Option<RowEvent<'_>> = if let Some(d) = &deferred {
-                    (hit_cursor < d.hit_indices.len() && d.hit_indices[hit_cursor] as usize == i)
-                        .then(|| {
-                            hit_cursor += 1;
-                            // M1（P4 终态机制 2026-09-02）：fire `to_event` 用**规则
-                            // 读集**投影（ctx 只读该集）而非窗口并集——消除未引用结构化
-                            // 列的每 fire JSON 解析。无法窄化（All）→ 回退窗口投影。
-                            // 仅影响 to_event；step/guard 的 field_value 直读不看投影。
-                            let proj = self
-                                .executor
-                                .fire_trigger_projection()
-                                .or_else(|| d.projection.clone());
-                            RowEvent::Columnar(ColumnarEvent::with_index_projected(
-                                d.batch,
-                                row_index,
-                                Arc::clone(&d.index),
-                                proj,
-                            ))
-                        })
-                } else {
-                    event.map(|ev| RowEvent::Eager(ev.as_ref()))
-                };
-                if let Some(row_event) = row_event {
+                let row_source: Option<(RowEvent<'_>, Option<TriggerEvent>)> =
+                    if let Some(d) = &deferred {
+                        (hit_cursor < d.hit_indices.len()
+                            && d.hit_indices[hit_cursor] as usize == i)
+                            .then(|| {
+                                hit_cursor += 1;
+                                // M1（P4 终态机制 2026-09-02）：fire `to_event` 用**规则
+                                // 读集**投影（ctx 只读该集）而非窗口并集——消除未引用结构化
+                                // 列的每 fire JSON 解析。无法窄化（All）→ 回退窗口投影。
+                                // 仅影响 to_event；step/guard 的 field_value 直读不看投影。
+                                let proj = self
+                                    .executor
+                                    .fire_trigger_projection()
+                                    .or_else(|| d.projection.clone());
+                                // M3（2026-09-02）：fire 触发行改携 **owned 列式快照**——
+                                // 机器在 Matched 时直接用（不再每 fire `to_event()` 物化
+                                // HashMap + JSON 解析）；ctx 经 FieldSource 按需直读列。
+                                // 仅当规则需要触发事件字段时预捕获（cheap Arc clone×3）。
+                                let trigger =
+                                    self.executor.plan().match_plan.trigger_event_needed.then(
+                                        || {
+                                            TriggerEvent::columnar(
+                                                Arc::clone(&d.batch_arc),
+                                                row_index,
+                                                Arc::clone(&d.index),
+                                                proj.clone(),
+                                            )
+                                        },
+                                    );
+                                (
+                                    RowEvent::Columnar(ColumnarEvent::with_index_projected(
+                                        d.batch,
+                                        row_index,
+                                        Arc::clone(&d.index),
+                                        proj,
+                                    )),
+                                    trigger,
+                                )
+                            })
+                    } else {
+                        event.map(|ev| (RowEvent::Eager(ev.as_ref()), None))
+                    };
+                if let Some((row_event, row_trigger)) = row_source {
                     let _advance_start = rule_profiling();
                     for alias in ordered_aliases {
                         if !alias_accepts(
@@ -1616,7 +1641,7 @@ impl RuleTask {
                             (outcome.result, outcome.progress)
                         } else {
                             (
-                                machine.advance_at_with_masks_key(
+                                machine.advance_at_with_masks_key_capture(
                                     alias,
                                     &row_event,
                                     event_nanos,
@@ -1624,6 +1649,7 @@ impl RuleTask {
                                     row_index,
                                     Some(&branch_masks),
                                     key_overrides.as_ref().map(|ko| &ko[i]),
+                                    row_trigger.as_ref(),
                                 ),
                                 None,
                             )

@@ -1,12 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use foldhash::fast::RandomState as FoldRandomState;
 use smol_str::SmolStr;
 
 use super::key::{ScopeKey, extract_scope_key_from_row};
-use crate::match_engine::event_bridge::JoinRow;
+use crate::match_engine::event_bridge::{JoinRow, TriggerEvent};
 use wf_lang::ast::FieldRef;
 use wf_lang::plan::KeyMapPlan;
 
@@ -191,11 +190,14 @@ pub struct MatchedContext {
     pub window_start_time_nanos: i64,
     pub window_end_time_nanos: i64,
     pub machine_id: String,
-    /// The event that triggered this match (on-event fire). Yield's scalar
-    /// field reads resolve from it, so rules that don't need the full
-    /// `field_values` history can skip collecting it. `None` for fires without
-    /// a triggering event (close) — those keep reading from `field_values`.
-    pub trigger_event: Option<Arc<Event>>,
+    /// The row that triggered this match (on-event fire). Owned trigger row
+    /// (M3 §11.6): deferred-match fires carry a projected columnar snapshot
+    /// (no per-fire `to_event()`), row-mode/fallback captures materialize an
+    /// [`Event`]. Yield's scalar field reads resolve from it, so rules that
+    /// don't need the full `field_values` history can skip collecting it.
+    /// `None` for fires without a triggering event (close) — those keep
+    /// reading from `field_values`.
+    pub trigger_event: Option<TriggerEvent>,
 }
 
 /// Per-step snapshot captured when a step is satisfied.

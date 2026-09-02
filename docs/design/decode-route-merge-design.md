@@ -407,7 +407,7 @@ loop {
 > 终点判定（§11.3-3）不变：`batch_to_events` / `materialize_rows` /
 > `OnceLock` 调用点归零（仅测试引用）。
 
-### 11.6 终态通用机制：按读集物化 → FieldSource 直读（M1/M2 已落 2026-09-02）
+### 11.6 终态通用机制：按读集物化 → FieldSource 直读（M1/M2/M3 已落 2026-09-02）
 
 **动机（实测）**：qradar rules 段 CPU 采样 + census 显示——376 条 match 规则**全走
 deferred 列式路径**（无行式整批物化），但 138 条（36%）`trigger_event_needed=true`、
@@ -449,8 +449,8 @@ untrackable`（合成字段 → All → None）。实测 qradar rules 段 serde_
 > （跨窗裸名非本批列 → to_event 无幻影键；Path root 整列物化；未读结构化列
 > 不解析）。
 
-**终态后续（M2 已落 2026-09-02；M3 未开始）**：M2 = `executor::eval` 泛型化——
-L3/输出 eval 族（`eval_yield_expr*` / `eval_bool_expr` / `eval_expr_with_l3` /
+**M2 已落 2026-09-02**：`executor::eval` 泛型化——L3/输出 eval 族
+（`eval_yield_expr*` / `eval_bool_expr` / `eval_expr_with_l3` /
 `eval_score` / `eval_entity_id` + builtins/step_data/utils）ctx 从 `&Event` 改
 `&dyn FieldSource`（FieldSource 名协议：`field_value` / `field_names`）：
 
@@ -465,8 +465,29 @@ L3/输出 eval 族（`eval_yield_expr*` / `eval_bool_expr` / `eval_expr_with_l3`
   表达式/入口字节一致；`RowOnlySource`（裸行，无合成条目）= 无合成条目的
   Event（L3 空历史语义）；field_names 枚举契约锁。
 
-M3 = `MatchedContext.trigger_event: Arc<Event>` → 列式行引用（owned Arc batch
-+ row + needed），ctx 直读列。M2+M3 到达 §11.3 终点（生产路径 `Event` 归零）。
+**M3 已落 2026-09-02；§11.3 终点达成**：`MatchedContext.trigger_event`
+`Option<Arc<Event>>` → `Option<TriggerEvent>`（owned 列式行引用：`Event` 变体
+= row-mode/回退物化；`Columnar` 变体 = Arc batch + row + FieldIndex + 投影）：
+
+- `TriggerEvent` 实现 `FieldSource`（field_value 直读列，field_names 尊重
+  投影，to_event 复用 ColumnarEvent 物化语义）——M2 的 FieldSource 化消费方
+  （build_eval_context / ctx-free resolve_field / resolve_match_field）零改读；
+- 机器捕获外置：`advance_at_with_masks_key_capture` 带 owned trigger capture
+  （deferred 路径 = rule_task 每命中行预建列式快照，Arc clone×3，仅
+  trigger_event_needed 时）；默认 None 回退机器内 `event.to_event()`（row-mode
+  / 测试不变）；
+- rule_task deferred 命中行：`DeferredRows` 携每批 `batch_arc`，命中行构造
+  快照直接入机器——**fire 不再 to_event**（HashMap + 结构化列 JSON 解析归零），
+  ctx 按需经 field_value 直读列（结构化字段仍按读集解析一次）；
+- 行为零变化保证：投影一致性（快照投影 == M1 fire 投影/窗口并集）、读集
+  闭合（输出 Field 读名 ⊆ Named ⊆ 投影 → 快照/物化 map 无分歧）、null/缺失
+  语义一致；对拍：`trigger_event_columnar_matches_event_fieldsource_and_
+  projection`（双变体 field_value/to_event/投影窄化字节一致）/
+  `machine_capture_trigger_columnar_skips_fire_materialization`（捕获路径
+  ctx 携 Columnar 变体、回退路径仍 Event 变体，两者 to_event 一致）。
+
+M2+M3 到达 §11.3 终点（生产路径每 fire `Event` 物化归零——deferred 列式
+匹配路径不再有任何逐事件 HashMap/JSON 解析）。
 
 ### 11.5 与 merge 的关系
 

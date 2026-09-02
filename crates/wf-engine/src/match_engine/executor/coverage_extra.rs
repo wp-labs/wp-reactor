@@ -35,8 +35,8 @@ use crate::match_engine::match_engine::{
     MatchedContext, StepData, StepResult, Value, WindowLookup,
 };
 use crate::match_engine::{
-    DeferredLeft, DeferredPending, FieldSource, JoinRow, RuleExecutor, batch_to_events,
-    batch_to_events_filtered, build_field_index,
+    DeferredLeft, DeferredPending, FieldSource, JoinRow, RuleExecutor, TriggerEvent,
+    batch_to_events, batch_to_events_filtered, build_field_index,
 };
 use wp_model_core::model::DataRecord;
 
@@ -1320,7 +1320,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
         std::slice::from_ref(&sd1),
         &[],
         &[&StepPlan { branches: vec![] }],
-        Some(&trigger),
+        Some(&TriggerEvent::from_event(Arc::new(trigger.clone()))),
         &all,
         None,
     );

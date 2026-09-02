@@ -54,7 +54,7 @@ use crate::match_engine::match_engine::{
     BindData, CepStateMachine, CloseOutput, CloseReason, EngineHashMap, Event, MatchedContext,
     ScopeKey, StepData, Value, WindowLookup,
 };
-use crate::match_engine::{JoinRow, RuleExecutor, apply_conv};
+use crate::match_engine::{JoinRow, RuleExecutor, TriggerEvent, apply_conv};
 
 use super::helpers::{event, num, simple_plan, simple_rule_plan, str_val};
 
@@ -1138,7 +1138,7 @@ fn simple_matched(rule: &str, scope_key: Vec<Value>, event: &Event, ts: i64) -> 
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: "".into(),
-        trigger_event: Some(Arc::new(event.clone())),
+        trigger_event: Some(TriggerEvent::from_event(Arc::new(event.clone()))),
     }
 }
 
@@ -1387,7 +1387,7 @@ fn q13_match_snapshot_join() {
             &matched.step_data,
             &matched.bind_data,
             &step_plans,
-            matched.trigger_event.as_deref(),
+            matched.trigger_event.as_ref(),
             &needed,
             None,
         );
@@ -1405,7 +1405,7 @@ fn q13_match_snapshot_join() {
             &matched.step_data,
             &matched.bind_data,
             &step_plans,
-            matched.trigger_event.as_deref(),
+            matched.trigger_event.as_ref(),
             &needed,
             None,
         );
@@ -1500,7 +1500,7 @@ fn q6_match_emit() {
             &matched.step_data,
             &matched.bind_data,
             &step_plans,
-            matched.trigger_event.as_deref(),
+            matched.trigger_event.as_ref(),
             &needed,
             None,
         );
@@ -1516,7 +1516,7 @@ fn q6_match_emit() {
         &matched.step_data,
         &matched.bind_data,
         &step_plans,
-        matched.trigger_event.as_deref(),
+        matched.trigger_event.as_ref(),
         &needed,
         None,
     );

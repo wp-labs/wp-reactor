@@ -677,6 +677,117 @@ impl JoinRow {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TriggerEvent — owned per-fire trigger row（P4 终态机制 M3 §11.6）
+// ---------------------------------------------------------------------------
+
+/// Owned per-fire trigger row: either a materialized [`Event`] (row-mode /
+/// fallback capture) or an owned projected columnar view (Arc batch + row +
+/// field index + projection). Deferred-match fires carry the columnar view —
+/// no per-fire `to_event()` — and consumers read fields lazily through
+/// [`FieldSource`] (`build_eval_context` / ctx-free `resolve_field`). Field
+/// reads are byte-identical to the eager path (`extract_field_value`);
+/// `field_names` respects the projection so ctx building sees exactly the M1
+/// read-set columns.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TriggerEvent {
+    Event(Arc<Event>),
+    Columnar {
+        batch: Arc<RecordBatch>,
+        row: usize,
+        index: Arc<FieldIndex>,
+        projection: Option<Arc<HashSet<String>>>,
+    },
+}
+
+impl TriggerEvent {
+    /// Wrap an already-owned materialized event (row-mode captures).
+    pub fn from_event(event: Arc<Event>) -> Self {
+        TriggerEvent::Event(event)
+    }
+
+    /// Owned projected columnar snapshot (deferred-match captures).
+    pub fn columnar(
+        batch: Arc<RecordBatch>,
+        row: usize,
+        index: Arc<FieldIndex>,
+        projection: Option<Arc<HashSet<String>>>,
+    ) -> Self {
+        TriggerEvent::Columnar {
+            batch,
+            row,
+            index,
+            projection,
+        }
+    }
+}
+
+impl From<Arc<Event>> for TriggerEvent {
+    fn from(event: Arc<Event>) -> Self {
+        TriggerEvent::Event(event)
+    }
+}
+
+impl From<Event> for TriggerEvent {
+    fn from(event: Event) -> Self {
+        TriggerEvent::Event(Arc::new(event))
+    }
+}
+
+impl FieldSource for TriggerEvent {
+    fn field_value(&self, name: &str) -> Option<Value> {
+        match self {
+            TriggerEvent::Event(ev) => ev.fields.get(name).cloned(),
+            TriggerEvent::Columnar {
+                batch, row, index, ..
+            } => {
+                let idx = *index.get(name)?;
+                let col = batch.column(idx);
+                if col.is_null(*row) {
+                    return None;
+                }
+                extract_field_value(batch.schema_ref().field(idx), col.as_ref(), *row)
+            }
+        }
+    }
+
+    fn field_names(&self) -> Vec<&str> {
+        match self {
+            TriggerEvent::Event(ev) => ev.fields.keys().map(|k| k.as_str()).collect(),
+            TriggerEvent::Columnar {
+                batch, projection, ..
+            } => batch
+                .schema_ref()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .filter(|name| match projection {
+                    Some(proj) => proj.contains(*name),
+                    None => true,
+                })
+                .collect(),
+        }
+    }
+
+    fn to_event(&self) -> Event {
+        match self {
+            TriggerEvent::Event(ev) => (**ev).clone(),
+            TriggerEvent::Columnar {
+                batch,
+                row,
+                index,
+                projection,
+            } => ColumnarEvent::with_index_projected(
+                batch.as_ref(),
+                *row,
+                Arc::clone(index),
+                projection.clone(),
+            )
+            .to_event(),
+        }
+    }
+}
+
 /// Build columnar [`JoinRow`]s for every row of the given (cheaply Arc-cloned)
 /// batches — the scan-fallback join path. No Event/HashMap materialization.
 /// `projection` mirrors the window's `materialize_fields`: `None` = all columns.

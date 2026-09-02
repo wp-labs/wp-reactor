@@ -35,12 +35,13 @@ use crate::match_engine::match_engine::{
     values_equal,
 };
 use crate::match_engine::{
-    ColumnarEvent, JoinRow, RuleExecutor, WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY,
-    WFL_FIELD_TYPE_OBJECT, apply_conv, batch_event_time_nanos, batch_event_time_nanos_at,
-    batch_raw_ts_nanos, batch_time_col_index, batch_to_events, batch_to_events_filtered,
-    batch_to_timestamped_rows, build_field_index, column_scalar_string, columnar_join_rows,
-    columnar_timestamped_join_rows, extract_key_simple, is_wfl_structured_field, mask_to_indices,
-    materialize_rows, materialize_rows_filtered, wfl_structured_field_kind,
+    ColumnarEvent, JoinRow, RuleExecutor, TriggerEvent, WFL_FIELD_TYPE_ARRAY,
+    WFL_FIELD_TYPE_METADATA_KEY, WFL_FIELD_TYPE_OBJECT, apply_conv, batch_event_time_nanos,
+    batch_event_time_nanos_at, batch_raw_ts_nanos, batch_time_col_index, batch_to_events,
+    batch_to_events_filtered, batch_to_timestamped_rows, build_field_index, column_scalar_string,
+    columnar_join_rows, columnar_timestamped_join_rows, extract_key_simple,
+    is_wfl_structured_field, mask_to_indices, materialize_rows, materialize_rows_filtered,
+    wfl_structured_field_kind,
 };
 
 use super::helpers::*;
@@ -1582,7 +1583,7 @@ fn build_eval_context_named_mode_and_trigger_event_precedence() {
         &[],
         &[],
         &[],
-        Some(&trigger),
+        Some(&TriggerEvent::from_event(Arc::new(trigger.clone()))),
         &CloseCtxFields::All,
         None,
     );
