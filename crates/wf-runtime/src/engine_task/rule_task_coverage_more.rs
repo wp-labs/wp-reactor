@@ -754,6 +754,119 @@ async fn flush_complements_tail_sessions_beyond_shard_watermark() {
 }
 
 // ---------------------------------------------------------------------------
+// scan_timeouts — 墙钟累计推进（memory_stability idle 实例释放回归）
+// ---------------------------------------------------------------------------
+
+/// memory_stability 形态 task：sliding(ttl) + count>=1M（永远不触发）单步规则，
+/// 实例长期存活为部分匹配。返回 task + 窗口。
+#[allow(clippy::type_complexity)]
+fn high_threshold_sliding_task(
+    ttl: std::time::Duration,
+) -> (RuleTask, Arc<Window>, mpsc::Receiver<AlertBatch>) {
+    let (mut task, alert_rx, win) = scan_timeouts_task(WindowSpec::Sliding(ttl));
+    let mut plan = minimal_plan();
+    plan.name = "scan_rule".into();
+    plan.match_plan.keys = vec![FieldRef::Simple("sip".into())];
+    plan.match_plan.window_spec = WindowSpec::Sliding(ttl);
+    plan.match_plan.event_steps = vec![StepPlan {
+        branches: vec![BranchPlan {
+            label: None,
+            source: "b".into(),
+            field: None,
+            guard: None,
+            agg: AggPlan {
+                transforms: vec![],
+                measure: Measure::Count,
+                cmp: CmpOp::Ge,
+                threshold: Expr::Number(1_000_000.0),
+            },
+        }],
+    }];
+    task.machine = Some(CepStateMachine::new(
+        "scan_rule".into(),
+        plan.match_plan.clone(),
+        Some("event_time".into()),
+    ));
+    task.executor = RuleExecutor::new(plan);
+    (task, win, alert_rx)
+}
+
+#[tokio::test]
+async fn scan_timeouts_sliding_releases_idle_instances_by_wall_clock() {
+    // burst：10 秒 × 100 个 distinct sip（1000 实例，全部存活）。
+    let (mut task, win, _alert_rx) =
+        high_threshold_sliding_task(std::time::Duration::from_secs(60));
+    let base = 1_700_000_000_000_000_000i64;
+    for sec in 0..10 {
+        let sips: Vec<String> = (0..100)
+            .map(|i| format!("10.0.{sec}.{i}"))
+            .collect();
+        let refs: Vec<&str> = sips.iter().map(|s| s.as_str()).collect();
+        win.append(make_batch(&refs, base + sec * 1_000_000_000))
+            .unwrap();
+    }
+    task.pull_and_advance().await;
+    let alive = task.machine.as_ref().unwrap().instance_count();
+    assert_eq!(alive, 1000, "burst 后全部 sip 实例存活");
+
+    // 静默 130s > TTL 60s：墙钟兜底应把实例全部释放（每扫描推进 ≤ interval）。
+    task.last_activity_wall = std::time::Instant::now() - std::time::Duration::from_secs(130);
+    task.scan_timeouts().await;
+    let after = task.machine.as_ref().unwrap().instance_count();
+    assert_eq!(
+        after, 0,
+        "sliding 实例必须按墙钟推进的 watermark 到期释放（idle {after} 实例滞留）"
+    );
+}
+
+#[tokio::test]
+async fn scan_timeouts_wall_clock_advance_accumulates_across_scans() {
+    // memory_stability 实证回归：daemon 的 scan_timeouts 每 1s 触发、idle 实例
+    // （TTL 60s）却永不释放——旧实现 effective watermark = event_wm + min(总
+    // idle, interval)：锚点 last_activity_wall 只在真实事件批时刷新，idle 期间
+    // 每次扫描都从冻结锚点量出「总 idle」再被 min(·, interval) 压成 interval，且
+    // 每次扫描都重新从 event_wm 算起（无累计）→ 累计推进钉死在 interval，实例
+    // TTL > interval 时永远到不了期。修复：单次扫描把 min(流逝, interval) 累加进
+    // `wall_advance_ns`（墙钟信用），effective = event_wm + 信用，真实事件批清零。
+    // 用毫秒级 TTL/interval 在真实时间下验证累计（旧实现永不释放 → 本测试红）。
+    let (mut task, win, _alert_rx) =
+        high_threshold_sliding_task(std::time::Duration::from_millis(300));
+    task.timeout_scan_interval = std::time::Duration::from_millis(100);
+    let base = 1_700_000_000_000_000_000i64;
+    let sips: Vec<String> = (0..50).map(|i| format!("10.0.1.{i}")).collect();
+    let refs: Vec<&str> = sips.iter().map(|s| s.as_str()).collect();
+    win.append(make_batch(&refs, base)).unwrap();
+    task.pull_and_advance().await;
+    assert_eq!(
+        task.machine.as_ref().unwrap().instance_count(),
+        50,
+        "burst 后实例存活"
+    );
+    // 首扫（几乎无墙钟流逝）：不得提前驱逐。
+    task.scan_timeouts().await;
+    assert_eq!(
+        task.machine.as_ref().unwrap().instance_count(),
+        50,
+        "无流逝不得提前驱逐"
+    );
+    // 每 ~120ms 扫一次：单次推进 ≤ interval=100ms（累计信用），累计应在
+    // ~TTL=300ms 后清空（旧实现无累计、推进钉死在 interval → 永不释放 → 红）。
+    let mut released = false;
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        task.scan_timeouts().await;
+        if task.machine.as_ref().unwrap().instance_count() == 0 {
+            released = true;
+            break;
+        }
+    }
+    assert!(
+        released,
+        "多次扫描的墙钟推进必须累计到 TTL（墙钟信用随扫描累计而非钉死在单次 interval）"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // pull_and_advance — 整批 round-robin 门控
 // ---------------------------------------------------------------------------
 

@@ -126,9 +126,13 @@ pub(super) struct StatsTask {
     window_end: Option<i64>,
     /// 单调事件时间 watermark（批次最大时间, 不倒退）。
     last_watermark: i64,
-    /// 上次真实事件批处理的墙钟时刻（scan_timeouts 兜底推进用）。
+    /// 上次真实事件批处理的墙钟时刻（scan_timeouts 量度可消费墙钟用）。
     last_activity_wall: std::time::Instant,
-    /// 周期性超时扫描间隔（墙钟兜底推进 watermark 关闭尾部窗口）。
+    /// 已消费的墙钟信用（ns）：每次扫描把 min(流逝, interval) 累加进来、真实事件
+    /// 批处理/窗口收尾时清零 → 多次扫描累计推进 watermark 关闭尾部窗口（对齐 CEP
+    /// scan_timeouts 的 wall_advance_ns）。
+    wall_advance_ns: i64,
+    /// 周期性超时扫描间隔（单次扫描的墙钟推进上限；多次扫描累计关闭尾部窗口）。
     timeout_scan_interval: std::time::Duration,
     /// 已上报 metrics 的超限拒收累计值（delta 记账——`over_limit_new_buckets`
     /// 跨窗口累计, close 上报必须发增量, 否则重复计数）。
@@ -193,6 +197,7 @@ impl StatsTask {
             window_end: None,
             last_watermark: i64::MIN,
             last_activity_wall: std::time::Instant::now(),
+            wall_advance_ns: 0,
             timeout_scan_interval,
             last_reported_over_limit: 0,
             last_reported_spill_evictions: 0,
@@ -324,6 +329,8 @@ impl StatsTask {
         shard_rows: Option<&[u32]>,
     ) {
         self.last_activity_wall = std::time::Instant::now();
+        // 真实事件推进会覆盖 idle 的墙钟信用（避免与事件时间双重计数）。
+        self.wall_advance_ns = 0;
         // 分片共享批级时间缓存: 首片扫全批时间 max, 其余片命中（q17 10 片原
         // 各扫全批 10×——batch_max_time 是时间列读取的主要来源, sample 热点）。
         let max_time = match &self.mask_cache {
@@ -969,16 +976,22 @@ impl StatsTask {
     ///
     /// 语义对齐 CEP: 空窗口不产出（无实例无输出）; 关闭后**清空窗口状态**
     /// （不设新桶）——墙钟持续推进若不重置会每 tick 关闭一个空窗口循环产出。
+    ///
+    /// 2026-09-02 memory_stability：单次扫描把 min(流逝, interval) 的墙钟累加进
+    /// `wall_advance_ns`（累计信用）→ 多次扫描累计推进 watermark 关闭尾部窗口。
+    /// 旧实现每次扫描把 min(总 idle, interval) 直接当推进量（无累计），尾部窗口端
+    /// > last_watermark+interval 时永不收口（等 EOS 才关）。
     pub(super) async fn scan_timeouts(&mut self) {
         let Some(end) = self.window_end else {
             return; // 无窗口（无数据 / 已收尾）
         };
-        let effective_watermark = self.last_watermark.saturating_add(
-            self.last_activity_wall
-                .elapsed()
-                .min(self.timeout_scan_interval)
-                .as_nanos() as i64,
-        );
+        let wall_advance = self
+            .last_activity_wall
+            .elapsed()
+            .min(self.timeout_scan_interval)
+            .as_nanos() as i64;
+        self.wall_advance_ns += wall_advance;
+        let effective_watermark = self.last_watermark.saturating_add(self.wall_advance_ns);
         if effective_watermark < end {
             return;
         }
@@ -989,6 +1002,8 @@ impl StatsTask {
         // 清空窗口状态, 等待真实事件重新开桶（避免空窗口循环产出）。
         self.window_start = None;
         self.window_end = None;
+        // 本窗口收尾已消费掉信用；清零避免下一窗口（事件时间还早）被旧信用提前关。
+        self.wall_advance_ns = 0;
     }
 
     // ------------------------------------------------------------------

@@ -385,15 +385,18 @@ pub(super) struct RuleTask {
     /// instances on every EOS but keeps running so a daemon can accept
     /// multiple finite inputs.
     pub(super) eos_flush: tokio::sync::watch::Receiver<u64>,
-    /// Wall clock when events were last processed. When input goes idle, this
-    /// stays put so the periodic timeout scan can advance the effective watermark
-    /// by the elapsed wall time — letting instances expire per their window TTL
-    /// even without new events (window semantics, not just event-time).
+    /// 墙钟“信用”锚点：每次真实事件批处理后拨到当前时刻；idle 后 scan_timeouts
+    /// 用它量度可消费的墙钟（每次最多消费 `timeout_scan_interval`）。
     last_activity_wall: std::time::Instant,
-    /// Periodic timeout-scan interval: the wall-clock expiry advance is **capped**
-    /// at this (see `scan_timeouts`) so a slow/backpressured pipeline cannot race
-    /// the effective watermark far ahead of event time and snowball into a huge
-    /// single expiry sweep that starves pushes.
+    /// 已消费的墙钟信用（ns）：idle 期间每次 `scan_timeouts` 把 min(流逝, interval)
+    /// 累加进来、真实事件批处理时清零（事件时间本身推进会覆盖 idle 推进）→
+    /// effective watermark = 机器事件 watermark + 该信用，多次扫描累计到窗口 TTL
+    /// （memory_stability：daemon 1s 扫描下 TTL 60s 的 idle 实例必须能释放；旧实现
+    /// 无此字段，每次扫描从冻结锚点量「总 idle」再 min(·, interval)，累计钉死）。
+    wall_advance_ns: i64,
+    /// 周期扫描间隔：单次 `scan_timeouts` 的墙钟推进**上限**（见 `scan_timeouts`），
+    /// 慢/背压管道无法一次把 effective watermark 甩到事件时间之前很远、雪崩成
+    /// 单次巨型过期扫描饿死 push 消费。
     timeout_scan_interval: std::time::Duration,
     /// Push-mode input channel (R1). When `Some`, the rule consumes pushed
     /// `Arc<Vec<Arc<Event>>>` instead of pulling from the window read lock; when
@@ -658,6 +661,7 @@ impl RuleTask {
             pipe_registry,
             eos_flush,
             last_activity_wall: std::time::Instant::now(),
+            wall_advance_ns: 0,
             timeout_scan_interval,
             push_rx,
             pushed_seq: 0,
@@ -1301,6 +1305,8 @@ impl RuleTask {
         // periodic timeout scan can advance the watermark across idle gaps.
         if input_events > 0 {
             self.last_activity_wall = std::time::Instant::now();
+            // 真实事件推进会覆盖 idle 的墙钟信用（避免与事件时间双重计数）。
+            self.wall_advance_ns = 0;
             // Cache wall time for the emit path's e2e-latency sample.
             self.cached_wall_nanos
                 .store(wall_nanos(), Ordering::Relaxed);
@@ -2728,18 +2734,26 @@ impl RuleTask {
             event_watermark
         } else {
             // Advance the effective watermark by the wall-clock time elapsed since the
-            // last event was processed — but **capped at one scan interval**. This
+            // last event was processed — **capped at one scan interval per scan**. This
             // lets idle instances expire per their window TTL (window semantics, not
             // just event-time), while bounding each sweep: a slow/backpressured
             // pipeline cannot accumulate minutes of wall-clock and snowball into a
             // huge single expiry sweep that starves push consumption (q5/q6/q7 froze
             // at ~22-25M appends on 30M data before this cap).
-            event_watermark.saturating_add(
-                self.last_activity_wall
-                    .elapsed()
-                    .min(self.timeout_scan_interval)
-                    .as_nanos() as i64,
-            )
+            //
+            // 2026-09-02 memory_stability：单次扫描消费 ≤ interval 的墙钟并把它记入
+            // `wall_advance_ns`（累计信用），effective watermark = 事件 watermark +
+            // 信用 —— 多次扫描累计到 TTL。旧实现每次扫描都从冻结锚点量「总 idle」再
+            // min(·, interval) 直接当推进量，累计被钉死在 interval，TTL > interval 的
+            // idle 实例永不释放（daemon instances 钉 10000 不降）。真实事件批处理会
+            // 清零信用（事件时间本身推进会覆盖 idle 推进）。
+            let wall_advance = self
+                .last_activity_wall
+                .elapsed()
+                .min(self.timeout_scan_interval)
+                .as_nanos() as i64;
+            self.wall_advance_ns += wall_advance;
+            event_watermark.saturating_add(self.wall_advance_ns)
         };
         let started = Instant::now();
         // No input batch is being processed here (timeout scan), so the window
