@@ -380,6 +380,34 @@ mod tests {
             }),
         }];
         assert_path(&plan, ExecutionPath::ColumnarEach);
+
+        // gap-6（2026-09-02 收口）：score 非「常量 | 常量×flat」的可列式表达
+        // 式（字段×字段 `a*b`）→ 批级 score_cvec → 列式。
+        let mut plan = each_base();
+        plan.score_plan = ScorePlan {
+            expr: Expr::BinOp {
+                op: BinOp::Mul,
+                left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "a".into()))),
+                right: Box::new(Expr::Field(FieldRef::Simple("b".into()))),
+            },
+        };
+        assert_path(&plan, ExecutionPath::ColumnarEach);
+
+        // gap-7（2026-09-02 收口）：entity 非字面量/flat 的可列式表达式
+        // （list-index `e.tags[0]`、flat 组件 Add）→ 批级 entity_cvec → 列式。
+        let mut plan = each_base();
+        plan.entity_plan.entity_id_expr = Expr::Field(FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![PathSegment::Field("tags".into()), PathSegment::Index(0)],
+        });
+        assert_path(&plan, ExecutionPath::ColumnarEach);
+        let mut plan = each_base();
+        plan.entity_plan.entity_id_expr = Expr::BinOp {
+            op: BinOp::Add,
+            left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
+            right: Box::new(Expr::Number(1.0)),
+        };
+        assert_path(&plan, ExecutionPath::ColumnarEach);
     }
 
     #[test]
@@ -576,22 +604,32 @@ mod tests {
         }];
         assert_path(&plan, ExecutionPath::EagerRows);
 
-        // 6. score 非「常量 | 常量×flat」（字段×字段）。
+        // gap-6/7 负向边界（2026-09-02 收口后残项）：**非列式** score / entity
+        // （上/strftime 等函数、对象嵌套 Path）→ 仍行式。
         let mut plan = each_base();
         plan.score_plan = ScorePlan {
-            expr: Expr::BinOp {
-                op: BinOp::Mul,
-                left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "a".into()))),
-                right: Box::new(Expr::Field(FieldRef::Simple("b".into()))),
+            expr: Expr::FuncCall {
+                qualifier: None,
+                name: "upper".into(),
+                args: vec![Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))],
             },
         };
         assert_path(&plan, ExecutionPath::EagerRows);
 
-        // 7. entity 非字面量 / flat 字段（Path 形态）。
+        // 7. entity 非列式（单段 object 根 Path / 对象嵌套 Path）→ 仍行式。
         let mut plan = each_base();
         plan.entity_plan.entity_id_expr = Expr::Field(FieldRef::Path {
             alias: "b".into(),
             segments: vec![PathSegment::Field("obj".into())],
+        });
+        assert_path(&plan, ExecutionPath::EagerRows);
+        let mut plan = each_base();
+        plan.entity_plan.entity_id_expr = Expr::Field(FieldRef::Path {
+            alias: "b".into(),
+            segments: vec![
+                PathSegment::Field("obj".into()),
+                PathSegment::Field("sub".into()),
+            ],
         });
         assert_path(&plan, ExecutionPath::EagerRows);
 

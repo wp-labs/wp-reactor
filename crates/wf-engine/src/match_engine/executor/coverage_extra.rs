@@ -2437,12 +2437,13 @@ fn each_plan_columnar_safe_gate_branches() {
     plan.binds[0].filter = Some(Expr::Field(FieldRef::Simple("x".into())));
     assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
 
-    // Non-constant score → false.
+    // Non-constant score：裸 flat 字段（`score(b.price)`）→ 可列式（gap-6
+    // 2026-09-02，一般列式表达式）→ safe。
     let mut plan = base();
     plan.score_plan = ScorePlan {
         expr: Expr::Field(FieldRef::Simple("sip".into())),
     };
-    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+    assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
 
     // BinOp score: 常量×字段（q1 `0.908 * b.price` 形态）→ safe（无 join）。
     let mut plan = base();
@@ -2466,7 +2467,7 @@ fn each_plan_columnar_safe_gate_branches() {
     };
     assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
 
-    // 其他 BinOp（Add）→ false。
+    // 其他 BinOp（Add，常量+flat 字段）→ 可列式（gap-6）→ safe。
     let mut plan = base();
     plan.score_plan = ScorePlan {
         expr: Expr::BinOp {
@@ -2475,9 +2476,9 @@ fn each_plan_columnar_safe_gate_branches() {
             right: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
         },
     };
-    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+    assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
 
-    // 字段×字段 → false。
+    // 字段×字段 → 可列式（gap-6）→ safe。
     let mut plan = base();
     plan.score_plan = ScorePlan {
         expr: Expr::BinOp {
@@ -2486,7 +2487,7 @@ fn each_plan_columnar_safe_gate_branches() {
             right: Box::new(Expr::Field(FieldRef::Simple("sip".into()))),
         },
     };
-    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+    assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
 
     // 常量×字段 + 活 join → false（join 列式路径 score 仅允许常量）。
     let mut plan = base();
@@ -2507,7 +2508,8 @@ fn each_plan_columnar_safe_gate_branches() {
     }];
     assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
 
-    // Entity = Path field / general expr → false.
+    // Entity = Path（单段 object 根，非列式）→ false；Add 表达式（flat 组件）
+    // → 可列式（gap-7）→ true。
     let mut plan = base();
     plan.entity_plan.entity_id_expr = Expr::Field(FieldRef::Path {
         alias: "b".into(),
@@ -2520,7 +2522,7 @@ fn each_plan_columnar_safe_gate_branches() {
         left: Box::new(Expr::Field(FieldRef::Simple("sip".into()))),
         right: Box::new(Expr::Number(1.0)),
     };
-    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+    assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
 
     // General yield expression → false.
     let mut plan = base();
@@ -4717,6 +4719,77 @@ fn gap5_tag0_label(r: &DataRecord) -> String {
         .expect("tag0 field")
 }
 
+/// gap-6/7 夹具：构造 on-each 规则（绑定 e、无 filter/where/let/yield）并返回
+/// executor——score/entity 由参数给出。
+fn gap67_plan(rule: &str, score: Expr, entity: Expr) -> RuleExecutor {
+    let mut plan = simple_rule_plan(rule, simple_plan(vec![], vec![]), score, "ip", entity);
+    plan.binds[0].alias = "e".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    RuleExecutor::new(plan)
+}
+
+/// gap-6/7 对拍夹具：同一批上执行行式/列式 each 直接批路径，断言
+/// appended/rejected/failed 与输出逐位一致，返回 (行式输出, 列式输出)。
+fn gap67_parity(exec: &RuleExecutor, batch: &RecordBatch) -> (Vec<DataRecord>, Vec<DataRecord>) {
+    let t = 1_700_000_000_000_000_000i64;
+    let events = crate::match_engine::event_bridge::batch_to_events(batch);
+    let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let col_events: Vec<ColumnarEvent> = (0..batch.num_rows())
+        .map(|r| ColumnarEvent::new(batch, r))
+        .collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+    let out_col: Vec<_> = b_col
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(sr.appended, sc.appended, "appended 一致");
+    assert_eq!(sr.rejected, sc.rejected, "rejected 一致");
+    assert_eq!(sr.failed, sc.failed, "failed 一致");
+    assert_eq!(app_row, app_col, "appended 索引一致");
+    assert_eq!(out_row, out_col, "gap-6/7 输出逐位对拍");
+    (out_row, out_col)
+}
+
+/// 读输出记录的 score（Float）。
+fn gap67_score(r: &DataRecord) -> f64 {
+    r.fields()
+        .find(|f| f.get_name() == wf_lang::wfu_meta::WFU_SCORE)
+        .and_then(|f| match f.get_value() {
+            wp_model_core::model::Value::Float(v) => Some(*v),
+            _ => None,
+        })
+        .expect("score field")
+}
+
+/// 读输出记录的 entity_id（Char）。
+fn gap67_entity(r: &DataRecord) -> String {
+    r.fields()
+        .find(|f| f.get_name() == wf_lang::wfu_meta::WFU_ENTITY_ID)
+        .and_then(|f| match f.get_value() {
+            wp_model_core::model::Value::Chars(v) => Some(v.to_string()),
+            _ => None,
+        })
+        .expect("entity_id field")
+}
+
 #[test]
 fn each_columnar_list_index_yield_matches_row_path() {
     use arrow::array::ListArray;
@@ -4800,9 +4873,217 @@ fn each_columnar_list_index_json_array_yield_matches_row_path() {
         "b",
         "null 元素被丢弃，[1] → b"
     );
+    assert_eq!(
+        gap5_tag0_label(&out_col[0]),
+        "b",
+        "null 元素被丢弃，[1] → b"
+    );
     assert_eq!(gap5_tag0_label(&out_col[1]), "", "越界 → 空串");
     assert_eq!(gap5_tag0_label(&out_col[2]), "", "空数组越界 → 空串");
     assert_eq!(gap5_tag0_label(&out_col[3]), "", "null cell → 空串");
+}
+
+// ---------------------------------------------------------------------------
+// P4 gap-6/7（2026-09-02）：score 非「常量 | 常量×flat」/ entity 非字面量 /
+// flat 的可列式表达式 → 批级 score_cvec / entity_cvec（编译失败/读结构化列
+// 逐行 eval_score / eval_entity_id 回退）——行式/列式逐位对拍。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn each_columnar_general_score_matches_row_path() {
+    // gap-6：score = 字段×字段（`e.a * e.b`）→ 批级 score_cvec。
+    // 语义抽查：2×3=6；10×10=100（clamp 上限）；-5×10=-50 → 0（clamp 下限）；
+    // 100×2=200 → 100；b=null → 整行 failed（非数值与行式 eval_score 一致）。
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("id", DataType::Int64, true),
+        ArrowField::new("a", DataType::Int64, true),
+        ArrowField::new("b", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(2),
+                Some(10),
+                Some(-5),
+                Some(100),
+                Some(7),
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(3),
+                Some(10),
+                Some(10),
+                Some(2),
+                None,
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let exec = gap67_plan(
+        "gap6_score_fxf",
+        Expr::BinOp {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "a".into()))),
+            right: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "b".into()))),
+        },
+        Expr::Field(FieldRef::Qualified("e".into(), "id".into())),
+    );
+    assert!(
+        exec.each_plan_columnar_safe(),
+        "gap-6：字段×字段 score 必须放行"
+    );
+    let (_, out_col) = gap67_parity(&exec, &batch);
+    assert_eq!(out_col.len(), 4, "null 操作数行被 failed 丢弃");
+    assert_eq!(gap67_score(&out_col[0]), 6.0);
+    assert_eq!(gap67_score(&out_col[1]), 100.0);
+    assert_eq!(gap67_score(&out_col[2]), 0.0);
+    assert_eq!(gap67_score(&out_col[3]), 100.0);
+}
+
+#[test]
+fn each_columnar_general_score_null_and_bad_cells_matches_row_path() {
+    // gap-6 边界：裸 flat 字段 score（null cell → failed 行）；非数值列
+    // （Utf8）score → 全行 failed；引用批 schema 外字段 → 编译槽位全 null →
+    // 全行 failed（行式 eval_score 同语义）。
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            ArrowField::new("id", DataType::Int64, true),
+            ArrowField::new("v", DataType::Int64, true),
+            ArrowField::new("label", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("x"), Some("y"), Some("z")])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    // 1) 裸 flat 字段 score(`e.v`)：null 行 failed。
+    let exec = gap67_plan(
+        "gap6_score_bare",
+        Expr::Field(FieldRef::Qualified("e".into(), "v".into())),
+        Expr::Field(FieldRef::Qualified("e".into(), "id".into())),
+    );
+    assert!(exec.each_plan_columnar_safe());
+    let (_, out_col) = gap67_parity(&exec, &batch);
+    assert_eq!(out_col.len(), 2, "null score cell → failed 行");
+    assert_eq!(gap67_score(&out_col[0]), 1.0);
+    assert_eq!(gap67_score(&out_col[1]), 3.0);
+
+    // 2) 非数值列（Utf8）score(`e.label`) → 全行 failed。
+    let exec = gap67_plan(
+        "gap6_score_utf8",
+        Expr::Field(FieldRef::Qualified("e".into(), "label".into())),
+        Expr::Field(FieldRef::Qualified("e".into(), "id".into())),
+    );
+    assert!(exec.each_plan_columnar_safe());
+    let (out_row, out_col) = gap67_parity(&exec, &batch);
+    assert!(
+        out_row.is_empty() && out_col.is_empty(),
+        "非数值 score 全行 failed"
+    );
+
+    // 3) score 引用 schema 外字段（`e.missing`）→ 编译槽位全 null → 全行
+    // failed（列式 == 行式 eval_score 的 Err 语义）。
+    let exec = gap67_plan(
+        "gap6_score_missing",
+        Expr::Field(FieldRef::Qualified("e".into(), "missing".into())),
+        Expr::Field(FieldRef::Qualified("e".into(), "id".into())),
+    );
+    assert!(exec.each_plan_columnar_safe());
+    let (out_row, out_col) = gap67_parity(&exec, &batch);
+    assert!(
+        out_row.is_empty() && out_col.is_empty(),
+        "缺失字段 score 全行 failed"
+    );
+}
+
+#[test]
+fn each_columnar_general_entity_matches_row_path() {
+    use arrow::array::ListArray;
+    use arrow::buffer::OffsetBuffer;
+    // gap-7：entity = 可列式表达式——list-index（`e.tags[0]`，原生 List）
+    // 与复合 Add（`e.a + e.b`，数字渲染 number_to_string）。
+    // 1) list-index entity：行 0 = ["prod","edge"] → "prod"；1 = [null] → ""；
+    //    2 = [] → ""；3 = ["dmz"] → "dmz"——全部 append（entity 不拒绝行）。
+    let values = StringArray::from(vec![Some("prod"), Some("edge"), None, Some("dmz")]);
+    let tags = ListArray::try_new(
+        Arc::new(ArrowField::new("item", DataType::Utf8, true)),
+        OffsetBuffer::new(vec![0i32, 2, 3, 3, 4].into()),
+        Arc::new(values) as ArrayRef,
+        None,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            ArrowField::new(
+                "tags",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            ArrowField::new("id", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(tags) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let exec = gap67_plan(
+        "gap7_entity_list_index",
+        Expr::Number(50.0),
+        Expr::Field(FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![PathSegment::Field("tags".into()), PathSegment::Index(0)],
+        }),
+    );
+    assert!(
+        exec.each_plan_columnar_safe(),
+        "gap-7：list-index entity 必须放行"
+    );
+    let (_, out_col) = gap67_parity(&exec, &batch);
+    assert_eq!(out_col.len(), 4);
+    assert_eq!(gap67_entity(&out_col[0]), "prod");
+    assert_eq!(gap67_entity(&out_col[1]), "", "[null] 元素 → 空串");
+    assert_eq!(gap67_entity(&out_col[2]), "", "空列表越界 → 空串");
+    assert_eq!(gap67_entity(&out_col[3]), "dmz");
+
+    // 2) 复合 Add entity（`e.a + e.b`）→ number_to_string 渲染。
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            ArrowField::new("id", DataType::Int64, true),
+            ArrowField::new("a", DataType::Int64, true),
+            ArrowField::new("b", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(2), Some(20), Some(5)])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(3), Some(2), Some(-5)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let exec = gap67_plan(
+        "gap7_entity_add",
+        Expr::Number(50.0),
+        Expr::BinOp {
+            op: BinOp::Add,
+            left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "a".into()))),
+            right: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "b".into()))),
+        },
+    );
+    assert!(exec.each_plan_columnar_safe());
+    let (_, out_col) = gap67_parity(&exec, &batch);
+    assert_eq!(out_col.len(), 3);
+    assert_eq!(gap67_entity(&out_col[0]), "5");
+    assert_eq!(gap67_entity(&out_col[1]), "22");
+    assert_eq!(gap67_entity(&out_col[2]), "0");
 }
 
 // ---------------------------------------------------------------------------

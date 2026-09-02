@@ -108,6 +108,26 @@ impl ScorePlan {
     }
 }
 
+/// score 是否为「一般列式表达式」（非 常量 / 常量×flat 快通道形状）——gate 的
+/// score_ok 与列式执行器的 score_cvec 槽位共用同一分类（gap-6 2026-09-02）。
+fn score_is_general(expr: &Expr) -> bool {
+    score_shape(expr).is_none()
+}
+
+/// entity 是否为「一般列式表达式」（非 StringLit / flat Field 快通道形状）——
+/// gate 放行与执行器 entity_cvec 槽位共用同一分类（gap-7 2026-09-02）。flat =
+/// Simple/Qualified/Bracketed（无活 join 时 out_shape_ok 的定义；本执行器只
+/// 服务无活 join 的 each-direct 列式路径）。
+fn entity_is_general(expr: &Expr) -> bool {
+    !matches!(expr, Expr::StringLit(_))
+        && !matches!(
+            expr,
+            Expr::Field(
+                FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
+            )
+        )
+}
+
 // L3 batched write (now unconditional): collect a segment's column values and
 // bulk-`extend` each builder column once at the end via
 // `commit_each_rows_batch`, instead of per-row `commit_each_row`. Cell staging
@@ -691,15 +711,16 @@ impl RuleExecutor {
         stats
     }
 
-    /// Whether the on-each plan can run the columnar fast path: no joins, no
-    /// each filter, constant score, entity = field/const, yield values =
-    /// literal/field (flat refs only), a post-`where` that is absent or
-    /// columnar (gap-3 2026-09-02：无活 join 时批级守卫掩码，行式 where_ok
-    /// 严格语义对拍锁定), and every bind filter absent or columnar (a
-    /// non-columnar bind filter falls back to the per-event interpreted
-    /// `event_matches_alias`, which the columnar branch does not replicate).
-    /// Anything else falls back to the Event-based path, keeping both paths
-    /// byte-identical by construction.
+    /// Whether the on-each plan can run the columnar fast path: 形状门控合
+    /// 集（2026-09-02 gap 3-7 收口后）——where 无或可列式、each filter 无活
+    /// join 任意（gap-4 逐行解释回退）、score 常量 / 常量×flat / 无活 join 可列
+    /// 式（gap-6 score_cvec + 逐行回退）、entity 字面量 / flat / 无活 join 可列
+    /// 式（gap-7 entity_cvec + 逐行回退）、yield ∈ {字面量, flat, list-index
+    /// （gap-5）, 列式输出函数/表达式}、bind filter 无或列式（非列式逐行
+    /// `event_matches_alias` 回退）、let RHS 可列式且非 yield 表达式不引用 let。
+    /// 活 join 须满足列式 join 形状（each_join_plan 非 None）。Anything else
+    /// falls back to the Event-based path, keeping both paths byte-identical by
+    /// construction（不满足的残项见 §11.2 表 + execution_path 矩阵）。
     pub fn each_plan_columnar_safe(&self) -> bool {
         let Some(each_plan) = &self.plan.each_plan else {
             return false;
@@ -795,14 +816,19 @@ impl RuleExecutor {
             }
         };
         // Score 形状：常量（原有）或「常量×flat 字段」（q1 `0.908*b.price`）。
-        // 有活 join 时仍只允许常量——join 列式富化路径的 score 未接右窗字段
-        // 读取，BinOp 一律回退行式，避免 columnar_join 的 unreachable。
+        // 无活 join 时**任意可列式表达式**放行（gap-6 2026-09-02：字段×字段
+        // 等编译批级 cvec，编译失败逐行 eval_score 回退）；有活 join 时仍只允
+        // 许常量——join 列式富化路径的 score 未接右窗字段读取，BinOp 一律回退
+        // 行式，避免 columnar_join 的 unreachable。
         let score_ok = match score_shape(&self.plan.score_plan.expr) {
             Some(ScoreShape::Const(_)) => true,
             Some(ScoreShape::MulConst { field, .. }) => {
                 self.live_joins.is_empty() && out_shape_ok(field)
             }
-            None => false,
+            None => {
+                self.live_joins.is_empty()
+                    && wf_lang::columnar::expr_is_columnar(&self.plan.score_plan.expr)
+            }
         };
         if !score_ok {
             return false;
@@ -810,6 +836,10 @@ impl RuleExecutor {
         match &self.plan.entity_plan.entity_id_expr {
             Expr::StringLit(_) => {}
             Expr::Field(fr) if out_shape_ok(fr) => {}
+            // gap-7（2026-09-02）：无活 join 的**可列式** entity 表达式（如
+            // list-index 字段、flat 组件构成的 if/cmp 表达式）→ 编译 cvec，编译
+            // 失败逐行 eval_entity_id 回退；非列式（对象/数组嵌套 Path 等）仍行式。
+            expr if self.live_joins.is_empty() && wf_lang::columnar::expr_is_columnar(expr) => {}
             _ => return false,
         }
         self.plan
@@ -951,6 +981,14 @@ pub struct EachBatchVecs {
     /// post-join `where` 掩码（无 join 时仅驱动列；gap-3 列式化 2026-09-02）：
     /// `None` = 无 where / 编译失败（结构化参数等）→ 逐行 `where_ok` 回退。
     where_cvec: Option<CVec>,
+    /// 一般 score 表达式（非 常量/常量×flat，P4 gap-6 2026-09-02）批级 cvec：
+    /// 逐行 cell → Number → clamp；`None` = 非一般形状 / 编译失败（读结构化
+    /// 列等）→ 逐行 `eval_score` 回退（与行式字节一致）。
+    score_cvec: Option<CVec>,
+    /// 一般 entity 表达式（非 StringLit / flat Field，P4 gap-7 2026-09-02）
+    /// 批级 cvec：逐行 cell → Value → `value_to_string`；`None` = 非一般形状 /
+    /// 编译失败 → 逐行 `eval_entity_id` 回退。
+    entity_cvec: Option<CVec>,
     /// Prepared batch row count + address — `debug_assert!` that the executor's
     /// segment rows read the same batch (misuse would index the wrong cvecs).
     num_rows: usize,
@@ -1028,10 +1066,35 @@ impl RuleExecutor {
             .filter(|w| !crate::match_engine::columnar::arg_reads_structured(&view, w))
             .and_then(|w| compile_guard(w, &view))
             .map(|plan| plan.eval_vec(&view, n));
+        // 一般 score / entity（P4 gap-6/7，2026-09-02）：非快通道形状
+        // （常量 / 常量×flat、StringLit / flat Field）的可列式表达式编译为批级
+        // cvec——快通道形状不编译（score_cvec/entity_cvec = None，行循环走原
+        // 有 lane）。读结构化列的表达式不编译（列式读原始 JSON 文本 vs 解释器
+        // 解析成 Object/Array 可分叉）→ 逐行 eval_score / eval_entity_id 回退。
+        let score_cvec = if score_is_general(&self.plan.score_plan.expr) {
+            let expr = &self.plan.score_plan.expr;
+            (!crate::match_engine::columnar::arg_reads_structured(&view, expr))
+                .then(|| compile_guard(expr, &view))
+                .flatten()
+                .map(|plan| plan.eval_vec(&view, n))
+        } else {
+            None
+        };
+        let entity_expr = &self.plan.entity_plan.entity_id_expr;
+        let entity_cvec = if entity_is_general(entity_expr) {
+            (!crate::match_engine::columnar::arg_reads_structured(&view, entity_expr))
+                .then(|| compile_guard(entity_expr, &view))
+                .flatten()
+                .map(|plan| plan.eval_vec(&view, n))
+        } else {
+            None
+        };
         EachBatchVecs {
             general_cvecs,
             filter_cvec,
             where_cvec,
+            score_cvec,
+            entity_cvec,
             num_rows: n,
             batch_ptr: batch as *const RecordBatch as usize,
         }
@@ -1115,18 +1178,18 @@ impl RuleExecutor {
         let origin = AlertOrigin::Event;
 
         // Plan-constant specialization — the safety gate guarantees these
-        // shapes (score const or const×field; entity StringLit or flat Field;
-        // yields Lit/Field).
-        let score_plan = match ScorePlan::parse(&self.plan.score_plan.expr) {
-            Some(p) => p,
-            None => unreachable!("columnar gate requires const or const×field score"),
-        };
+        // shapes: score 常量 / 常量×flat（快通道）或可列式表达式（gap-6，批级
+        // score_cvec，编译失败逐行 eval_score 回退）；entity StringLit / flat
+        // Field（快通道）或可列式表达式（gap-7，entity_cvec 同款回退）。
+        let score_plan = ScorePlan::parse(&self.plan.score_plan.expr);
         let entity_const: Option<String> = match &self.plan.entity_plan.entity_id_expr {
             Expr::StringLit(s) => Some(s.clone()),
             _ => None,
         };
         let entity_field: Option<&FieldRef> = match &self.plan.entity_plan.entity_id_expr {
-            Expr::Field(fr) => Some(fr),
+            Expr::Field(
+                fr @ (FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)),
+            ) => Some(fr),
             _ => None,
         };
         let yield_kinds: Vec<YieldKind> = self
@@ -1257,8 +1320,9 @@ impl RuleExecutor {
             .iter()
             .map(|fr| resolve(fr.map(field_ref_name)))
             .collect();
-        // Score 列索引（常量×字段模式）：批级解析一次，行循环 value_at 读取。
-        let score_idx: Option<usize> = match score_plan.field() {
+        // Score 列索引（常量×字段快通道）：批级解析一次，行循环 value_at 读取。
+        // 一般 score（gap-6）无单列——用批级 score_cvec。
+        let score_idx: Option<usize> = match score_plan.as_ref().and_then(|p| p.field()) {
             Some(fr) => resolve(Some(field_ref_name(fr))),
             None => None,
         };
@@ -1340,9 +1404,23 @@ impl RuleExecutor {
             } else {
                 None
             };
-            let Some(score) = score_plan.eval(event, score_idx) else {
-                // score 字段缺失/非数值——与解释路径 `eval_score` 的 Err 一致，
-                // 整行跳过。
+            // -- score（与行式 `eval_score` 严格一致：非数值/缺失 → 整行跳过）--
+            // 快通道：常量 / 常量×flat 走 `ScorePlan::eval`；一般列式表达式
+            // （gap-6 2026-09-02）从批级 score_cvec 取 cell → Number → clamp；
+            // 槽位 None（编译失败 / 读结构化列）→ 逐行 eval_score 回退（Event
+            // 视图，行式语义）。
+            let score = match (score_plan.as_ref(), prepared.score_cvec.as_ref()) {
+                (Some(p), _) => p.eval(event, score_idx),
+                (None, Some(cvec)) => match cvec.scalar_at(event.row()) {
+                    Some(s) => match cscalar_to_value(&s) {
+                        Value::Number(n) => Some(n.clamp(0.0, 100.0)),
+                        _ => None,
+                    },
+                    None => None,
+                },
+                (None, None) => eval_score(&self.plan.score_plan.expr, &event.to_event()).ok(),
+            };
+            let Some(score) = score else {
                 stats.failed += 1;
                 continue;
             };
@@ -1352,9 +1430,10 @@ impl RuleExecutor {
             // is the raw number on typed numeric lanes, letting that same yield
             // stage directly without constructing a `Value` (last materialization).
             let (entity_id, entity_val, entity_f64): (String, Option<Value>, Option<f64>) =
-                match &entity_const {
-                    Some(s) => (s.clone(), None, None),
-                    None => match &entity_col {
+                if let Some(s) = &entity_const {
+                    (s.clone(), None, None)
+                } else if entity_field.is_some() {
+                    match &entity_col {
                         EntityCol::I64(i64col) => match i64col.read(event.row()) {
                             Some(v) => {
                                 let mut es = String::with_capacity(20);
@@ -1385,7 +1464,34 @@ impl RuleExecutor {
                                 }
                             }
                         }
-                    },
+                    }
+                } else {
+                    // gap-7：可列式 entity 表达式——批级 entity_cvec cell →
+                    // Value → `value_to_string`（同 entity 快通道的 Generic 渲染）；
+                    // 槽位 None（编译失败 / 读结构化列）→ 逐行 eval_entity_id。
+                    match &prepared.entity_cvec {
+                        Some(cvec) => match cvec.scalar_at(event.row()) {
+                            Some(s) => {
+                                let v = cscalar_to_value(&s);
+                                (value_to_string(&v), None, None)
+                            }
+                            None => {
+                                let (eid, eval) = empty_entity_pair();
+                                (eid, eval, None)
+                            }
+                        },
+                        None => match eval_entity_id(
+                            &self.plan.entity_plan.entity_id_expr,
+                            &event.to_event(),
+                        ) {
+                            Ok(eid) => (eid, None, None),
+                            Err(e) => {
+                                log::warn!("alert export error: {e}");
+                                stats.failed += 1;
+                                continue;
+                            }
+                        },
+                    }
                 };
             if let Some(t) = t_entity {
                 prof.add(e1_bucket_entity(), t);

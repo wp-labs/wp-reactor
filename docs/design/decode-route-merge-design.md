@@ -278,8 +278,8 @@ loop {
 | 3 | each + 后置 `where`（无 join 时 where 非空） | q15/q16/q17 形态 | 中 | ✅ **2026-09-02 收口**——无活 join + 可列式驱动列 where（批级守卫掩码；真实可达形状 = 死 join + 驱动列 where） |
 | 4 | each filter / bind filter 非列式 | 通用 | 中 | ✅ **2026-09-02 收口**——非列式 each filter 逐行 `passes_each_filter` 回退；非列式 bind filter 命中循环逐行 `event_matches_alias`（不再 `hit.fill(true)` 丢 filter） |
 | 5 | **list-index 输出字段**（`c.tags[0]`，Path=[Field,Index]） | qradar 形态（tags/categories 下标） | 小-中 | ✅ **2026-09-02 收口**——无活 join 时编译 ListIndex cvec（Field 快通道 `value_at` 只读 flat 列，索引元素需 offset 读；root 引用 let 拒绝）；**有活 join 的非限定/歧义裸名仍行式**（门控 out_shape 保持限定，残项） |
-| 6 | score 非「常量 \| 常量×flat 字段」 | 通用 | 小-中 | 开放 |
-| 7 | entity 非字面量 / flat 字段 | 通用 | 小 | 开放 |
+| 6 | score 非「常量 \| 常量×flat 字段」（裸 flat 字段 / 字段×字段 / 复合算数） | 通用 | 小-中 | ✅ **2026-09-02 收口**——无活 join 的可列式 score 编译批级 score_cvec（逐行 cell → Number → clamp；读结构化列/编译失败逐行 eval_score 回退；非数值/缺失 → 整行 failed 与行式一致）；活 join 仍只允许常量 |
+| 7 | entity 非字面量 / flat 字段（list-index / flat 组件复合表达式） | 通用 | 小 | ✅ **2026-09-02 收口**——无活 join 的可列式 entity 编译批级 entity_cvec（cell → Value → `value_to_string`，与快通道 Generic 渲染同源；编译失败逐行 eval_entity_id 回退）；**非列式（对象/数组嵌套 Path）仍行式** |
 | 8 | yield 非字面量 / flat / 列式输出函数（有 join 更严） | 通用 | 中 | 开放 |
 
 ### 11.3 排序与验证口径
@@ -337,6 +337,22 @@ loop {
 > 空列表/越界）+ `each_columnar_list_index_json_array_yield_matches_row_path`
 > （JsonArray-metadata Utf8 = qradar 帧 `array/…` 真实存储形态，含 null-drop
 > 探针 `["a",null,"b"][1]`→"b"）。
+>
+> **gap 6/7 已收口（2026-09-02）**：score / entity 的非「常量/常量×flat」/非
+> 字面量-flat 形态不再整条回退行式——无活 join 的可列式 score / entity 表达式
+> 编译批级 `score_cvec` / `entity_cvec`（`each_batch_prepare` 与 where/filter
+> 同机制，读结构化列不编译——列式读原始 JSON 文本 vs 解释器解析可分叉），逐
+> 行 cell 求值：score → Number → clamp（非数值/缺失 → 整行 failed，与行式
+> `eval_score` Err 一致）；entity → Value → `value_to_string`（null/缺失 → 空
+> 串，不拒行）。快通道保留：score 常量 / 常量×flat（f64 直读）、entity
+> StringLit / flat Field（typed 列 lane）。编译失败 → 逐行 eval_score /
+> eval_entity_id（Event 视图）回退。矩阵断言 gap 6（字段×字段、裸 flat 字段
+> score）与 gap 7（list-index / Add 复合 entity）翻转为 `ColumnarEach`（非列式
+> upper() score / 对象嵌套 Path entity 负向边界仍 `EagerRows`）。对拍：
+> `each_columnar_general_score_matches_row_path`（int×int clamp 上下界 + null
+> 操作数 failed 行）/ `_null_and_bad_cells_...`（裸字段 null cell、Utf8 非数值
+> 全 failed、schema 外字段全 failed）/ `each_columnar_general_entity_...`
+> （list-index 原生 List null/空/越界 + 复合 Add 的 number_to_string 渲染）。
 
 1. **判据 = 生产路径是否还走行式**（不再看性能收益）：每收一项，该类规则的生产执行轨
    切换为列式，行式路径保留为测试对拍 golden（从“生产实现”变“测试参考”）；
@@ -367,6 +383,7 @@ loop {
 | `deferred_exec.rs` `DeferredPending.left` 每行 Event | ✅ gap 1/2：`DeferredLeft`（`JoinRow::Columnar` + 投影遮蔽；有 let 回退物化一次） |
 | each + 无活 join where 的 eager 物化 | ✅ gap 3：批级 `where_cvec` 守卫掩码 |
 | each list-index 输出字段（`c.tags[0]`）的整条回退 | ✅ gap 5：`compile_yield_cvec` 编译 `ListIndex` cvec + yield 分类 `General` |
+| each 非快通道 score / entity 的 eager 物化 | ✅ gap 6/7：批级 `score_cvec` / `entity_cvec`（编译失败逐行解释回退，不整批物化） |
 
 受控「反物化」（emit/到期时**按命中行**物化，非全批——保留，属输出路径）：
 `DeferredLeft::to_event` / `ColumnarEvent::to_event` / `JoinRow::to_event` / `RowEvent::to_event`。
@@ -374,10 +391,10 @@ loop {
 转换核心（代码保留，测试 golden + 回退）：`event_bridge.rs` `batch_to_events[_with]` /
 `materialize_rows[_with]`；`ColumnarEvent` / `JoinRow::Columnar` 为反物化的现成方案。
 
-> 与 §11.2 缺口对应：gap 6-8（score/entity 非列式、yield 非列式表达式）→ 触
-> #2（each 侧）/ #1（match 侧）；stats 行式回退 → #4。（gap 1/2/3/4/5 已收口：
-> deferred pending / each where / 非列式 filter / list-index 输出均已列式或逐行
-> 解释回退。）
+> 与 §11.2 缺口对应：gap 8（yield 非列式函数/表达式）→ 触 #2（each 侧）/
+> #1（match 侧）；stats 行式回退 → #4。（gap 1-7 已收口：deferred pending /
+> each where / 非列式 filter / list-index 输出 / 一般 score·entity 均已列式或
+> 逐行解释回退。）
 > 终点判定（§11.3-3）不变：`batch_to_events` / `materialize_rows` /
 > `OnceLock` 调用点归零（仅测试引用）。
 
