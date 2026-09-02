@@ -24,6 +24,12 @@ pub enum ExecutionPath {
     /// 前置：raw batch 在、无 machine、无 deferred join、无 key 分片行子集、
     /// DEBUG 关、形状门控过。同样不物化 Event。
     ColumnarEach,
+    /// deferred join（`emit at`）规则：驱动事件经列式视图挂起（P4 gap-1 收口
+    /// 后，2026-09-02）——免 eager_events 逐行 Event 物化，挂起队列持
+    /// `JoinRow::Columnar`（Arc batch + 行号 + 投影）。有 let 绑定的规则在
+    /// 挂起时物化一次（`deferred_pending_for` 回退），无 let 全列式。
+    /// 前置：raw batch 在、无 machine、deferred join 在、DEBUG 关。
+    DeferredPending,
     /// 行式兜底：逐行 `Event` 物化（`batch_to_events[_filtered]`）。
     /// 命中 §11.2 任一缺口或结构前置不满足时落入。这是单轨化的"待收缩面"。
     EagerRows,
@@ -40,9 +46,6 @@ pub struct ExecutionPathContext<'a> {
     pub raw_batch: bool,
     /// 规则是状态机规则（match/stats/seq，非 on-each）。
     pub machine: bool,
-    /// 规则带 deferred join（`emit at`，挂起/到期评估——列式 each 快路径
-    /// 未接，q8 形态）。
-    pub deferred_join: bool,
     /// 本批是 key 分片行子集（列式 each 快路径未接行子集）。
     pub shard_rows: bool,
     /// tracing DEBUG 打开（调试详情需要行级 Event 渲染被拒行）。
@@ -57,6 +60,9 @@ impl RuleExecutor {
     /// 与 `RuleTask::process_batch` 的判定逐项同构（该函数是唯一消费方），
     /// 因此测试断言的路径 ≡ 生产实际执行的路径。
     pub fn execution_path(&self, ctx: &ExecutionPathContext<'_>) -> ExecutionPath {
+        // 规则是否带 deferred join（`emit at`）：计划的静态属性（RuleTask 的
+        // DeferredRuntime 构造同源），不由批上下文传入——矩阵测试据此断言。
+        let deferred_join = self.plan.joins.iter().any(|j| j.emit_at.is_some());
         // 与 process_batch 的 defer_materialize 完全一致：列式延迟物化只对
         // 状态机路径安全（非列式 bind filter 在缺失 mask 时全放行会静默丢
         // 过滤子集），且被拒行无 Event 可渲染 DEBUG 引用。
@@ -67,11 +73,19 @@ impl RuleExecutor {
         if defer_materialize {
             return ExecutionPath::DeferredMachine;
         }
+        // deferred join（`emit at`）驱动列式挂起（P4 gap-1，2026-09-02）：
+        // 与 process_batch 的 deferred_columnar gate 同构——无 machine（on-each
+        // 才有 deferred join）、有 emit_at join、raw batch 在、DEBUG 关。无
+        // let 绑定全列式；有 let 时挂起阶段物化一次（deferred_pending_for 回退）。
+        let deferred_pending = !ctx.debug_enabled && !ctx.machine && deferred_join && ctx.raw_batch;
+        if deferred_pending {
+            return ExecutionPath::DeferredPending;
+        }
         // 与 process_batch 的 columnar_each 完全一致：独立于 defer_materialize
         // （后者要求 machine 存在，on-each 无 machine，天然互斥）。
         let columnar_each = !ctx.debug_enabled
             && !ctx.machine
-            && !ctx.deferred_join
+            && !deferred_join
             && !ctx.shard_rows
             && ctx.raw_batch
             && if ctx.each_direct {
@@ -188,18 +202,36 @@ mod tests {
         )
     }
 
-    /// 默认生产上下文：raw batch 在、无 machine、无 deferred、非分片、
-    /// DEBUG 关、sink 直写。
+    /// 默认生产上下文：raw batch 在、无 machine、非分片、DEBUG 关、sink 直写。
     fn ctx() -> ExecutionPathContext<'static> {
         ExecutionPathContext {
             window_name: "w",
             raw_batch: true,
             machine: false,
-            deferred_join: false,
             shard_rows: false,
             debug_enabled: false,
             each_direct: true,
         }
+    }
+
+    /// on-each 基础规则 + 单个 emit at deferred join（q4/q8/q9 的驱动形态）。
+    fn deferred_each_base() -> RulePlan {
+        let mut plan = each_base();
+        plan.joins = vec![JoinPlan {
+            right_window: "bids".into(),
+            mode: JoinMode::Snapshot,
+            conds: vec![JoinCondPlan {
+                left: FieldRef::Qualified("e".into(), "id".into()),
+                right: FieldRef::Qualified("bids".into(), "auction".into()),
+            }],
+            within: None,
+            reduce: None,
+            emit_at: Some(Expr::Field(FieldRef::Qualified(
+                "e".into(),
+                "expires".into(),
+            ))),
+        }];
+        plan
     }
 
     /// 断言单个形状的路径（带规则名标签，失败时可见）。
@@ -291,9 +323,12 @@ mod tests {
     }
 
     #[test]
-    fn eight_gap_shapes_still_take_row_path() {
-        // --- 剩余缺口（§11.2 下表 8 项）→ 断言仍走行式 EagerRows ---
-        // 1. reduce maxrow join（q4/q9，非 Snapshot）——join 门控拒绝。
+    fn deferred_gap_shapes_take_deferred_pending_path() {
+        // --- §11.2 gap 1/2（q4/q9/q8，deferred join）2026-09-02 已收口：
+        // 驱动事件列式挂起（DeferredPending）。reduce/within 的列式执行在
+        // evaluate_deferred_join 内（右行 JoinRow::Columnar 读取，早已列式），
+        // 剩余缺口是驱动行的物化——已消除。---
+        // 1. reduce maxrow + emit at（q4/q9 真实形态）。
         let mut plan = each_base();
         plan.joins = vec![JoinPlan {
             right_window: "bids".into(),
@@ -310,11 +345,14 @@ mod tests {
                 },
                 label: None,
             }),
-            emit_at: None,
+            emit_at: Some(Expr::Field(FieldRef::Qualified(
+                "e".into(),
+                "expires".into(),
+            ))),
         }];
-        assert_path(&plan, ExecutionPath::EagerRows);
+        assert_path(&plan, ExecutionPath::DeferredPending);
 
-        // 2. within/interval join（q8）——within 非空 → join 门控拒绝。
+        // 2. within/interval + emit at（q8 真实形态）。
         let mut plan = each_base();
         plan.joins = vec![JoinPlan {
             right_window: "bids".into(),
@@ -333,17 +371,24 @@ mod tests {
                 },
                 hi: Bound {
                     open: false,
-                    val: BoundVal::Dur {
-                        dur: Duration::ZERO,
-                        neg: false,
-                    },
+                    val: BoundVal::Expr(Expr::Field(FieldRef::Qualified(
+                        "e".into(),
+                        "expires".into(),
+                    ))),
                 },
             }),
             reduce: None,
-            emit_at: None,
+            emit_at: Some(Expr::Field(FieldRef::Qualified(
+                "e".into(),
+                "expires".into(),
+            ))),
         }];
-        assert_path(&plan, ExecutionPath::EagerRows);
+        assert_path(&plan, ExecutionPath::DeferredPending);
+    }
 
+    #[test]
+    fn eight_gap_shapes_still_take_row_path() {
+        // --- 剩余缺口（§11.2 下表 3-8 项，非 deferred each 形态）→ 行式 ---
         // 3. each + 后置 where（无 join）——join_ok 要求 where 为空。
         let mut plan = each_base();
         plan.r#where = Some(Expr::BinOp {
@@ -353,7 +398,7 @@ mod tests {
         });
         assert_path(&plan, ExecutionPath::EagerRows);
 
-        // 4a. each filter 非列式（函数调用不在列式清单）。
+        // 4. each filter / bind filter 非列式（函数调用不在列式清单）。
         let mut plan = each_base();
         plan.each_plan = Some(EachPlan {
             alias: "e".into(),
@@ -365,7 +410,7 @@ mod tests {
         });
         assert_path(&plan, ExecutionPath::EagerRows);
 
-        // 4b. bind filter 非列式 → each 列式门控拒绝。
+        // 4（续）. bind filter 非列式 → each 列式门控拒绝。
         let mut plan = each_base();
         plan.binds[0].filter = Some(Expr::FuncCall {
             qualifier: None,
@@ -460,13 +505,28 @@ mod tests {
             ExecutionPath::EagerRows,
             "DEBUG 开 → 行式（match）"
         );
-        // deferred join（emit at，q8 结构）。
-        let mut pctx = ctx();
-        pctx.deferred_join = true;
+        // deferred join（emit at，q4/q8/q9 结构）→ DeferredPending（P4 gap-1
+        // 已收口：驱动列式挂起，非行式）。
         assert_eq!(
-            RuleExecutor::new(each_base()).execution_path(&pctx),
+            RuleExecutor::new(deferred_each_base()).execution_path(&ctx()),
+            ExecutionPath::DeferredPending,
+            "deferred join → 列式挂起"
+        );
+        // deferred join + DEBUG → 行式（被拒行需 Event 渲染调试详情）。
+        let mut pctx = ctx();
+        pctx.debug_enabled = true;
+        assert_eq!(
+            RuleExecutor::new(deferred_each_base()).execution_path(&pctx),
             ExecutionPath::EagerRows,
-            "deferred join → 行式"
+            "deferred join + DEBUG → 行式"
+        );
+        // deferred join + 无 raw batch（relay push 只带 events）→ 行式。
+        let mut pctx = ctx();
+        pctx.raw_batch = false;
+        assert_eq!(
+            RuleExecutor::new(deferred_each_base()).execution_path(&pctx),
+            ExecutionPath::EagerRows,
+            "deferred join + 无 raw batch → 行式"
         );
         // match + 非列式 bind filter → defer 不成立（机器路径 eager 兜底）。
         let mut plan = match_base();

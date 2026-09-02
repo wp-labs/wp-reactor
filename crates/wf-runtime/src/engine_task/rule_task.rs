@@ -13,10 +13,10 @@ use tokio::sync::mpsc;
 
 use wf_engine::alert::{AlertColumnBatch, AlertColumnBuilder, OutputRecord};
 use wf_engine::match_engine::{
-    CepStateMachine, CloseReason, ColumnarEvent, Event, ExecutionPath, ExecutionPathContext,
-    FieldIndex, FieldSource, GuardMasks, RuleExecutor, StepResult, batch_event_time_nanos_at,
-    batch_time_col_index, batch_to_events, batch_to_events_filtered, build_field_index,
-    close_is_qualified,
+    CepStateMachine, CloseReason, ColumnarEvent, DeferredLeft, Event, ExecutionPath,
+    ExecutionPathContext, FieldIndex, FieldSource, GuardMasks, JoinRow, RuleExecutor, StepResult,
+    batch_event_time_nanos_at, batch_time_col_index, batch_to_events, batch_to_events_filtered,
+    build_field_index, close_is_qualified,
 };
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
@@ -102,6 +102,15 @@ struct DeferredRows<'a> {
     /// The window's `materialize_fields` read-set projection: the columnar
     /// `to_event()` materializes only these fields on emit, matching the eager
     /// deferred path's projected trigger event.
+    projection: Option<Arc<HashSet<String>>>,
+}
+
+/// P4 gap-1（q4/q8/q9）：deferred join 驱动列的批级共享视图——Arc batch + 字段
+/// 索引 + 投影。行循环按行号懒建 `JoinRow::Columnar`（Arc 克隆共享），挂起队列
+/// 持该视图直到到期评估，免 eager_events 逐行 Event 物化。
+struct DeferredColumnarBatch {
+    batch: Arc<RecordBatch>,
+    index: Arc<FieldIndex>,
     projection: Option<Arc<HashSet<String>>>,
 }
 
@@ -1098,12 +1107,12 @@ impl RuleTask {
                 window_name,
                 raw_batch: batch.is_some(),
                 machine: self.machine.is_some(),
-                deferred_join: self.deferred.is_some(),
                 shard_rows: shard_rows.is_some(),
                 debug_enabled,
                 each_direct: self.each_direct,
             }) {
                 ExecutionPath::DeferredMachine => (true, false),
+                ExecutionPath::DeferredPending => (false, false),
                 ExecutionPath::ColumnarEach => (false, true),
                 ExecutionPath::EagerRows => (false, false),
             };
@@ -1112,6 +1121,30 @@ impl RuleTask {
         // deferred 若走快路径会被列式 join 当 Snapshot 即时输出——deferred
         // 语义丢失（2026-08-23 验证基线暴露：q8 引擎 33k vs oracle 82k）。
         // 该约束已入 `execution_path`（deferred_join 前置），此处仅保留注释。
+
+        // P4 gap-1（q4/q8/q9，2026-09-02）：deferred join 驱动列式挂起视图。
+        // 免 eager_events 逐行 Event 物化——挂起队列持 `JoinRow::Columnar`
+        // （Arc batch + 行号 + 字段索引 + 投影，同批共享）。有 let 绑定的规则
+        // 在 `deferred_pending_for` 挂起时物化一次（回退语义），无 let 全列式。
+        // DEBUG 开时保留 eager（被拒行需要 Event 渲染调试详情）。与
+        // `ExecutionPath::DeferredPending` 的前置逐项同构（machine 在时是 match
+        // 规则，走上面的 DeferredMachine/EagerRows 分支，不在此列）。
+        let deferred_columnar: Option<DeferredColumnarBatch> = if !debug_enabled
+            && self.machine.is_none()
+            && self.deferred.is_some()
+            && let Some(batch) = batch
+        {
+            let batch_arc = Arc::new(batch.clone());
+            let index = build_field_index(&batch_arc);
+            let projection = materialize_fields.map(|f| Arc::new(f.clone()));
+            Some(DeferredColumnarBatch {
+                batch: batch_arc,
+                index,
+                projection,
+            })
+        } else {
+            None
+        };
 
         // Row domain: a **sharded** deferred push only owns the rows partitioned
         // to this shard (`shard_rows`); an unsharded push scans the whole batch.
@@ -1203,27 +1236,34 @@ impl RuleTask {
         };
 
         // Eager events (full materialization), used by the non-deferred machine
-        // path and the `on each` path.
-        let eager_events: Option<Arc<Vec<Arc<Event>>>> = if defer_materialize || columnar_each {
-            None
-        } else {
-            Some(match events {
-                Some(events) => Arc::clone(events),
-                None => {
-                    let batch = batch.expect("deferred materialization requires the raw batch");
-                    let events = match materialize_fields {
-                        Some(fields) => batch_to_events_filtered(batch, fields),
-                        None => batch_to_events(batch),
-                    };
-                    Arc::new(events.into_iter().map(Arc::new).collect())
-                }
-            })
-        };
+        // path and the `on each` path. 2026-09-02 P4 gap-1：deferred 列式挂起
+        // 时同样免物化（行循环经 `DeferredColumnarBatch` 视图读列）。
+        let eager_events: Option<Arc<Vec<Arc<Event>>>> =
+            if defer_materialize || columnar_each || deferred_columnar.is_some() {
+                None
+            } else {
+                Some(match events {
+                    Some(events) => Arc::clone(events),
+                    None => {
+                        let batch = batch.expect("deferred materialization requires the raw batch");
+                        let events = match materialize_fields {
+                            Some(fields) => batch_to_events_filtered(batch, fields),
+                            None => batch_to_events(batch),
+                        };
+                        Arc::new(events.into_iter().map(Arc::new).collect())
+                    }
+                })
+            };
 
-        let input_events = deferred
-            .as_ref()
-            .map(|d| d.times.len())
-            .unwrap_or_else(|| eager_events.as_ref().map_or(0, |e| e.len()));
+        // 2026-09-02 P4 gap-1：deferred 列式挂起（deferred_columnar）时无
+        // eager_events 也无 DeferredRows——用整批行数计数（指标/活动墙钟口径
+        // 与 eager 路径一致）。
+        let input_events = deferred.as_ref().map(|d| d.times.len()).unwrap_or_else(|| {
+            eager_events
+                .as_ref()
+                .map(|e| e.len())
+                .unwrap_or_else(|| num_rows)
+        });
 
         let mut stats = RuleBatchDebugStats {
             input_events,
@@ -1801,28 +1841,65 @@ impl RuleTask {
                 .as_ref()
                 .filter(|alias| aliases.iter().any(|candidate| candidate == *alias))
             {
-                // The each path never defers materialization — `event` is always
-                // present for these rows.
-                let event = event.expect("each path is always eager");
-                if alias_accepts(
-                    &self.executor,
-                    &columnar_masks,
-                    alias,
-                    row_index,
-                    event.as_ref(),
-                    &lookup,
-                ) {
+                // deferred join 驱动行视图（P4 gap-1）：列式（无 eager 物化，
+                // `DeferredColumnarBatch`）或 Event 回退（DEBUG 开 / 无原始
+                // batch）。非 deferred 规则为 None，走下方 eager `event`。
+                let deferred_left: Option<DeferredLeft> =
+                    self.deferred
+                        .as_ref()
+                        .map(|_| match (&deferred_columnar, &event) {
+                            (Some(v), _) => DeferredLeft::Columnar(JoinRow::Columnar {
+                                batch: Arc::clone(&v.batch),
+                                row: row_index,
+                                index: Arc::clone(&v.index),
+                                projection: v.projection.clone(),
+                            }),
+                            (None, Some(ev)) => {
+                                let event: &Event = ev;
+                                DeferredLeft::Event(event.clone())
+                            }
+                            (None, None) => unreachable!("deferred without batch or eager events"),
+                        });
+                let accepted = match &deferred_left {
+                    Some(left) => alias_accepts(
+                        &self.executor,
+                        &columnar_masks,
+                        alias,
+                        row_index,
+                        left,
+                        &lookup,
+                    ),
+                    None => {
+                        let event = event.expect("each path is always eager");
+                        alias_accepts(
+                            &self.executor,
+                            &columnar_masks,
+                            alias,
+                            row_index,
+                            event.as_ref(),
+                            &lookup,
+                        )
+                    }
+                };
+                if accepted {
                     if debug_enabled {
                         stats.alias_passed += 1;
                     }
-                    let event_nanos = event_time_nanos(event, self.each_time_field.as_deref());
+                    let event_nanos = match &deferred_left {
+                        Some(left) => event_time_nanos(left, self.each_time_field.as_deref()),
+                        None => event_time_nanos(
+                            event.expect("each path is always eager").as_ref(),
+                            self.each_time_field.as_deref(),
+                        ),
+                    };
                     // P3：deferred join（`emit at`）——驱动事件挂起（expiry = emit at），
                     // 不即时输出；到期评估在批次尾的 `scan_deferred`（设计 §5.2）。
                     if self.deferred.is_some() {
                         if let Some(deferred) = self.deferred.as_mut()
+                            && let Some(left) = &deferred_left
                             && let Some(pending) = self.executor.deferred_pending_for(
                                 deferred.join_idx,
-                                event,
+                                left,
                                 event_nanos,
                             )
                         {
@@ -1848,6 +1925,8 @@ impl RuleTask {
                         }
                         continue;
                     }
+                    // 非 deferred 规则：eager event 恒在（deferred 分支已 continue）。
+                    let event = event.expect("each path is always eager");
                     if self.each_direct {
                         if !debug_enabled {
                             // Plan C2 batched: defer to the vectorized pass
@@ -1956,7 +2035,13 @@ impl RuleTask {
                         stats.alias_rejected += 1;
                     }
                     if debug_enabled && stats.allow_detail() {
-                        let event_ref = event_debug_ref(event, batch_seq, row_index);
+                        // debug_enabled 时 deferred_columnar 必为 None（其前置
+                        // 含 !debug）→ eager event 恒在。
+                        let event_ref = event_debug_ref(
+                            event.expect("each path is always eager"),
+                            batch_seq,
+                            row_index,
+                        );
                         wf_debug!(pipe,
                             rule = %rule_name_for_log,
                             stage = 0,
@@ -4701,11 +4786,11 @@ fn record_wfu_intermediate_meta_value(
     }
 }
 
-fn event_time_nanos(event: &wf_engine::match_engine::Event, time_field: Option<&str>) -> i64 {
+fn event_time_nanos(event: &dyn FieldSource, time_field: Option<&str>) -> i64 {
     time_field
-        .and_then(|field| event.fields.get(field))
+        .and_then(|field| event.field_value(field))
         .and_then(|value| match value {
-            wf_engine::match_engine::Value::Number(n) => Some(*n as i64),
+            wf_engine::match_engine::Value::Number(n) => Some(n as i64),
             _ => None,
         })
         .unwrap_or(0)
@@ -5258,9 +5343,9 @@ mod retention_pin_tests {
             lo_open: false,
             hi_open: false,
             expiry_nanos: lo_ns + 1_000_000_000,
-            left: wf_engine::match_engine::Event {
+            left: wf_engine::match_engine::DeferredLeft::Event(Event {
                 fields: Default::default(),
-            },
+            }),
         }
     }
 

@@ -5,8 +5,8 @@ use wf_lang::plan::{JoinCondPlan, JoinPlan, StepPlan};
 
 use crate::match_engine::JoinRow;
 use crate::match_engine::match_engine::{
-    AsofLookup, BindData, EngineHashMap, Event, StepData, Value, WindowLookup, eval_expr,
-    field_ref_name, values_equal,
+    AsofLookup, BindData, EngineHashMap, Event, FieldSource, StepData, Value, WindowLookup,
+    eval_expr, field_ref_name, values_equal,
 };
 use crate::time::normalize_epoch_timestamp_float_nanos;
 
@@ -411,7 +411,7 @@ pub(crate) fn in_interval(ts: i64, lo_ns: i64, hi_ns: i64, lo_open: bool, hi_ope
 /// 区间界求值 → 纳秒：常量界相对左事件 ts（Dur，可负）；行内界为左行绝对时间表达式。
 pub(crate) fn eval_interval_bound(
     bound: &wf_lang::ast::Bound,
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     event_time_nanos: i64,
 ) -> Option<i64> {
     match &bound.val {
@@ -504,12 +504,17 @@ fn find_asof_row(
 }
 
 /// Check whether a row satisfies all join conditions against the current context.
-pub(crate) fn row_matches_conds(row: &JoinRow, conds: &[JoinCondPlan], ctx: &Event) -> bool {
+/// `ctx` 为任意字段源（Event / 列式视图）——读语义由 `field_value` 保证字节一致。
+pub(crate) fn row_matches_conds(
+    row: &JoinRow,
+    conds: &[JoinCondPlan],
+    ctx: &dyn FieldSource,
+) -> bool {
     conds.iter().all(|cond| {
         let left_name = field_ref_name(&cond.left);
         let right_name = field_ref_name(&cond.right);
-        match (ctx.fields.get(left_name), row.field_value(right_name)) {
-            (Some(lv), Some(rv)) => values_equal(lv, &rv),
+        match (ctx.field_value(left_name), row.field_value(right_name)) {
+            (Some(lv), Some(rv)) => values_equal(&lv, &rv),
             _ => false,
         }
     })

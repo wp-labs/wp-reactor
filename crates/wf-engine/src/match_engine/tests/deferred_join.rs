@@ -11,7 +11,7 @@ use wf_lang::plan::{EachPlan, JoinCondPlan, JoinPlan, RulePlan, YieldField};
 
 use crate::alert::AlertOrigin;
 use crate::match_engine::match_engine::{Event, Value, WindowLookup};
-use crate::match_engine::{JoinRow, RuleExecutor};
+use crate::match_engine::{DeferredLeft, JoinRow, RuleExecutor};
 
 use super::helpers::{event, num};
 
@@ -144,7 +144,7 @@ fn auction_event() -> Event {
 fn deferred_pending_for_evaluates_key_bounds_expiry() {
     let exec = RuleExecutor::new(q9_rule_plan());
     let pending = exec
-        .deferred_pending_for(0, &auction_event(), T)
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
         .expect("pending");
     assert_eq!(pending.key_field, "auction");
     assert_eq!(pending.key, num(5.0));
@@ -157,7 +157,9 @@ fn deferred_pending_for_evaluates_key_bounds_expiry() {
 #[test]
 fn execute_deferred_join_q9_maxrow_tie_and_label() {
     let exec = RuleExecutor::new(q9_rule_plan());
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
 
     // bids：100（ts=T+10s）、200（ts=T+20s）、200（ts=T+30s）——同价平手取 dateTime 最早
     let lookup = BidLookup(vec![
@@ -192,7 +194,9 @@ fn execute_deferred_join_closed_interval_boundaries_inclusive() {
     // A.dateTime AND A.expires`）——bid 恰在下界/上界都应命中；Q8 的上开桶
     // （`<bucket_end`）恰在边界排除（另一测试覆盖），两处语义相反，各钉一个。
     let exec = RuleExecutor::new(q9_rule_plan());
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     assert_eq!(pending.lo_ns, T);
     assert_eq!(pending.hi_ns, T + 60_000_000_000);
 
@@ -261,7 +265,9 @@ fn execute_deferred_join_multi_condition_recheck() {
         ("dateTime", num(T as f64)),
         ("expires", num((T + 60_000_000_000) as f64)),
     ]);
-    let pending = exec.deferred_pending_for(0, &auction, T).expect("pending");
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction.clone()), T)
+        .expect("pending");
     assert_eq!(pending.key_field, "auction");
     assert_eq!(pending.key, num(5.0));
 
@@ -292,7 +298,9 @@ fn execute_deferred_join_multi_condition_recheck() {
 #[test]
 fn execute_deferred_join_empty_set_no_output() {
     let exec = RuleExecutor::new(q9_rule_plan());
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     // 无匹配 bid（auction=5 无行，auction=9 有行）
     let lookup = BidLookup(vec![bid(T + 10_000_000_000, 9.0, 4.0, 999.0)]);
     let out = exec
@@ -318,7 +326,9 @@ fn execute_deferred_join_pure_existence_q8_shape() {
         value: Expr::Field(FieldRef::Simple("id".into())),
     }];
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
 
     // 命中
     let hit = BidLookup(vec![bid(T + 10_000_000_000, 5.0, 1.0, 100.0)]);
@@ -393,7 +403,7 @@ fn deferred_q8_bucket_end_half_open_interval() {
     // 驱动 person：id=5, dateTime=T（10s 桶界上）
     let person = event(vec![("id", num(5.0)), ("dateTime", num(T as f64))]);
     let pending = exec
-        .deferred_pending_for(0, &person, T)
+        .deferred_pending_for(0, &DeferredLeft::Event(person.clone()), T)
         .expect("Q8 person must pend");
     let bucket_ns = 10_000_000_000i64;
     assert_eq!(pending.lo_ns, T);
@@ -494,7 +504,9 @@ fn deferred_minrow_last_and_top_select() {
         label: Some("winner".into()),
     });
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     let rec = exec
         .execute_deferred_join(0, &pending, &lookup, T + 100_000_000_000)
         .unwrap()
@@ -516,7 +528,9 @@ fn deferred_minrow_last_and_top_select() {
         label: Some("winner".into()),
     });
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     let rec = exec
         .execute_deferred_join(0, &pending, &lookup, T + 100_000_000_000)
         .unwrap()
@@ -539,7 +553,9 @@ fn deferred_minrow_last_and_top_select() {
         label: Some("winner".into()),
     });
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     let rec = exec
         .execute_deferred_join(0, &pending, &lookup, T + 100_000_000_000)
         .unwrap()
@@ -575,7 +591,9 @@ fn deferred_minrow_with_tie_asc_picks_smallest_tie() {
         label: Some("winner".into()),
     });
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     let rec = exec
         .execute_deferred_join(0, &pending, &lookup, T + 100_000_000_000)
         .unwrap()
@@ -599,7 +617,9 @@ fn deferred_where_suppresses_output() {
         right: Box::new(Expr::Number(150.0)),
     });
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
 
     // price=100 < 150 → where false → 抑制
     let low = BidLookup(vec![bid(T + 10_000_000_000, 5.0, 1.0, 100.0)]);
@@ -633,7 +653,9 @@ fn deferred_respects_let_bindings() {
     }];
     plan.joins[0].emit_at = Some(Expr::Field(FieldRef::Simple("buf".into())));
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     // expiry = let buf = id(5) + 1000 = 1005（epoch 秒 → 归一化为 1005e9 纳秒）
     assert_eq!(pending.expiry_nanos, 1_005_000_000_000);
 }
@@ -665,7 +687,9 @@ fn deferred_open_upper_bound_excludes_boundary() {
         value: Expr::Field(FieldRef::Simple("id".into())),
     }];
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
 
     // ts == expires（边界）→ 上开排除 → 无输出
     let boundary = BidLookup(vec![bid(T + 60_000_000_000, 5.0, 1.0, 100.0)]);
@@ -700,7 +724,9 @@ fn deferred_multi_condition_rechecks_all_conds() {
     let mut auction = auction_event();
     auction.fields.insert("seller".into(), num(7.0));
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction, T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction.clone()), T)
+        .unwrap();
 
     // channel 匹配 → 输出
     let hit = BidLookup(vec![bid_with_channel(
@@ -760,7 +786,9 @@ fn execute_deferred_join_bare_label_yields_whole_row_object() {
         value: Expr::Field(FieldRef::Simple("winner".into())),
     }];
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     let lookup = BidLookup(vec![
         bid(T + 10_000_000_000, 5.0, 1.0, 100.0),
         bid(T + 20_000_000_000, 5.0, 2.0, 200.0),
@@ -797,7 +825,9 @@ fn execute_deferred_join_qualified_label_name_reads_injected_object() {
         value: Expr::Field(FieldRef::Qualified("a".into(), "winner".into())),
     }];
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     let lookup = BidLookup(vec![bid(T + 20_000_000_000, 5.0, 2.0, 200.0)]);
 
     let rec = exec

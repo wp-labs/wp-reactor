@@ -271,24 +271,35 @@ loop {
 
 剩余缺口（生产仍走行式）——each 门控 `each_plan_columnar_safe()`（each_exec.rs L695-827）的 8 条件：
 
-| # | 缺口 | 触发查询 | 量级 |
-|---|---|---|---|
-| 1 | **reduce maxrow join**（非 Snapshot） | q4/q9 | **大**（新执行器：右窗 per-key 窗口化归约 + 输出整行） |
-| 2 | **within/interval join** | q8 | **大**（列式 interval-join 结构） |
-| 3 | each + 后置 `where`（无 join 时 where 非空） | q15/q16/q17 形态 | 中 |
-| 4 | each filter / bind filter 非列式 | 通用 | 中 |
-| 5 | 输出字段非 flat / 非限定引用（有 join） | 通用 | 中 |
-| 6 | score 非「常量 \| 常量×flat 字段」 | 通用 | 小-中 |
-| 7 | entity 非字面量 / flat 字段 | 通用 | 小 |
-| 8 | yield 非字面量 / flat / 列式输出函数（有 join 更严） | 通用 | 中 |
+| # | 缺口 | 触发查询 | 量级 | 状态 |
+|---|---|---|---|---|
+| 1 | **reduce maxrow join**（非 Snapshot） | q4/q9 | **大**（新执行器：右窗 per-key 窗口化归约 + 输出整行） | ✅ **2026-09-02 收口**——deferred 驱动列式挂起（`DeferredPending.left` → `DeferredLeft`） |
+| 2 | **within/interval join** | q8 | **大**（列式 interval-join 结构） | ✅ **2026-09-02 收口**（同上；区间过滤本就列式，剩余是驱动行物化） |
+| 3 | each + 后置 `where`（无 join 时 where 非空） | q15/q16/q17 形态 | 中 | 开放 |
+| 4 | each filter / bind filter 非列式 | 通用 | 中 | 开放 |
+| 5 | 输出字段非 flat / 非限定引用（有 join） | 通用 | 中 | 开放 |
+| 6 | score 非「常量 \| 常量×flat 字段」 | 通用 | 小-中 | 开放 |
+| 7 | entity 非字面量 / flat 字段 | 通用 | 小 | 开放 |
+| 8 | yield 非字面量 / flat / 列式输出函数（有 join 更严） | 通用 | 中 | 开放 |
 
 ### 11.3 排序与验证口径
 
 > 状态（2026-09-02）：**断言基座已落地**——生产路径判定抽为单一事实源
 > `RuleExecutor::execution_path`（`executor/execution_path.rs`），`process_batch`
 > 是唯一消费方（断言的路径 ≡ 执行的路径）；矩阵测试按下表逐形状断言
-> `DeferredMachine / ColumnarEach / EagerRows`（已列式 7 条 + 8 缺口 + 结构
-> 前置 6 条，共 21 断言），缺口收敛时翻转向量即可回归。
+> `DeferredMachine / DeferredPending / ColumnarEach / EagerRows`（已列式 + 结构
+> 前置共 25 断言），缺口收敛时翻转向量即可回归。
+>
+> **gap 1/2 已收口（2026-09-02）**：deferred join（q4/q8/q9）驱动事件列式
+> 挂起——`DeferredPending.left` 从 `Event`（每驱动行 HashMap 物化）降为
+> `DeferredLeft::Columnar`（`JoinRow::Columnar`：Arc batch + 行号 + 索引 +
+> 投影，同批共享），挂起队列与注入期分配随之下降。有 let 绑定回退物化一次
+> （字节一致由构造保证）。`execution_path` 新增 `DeferredPending` 变体（无
+> machine + 有 emit_at join + raw batch + 非 DEBUG），矩阵断言 gap 1/2 真实
+> 形态（reduce/within + emit at）翻转为 `DeferredPending`；对拍测试
+> `deferred_pending_columnar_matches_eager` / `execute_columnar_matches_eager_output`
+> / `columnar_projection_shadows_unprojected_fields` / `multi_cond_recheck` /
+> `with_lets_materializes_once` 锁定列式 == eager 字节一致。
 
 1. **判据 = 生产路径是否还走行式**（不再看性能收益）：每收一项，该类规则的生产执行轨
    切换为列式，行式路径保留为测试对拍 golden（从“生产实现”变“测试参考”）；
@@ -305,7 +316,8 @@ loop {
 | 位置 | 路径 | 状态 |
 |---|---|---|
 | `router.rs` route_parse L361-380 | 非 defer 窗口全批 `batch_to_events[_filtered]` | 生产热路径（merge 后在源任务） |
-| `rule_task.rs` L1213-1229 | eager 兜底 `batch_to_events`（非 defer / 非 columnar each） | 生产热路径 |
+| `rule_task.rs` eager 兜底 | 非 defer / 非 columnar each / 非 deferred-pending 的 `batch_to_events` | 生产热路径（**2026-09-02 收窄**：deferred join 规则已改走列式挂起，免 eager 物化） |
+| `deferred_exec.rs` `DeferredPending.left` | **已列式化**（`DeferredLeft`：`JoinRow::Columnar` + 投影遮蔽；有 let 回退 Event 物化一次） | ✅ 2026-09-02（gap 1/2） |
 | `event_bridge.rs` L117/L166 | `batch_to_events_with` / `materialize_rows_with` | 转换核心 |
 | `event_bridge.rs` L403/L623 | `ColumnarEvent` / `JoinRow::Columnar` | **反物化的现成方案**（列式 facade） |
 | 窗口 log `OnceLock`（buffer/mod.rs L844） | 惰性物化兜底 | hot-reload 新订阅者，生产 pull 已不用 |

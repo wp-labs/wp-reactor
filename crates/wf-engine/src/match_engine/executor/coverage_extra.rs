@@ -34,7 +34,10 @@ use crate::match_engine::match_engine::{
     AsofLookup, BindData, CepStateMachine, CloseOutput, CloseReason, EngineHashMap, Event,
     MatchedContext, StepData, StepResult, Value, WindowLookup,
 };
-use crate::match_engine::{JoinRow, RuleExecutor};
+use crate::match_engine::{
+    DeferredLeft, DeferredPending, FieldSource, JoinRow, RuleExecutor, batch_to_events,
+    batch_to_events_filtered, build_field_index,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers (local copies — `tests::helpers` is not reachable from this module)
@@ -5381,21 +5384,30 @@ fn deferred_pending_for_error_paths() {
     let exec = RuleExecutor::new(deferred_join_plan(None));
 
     // Join index out of range → None.
-    assert!(exec.deferred_pending_for(1, &auction_event(), T).is_none());
+    assert!(
+        exec.deferred_pending_for(1, &DeferredLeft::Event(auction_event()), T)
+            .is_none()
+    );
 
     // Missing key field → None.
     let ev = event(vec![
         ("dateTime", num(T as f64)),
         ("expires", num((T + 60_000_000_000) as f64)),
     ]);
-    assert!(exec.deferred_pending_for(0, &ev, T).is_none());
+    assert!(
+        exec.deferred_pending_for(0, &DeferredLeft::Event(ev), T)
+            .is_none()
+    );
 
     // Missing bound field → None.
     let ev = event(vec![
         ("id", num(5.0)),
         ("expires", num((T + 60_000_000_000) as f64)),
     ]);
-    assert!(exec.deferred_pending_for(0, &ev, T).is_none());
+    assert!(
+        exec.deferred_pending_for(0, &DeferredLeft::Event(ev), T)
+            .is_none()
+    );
 
     // Non-numeric expiry → None.
     let ev = event(vec![
@@ -5403,19 +5415,28 @@ fn deferred_pending_for_error_paths() {
         ("dateTime", num(T as f64)),
         ("expires", str_val("soon")),
     ]);
-    assert!(exec.deferred_pending_for(0, &ev, T).is_none());
+    assert!(
+        exec.deferred_pending_for(0, &DeferredLeft::Event(ev), T)
+            .is_none()
+    );
 
     // No emit_at on the join → None.
     let mut plan = deferred_join_plan(None);
     plan.joins[0].emit_at = None;
     let exec = RuleExecutor::new(plan);
-    assert!(exec.deferred_pending_for(0, &auction_event(), T).is_none());
+    assert!(
+        exec.deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+            .is_none()
+    );
 
     // No within on the join → None.
     let mut plan = deferred_join_plan(None);
     plan.joins[0].within = None;
     let exec = RuleExecutor::new(plan);
-    assert!(exec.deferred_pending_for(0, &auction_event(), T).is_none());
+    assert!(
+        exec.deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+            .is_none()
+    );
 
     // Happy path (with lets injected).
     let mut plan = deferred_join_plan(None);
@@ -5428,7 +5449,9 @@ fn deferred_pending_for_error_paths() {
         },
     }];
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     assert_eq!(pending.key_field, "auction");
     assert_eq!(pending.key, num(5.0));
     assert_eq!(pending.lo_ns, T);
@@ -5468,7 +5491,9 @@ fn execute_deferred_join_reduce_variants() {
         },
     ];
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     // Same price, tie desc → latest dateTime wins (bidder=3).
     let lookup = RowsLookup::with_ts(vec![
         bid(T + 10_000_000_000, 5.0, 1.0, 200.0),
@@ -5502,7 +5527,9 @@ fn execute_deferred_join_reduce_variants() {
         label: None,
     }));
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     let lookup = RowsLookup::with_ts(vec![
         bid(T + 10_000_000_000, 5.0, 1.0, 100.0),
         bid(T + 20_000_000_000, 5.0, 2.0, 100.0),
@@ -5531,7 +5558,9 @@ fn execute_deferred_join_reduce_variants() {
         value: Expr::Field(FieldRef::Simple("bidder".into())),
     }];
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     let lookup = RowsLookup::with_ts(vec![
         bid(T + 10_000_000_000, 5.0, 1.0, 100.0),
         bid(T + 20_000_000_000, 5.0, 2.0, 100.0),
@@ -5562,7 +5591,9 @@ fn execute_deferred_join_reduce_variants() {
         value: Expr::Field(FieldRef::Simple("price".into())),
     }];
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     let lookup = RowsLookup::with_ts(vec![
         bid(T + 10_000_000_000, 5.0, 1.0, 100.0),
         bid(T + 20_000_000_000, 5.0, 2.0, 200.0),
@@ -5594,7 +5625,9 @@ fn execute_deferred_join_reduce_variants() {
         value: Expr::Field(FieldRef::Simple("price".into())),
     }];
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     let lookup = RowsLookup::with_ts(vec![
         bid(T + 10_000_000_000, 5.0, 1.0, 100.0),
         bid(T + 20_000_000_000, 5.0, 2.0, 300.0),
@@ -5624,7 +5657,9 @@ fn execute_deferred_join_reduce_variants() {
         label: None,
     }));
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     let lookup = RowsLookup::with_ts(vec![bid(T + 10_000_000_000, 5.0, 1.0, 100.0)]);
     assert!(
         exec.execute_deferred_join(0, &pending, &lookup, T + 100_000_000_000)
@@ -5637,7 +5672,9 @@ fn execute_deferred_join_reduce_variants() {
 fn execute_deferred_join_empty_and_missing_paths() {
     // No join at index → Ok(None).
     let exec = RuleExecutor::new(deferred_join_plan(None));
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     assert!(
         exec.execute_deferred_join(7, &pending, &EmptyLookup, T)
             .unwrap()
@@ -5666,7 +5703,9 @@ fn execute_deferred_join_empty_and_missing_paths() {
     let mut plan = deferred_join_plan(None);
     plan.r#where = Some(Expr::Bool(false));
     let exec = RuleExecutor::new(plan);
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     let lookup = RowsLookup::with_ts(vec![bid(T + 10_000_000_000, 5.0, 1.0, 100.0)]);
     assert!(
         exec.execute_deferred_join(0, &pending, &lookup, T)
@@ -5677,7 +5716,9 @@ fn execute_deferred_join_empty_and_missing_paths() {
     // Pure existence (reduce None): earliest row enriches; output has
     // `origin=deferred` and `fired_at` = the pending expiry.
     let exec = RuleExecutor::new(deferred_join_plan(None));
-    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(auction_event()), T)
+        .unwrap();
     let lookup = RowsLookup::with_ts(vec![
         bid(T + 10_000_000_000, 5.0, 1.0, 100.0),
         bid(T + 20_000_000_000, 5.0, 2.0, 200.0),
@@ -5689,6 +5730,311 @@ fn execute_deferred_join_empty_and_missing_paths() {
     assert_eq!(rec.origin.as_str(), "deferred");
     // fired_at = expiry (T+60s in ms → formatted).
     assert_eq!(&*rec.fired_at, "2023-11-14T22:14:20.000Z");
+}
+
+// ---------------------------------------------------------------------------
+// P4 gap-1（2026-09-02）：deferred 驱动列式挂起——列式视图与 eager Event
+// 对拍（oracle identical），投影遮蔽语义，let 回退物化。
+// ---------------------------------------------------------------------------
+
+/// 构造 2 行 auction 驱动批：id / dateTime / expires / category（均 i64）。
+/// 经 `extract_field_value` → Value::Number(f64)，与 `batch_to_events` 同转换。
+fn deferred_auction_batch() -> RecordBatch {
+    use arrow::array::Int64Array;
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("dateTime", DataType::Int64, false),
+        ArrowField::new("expires", DataType::Int64, false),
+        ArrowField::new("category", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![5, 9])),
+            Arc::new(Int64Array::from(vec![T, T + 10_000_000_000])),
+            Arc::new(Int64Array::from(vec![
+                T + 60_000_000_000,
+                T + 70_000_000_000,
+            ])),
+            Arc::new(Int64Array::from(vec![10, 20])),
+        ],
+    )
+    .unwrap()
+}
+
+/// 断言两个 pending 的全部标量字段一致（key/界/触发点/开闭）。
+fn assert_pending_eq(a: &DeferredPending, b: &DeferredPending) {
+    assert_eq!(a.key_field, b.key_field);
+    assert_eq!(a.key, b.key);
+    assert_eq!(a.lo_ns, b.lo_ns);
+    assert_eq!(a.hi_ns, b.hi_ns);
+    assert_eq!(a.lo_open, b.lo_open);
+    assert_eq!(a.hi_open, b.hi_open);
+    assert_eq!(a.expiry_nanos, b.expiry_nanos);
+}
+
+#[test]
+fn deferred_pending_columnar_matches_eager() {
+    let exec = RuleExecutor::new(deferred_join_plan(None));
+    let batch = deferred_auction_batch();
+    let index = build_field_index(&batch);
+    let eager_events = batch_to_events(&batch);
+
+    for (row, eager) in eager_events.iter().enumerate() {
+        // 列式视图（无投影）挂起 == eager Event 挂起（标量字段 + 物化结果）。
+        let left = DeferredLeft::Columnar(JoinRow::Columnar {
+            batch: Arc::new(batch.clone()),
+            row,
+            index: Arc::clone(&index),
+            projection: None,
+        });
+        let pending_col = exec.deferred_pending_for(0, &left, T).unwrap();
+        let pending_eager = exec
+            .deferred_pending_for(0, &DeferredLeft::Event(eager.clone()), T)
+            .unwrap();
+        assert_pending_eq(&pending_col, &pending_eager);
+        // 无投影 to_event == batch_to_events 全列 Event（oracle identical）。
+        assert_eq!(
+            pending_col.left.to_event().fields,
+            eager.fields,
+            "row {row}: 列式 to_event 必须与 batch_to_events 字节一致"
+        );
+        // 全链路评估（Q9 纯存在 → 输出 ctx）字节一致。
+        let lookup = RowsLookup::with_ts(vec![bid(T + 10_000_000_000, 5.0, 1.0, 100.0)]);
+        let out_col = exec
+            .evaluate_deferred_join(0, &pending_col, &lookup)
+            .unwrap();
+        let out_eager = exec
+            .evaluate_deferred_join(0, &pending_eager, &lookup)
+            .unwrap();
+        assert_eq!(out_col, out_eager, "row {row}: 评估输出 ctx 字节一致");
+    }
+}
+
+#[test]
+fn deferred_columnar_projection_shadows_unprojected_fields() {
+    let exec = RuleExecutor::new(deferred_join_plan(None));
+    let batch = deferred_auction_batch();
+    let index = build_field_index(&batch);
+    let projection: HashSet<String> = ["id", "dateTime", "expires"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let proj = Arc::new(projection);
+    // 投影 = 规则读集（缺 category）：与 `batch_to_events_filtered` 裁剪一致。
+    let eager_filtered = batch_to_events_filtered(&batch, &proj);
+    for (row, eager) in eager_filtered.iter().enumerate() {
+        let left = DeferredLeft::Columnar(JoinRow::Columnar {
+            batch: Arc::new(batch.clone()),
+            row,
+            index: Arc::clone(&index),
+            projection: Some(Arc::clone(&proj)),
+        });
+        // 投影外字段读 None（对齐 eager 裁剪 Event——字段不在 map 里）。
+        assert_eq!(
+            left.field_value("category"),
+            None,
+            "row {row}: 投影外字段必须读 None"
+        );
+        assert_eq!(
+            left.field_value("id"),
+            eager.fields.get("id").cloned(),
+            "row {row}: 投影内字段直读"
+        );
+        assert_eq!(
+            left.to_event().fields,
+            eager.fields,
+            "row {row}: 投影 to_event == batch_to_events_filtered"
+        );
+    }
+}
+
+#[test]
+fn deferred_execute_columnar_matches_eager_output() {
+    // q9 形态：maxrow + label 注入 + winner 输出字段。
+    let plan = deferred_join_plan(Some(ReduceClause {
+        measure: ReduceMeasure::Maxrow {
+            field: FieldRef::Simple("price".into()),
+            tie: None,
+        },
+        label: Some("winner".into()),
+    }));
+    let mut plan = plan;
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "winner_bidder".into(),
+            value: Expr::Field(FieldRef::Path {
+                alias: "winner".into(),
+                segments: vec![PathSegment::Field("bidder".into())],
+            }),
+        },
+        YieldField {
+            name: "winner_price".into(),
+            value: Expr::Field(FieldRef::Path {
+                alias: "winner".into(),
+                segments: vec![PathSegment::Field("price".into())],
+            }),
+        },
+    ];
+    let exec = RuleExecutor::new(plan);
+    let batch = deferred_auction_batch();
+    let index = build_field_index(&batch);
+    let eager = &batch_to_events(&batch)[0];
+    let pending_col = exec
+        .deferred_pending_for(
+            0,
+            &DeferredLeft::Columnar(JoinRow::Columnar {
+                batch: Arc::new(batch.clone()),
+                row: 0,
+                index: Arc::clone(&index),
+                projection: None,
+            }),
+            T,
+        )
+        .unwrap();
+    let pending_eager = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(eager.clone()), T)
+        .unwrap();
+    let lookup = RowsLookup::with_ts(vec![
+        bid(T + 10_000_000_000, 5.0, 1.0, 200.0),
+        bid(T + 20_000_000_000, 5.0, 2.0, 400.0),
+        bid(T + 30_000_000_000, 9.0, 3.0, 999.0), // 其他 auction
+    ]);
+    let out_col = exec
+        .execute_deferred_join(0, &pending_col, &lookup, T + 100_000_000_000)
+        .unwrap()
+        .expect("columnar deferred output");
+    let out_eager = exec
+        .execute_deferred_join(0, &pending_eager, &lookup, T + 100_000_000_000)
+        .unwrap()
+        .expect("eager deferred output");
+    let get = |rec: &crate::alert::OutputRecord, name: &str| {
+        rec.yield_fields
+            .iter()
+            .find(|(n, _)| &**n == name)
+            .map(|(_, v)| v.clone())
+            .unwrap()
+    };
+    assert_eq!(out_col.origin, out_eager.origin);
+    assert_eq!(out_col.fired_at, out_eager.fired_at);
+    assert_eq!(
+        get(&out_col, "winner_bidder"),
+        get(&out_eager, "winner_bidder")
+    );
+    assert_eq!(
+        get(&out_col, "winner_price"),
+        get(&out_eager, "winner_price")
+    );
+    assert_eq!(get(&out_col, "winner_bidder"), num(2.0), "max price bidder");
+    assert_eq!(get(&out_col, "winner_price"), num(400.0));
+}
+
+#[test]
+fn deferred_columnar_multi_cond_recheck_reads_left_via_field_source() {
+    // 多 join 条件（cond_recheck_redundant = false）：cond 复核经
+    // `row_matches_conds(row, conds, &dyn FieldSource)` 读列式 left。
+    let mut plan = deferred_join_plan(None);
+    plan.joins[0].conds.push(JoinCondPlan {
+        left: FieldRef::Qualified("a".into(), "category".into()),
+        right: FieldRef::Qualified("bid_events".into(), "channel".into()),
+    });
+    let exec = RuleExecutor::new(plan);
+    let batch = deferred_auction_batch();
+    let index = build_field_index(&batch);
+    let pending_col = exec
+        .deferred_pending_for(
+            0,
+            &DeferredLeft::Columnar(JoinRow::Columnar {
+                batch: Arc::new(batch.clone()),
+                row: 0,
+                index: Arc::clone(&index),
+                projection: None,
+            }),
+            T,
+        )
+        .unwrap();
+    // 第一个候选 channel 匹配（category=10）、第二个不匹配 → 只命中第一个。
+    let lookup = RowsLookup::with_ts(vec![
+        {
+            let mut f = EngineHashMap::default();
+            f.insert("auction".into(), num(5.0));
+            f.insert("bidder".into(), num(1.0));
+            f.insert("price".into(), num(100.0));
+            f.insert("dateTime".into(), num((T + 10_000_000_000) as f64));
+            f.insert("channel".into(), num(10.0));
+            (
+                T + 10_000_000_000,
+                JoinRow::Event(Arc::new(Event { fields: f })),
+            )
+        },
+        {
+            let mut f = EngineHashMap::default();
+            f.insert("auction".into(), num(5.0));
+            f.insert("bidder".into(), num(2.0));
+            f.insert("price".into(), num(200.0));
+            f.insert("dateTime".into(), num((T + 20_000_000_000) as f64));
+            f.insert("channel".into(), num(99.0));
+            (
+                T + 20_000_000_000,
+                JoinRow::Event(Arc::new(Event { fields: f })),
+            )
+        },
+    ]);
+    let out = exec
+        .execute_deferred_join(0, &pending_col, &lookup, T + 100_000_000_000)
+        .unwrap()
+        .expect("deferred output");
+    // 纯存在：区间内最早命中行富化（第一个候选 channel 匹配、第二个被复核拒绝）。
+    // 计划未声明 yield 字段（空字段集）——断言输出产生且 origin 正确。
+    assert_eq!(out.origin.as_str(), "deferred");
+    assert_eq!(out.yield_fields.len(), 0);
+}
+
+#[test]
+fn deferred_pending_columnar_with_lets_materializes_once() {
+    // 有 let 绑定的规则：列式 left 在挂起时物化 + apply_lets（回退语义），
+    // 物化结果与 eager 路径字节一致。
+    let mut plan = deferred_join_plan(None);
+    plan.lets = vec![LetPlan {
+        name: "bound_hint".into(),
+        expr: Expr::BinOp {
+            op: BinOp::Add,
+            left: Box::new(Expr::Field(FieldRef::Simple("id".into()))),
+            right: Box::new(Expr::Number(1.0)),
+        },
+    }];
+    let exec = RuleExecutor::new(plan);
+    let batch = deferred_auction_batch();
+    let index = build_field_index(&batch);
+    let pending_col = exec
+        .deferred_pending_for(
+            0,
+            &DeferredLeft::Columnar(JoinRow::Columnar {
+                batch: Arc::new(batch.clone()),
+                row: 0,
+                index: Arc::clone(&index),
+                projection: None,
+            }),
+            T,
+        )
+        .unwrap();
+    // eager 基准 = 同批第 0 行（与列式视图同字段集，字段一致才可比）。
+    let eager_row = batch_to_events(&batch)[0].clone();
+    let pending_eager = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(eager_row), T)
+        .unwrap();
+    // 列式 + let → 回退物化为 Event（非列式视图）。
+    assert!(matches!(pending_col.left, DeferredLeft::Event(_)));
+    assert_eq!(
+        pending_col.left.to_event().fields,
+        pending_eager.left.to_event().fields,
+        "let 回退物化必须与 eager 字节一致"
+    );
+    assert_eq!(
+        pending_col.left.to_event().fields.get("bound_hint"),
+        Some(&num(6.0)),
+        "let 绑定注入（id=5 → 6）"
+    );
 }
 
 #[test]

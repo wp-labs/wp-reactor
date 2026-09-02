@@ -22,7 +22,7 @@ pub use event_bridge::{
     wfl_structured_field_kind,
 };
 pub use executor::{
-    DeferredPending, DistinctKey, DistinctSet, EachDirectBatchStats, ExecutionPath,
+    DeferredLeft, DeferredPending, DistinctKey, DistinctSet, EachDirectBatchStats, ExecutionPath,
     ExecutionPathContext, PipeEachRow, PipeRowSink, RowFieldLayout, RowFields, RuleExecutor,
     RuleExecutorOptions, StatsAccum, StatsBucketAccs, StatsExecutor, StatsMaskCache,
     StatsWindowState,

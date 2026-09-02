@@ -22,10 +22,10 @@ use wf_lang::ast::{
 };
 use wf_lang::plan::{EachPlan, JoinCondPlan, JoinPlan, LetPlan, RulePlan, YieldField};
 
-use crate::match_engine::JoinRow;
 use crate::match_engine::RuleExecutor;
 use crate::match_engine::executor::execute_joins;
 use crate::match_engine::match_engine::{EngineHashMap, Event, Value, WindowLookup};
+use crate::match_engine::{DeferredLeft, FieldSource, JoinRow};
 
 const N: usize = 1_000_000;
 const NOW: i64 = 1_750_000_000_000_000_000;
@@ -186,7 +186,9 @@ fn deferred_join_hot_paths() {
     let exec = RuleExecutor::new(deferred_plan(true));
     let start = Instant::now();
     for _ in 0..N {
-        let p = exec.deferred_pending_for(0, &event, NOW).expect("pending");
+        let p = exec
+            .deferred_pending_for(0, &DeferredLeft::Event(event.clone()), NOW)
+            .expect("pending");
         std::hint::black_box(&p);
     }
     let pending_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
@@ -198,7 +200,7 @@ fn deferred_join_hot_paths() {
     let start = Instant::now();
     for _ in 0..N {
         let p = exec_let
-            .deferred_pending_for(0, &event_let, NOW)
+            .deferred_pending_for(0, &DeferredLeft::Event(event_let.clone()), NOW)
             .expect("pending");
         std::hint::black_box(&p);
     }
@@ -206,7 +208,9 @@ fn deferred_join_hot_paths() {
     report("pending+lets", pending_let_ns, pending_ns);
 
     // ---- 2. 到期评估（Q9：maxrow + tie + label 注入 + alert 构建）----
-    let pending = exec.deferred_pending_for(0, &event, NOW).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(event.clone()), NOW)
+        .unwrap();
     let start = Instant::now();
     for _ in 0..N {
         let rec = exec
@@ -220,7 +224,9 @@ fn deferred_join_hot_paths() {
 
     // ---- 3. 纯存在（Q8 形状，无 reduce/label）----
     let exec8 = RuleExecutor::new(deferred_plan(false));
-    let pending8 = exec8.deferred_pending_for(0, &event, NOW).unwrap();
+    let pending8 = exec8
+        .deferred_pending_for(0, &DeferredLeft::Event(event.clone()), NOW)
+        .unwrap();
     let start = Instant::now();
     for _ in 0..N {
         let rec = exec8
@@ -346,7 +352,9 @@ fn q4a_auction_event() -> Event {
 fn q4a_deferred_eval_candidate_scan() {
     let exec = RuleExecutor::new(q4a_deferred_plan());
     let event = q4a_auction_event();
-    let pending = exec.deferred_pending_for(0, &event, NOW).expect("pending");
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(event.clone()), NOW)
+        .expect("pending");
     let base_rows: Vec<(i64, JoinRow)> = (0..32usize)
         .map(|i| {
             timed_bid(
@@ -410,7 +418,9 @@ fn q4a_eval_cost_decomposition() {
     let exec = RuleExecutor::new(plan.clone());
     let join = &plan.joins[0];
     let event = q4a_auction_event();
-    let pending = exec.deferred_pending_for(0, &event, NOW).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(event.clone()), NOW)
+        .unwrap();
 
     // 候选：key=5.0 的 4 条（与 eval-q4a-cand4 同构）。
     let rows: Vec<(i64, JoinRow)> = (0..4)
@@ -479,21 +489,22 @@ fn q4a_eval_cost_decomposition() {
     let reduce_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
     report("q4a-④reduce×4", reduce_ns, reduce_ns);
 
-    // ⑤a left clone（evaluate 的 out_ctx = pending.left.clone() 成本；move 可省）。
+    // ⑤a left 物化（evaluate 的 out_ctx = pending.left.to_event() 成本；
+    // 2026-09-02 列式化后仅到期评估时物化一次）。
     let start = Instant::now();
     for _ in 0..N {
-        let ctx = pending.left.clone();
+        let ctx = pending.left.to_event();
         std::hint::black_box(&ctx);
     }
     let clone_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
-    report("q4a-⑤a-left-clone", clone_ns, clone_ns);
+    report("q4a-⑤a-left-to_event", clone_ns, clone_ns);
 
     // ⑤ enrich_join_row（全量：qualified + bare；eager 路径契约）。
     let winner =
         select_reduce_row(rows.clone(), &join.reduce.as_ref().unwrap().measure).expect("winner");
     let start = Instant::now();
     for _ in 0..N {
-        let mut ctx = pending.left.clone();
+        let mut ctx = pending.left.to_event();
         enrich_join_row(&mut ctx, join, &winner);
         std::hint::black_box(&ctx);
     }
@@ -503,7 +514,7 @@ fn q4a_eval_cost_decomposition() {
     // ⑤b enrich_join_row_bare（deferred 路径 2026-08-26：只裸名，省 qualified 死数据）。
     let start = Instant::now();
     for _ in 0..N {
-        let mut ctx = pending.left.clone();
+        let mut ctx = pending.left.to_event();
         enrich_join_row_bare(&mut ctx, &winner);
         std::hint::black_box(&ctx);
     }
@@ -514,7 +525,7 @@ fn q4a_eval_cost_decomposition() {
     let start = Instant::now();
     for _ in 0..N {
         let rec = exec
-            .build_each_alert_pipe(&pending.left, pending.expiry_nanos)
+            .build_each_alert_pipe(&pending.left.to_event(), pending.expiry_nanos)
             .unwrap()
             .expect("light build");
         std::hint::black_box(&rec);
@@ -560,13 +571,17 @@ fn deferred_join_overhead_bounded() {
     // 挂起
     let start = Instant::now();
     for _ in 0..n {
-        let p = exec.deferred_pending_for(0, &event, NOW).expect("pending");
+        let p = exec
+            .deferred_pending_for(0, &DeferredLeft::Event(event.clone()), NOW)
+            .expect("pending");
         std::hint::black_box(&p);
     }
     let pending_ns = start.elapsed().as_secs_f64() * 1e9 / n as f64;
 
     // 到期评估
-    let pending = exec.deferred_pending_for(0, &event, NOW).unwrap();
+    let pending = exec
+        .deferred_pending_for(0, &DeferredLeft::Event(event.clone()), NOW)
+        .unwrap();
     let start = Instant::now();
     for _ in 0..n {
         let rec = exec

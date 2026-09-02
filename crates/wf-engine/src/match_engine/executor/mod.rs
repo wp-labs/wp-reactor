@@ -11,7 +11,7 @@ pub(crate) use context::{enrich_join_row, enrich_join_row_bare, in_interval, row
 #[cfg(test)]
 pub(crate) use deferred_exec::select_reduce_row;
 mod deferred_exec;
-pub use deferred_exec::DeferredPending;
+pub use deferred_exec::{DeferredLeft, DeferredPending};
 mod each_exec;
 mod eval;
 mod execution_path;
