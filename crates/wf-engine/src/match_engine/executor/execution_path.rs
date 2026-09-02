@@ -330,6 +330,22 @@ mod tests {
             right: Box::new(Expr::StringLit("10.0.0.1".into())),
         });
         assert_path(&plan, ExecutionPath::ColumnarEach);
+
+        // gap-3 pipe 变体：each→pipe + 列式 where → pipe 门控同样放行。
+        let mut pctx = ctx();
+        pctx.each_direct = false;
+        let mut plan = each_base();
+        plan.yield_plan.target = "pipe_win".into();
+        plan.r#where = Some(Expr::BinOp {
+            op: BinOp::Eq,
+            left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
+            right: Box::new(Expr::StringLit("10.0.0.1".into())),
+        });
+        assert_eq!(
+            RuleExecutor::new(plan).execution_path(&pctx),
+            ExecutionPath::ColumnarEach,
+            "each→pipe + 列式 where 必须走 pipe 列式"
+        );
     }
 
     #[test]

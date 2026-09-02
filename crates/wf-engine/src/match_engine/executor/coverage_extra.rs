@@ -2355,6 +2355,19 @@ fn each_plan_columnar_safe_gate_branches() {
         filter: Some(Expr::Field(FieldRef::Simple("x".into()))),
     });
     assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+    // gap-3（2026-09-02）：**where 引用 let 变量** → 拒绝（列式 where 掩码无
+    // let 视图，引用会静默读空 → 失真；行式 where_ok 在 apply_lets 后生效）。
+    let mut plan = base();
+    plan.lets = vec![LetPlan {
+        name: "x".into(),
+        expr: Expr::Number(1.0),
+    }];
+    plan.r#where = Some(Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Simple("x".into()))),
+        right: Box::new(Expr::Number(1.0)),
+    });
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
 
     // Joins → false.
     let mut plan = base();
@@ -4330,6 +4343,285 @@ fn each_columnar_where_missing_column_rejects_all_parity() {
     let (_, app_row, app_col) = assert_each_columnar_where_matches_row(plan, &batch);
     assert_eq!(app_row, Vec::<usize>::new(), "缺失列 where → 全拒");
     assert_eq!(app_col, Vec::<usize>::new(), "缺失列 where → 全拒");
+}
+
+/// gap-3 形状矩阵：多种列式 where 形状（Utf8 Ne / Float Gt / 复合 And+Or 含
+/// null 短路 / Not / Bool 字面量 / 算术比较（q14 形态）/ cidr_match /
+/// startswith）与行式 where_ok 逐位对拍。
+#[test]
+fn each_columnar_where_shape_matrix_matches_row_path() {
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("sip", DataType::Utf8, true),
+        ArrowField::new("price", DataType::Float64, true),
+        ArrowField::new("category", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("10.0.0.1"),
+                Some("10.0.0.2"),
+                Some("10.0.0.3"),
+                None,
+                Some("192.168.1.1"),
+            ])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![
+                Some(5_000_000.0),
+                Some(60_000_000.0),
+                None,
+                Some(100.0),
+                Some(2_000_000.0),
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(10),
+                Some(20),
+                Some(30),
+                None,
+                Some(10),
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let ef = |n: &str| Expr::Field(FieldRef::Qualified("e".into(), n.into()));
+    let cmp = |op: BinOp, l: Expr, r: Expr| Expr::BinOp {
+        op,
+        left: Box::new(l),
+        right: Box::new(r),
+    };
+    // (形状名, where 表达式, 期望 appended 索引)。
+    let cases: Vec<(&str, Expr, Vec<usize>)> = vec![
+        (
+            "utf8_ne",
+            cmp(BinOp::Ne, ef("sip"), Expr::StringLit("10.0.0.3".into())),
+            vec![0, 1, 4], // r2 相等拒；r3 null → 严格拒
+        ),
+        (
+            "float_gt",
+            cmp(BinOp::Gt, ef("price"), Expr::Number(100.5)),
+            vec![0, 1, 4], // r2 null 拒；r3 100 <= 100.5 拒
+        ),
+        (
+            "compound_and_or",
+            cmp(
+                BinOp::And,
+                cmp(
+                    BinOp::Or,
+                    cmp(BinOp::Eq, ef("category"), Expr::Number(10.0)),
+                    cmp(BinOp::Eq, ef("category"), Expr::Number(20.0)),
+                ),
+                cmp(BinOp::Ne, ef("sip"), Expr::StringLit("10.0.0.3".into())),
+            ),
+            vec![0, 1, 4], // r2: cat 30 + sip==3 → 拒；r3: cat null → Or null → 拒
+        ),
+        (
+            "not",
+            Expr::Not(Box::new(cmp(BinOp::Eq, ef("category"), Expr::Number(10.0)))),
+            vec![1, 2], // r0/r4 cat=10 → Not true → false 拒；r3 cat null → Not null → 拒
+        ),
+        ("bool_lit", Expr::Bool(true), vec![0, 1, 2, 3, 4]),
+        (
+            "arith_cmp",
+            cmp(
+                BinOp::Gt,
+                cmp(BinOp::Mul, ef("price"), Expr::Number(0.908)),
+                Expr::Number(1_000_000.0),
+            ),
+            vec![0, 1, 4], // r2 null 拒；r3 100*0.908 拒
+        ),
+        (
+            "cidr_match",
+            Expr::FuncCall {
+                qualifier: None,
+                name: "cidr_match".into(),
+                args: vec![ef("sip"), Expr::StringLit("10.0.0.0/8".into())],
+            },
+            vec![0, 1, 2], // r3 sip null → null 拒；r4 192.168 拒
+        ),
+        (
+            "startswith",
+            Expr::FuncCall {
+                qualifier: None,
+                name: "startswith".into(),
+                args: vec![ef("sip"), Expr::StringLit("10.0.0.".into())],
+            },
+            vec![0, 1, 2],
+        ),
+    ];
+    for (name, where_expr, expect) in cases {
+        let mut plan = simple_rule_plan(
+            &format!("gap3_{name}"),
+            simple_plan(vec![], vec![]),
+            Expr::Number(5.0),
+            "ip",
+            ef("sip"),
+        );
+        plan.binds[0].alias = "e".into();
+        plan.each_plan = Some(EachPlan {
+            alias: "e".into(),
+            filter: None,
+        });
+        plan.r#where = Some(where_expr);
+        plan.yield_plan.fields = vec![YieldField {
+            name: "sip_out".into(),
+            value: ef("sip"),
+        }];
+        let (_, app_row, app_col) = assert_each_columnar_where_matches_row(plan, &batch);
+        assert_eq!(app_row, expect, "{name}: 行式 appended 索引");
+        assert_eq!(app_col, expect, "{name}: 列式 appended 索引");
+    }
+}
+
+/// gap-3 pipe 路径：each→pipe + 列式 where，行式（execute_each_with_joins
+/// 记录路径）vs 列式（execute_each_pipe_batch_columnar → Vec<PipeEachRow>）
+/// entity 顺序/计数一致。
+#[test]
+fn each_columnar_pipe_where_matches_row_path() {
+    use crate::match_engine::executor::PipeEachRow;
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("sip", DataType::Utf8, true),
+        ArrowField::new("category", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("10.0.0.1"),
+                Some("10.0.0.2"),
+                Some("10.0.0.3"),
+                None,
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(10),
+                Some(20),
+                Some(10),
+                Some(10),
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut plan = simple_rule_plan(
+        "gap3_pipe",
+        simple_plan(vec![], vec![]),
+        Expr::Number(5.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    plan.r#where = Some(Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Qualified(
+            "e".into(),
+            "category".into(),
+        ))),
+        right: Box::new(Expr::Number(10.0)),
+    });
+    plan.yield_plan = YieldPlan {
+        target: "pipe_win".into(),
+        version: None,
+        fields: vec![YieldField {
+            name: "sip_out".into(),
+            value: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+        }],
+    };
+    // 死 Snapshot join（checker 要求 where 有 join；where 只读驱动列 → 死）。
+    plan.joins.push(JoinPlan {
+        right_window: "person_events".into(),
+        mode: JoinMode::Snapshot,
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Qualified("e".into(), "id".into()),
+            right: FieldRef::Qualified("person_events".into(), "id".into()),
+        }],
+        within: None,
+        reduce: None,
+        emit_at: None,
+    });
+    let exec = RuleExecutor::new(plan);
+    assert!(
+        exec.each_pipe_columnar_safe(),
+        "gap-3 pipe：each→pipe + 列式 where 必须放行"
+    );
+    let t = 1_700_000_000_000_000_000i64;
+    // 行式：逐事件 execute_each_with_joins（记录路径，where 生效）。
+    let events = crate::match_engine::event_bridge::batch_to_events(&batch);
+    let row_entities: Vec<String> = events
+        .iter()
+        .filter_map(|e| {
+            exec.execute_each_with_joins(e, t, &EmptyLookup, &[], 0)
+                .unwrap()
+                .map(|rec| rec.entity_id)
+        })
+        .collect();
+    // 列式：prepared + sink。
+    let prepared = exec.each_batch_prepare(&batch);
+    let col_events: Vec<ColumnarEvent> = (0..batch.num_rows())
+        .map(|r| ColumnarEvent::new(&batch, r))
+        .collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut sink: Vec<PipeEachRow> = Vec::new();
+    let sc = exec.execute_each_pipe_batch_columnar(&col_refs, &prepared, &mut sink);
+    let col_entities: Vec<&str> = sink.iter().map(|r| r.entity_id.as_str()).collect();
+    // where category==10 → r0/r2 过；r1(20) 拒；r3(sip null 但 category 10) 过。
+    assert_eq!(
+        row_entities,
+        vec!["10.0.0.1", "10.0.0.3", ""],
+        "行式 entity 顺序"
+    );
+    assert_eq!(sc.appended, 3, "列式 appended");
+    assert_eq!(sc.rejected, 1, "列式 rejected（r1）");
+    assert_eq!(
+        col_entities,
+        vec!["10.0.0.1", "10.0.0.3", ""],
+        "列式 entity 顺序"
+    );
+}
+
+/// gap-3 gate 拒绝：InList / strftime 不在守卫列式清单（expr_is_columnar
+/// false）→ 保持行式（这些形状行式 where_ok 语义不变）。
+#[test]
+fn each_columnar_where_inlist_strftime_stay_row_path() {
+    let ef = |n: &str| Expr::Field(FieldRef::Qualified("e".into(), n.into()));
+    let where_exprs: Vec<Expr> = vec![
+        // InList（q15/q16/q17 形态）——守卫门控不列式。
+        Expr::InList {
+            expr: Box::new(ef("category")),
+            list: vec![Expr::Number(10.0), Expr::Number(20.0)],
+            negated: false,
+        },
+        // strftime 函数比较——守卫门控不列式。
+        Expr::BinOp {
+            op: BinOp::Eq,
+            left: Box::new(Expr::FuncCall {
+                qualifier: None,
+                name: "strftime".into(),
+                args: vec![ef("ts"), Expr::StringLit("%H".into())],
+            }),
+            right: Box::new(Expr::StringLit("12".into())),
+        },
+    ];
+    for (i, where_expr) in where_exprs.into_iter().enumerate() {
+        let mut plan = simple_rule_plan(
+            &format!("gap3_reject_{i}"),
+            simple_plan(vec![], vec![]),
+            Expr::Number(5.0),
+            "ip",
+            ef("sip"),
+        );
+        plan.binds[0].alias = "e".into();
+        plan.each_plan = Some(EachPlan {
+            alias: "e".into(),
+            filter: None,
+        });
+        plan.r#where = Some(where_expr);
+        assert!(
+            !RuleExecutor::new(plan).each_plan_columnar_safe(),
+            "InList/strftime where 必须保持行式（{i}）"
+        );
+    }
 }
 
 /// Q14 变体：fmt 的 IfThenElse 分支 / count_char 参数含 OBJECT 元数据字段。
