@@ -14,6 +14,8 @@ mod deferred_exec;
 pub use deferred_exec::DeferredPending;
 mod each_exec;
 mod eval;
+mod execution_path;
+pub use execution_path::{ExecutionPath, ExecutionPathContext};
 mod match_exec;
 mod stats_exec;
 

@@ -13,9 +13,10 @@ use tokio::sync::mpsc;
 
 use wf_engine::alert::{AlertColumnBatch, AlertColumnBuilder, OutputRecord};
 use wf_engine::match_engine::{
-    CepStateMachine, CloseReason, ColumnarEvent, Event, FieldIndex, FieldSource, GuardMasks,
-    RuleExecutor, StepResult, batch_event_time_nanos_at, batch_time_col_index, batch_to_events,
-    batch_to_events_filtered, build_field_index, close_is_qualified,
+    CepStateMachine, CloseReason, ColumnarEvent, Event, ExecutionPath, ExecutionPathContext,
+    FieldIndex, FieldSource, GuardMasks, RuleExecutor, StepResult, batch_event_time_nanos_at,
+    batch_time_col_index, batch_to_events, batch_to_events_filtered, build_field_index,
+    close_is_qualified,
 };
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
@@ -1078,48 +1079,39 @@ impl RuleTask {
             None => GuardMasks::default(),
         };
 
-        // Deferral is safe only for the state-machine path when debug detail
-        // logging is off (rejected rows have no Event to render a debug ref
-        // from) and every bind filter of this window is columnar (a missing
-        // mask in the deferred path accepts all rows — a non-columnar filter
-        // would silently lose its rejection). The raw batch must be present;
-        // relay/push pushes that also carry materialized `events` now prefer
-        // the columnar path too — the materialized events are only used as the
-        // emit-path trigger projection (byte-identical via `materialize_fields`),
-        // so carrying them is no longer a reason to force eager per-row
-        // materialization (q15 eager_row 1.1µs vs deferred 326ns, 2026-08-22).
-        let defer_materialize = batch.is_some()
-            && self.machine.is_some()
-            && !debug_enabled
-            && self.executor.bind_filters_columnar_safe(window_name);
-
-        // On-each columnar fast path: no per-row `Event` materialization —
-        // field values are read straight from the Arrow columns. Byte-identical
-        // to the eager path (deferred-vs-columnar 对拍 test locks it).
-        // Independent of `defer_materialize` (that requires a state machine;
-        // Q1 on-each has none).
-        // 2026-08-25 q13a 列式化：中间管道目标（!each_direct）的 each 规则在
-        // 满足 `each_pipe_columnar_safe` 形状（q13a：投影 + `%` BinOp yield）
-        // 时同样走列式快路径——免每行 Event 物化 + OutputRecord + stage 的
-        // 三重分配（q13a row path 1248ns/行，见 rule_task_bench）。
-        // 2026-08-25 q13b 列式化：**放开 `events.is_none()`**——push 消费者
-        // （中间窗，广播带 events+batch）同样可从 raw batch 列式读（batch
-        // 驱动，events 被忽略不物化，与 pull 字节一致）。防御：key 分区
-        // push 携带 `shard_rows`（列式分支未接行子集，走行式）。
-        let columnar_each = !debug_enabled
-            && self.machine.is_none()
-            && self.deferred.is_none()
-            && shard_rows.is_none()
-            && batch.is_some()
-            && if self.each_direct {
-                self.executor.each_plan_columnar_safe()
-            } else {
-                self.executor.each_pipe_columnar_safe()
+        // 生产执行路径判定（P4 单轨化可观测性基座，见 design §11.3）：唯一事实
+        // 源 `RuleExecutor::execution_path`——execution_path.rs 矩阵测试逐形状
+        // 断言，断言的路径 ≡ 生产执行的路径，避免内联布尔与断言漂移。解构为
+        // 下述两个布尔供各分支复用：
+        //   DeferredMachine → defer_materialize：match 规则 P3 FieldView 列式喂
+        //     状态机。前置 = raw batch 在 + machine 在 + DEBUG 关 + 该窗 bind
+        //     filter 全列式（非列式 filter 在缺失 mask 时全放行会静默丢过滤子
+        //     集；被拒行无 Event 可渲染 DEBUG 引用）。relay/push 同时携带物化
+        //     events 也走此路径——events 仅作 emit 触发投影（materialize_fields
+        //     字节一致），不再是强制逐行物化的理由（q15 eager 1.1µs vs
+        //     deferred 326ns，2026-08-22）。
+        //   ColumnarEach → columnar_each：on-each 列式快路径（无 per-row Event
+        //     物化；q13a pipe 列式化、q13b 放开 events.is_none()）。
+        //   EagerRows → 行式 Event 物化兜底（下述 eager events 分支）。
+        let (defer_materialize, columnar_each) =
+            match self.executor.execution_path(&ExecutionPathContext {
+                window_name,
+                raw_batch: batch.is_some(),
+                machine: self.machine.is_some(),
+                deferred_join: self.deferred.is_some(),
+                shard_rows: shard_rows.is_some(),
+                debug_enabled,
+                each_direct: self.each_direct,
+            }) {
+                ExecutionPath::DeferredMachine => (true, false),
+                ExecutionPath::ColumnarEach => (false, true),
+                ExecutionPath::EagerRows => (false, false),
             };
         // 注：deferred（emit at）规则不得走列式 each 快路径：挂起/到期评估在
         // 行循环里（deferred_pending_for → scan_deferred）。q8 等 on each +
         // deferred 若走快路径会被列式 join 当 Snapshot 即时输出——deferred
         // 语义丢失（2026-08-23 验证基线暴露：q8 引擎 33k vs oracle 82k）。
+        // 该约束已入 `execution_path`（deferred_join 前置），此处仅保留注释。
 
         // Row domain: a **sharded** deferred push only owns the rows partitioned
         // to this shard (`shard_rows`); an unsharded push scans the whole batch.

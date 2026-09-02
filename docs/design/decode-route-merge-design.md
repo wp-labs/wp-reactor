@@ -236,48 +236,85 @@ loop {
 
 ---
 
-## 11. 物化列式化路线图（P4，独立于 merge）
+## 11. 物化单轨化路线图（P4，独立于 merge）
 
-> 前情：`route_parse` 里的 `batch_to_events`（Arrow → `Event`）只对**非 defer 窗口**执行
-> （`compute_window_field_usage`，wf-lang/field_usage.rs）。它的存在 = **列式引擎未覆盖面的清单**。
-> qradar 已全 defer（实测 p=2 伤即 route 无活）；真正触发物化的是 join 类查询
-> （nexmark q3 的 post-join where / q13 等 deferred reduce）。
-> 本路线图与 merge（P1-P3）正交：merge 不依赖它，它也不依赖 merge。
+> 前情（2026-09-01 基线实测后重定向）：`batch_to_events`（Arrow → `Event`）的存在 =
+> **列式引擎未覆盖面的清单**。**动机从性能改为一致性**：
+> 1. **已存在语义分歧**：`>2^53` 整数 / 纳秒时间戳，列式路径原生 i64 精确、行式路径
+>    `Value::Number(f64)` 丢精度（CHANGELOG 1.1.0 "documented semantic divergence"——
+>    同一查询两条路径可能给出不同结果，`2^53 == 2^53+1` 列式 false / 行式 true）；
+> 2. **双路径对拍约束**：`ColumnarEvent` 处处背 "byte-identical to eager path"——维护负担 + 漂移风险；
+> 3. **新功能双实现**：新增表达式构造要列式编译 + 行式解释各做一遍（触发面 8 门控即双实现清单）。
+> 性能基线否定（nexmark 10m 墙梯）：q4/q9（each+reduce join，回退 eager）rules 增量
+> +60~108ns/事件，但 q4 为等墙（CPU 14%、RSS 5.3GB 堆积）——**列式化对吞吐无收益**。
+> 故本路线图以**一致性**为判据：生产只保留一条执行路径。
 
-### 11.1 目标终态
+### 11.1 目标终态：生产单轨化（非“删行式解释器”）
 
-端到端纯列式：`Row batch → Arrow 列 → 列式过滤/状态机/输出`，`Event` / `batch_to_events` /
-窗口 log 的惰性 `OnceLock` 物化全部退役。物化不再是"可选环节"，而是不存在的环节。
+```
+生产路径：全列式（ColumnarEvent / 列式 join / 列式 let）——唯一执行轨
+行式解释器：保留，降级为「测试对拍 golden」——只活在测试里，不进生产
+```
 
-### 11.2 覆盖清单（物化触发源 → 列式化项）
+一致性由**构造**保证（一条数据一种读法、一个结果），不再靠 "byte-identical 约束 + 对拍" 维持。
+`Event` / `batch_to_events` / 窗口 log 惰性 `OnceLock` 从生产路径退役（代码可保留为测试参考）。
 
-窗口能否 defer 的判定（field_usage.rs L109-116 的局部变量 `plan_defer_safe`，非独立函数）：
-`each 规则 || match 有 event/close/seq 步骤 || 全部 bind filter 列式`。
-非 defer 触发源 = 需要行级 eval context 的表达式：
+### 11.2 覆盖清单（触发面分析结论，2026-09-01）
 
-| 触发源 | 当前实现 | 列式化 | 量级 | 注 |
-|---|---|---|---|---|
-| bind filter | 部分列式（scope-key 直读 `0c989f7`） | 剩余 case 逐个覆盖 | 小 | qradar 已全 defer |
-| entity_id / score / yield 表达式 | eval context 逐行 eval | 每批对命中行算输出列 | 小-中 | qradar 的 `score(50.0)` 常量 + `entity(c.sip)` 字段引用很轻 |
-| join 后 `where`（读 join 侧字段） | join lookup 产生行级 Event | join 结果列式化 | **大** | q3 回归记录（field_usage L161-165） |
-| deferred join（`emit at`）reduce 字段 | eval context | 与上同源 | **大** | L481-500 测试 |
-| MACHINE_ID | 已是列字段 | — | ✅ | |
+已列式（无需动）：
+
+| 形态 | 证据 |
+|---|---|
+| match 规则（P3 FieldView 列式喂状态机） | qradar 376 条全走此路径，无物化 |
+| each + **Snapshot** join（q13b/q20） | `parse_each_join_columnar` + `emit_each_direct_batch_columnar_join` |
+| each + **let**（q22：split/mvindex/concat） | 2026-08-25 层 2：let RHS 列式编译 + yield 引用内联 |
+
+剩余缺口（生产仍走行式）——each 门控 `each_plan_columnar_safe()`（each_exec.rs L695-827）的 8 条件：
+
+| # | 缺口 | 触发查询 | 量级 |
+|---|---|---|---|
+| 1 | **reduce maxrow join**（非 Snapshot） | q4/q9 | **大**（新执行器：右窗 per-key 窗口化归约 + 输出整行） |
+| 2 | **within/interval join** | q8 | **大**（列式 interval-join 结构） |
+| 3 | each + 后置 `where`（无 join 时 where 非空） | q15/q16/q17 形态 | 中 |
+| 4 | each filter / bind filter 非列式 | 通用 | 中 |
+| 5 | 输出字段非 flat / 非限定引用（有 join） | 通用 | 中 |
+| 6 | score 非「常量 \| 常量×flat 字段」 | 通用 | 小-中 |
+| 7 | entity 非字面量 / flat 字段 | 通用 | 小 |
+| 8 | yield 非字面量 / flat / 列式输出函数（有 join 更严） | 通用 | 中 |
 
 ### 11.3 排序与验证口径
 
-1. **按量级从小到大推进**：bind filter 剩余 case → entity/score/yield → join 侧 eval（最后，最大）;
+> 状态（2026-09-02）：**断言基座已落地**——生产路径判定抽为单一事实源
+> `RuleExecutor::execution_path`（`executor/execution_path.rs`），`process_batch`
+> 是唯一消费方（断言的路径 ≡ 执行的路径）；矩阵测试按下表逐形状断言
+> `DeferredMachine / ColumnarEach / EagerRows`（已列式 7 条 + 8 缺口 + 结构
+> 前置 6 条，共 21 断言），缺口收敛时翻转向量即可回归。
+
+1. **判据 = 生产路径是否还走行式**（不再看性能收益）：每收一项，该类规则的生产执行轨
+   切换为列式，行式路径保留为测试对拍 golden（从“生产实现”变“测试参考”）；
 2. **每完成一项**：
-   - `compute_window_field_usage` 的非 defer 集合应**收缩**（新增断言：某窗口从 needs_all/非 defer 落入 defer_materialization）;
-   - 对应正确性测试（q3/q13 join 对拍、deferred 归并）全绿;
-   - perf-diag 实测该形态窗口不再是墙（`decode→floor` 增量随物化消失而下降）;
-3. **终点判定**：全仓 `defer_materialization` 集合 = 所有被消费窗口；`batch_to_events`/`OnceLock` 死代码删除。
+   - 该形状规则的**生产执行路径断言为列式**（`execution_path` 矩阵测试翻转向量：
+     对应断言从 `EagerRows` 改为 `DeferredMachine` / `ColumnarEach`）;
+   - 行式/列式对拍测试**保留**（行式变 golden，继续锁定语义）;
+   - `compute_window_field_usage` 的非 defer 集合收缩断言;
+3. **终点判定**：生产执行路径 `batch_to_events` / `materialize_rows` / 窗口惰性 `OnceLock`
+   调用点归零（仅测试引用）；`Event` 类型只存在于测试对拍与 hot-reload 兜底。
 
-### 11.4 与 merge 的关系
+### 11.4 物化代码现状（2026-09-01 盘点）
 
-- merge（P1-P3）把 route 并入源任务后，**物化仍在源任务执行**（每批一次、Arc 共享、跨连接并行）——
+| 位置 | 路径 | 状态 |
+|---|---|---|
+| `router.rs` route_parse L361-380 | 非 defer 窗口全批 `batch_to_events[_filtered]` | 生产热路径（merge 后在源任务） |
+| `rule_task.rs` L1213-1229 | eager 兜底 `batch_to_events`（非 defer / 非 columnar each） | 生产热路径 |
+| `event_bridge.rs` L117/L166 | `batch_to_events_with` / `materialize_rows_with` | 转换核心 |
+| `event_bridge.rs` L403/L623 | `ColumnarEvent` / `JoinRow::Columnar` | **反物化的现成方案**（列式 facade） |
+| 窗口 log `OnceLock`（buffer/mod.rs L844） | 惰性物化兜底 | hot-reload 新订阅者，生产 pull 已不用 |
+
+### 11.5 与 merge 的关系
+
+- merge（P1-P3）把 route 并入源任务后，非 defer 窗口的物化仍在源任务执行（每批一次、Arc 共享）——
   不构成 merge 的阻塞项;
-- P4 完成后 merge 后的 route 分支进一步收敛为纯路由 + 分片（都无物化分支），
-  但两者可独立合并/独立验证。
+- P4 与 merge 可独立合并/独立验证；P4 完成后 merge 后的 route 分支收敛为纯路由 + 分片。
 
 ---
 
