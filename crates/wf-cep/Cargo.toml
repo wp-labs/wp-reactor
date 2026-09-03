@@ -1,0 +1,14 @@
+[package]
+name = "wf-cep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 纯叶 crate（P4 v0.1）：仅承载与 IO/列式执行无关的纯逻辑单元，
+# 由 wf-engine 经 shim 模块重导出（engine 公开路径不变）。
+# 依赖墙：禁止引入 tokio / arrow / 任何异步与 IO 依赖。
+[dependencies]
+wf-lang = { path = "../wf-lang" }
+regex = { workspace = true }
+orion-error = { workspace = true }
+moju-derive = { workspace = true }

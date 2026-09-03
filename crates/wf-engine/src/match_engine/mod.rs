@@ -13,12 +13,17 @@
 
 pub mod async_persist;
 mod cep;
-mod cidr_cache;
+mod cidr_cache {
+    pub(crate) use wf_cep::cidr_cache::*;
+}
 pub mod columnar;
 pub mod contract;
 pub mod event_bridge;
 mod executor;
-mod regex_cache;
+// 纯叶已下沉 wf-cep；shim 保持 crate 内引用路径不变
+mod regex_cache {
+    pub(crate) use wf_cep::regex_cache::*;
+}
 pub mod spill;
 
 #[cfg(test)]

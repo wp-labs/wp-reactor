@@ -48,6 +48,13 @@ jobs:
       # pub 面门禁：lib 目标上 unreachable_pub 必须为 0（孤儿 pub = 对外宣称 API 却无人可达）
       - name: Clippy (unreachable-pub gate on lib)
         run: cargo clippy --lib --workspace --all-features -- -D warnings -W unreachable_pub
+      # wf-cep 依赖墙（P4）：纯叶 crate 禁止引入 tokio/arrow（数据面 IO 依赖）
+      - name: wf-cep dependency wall (no tokio/arrow)
+        run: |
+          if cargo tree -p wf-cep | grep -E '(^|[^a-zA-Z])(tokio|arrow)([^a-zA-Z]|$)'; then
+            echo "wf-cep 引入被禁依赖 tokio/arrow" >&2
+            exit 1
+          fi
 
   security:
     name: Security Audit

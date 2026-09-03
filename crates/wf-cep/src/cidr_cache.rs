@@ -1,6 +1,6 @@
 //! Per-thread parsed-CIDR cache for the interpreted eval paths.
 //!
-//! Symmetric to [`super::regex_cache`]: `cidr_match`'s second argument is a
+//! Symmetric to [`crate::regex_cache`]: `cidr_match`'s second argument is a
 //! compile-time-checked string literal, so the same subnet is parsed
 //! repeatedly per event on the fallback (non-columnar) path. The columnar
 //! path parses once per batch at `compile_expr` time; this cache gives the
@@ -23,7 +23,7 @@ const MAX_ENTRIES: usize = 512;
 /// Get the parsed subnet for `cidr`, parsing and caching on first use.
 /// Invalid subnets return `None` (mirroring the previous per-event
 /// `Cidr::parse(&cidr)?` behavior).
-pub(crate) fn cached_cidr(cidr: &str) -> Option<Cidr> {
+pub fn cached_cidr(cidr: &str) -> Option<Cidr> {
     CIDR_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
         if let Some(net) = cache.get(cidr) {

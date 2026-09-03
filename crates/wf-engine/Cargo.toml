@@ -10,6 +10,7 @@ name = "wf_engine"
 [dependencies]
 wf-config = { path = "../wf-config" }
 wf-lang = { path = "../wf-lang" }
+wf-cep = { path = "../wf-cep" }
 wp-connector-api = { workspace = true }
 wp-model-core = { workspace = true }
 arrow = { workspace = true }

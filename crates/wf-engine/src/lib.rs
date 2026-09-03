@@ -14,12 +14,17 @@
 //! hot-path-vectorization / async-persist / match-expiry-semantics …）。
 
 pub mod alert;
-pub mod error;
+// error/time 纯叶已下沉 wf-cep；此处 shim 重导出保持公开路径不变
+pub mod error {
+    pub use wf_cep::error::*;
+}
 pub mod external;
 pub mod match_engine;
 pub mod pipe;
 pub mod sink;
-pub(crate) mod time;
+pub(crate) mod time {
+    pub use wf_cep::time::*;
+}
 pub mod window;
 
 pub use time::normalize_epoch_timestamp_float_nanos;

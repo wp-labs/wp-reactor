@@ -1,4 +1,4 @@
-pub(crate) fn epoch_nanos_to_millis(nanos: i64) -> i64 {
+pub fn epoch_nanos_to_millis(nanos: i64) -> i64 {
     nanos.div_euclid(1_000_000)
 }
 
@@ -24,7 +24,7 @@ pub fn normalize_epoch_timestamp_float_nanos(raw: f64) -> Option<i64> {
     Some(nanos.round() as i64)
 }
 
-pub(crate) fn positive_interval_seconds_to_nanos(interval_seconds: f64) -> Option<i64> {
+pub fn positive_interval_seconds_to_nanos(interval_seconds: f64) -> Option<i64> {
     if !interval_seconds.is_finite() || interval_seconds <= 0.0 {
         return None;
     }

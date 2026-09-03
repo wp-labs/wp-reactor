@@ -26,7 +26,7 @@ const MAX_ENTRIES: usize = 512;
 /// Get the compiled regex for `pat`, compiling and caching on first use.
 /// Invalid patterns return `None` (mirroring the previous per-event
 /// `Regex::new(&pat).ok()?` behavior).
-pub(crate) fn cached_regex(pat: &str) -> Option<Arc<regex::Regex>> {
+pub fn cached_regex(pat: &str) -> Option<Arc<regex::Regex>> {
     REGEX_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
         if let Some(re) = cache.get(pat) {
