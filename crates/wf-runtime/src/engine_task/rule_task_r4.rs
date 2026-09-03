@@ -48,7 +48,7 @@ use super::super::tests::test_window_config;
 // 辅助
 // ---------------------------------------------------------------------------
 
-fn test_schema() -> SchemaRef {
+pub(super) fn test_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         ArrowField::new("sip", DataType::Utf8, true),
         ArrowField::new(
@@ -65,7 +65,7 @@ fn empty_router() -> Arc<Router> {
     ))
 }
 
-fn minimal_plan() -> RulePlan {
+pub(super) fn minimal_plan() -> RulePlan {
     RulePlan {
         name: "r4_rule".into(),
         binds: vec![],
@@ -111,23 +111,23 @@ fn minimal_plan() -> RulePlan {
     }
 }
 
-struct Spec {
-    plan: RulePlan,
-    machine: Option<CepStateMachine>,
-    each_alias: Option<String>,
-    each_time_field: Option<String>,
-    window_sources: Vec<super::super::task_types::WindowSource>,
-    sink_fanout: Arc<SinkFanout>,
-    router: Arc<Router>,
-    metrics: Option<Arc<RuntimeMetrics>>,
-    intermediate_targets: HashSet<String>,
-    pipe_registry: Arc<PipeRegistry>,
-    push_rx: Option<mpsc::Receiver<RulePush>>,
-    shard_index: Option<usize>,
-    shard_count: usize,
-    key_partitioned: bool,
-    progress: HashMap<String, Arc<AtomicU64>>,
-    conv_sink: Option<ConvShardSink>,
+pub(super) struct Spec {
+    pub(super) plan: RulePlan,
+    pub(super) machine: Option<CepStateMachine>,
+    pub(super) each_alias: Option<String>,
+    pub(super) each_time_field: Option<String>,
+    pub(super) window_sources: Vec<super::super::task_types::WindowSource>,
+    pub(super) sink_fanout: Arc<SinkFanout>,
+    pub(super) router: Arc<Router>,
+    pub(super) metrics: Option<Arc<RuntimeMetrics>>,
+    pub(super) intermediate_targets: HashSet<String>,
+    pub(super) pipe_registry: Arc<PipeRegistry>,
+    pub(super) push_rx: Option<mpsc::Receiver<RulePush>>,
+    pub(super) shard_index: Option<usize>,
+    pub(super) shard_count: usize,
+    pub(super) key_partitioned: bool,
+    pub(super) progress: HashMap<String, Arc<AtomicU64>>,
+    pub(super) conv_sink: Option<ConvShardSink>,
 }
 
 impl Default for Spec {
@@ -153,7 +153,7 @@ impl Default for Spec {
     }
 }
 
-fn make_task(spec: Spec) -> RuleTask {
+pub(super) fn make_task(spec: Spec) -> RuleTask {
     let Spec {
         plan,
         machine,
@@ -197,7 +197,7 @@ fn make_task(spec: Spec) -> RuleTask {
     task
 }
 
-fn make_window(name: &str, schema: &SchemaRef) -> (Arc<Window>, Arc<Notify>) {
+pub(super) fn make_window(name: &str, schema: &SchemaRef) -> (Arc<Window>, Arc<Notify>) {
     let mut cfg = test_window_config(usize::MAX);
     cfg.name = name.to_string();
     let win = Window::new(
@@ -214,7 +214,7 @@ fn make_window(name: &str, schema: &SchemaRef) -> (Arc<Window>, Arc<Notify>) {
     (Arc::new(win), Arc::new(Notify::new()))
 }
 
-fn make_batch(sips: &[&str], ts: i64) -> arrow::record_batch::RecordBatch {
+pub(super) fn make_batch(sips: &[&str], ts: i64) -> arrow::record_batch::RecordBatch {
     let n = sips.len();
     arrow::record_batch::RecordBatch::try_new(
         test_schema(),
@@ -228,7 +228,7 @@ fn make_batch(sips: &[&str], ts: i64) -> arrow::record_batch::RecordBatch {
     .expect("batch")
 }
 
-fn metrics() -> Arc<RuntimeMetrics> {
+pub(super) fn metrics() -> Arc<RuntimeMetrics> {
     Arc::new(RuntimeMetrics::new(
         &["r4_rule".to_string()],
         &[],
@@ -239,7 +239,7 @@ fn metrics() -> Arc<RuntimeMetrics> {
 
 /// 单步 count>=3 规则（tests.rs 的 make_task 形状）: 机器路径的安全计划。
 /// 返回 (RulePlan, machine)。
-fn machine_rule() -> (RulePlan, CepStateMachine) {
+pub(super) fn machine_rule() -> (RulePlan, CepStateMachine) {
     use wf_lang::ast::{CmpOp, Measure};
     use wf_lang::plan::{AggPlan, BranchPlan, StepPlan};
     let match_plan = MatchPlan {
@@ -334,7 +334,7 @@ fn record_with(target: &str, event_time_nanos: i64) -> OutputRecord {
 /// 在指定 tracing dispatch 下运行 async 闭包（当前线程 runtime）。
 /// 用于隔离 debug 开/关: `Dispatch::none()` 关闭所有级别（defer/columnar 路径
 /// 需要 `!debug_enabled`）, 而 `debug_dispatch()` 打开（细节日志路径）。
-fn run_with_dispatch<F, Fut>(dispatch: tracing::Dispatch, f: F)
+pub(super) fn run_with_dispatch<F, Fut>(dispatch: tracing::Dispatch, f: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
