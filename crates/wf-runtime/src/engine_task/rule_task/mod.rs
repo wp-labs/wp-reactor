@@ -1132,75 +1132,14 @@ impl RuleTask {
             None => RowDomain::Full(num_rows),
         };
 
-        let deferred: Option<DeferredRows> = if defer_materialize {
-            let batch = batch.expect("deferral requires the raw batch");
-            let time_field = self.machine.as_ref().and_then(|m| m.time_field());
-            // Scan needs the event time for every row (watermark/expiry); read
-            // it straight from the time column with the same f64 round-trip the
-            // eager path uses (`extract_event_time`). Resolve the column once,
-            // then read per row over `row_domain` (whole batch for unsharded,
-            // this shard's subset for sharded).
-            //
-            // `times` / `hit` / `hit_indices` are all **row-domain-relative**
-            // (length == `row_domain.len()`; slot i covers `row_domain[i]`), so
-            // a sharded push allocates only its own shard's rows — not the whole
-            // batch. Absolute batch rows are recovered from `row_domain` at the
-            // point they are needed (materialization, hit matching below).
-            let time_col_index = batch_time_col_index(batch, time_field);
-            // 事件时间列存在时逐行 push（免 `vec![0; n]` 零填 + 覆盖的双写）。
-            let mut times = Vec::with_capacity(row_domain.len());
-            if let Some(col_idx) = time_col_index {
-                for i in 0..row_domain.len() {
-                    times.push(batch_event_time_nanos_at(
-                        batch,
-                        col_idx,
-                        row_domain.row_at(i),
-                    ));
-                }
-            } else {
-                times.resize(row_domain.len(), 0);
-            }
-            // Hit = any alias's columnar bind filter accepts this row. The
-            // window-level defer flag guarantees every alias here is columnar;
-            // a missing mask is a defensive fallback that materializes all rows.
-            let mut hit = vec![false; row_domain.len()];
-            for alias in aliases.iter() {
-                match columnar_masks.get(alias) {
-                    Some(Some(mask)) => {
-                        for (i, h) in hit.iter_mut().enumerate() {
-                            *h |= mask.value(row_domain.row_at(i));
-                        }
-                    }
-                    _ => {
-                        for h in hit.iter_mut() {
-                            *h = true;
-                        }
-                    }
-                }
-            }
-            // Row-domain-relative hit positions.
-            let hit_indices: Vec<u32> = (0..row_domain.len())
-                .filter(|&i| hit[i])
-                .map(|i| i as u32)
-                .collect();
-            // P3 FieldView: hit rows are fed to the state machine straight from
-            // the columns — no HashMap materialization. The batch-level field
-            // index makes `ColumnarEvent::field_value` O(1) per read; the
-            // `materialize_fields` projection keeps the emit-path trigger event
-            // byte-identical to the eager deferred path (projected). (The
-            // `columnar_each` early path is machine-free, so this branch never
-            // runs for it; `materialize_rows[_filtered]` stays only on the
-            // eager path below.)
-            let index = build_field_index(batch);
-            let projection = materialize_fields.map(|f| Arc::new(f.clone()));
-            Some(DeferredRows {
-                times,
-                hit_indices,
-                batch,
-                batch_arc: Arc::new(batch.clone()),
-                index,
-                projection,
-            })
+        let deferred = if defer_materialize {
+            Some(self.build_deferred_rows(
+                batch.expect("deferral requires the raw batch"),
+                aliases,
+                &columnar_masks,
+                materialize_fields,
+                &row_domain,
+            ))
         } else {
             None
         };
@@ -2188,6 +2127,87 @@ impl RuleTask {
         // Same latency bound for staged intermediate (pipe) rows.
         self.flush_pipes().await;
     }
+    /// Deferred rows（L2 延迟物化，2026-08-29 读批相位）：列时间扫描 +
+    /// 掩码命中位 + P3 FieldView 列索引——命中行直接从列喂状态机，免逐行
+    /// Event HashMap 物化。行域相对（row-domain-relative）语义见
+    /// `process_batch` 的 RowDomain 注释。
+    fn build_deferred_rows<'a>(
+        &self,
+        batch: &'a RecordBatch,
+        aliases: &[String],
+        columnar_masks: &HashMap<String, Option<BooleanArray>>,
+        materialize_fields: Option<&HashSet<String>>,
+        row_domain: &RowDomain<'_>,
+    ) -> DeferredRows<'a> {
+        let time_field = self.machine.as_ref().and_then(|m| m.time_field());
+        // Scan needs the event time for every row (watermark/expiry); read
+        // it straight from the time column with the same f64 round-trip the
+        // eager path uses (`extract_event_time`). Resolve the column once,
+        // then read per row over `row_domain` (whole batch for unsharded,
+        // this shard's subset for sharded).
+        //
+        // `times` / `hit` / `hit_indices` are all **row-domain-relative**
+        // (length == `row_domain.len()`; slot i covers `row_domain[i]`), so
+        // a sharded push allocates only its own shard's rows — not the whole
+        // batch. Absolute batch rows are recovered from `row_domain` at the
+        // point they are needed (materialization, hit matching below).
+        let time_col_index = batch_time_col_index(batch, time_field);
+        // 事件时间列存在时逐行 push（免 `vec![0; n]` 零填 + 覆盖的双写）。
+        let mut times = Vec::with_capacity(row_domain.len());
+        if let Some(col_idx) = time_col_index {
+            for i in 0..row_domain.len() {
+                times.push(batch_event_time_nanos_at(
+                    batch,
+                    col_idx,
+                    row_domain.row_at(i),
+                ));
+            }
+        } else {
+            times.resize(row_domain.len(), 0);
+        }
+        // Hit = any alias's columnar bind filter accepts this row. The
+        // window-level defer flag guarantees every alias here is columnar;
+        // a missing mask is a defensive fallback that materializes all rows.
+        let mut hit = vec![false; row_domain.len()];
+        for alias in aliases.iter() {
+            match columnar_masks.get(alias) {
+                Some(Some(mask)) => {
+                    for (i, h) in hit.iter_mut().enumerate() {
+                        *h |= mask.value(row_domain.row_at(i));
+                    }
+                }
+                _ => {
+                    for h in hit.iter_mut() {
+                        *h = true;
+                    }
+                }
+            }
+        }
+        // Row-domain-relative hit positions.
+        let hit_indices: Vec<u32> = (0..row_domain.len())
+            .filter(|&i| hit[i])
+            .map(|i| i as u32)
+            .collect();
+        // P3 FieldView: hit rows are fed to the state machine straight from
+        // the columns — no HashMap materialization. The batch-level field
+        // index makes `ColumnarEvent::field_value` O(1) per read; the
+        // `materialize_fields` projection keeps the emit-path trigger event
+        // byte-identical to the eager deferred path (projected). (The
+        // `columnar_each` early path is machine-free, so this branch never
+        // runs for it; `materialize_rows[_filtered]` stays only on the
+        // eager path below.)
+        let index = build_field_index(batch);
+        let projection = materialize_fields.map(|f| Arc::new(f.clone()));
+        DeferredRows {
+            times,
+            hit_indices,
+            batch,
+            batch_arc: Arc::new(batch.clone()),
+            index,
+            projection,
+        }
+    }
+
     /// On-each columnar fast path（2026-08-25 q13a 列式化）：命中行来自
     /// （缺席或列式的）bind-filter 掩码，整批向量化装载/直发——完全跳过行
     /// 循环。`process_batch` 的 columnar_each 分支早退委托（含 pipe 装载的
