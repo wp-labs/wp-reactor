@@ -2,6 +2,18 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [2.0.17] -- latest
+
+### Changed
+
+- **工程内务（公开 API 与行为不变）**：
+  - `wf-runtime`：`rule_task` 单体拆分——目录化后抽出 `debug.rs`（批级调试统计）与 `stager.rs`（`PipeBatchStager` 中间管道列式装载全家：类型/形状解析/JSON 值渲染/`PendingEventBatch`）；`process_batch`（~1300 行）逐步内抽：columnar_each 快路径独立方法、`build_deferred_rows`（L2 延迟物化读批相位）、`log_batch_start`/`log_batch_summary`（批前/批尾诊断），并用 `PendingAlertColumns::builder_for` 收口 emit 路径 8 处同构列 builder get-or-create（净减 ~200 行）；
+  - `wf-engine`：`stats_exec.rs`（4162 行）拆为 `stats_exec/` 六文件——`mod.rs`（头文档 + 同名 re-export 面，对外路径零变化）、`masks.rs`（批级 where mask 缓存）、`accum.rs`（状态/累加类型簇）、`state.rs`（桶表 + spill 窗口状态）、`exec.rs`（`StatsExecutor` 主实现）、`eval.rs`（归并/求值/读取纯函数簇）；`fanout.rs` 目录化为 `fanout/`（核心 + 分片行路由）；拆分中重组历史混合 doc 归属，修正随迁漂移的相对路径；
+  - 可见性门禁：`stats_exec::StatsBucket` re-export 链对齐 `unreachable_pub`（lib 目标门禁保持 0）；
+- **文档/资产**：生产单体文件补模块导航（rule_task/each_exec/fanout/check_funcs/spawn）；refactor 会话交接快照入库；moju 渲染图与布局产物更新。
+
+- **验证**：`wf-engine` 1338 / `wf-runtime` 606 / 跨仓 warp-fusion 364 项全绿（含 oracle 对拍 e2e）；双 clippy（all-targets + lib `unreachable_pub`）与 `wf-cep` 依赖墙 0 告警。
+
 ## [2.0.16] -- latest
 
 ### Changed
