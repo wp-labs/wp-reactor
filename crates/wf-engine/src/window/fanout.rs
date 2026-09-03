@@ -1,3 +1,7 @@
+//! 规则-窗口订阅扇出与分片（rule_shards）：窗口订阅注册、读游标分批、把行
+//! 子集分发给各规则 worker；分片键 = 简单字段取模或表达式派生键逐行求值哈希
+//! （issue #80，见 partition 相关函数）。测试在 `window/tests/`。
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;

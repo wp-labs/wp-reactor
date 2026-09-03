@@ -1,3 +1,7 @@
+//! 直发（on-each）执行路径：逐事件/逐批推进 step 分支，命中即组装输出行
+//! （alert 列构建复用），覆盖 deferred / pipe 等变体；与 stats_exec（窗口
+//! 统计）正交。引擎内执行器组织见 `executor/mod.rs`。
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;

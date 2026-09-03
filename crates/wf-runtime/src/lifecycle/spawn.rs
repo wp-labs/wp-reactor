@@ -1,3 +1,7 @@
+//! 引擎任务组构造与启动接线：把 runtime 各任务（receiver / window /
+//! evictor / rules / alert / metrics …）按配置实例化并拉起，处理启动参数与
+//! 传播；生命周期编排见 `lifecycle/mod.rs`。
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64};

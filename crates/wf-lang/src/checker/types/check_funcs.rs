@@ -1,3 +1,6 @@
+//! WFL 内建函数目录与编译期契约：函数名 → 参数/返回签名规则、调用点类型检查
+//! （`check_func_call`）与特判（时间函数/聚合/窗口查询等）。
+
 use crate::ast::{Expr, FieldRef, Measure};
 use crate::schema::BaseType;
 

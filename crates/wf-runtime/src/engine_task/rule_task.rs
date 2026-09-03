@@ -1,3 +1,8 @@
+//! 规则执行任务：把 wf-engine 的批量执行（RuleExecutor / CepStateMachine /
+//! 列式-解释双路径）接到窗口读侧与 emit 侧，含任务级并发、背压与诊断采样。
+//! 引擎任务总览见 `crate` lib.rs 的 `//!` 导航；相关设计：
+//! `docs/design/concurrency-scaling.md`、`columnar-execution-design.md`。
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
