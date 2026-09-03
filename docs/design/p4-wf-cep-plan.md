@@ -84,3 +84,27 @@ builder helpers（供 engine 剩测/bench 使用；避免重复实现）。
   测试）；engine 以 shim 模块重导出，公开路径零变化；CI 增加 wf-cep 依赖墙
   （禁 tokio/arrow）。后续 P4 扩展（eval/Value 等）以本 crate 为落点，需先解决
   列式表示抽象或接受「同步内核（arrow 数据面允许）」重定界。
+
+---
+
+## 决策 A（2026-09-03）：墙修订 + 同步执行核大拆
+
+- 边界勘误：CEP 语义类型按设计直接操作 Arrow 行（ColumnarEvent 借 &RecordBatch、
+  TriggerEvent 持 Arc<RecordBatch>），且孤儿规则令 Event/FieldSource/Value 必须
+  同 crate → 「无 arrow 纯化」不可能，纯叶（v0.1）是例外不是常态。
+- **墙修订**：wf-cep 允许 arrow 纯数据面；禁止 tokio / async / 网络 / 持久化 IO
+  （CI 墙步已改）。
+- **目标**：wf-cep 收编 match_engine 同步执行核（cep + event_bridge + columnar +
+  executor + alert + external + contract + 已迁纯叶）；engine 留 window /
+  sink / async_persist / spill / 门面 shim（公开路径零变化，engine 内部引用经
+  shim 模块保持）。
+- **切片积压（自底向上，每片绿闸推进）**：
+  1. ✅ 纯叶：time/regex_cache/cidr_cache/error（v0.1）
+  2. ✅ Value 层：Value/EngineHashMap/EngineHashSet/MACHINE_ID -> wf_cep::value
+     （Event/FieldSource 留引擎避孤儿；types.rs 别名重导出）；external -> wf_cep
+     （engine pub mod shim）
+  3. ⏳ RowFields/RowFieldLayout（纯值类型，解 stats_exec 耦合）
+  4. ⏳ cep（types 引擎耦合段切留 engine）+ event_bridge（FieldSource 随 Event 迁）
+  5. ⏳ executor/columnar（解 alert/spill/window::scope_key_columnar 后）
+  6. ⏳ engine 收尾：window/sink/async_persist/spill + 门面收缩；测试归位
+- 每片完成 = wf-cep 编译 + engine 编译 + 全量测试 + 两道 clippy 门禁。

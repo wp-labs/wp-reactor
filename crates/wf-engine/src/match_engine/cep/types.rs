@@ -1,7 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 
-use foldhash::fast::RandomState as FoldRandomState;
 use smol_str::SmolStr;
 
 use super::key::{ScopeKey, extract_scope_key_from_row};
@@ -9,21 +8,12 @@ use crate::match_engine::event_bridge::{JoinRow, TriggerEvent};
 use wf_lang::ast::FieldRef;
 use wf_lang::plan::KeyMapPlan;
 
-/// HashMap/HashSet over hot-path keys (InstanceKey, field names, event field
-/// keys) using foldhash's fast, minimally-DoS-resistant hasher instead of the
-/// default SipHash. SipHash was ~3k samples of the match-engine profile; field
-/// names / rule keys are internal, and InstanceKey values carry a random seed
-/// via `FoldRandomState` so collision attacks stay hard.
-pub type EngineHashMap<K, V> = HashMap<K, V, FoldRandomState>;
-pub type EngineHashSet<K> = HashSet<K, FoldRandomState>;
+// Value 层已下沉 wf-cep（P4-A 片 1）；此处别名重导出保持 engine 内路径不变。
+pub use wf_cep::value::{EngineHashMap, EngineHashSet, MACHINE_ID, Value};
 
 // ---------------------------------------------------------------------------
 // Public types — Event & Value
 // ---------------------------------------------------------------------------
-
-/// Field name for machine identifier carried in events and batches
-/// for per-machine metrics labeling.
-pub const MACHINE_ID: &str = "wp_src_ip";
 
 /// A thin event abstraction: named fields with heterogeneous values.
 ///
@@ -33,17 +23,6 @@ pub const MACHINE_ID: &str = "wp_src_ip";
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct Event {
     pub fields: EngineHashMap<SmolStr, Value>,
-}
-
-/// Scalar value carried inside an [`Event`].
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
-pub enum Value {
-    Number(f64),
-    Str(SmolStr),
-    Bool(bool),
-    Array(Vec<Value>),
-    Object(EngineHashMap<SmolStr, Value>),
 }
 
 // ---------------------------------------------------------------------------

@@ -18,7 +18,10 @@ pub mod alert;
 pub mod error {
     pub use wf_cep::error::*;
 }
-pub mod external;
+// external 已下沉 wf-cep（P4-A 片 1）；shim 重导出保持公开路径
+pub mod external {
+    pub use wf_cep::external::*;
+}
 pub mod match_engine;
 pub mod pipe;
 pub mod sink;

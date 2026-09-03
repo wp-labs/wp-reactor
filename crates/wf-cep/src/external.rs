@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crate::match_engine::Value;
+use crate::value::Value;
 
 /// Trait implemented by `wf-runtime::external::ExternalRuntime`.
 pub trait ExternalCallHandler: Send + Sync {
