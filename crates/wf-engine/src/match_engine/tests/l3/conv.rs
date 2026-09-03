@@ -85,11 +85,8 @@ fn conv_top_ties_keeps_rank_1_ties() {
             }],
         },
     ]]);
-    let result = crate::match_engine::match_engine::apply_conv(
-        &plan,
-        &[FieldRef::Simple("sip".into())],
-        outputs,
-    );
+    let result =
+        crate::match_engine::cep::apply_conv(&plan, &[FieldRef::Simple("sip".into())], outputs);
     assert_eq!(result.len(), 2, "并列第 1 名全输出");
     for o in &result {
         let m = o.close_step_data[0].measure_value;
@@ -114,11 +111,8 @@ fn conv_top_ties_rank_2_keeps_rank_2_ties() {
             }],
         },
     ]]);
-    let result = crate::match_engine::match_engine::apply_conv(
-        &plan,
-        &[FieldRef::Simple("sip".into())],
-        outputs,
-    );
+    let result =
+        crate::match_engine::cep::apply_conv(&plan, &[FieldRef::Simple("sip".into())], outputs);
     assert_eq!(result.len(), 3, "100 + 两条 90");
 }
 
@@ -139,11 +133,8 @@ fn conv_top_ties_without_ties_equals_top() {
             }],
         },
     ]]);
-    let result = crate::match_engine::match_engine::apply_conv(
-        &plan,
-        &[FieldRef::Simple("sip".into())],
-        outputs,
-    );
+    let result =
+        crate::match_engine::cep::apply_conv(&plan, &[FieldRef::Simple("sip".into())], outputs);
     assert_eq!(result.len(), 1);
 }
 
@@ -164,11 +155,8 @@ fn conv_top_ties_zero_does_not_panic() {
             }],
         },
     ]]);
-    let result = crate::match_engine::match_engine::apply_conv(
-        &plan,
-        &[FieldRef::Simple("sip".into())],
-        outputs,
-    );
+    let result =
+        crate::match_engine::cep::apply_conv(&plan, &[FieldRef::Simple("sip".into())], outputs);
     assert!(result.is_empty(), "top_ties(0) 输出为空");
 }
 
@@ -183,11 +171,8 @@ fn conv_top_ties_empty_sort_keys_falls_back_to_top() {
         n: 1,
         sort_keys: vec![],
     }]]);
-    let result = crate::match_engine::match_engine::apply_conv(
-        &plan,
-        &[FieldRef::Simple("sip".into())],
-        outputs,
-    );
+    let result =
+        crate::match_engine::cep::apply_conv(&plan, &[FieldRef::Simple("sip".into())], outputs);
     assert_eq!(result.len(), 1, "空 sort_keys 退化为 top(1)");
 }
 
@@ -208,11 +193,8 @@ fn conv_top_ties_exactly_n_outputs_short_circuits() {
             }],
         },
     ]]);
-    let result = crate::match_engine::match_engine::apply_conv(
-        &plan,
-        &[FieldRef::Simple("sip".into())],
-        outputs,
-    );
+    let result =
+        crate::match_engine::cep::apply_conv(&plan, &[FieldRef::Simple("sip".into())], outputs);
     assert_eq!(result.len(), 2);
 }
 
@@ -252,11 +234,8 @@ fn conv_top_ties_multi_key_requires_all_keys_equal() {
             ],
         },
     ]]);
-    let result = crate::match_engine::match_engine::apply_conv(
-        &plan,
-        &[FieldRef::Simple("sip".into())],
-        outputs,
-    );
+    let result =
+        crate::match_engine::cep::apply_conv(&plan, &[FieldRef::Simple("sip".into())], outputs);
     // 100/1 与 100/2 第二键不同 → 不并列，仅 top-1；id 降序 → 100/2 在前。
     assert_eq!(result.len(), 1, "多键排序下 (100,1) 与 (100,2) 不并列");
     assert_eq!(result[0].close_step_data[1].measure_value, 2.0);
@@ -280,11 +259,8 @@ fn conv_top_ties_chain_with_dedup() {
         },
         ConvOpPlan::Dedup(ExprPlan::Field(FieldRef::Simple("m".into()))),
     ]]);
-    let result = crate::match_engine::match_engine::apply_conv(
-        &plan,
-        &[FieldRef::Simple("sip".into())],
-        outputs,
-    );
+    let result =
+        crate::match_engine::cep::apply_conv(&plan, &[FieldRef::Simple("sip".into())], outputs);
     // 两条 100 并列全保留 → dedup(m) 后剩 1 条（同为 m=100）。
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].close_step_data[0].measure_value, 100.0);
@@ -320,7 +296,7 @@ fn conv_sort_descending() {
     }])]]);
 
     let keys = vec![FieldRef::Simple("sip".into())];
-    let result = crate::match_engine::match_engine::apply_conv(&plan, &keys, outputs);
+    let result = crate::match_engine::cep::apply_conv(&plan, &keys, outputs);
 
     assert_eq!(result.len(), 3);
     // Highest first (10.0, 7.0, 3.0)
@@ -359,7 +335,7 @@ fn conv_sort_ascending() {
     }])]]);
 
     let keys = vec![FieldRef::Simple("sip".into())];
-    let result = crate::match_engine::match_engine::apply_conv(&plan, &keys, outputs);
+    let result = crate::match_engine::cep::apply_conv(&plan, &keys, outputs);
 
     assert_eq!(result[0].event_step_data[0].measure_value, 1.0);
     assert_eq!(result[1].event_step_data[0].measure_value, 5.0);
@@ -384,7 +360,7 @@ fn conv_top_n() {
 
     let plan = make_conv_plan(vec![vec![ConvOpPlan::Top(3)]]);
     let keys = vec![FieldRef::Simple("sip".into())];
-    let result = crate::match_engine::match_engine::apply_conv(&plan, &keys, outputs);
+    let result = crate::match_engine::cep::apply_conv(&plan, &keys, outputs);
 
     assert_eq!(result.len(), 3);
 }
@@ -418,7 +394,7 @@ fn conv_dedup() {
     ))]]);
 
     let keys = vec![FieldRef::Simple("sip".into())];
-    let result = crate::match_engine::match_engine::apply_conv(&plan, &keys, outputs);
+    let result = crate::match_engine::cep::apply_conv(&plan, &keys, outputs);
 
     // First entry per unique sip → two entries: 10.0.0.1 (first) and 10.0.0.2
     assert_eq!(result.len(), 2);
@@ -460,7 +436,7 @@ fn conv_where_filter() {
     })]]);
 
     let keys = vec![FieldRef::Simple("sip".into())];
-    let result = crate::match_engine::match_engine::apply_conv(&plan, &keys, outputs);
+    let result = crate::match_engine::cep::apply_conv(&plan, &keys, outputs);
 
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].scope_key[0], Value::Str("10.0.0.2".into()));
@@ -491,7 +467,7 @@ fn conv_chain_pipeline_sort_top() {
     ]]);
 
     let keys = vec![FieldRef::Simple("sip".into())];
-    let result = crate::match_engine::match_engine::apply_conv(&plan, &keys, outputs);
+    let result = crate::match_engine::cep::apply_conv(&plan, &keys, outputs);
 
     // Top 3 by score descending: 9.0, 8.0, 7.0
     assert_eq!(result.len(), 3);
@@ -527,7 +503,7 @@ fn conv_multiple_chains_sequential() {
     ]);
 
     let keys = vec![FieldRef::Simple("sip".into())];
-    let result = crate::match_engine::match_engine::apply_conv(&plan, &keys, outputs);
+    let result = crate::match_engine::cep::apply_conv(&plan, &keys, outputs);
 
     assert_eq!(result.len(), 2);
     assert_eq!(result[0].event_step_data[0].measure_value, 4.0);
@@ -610,7 +586,7 @@ fn scan_expired_at_with_conv_none_passthrough() {
 fn conv_empty_outputs_noop() {
     let plan = make_conv_plan(vec![vec![ConvOpPlan::Top(5)]]);
     let keys = vec![FieldRef::Simple("sip".into())];
-    let result = crate::match_engine::match_engine::apply_conv(&plan, &keys, vec![]);
+    let result = crate::match_engine::cep::apply_conv(&plan, &keys, vec![]);
     assert!(result.is_empty());
 }
 
@@ -632,7 +608,7 @@ fn conv_sort_by_scope_key() {
     }])]]);
 
     let keys = vec![FieldRef::Simple("name".into())];
-    let result = crate::match_engine::match_engine::apply_conv(&plan, &keys, outputs);
+    let result = crate::match_engine::cep::apply_conv(&plan, &keys, outputs);
 
     assert_eq!(result[0].scope_key[0], Value::Str("alpha".into()));
     assert_eq!(result[1].scope_key[0], Value::Str("bravo".into()));
@@ -684,7 +660,7 @@ fn conv_top_n_must_aggregate_across_shards() {
     ];
 
     // Per-shard conv: shard B's local top-2 wrongly keeps the 10.
-    let per_shard = crate::match_engine::match_engine::apply_conv(&plan, &keys, shard_b.clone());
+    let per_shard = crate::match_engine::cep::apply_conv(&plan, &keys, shard_b.clone());
     let per_shard_vals: Vec<f64> = per_shard
         .iter()
         .map(|o| o.event_step_data[0].measure_value)
@@ -694,7 +670,7 @@ fn conv_top_n_must_aggregate_across_shards() {
     // Merged conv (the P2c conv stage): global top-2 = [100, 95].
     let mut merged = shard_a;
     merged.extend(shard_b);
-    let aggregated = crate::match_engine::match_engine::apply_conv(&plan, &keys, merged);
+    let aggregated = crate::match_engine::cep::apply_conv(&plan, &keys, merged);
     let agg_vals: Vec<f64> = aggregated
         .iter()
         .map(|o| o.event_step_data[0].measure_value)

@@ -11,7 +11,7 @@ use wf_lang::plan::{BindPlan, EachPlan};
 
 use crate::match_engine::RuleExecutor;
 use crate::match_engine::batch_to_events;
-use crate::match_engine::match_engine::FieldSource;
+use crate::match_engine::cep::FieldSource;
 
 use super::helpers::{branch, count_ge, simple_plan, simple_rule_plan, step};
 

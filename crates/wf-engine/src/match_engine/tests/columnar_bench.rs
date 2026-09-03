@@ -17,7 +17,7 @@ use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use crate::match_engine::match_engine::{EngineHashMap, MatchedContext, StepData, WindowLookup};
+use crate::match_engine::cep::{EngineHashMap, MatchedContext, StepData, WindowLookup};
 use crate::match_engine::{
     AsofLookup, ColumnarEvent, FieldSource, JoinKey, JoinRow, RuleExecutor, Value,
     batch_raw_ts_nanos, batch_to_events, build_field_index, column_scalar_string,
@@ -781,8 +781,8 @@ fn columnar_not_overhead_bounded() {
 #[test]
 #[ignore = "性能断言（列式 vs 行式相对比例）：全量并发下比例失真会误报 → 隔离串行跑: cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture"]
 fn columnar_cidr_match_overhead_bounded() {
+    use crate::match_engine::cep::eval_expr;
     use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
-    use crate::match_engine::match_engine::eval_expr;
 
     let n = 1_000usize;
     let schema = Arc::new(Schema::new(vec![Field::new("sip", DataType::Utf8, true)]));
@@ -871,8 +871,8 @@ fn columnar_cidr_match_overhead_bounded() {
 #[test]
 #[ignore = "性能断言（列式 vs 行式相对比例）：全量并发下比例失真会误报 → 隔离串行跑: cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture"]
 fn columnar_regex_match_overhead_bounded() {
+    use crate::match_engine::cep::eval_expr;
     use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
-    use crate::match_engine::match_engine::eval_expr;
 
     let n = 1_000usize;
     let schema = Arc::new(Schema::new(vec![Field::new(
@@ -963,8 +963,8 @@ fn columnar_regex_match_overhead_bounded() {
 #[test]
 #[ignore = "性能断言（列式 vs 行式相对比例）：全量并发下比例失真会误报 → 隔离串行跑: cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture"]
 fn columnar_str_search_overhead_bounded() {
+    use crate::match_engine::cep::eval_expr;
     use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
-    use crate::match_engine::match_engine::eval_expr;
 
     let n = 1_000usize;
     let schema = Arc::new(Schema::new(vec![
@@ -1154,8 +1154,8 @@ fn compiled_guard_cache_beats_per_batch_compile() {
 #[test]
 #[ignore = "性能断言（列式 vs 行式相对比例）：全量并发下比例失真会误报 → 隔离串行跑: cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture"]
 fn columnar_output_func_cell_beats_per_row() {
+    use crate::match_engine::cep::eval_expr;
     use crate::match_engine::columnar::{ColumnarBatch, compile_guard, cscalar_to_value};
-    use crate::match_engine::match_engine::eval_expr;
 
     let n = 1_000usize;
     let schema = Arc::new(Schema::new(vec![

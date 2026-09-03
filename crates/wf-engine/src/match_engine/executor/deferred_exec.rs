@@ -15,7 +15,7 @@ use wf_lang::plan::JoinCondPlan;
 
 use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::CoreResult;
-use crate::match_engine::match_engine::{
+use crate::match_engine::cep::{
     EngineHashMap, Event, Value, WindowLookup, eval_expr, field_ref_name,
 };
 use crate::match_engine::{FieldSource, JoinRow};

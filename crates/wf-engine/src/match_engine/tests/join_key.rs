@@ -6,7 +6,7 @@ use wf_lang::ast::{FieldRef, MatchMode};
 use wf_lang::plan::{JoinKeyPlan, MatchPlan, WindowSpec};
 
 use crate::match_engine::JoinRow;
-use crate::match_engine::match_engine::{CepStateMachine, StepResult, Value, WindowLookup};
+use crate::match_engine::cep::{CepStateMachine, StepResult, Value, WindowLookup};
 
 use super::helpers::{branch, count_ge, event, num, simple_plan, step};
 

@@ -153,14 +153,14 @@ impl Clone for Subscription {
 /// 哈希分区（`partition_rows_by_key`/表达式分片, 同 key 同片）。
 #[derive(::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.RuleFanout")]
-pub struct WindowShardPartition {
+pub(crate) struct WindowShardPartition {
     pub spec: ShardKeySpec,
     pub shard_count: usize,
 }
 
 /// 输入行索引分区: `row % shard_count` 均匀切分（空键 stats 输入分片）。
 /// 行序保持（每片内行索引升序）, 时间分布均匀（各片窗口对齐）。
-pub fn partition_rows_by_index(batch: &RecordBatch, shard_count: usize) -> Vec<Vec<u32>> {
+pub(crate) fn partition_rows_by_index(batch: &RecordBatch, shard_count: usize) -> Vec<Vec<u32>> {
     let n = batch.num_rows();
     let shards = shard_count.max(1);
     let mut per: Vec<Vec<u32>> = vec![Vec::with_capacity(n / shards + 1); shards];

@@ -5,12 +5,12 @@ use wf_lang::ast::{Expr, FieldRef};
 
 use crate::alert::{AlertColumnBuilder, AlertOrigin, EachRowCells, OutputRecord};
 use crate::error::CoreResult;
-use crate::match_engine::columnar::cscalar_to_value;
-use crate::match_engine::event_bridge::TriggerEvent;
-use crate::match_engine::match_engine::{
+use crate::match_engine::cep::{
     Event, FieldSource, MatchedContext, Value, WindowLookup, eval_field_value, field_ref_name,
     value_to_string,
 };
+use crate::match_engine::columnar::cscalar_to_value;
+use crate::match_engine::event_bridge::TriggerEvent;
 
 use super::close_exec::CloseBatchVecs;
 use super::each_exec::EachDirectBatchStats;

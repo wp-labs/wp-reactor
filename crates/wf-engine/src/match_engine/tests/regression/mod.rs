@@ -5,7 +5,7 @@ use std::time::Duration;
 use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, FieldSelector, Measure};
 use wf_lang::plan::{AggPlan, BranchPlan};
 
-use crate::match_engine::match_engine::{CepStateMachine, CloseReason, StepResult};
+use crate::match_engine::cep::{CepStateMachine, CloseReason, StepResult};
 
 use super::helpers::*;
 

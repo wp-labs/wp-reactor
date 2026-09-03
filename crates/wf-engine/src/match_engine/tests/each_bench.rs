@@ -27,9 +27,9 @@ use wf_lang::plan::{EachPlan, JoinCondPlan, JoinPlan, YieldField};
 use wf_lang::{BaseType, FieldType};
 
 use crate::alert::{AlertColumnBuilder, AlertOrigin, EachRowCells};
+use crate::match_engine::cep::{field_ref_name, value_to_string};
 use crate::match_engine::event_bridge::{ColumnarEvent, materialize_rows};
 use crate::match_engine::executor::{EachWfxPrefix, format_nanos_utc};
-use crate::match_engine::match_engine::{field_ref_name, value_to_string};
 use crate::match_engine::{
     Event, JoinKey, JoinRow, RuleExecutor, Value, WindowLookup, columnar_join_rows,
 };

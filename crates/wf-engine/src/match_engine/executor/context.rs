@@ -4,11 +4,11 @@ use wf_lang::ast::{BoundVal, FieldRef, JoinMode};
 use wf_lang::plan::{JoinCondPlan, JoinPlan, StepPlan};
 
 use crate::match_engine::JoinRow;
-use crate::match_engine::event_bridge::TriggerEvent;
-use crate::match_engine::match_engine::{
+use crate::match_engine::cep::{
     AsofLookup, BindData, EngineHashMap, Event, FieldSource, StepData, Value, WindowLookup,
     eval_expr, field_ref_name, values_equal,
 };
+use crate::match_engine::event_bridge::TriggerEvent;
 use crate::time::normalize_epoch_timestamp_float_nanos;
 
 /// Which context fields the close/match alert builders need materialized.

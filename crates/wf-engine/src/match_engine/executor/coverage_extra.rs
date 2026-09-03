@@ -29,11 +29,11 @@ use wf_lang::plan::{
 use wf_lang::{BaseType, FieldType};
 
 use crate::alert::AlertColumnBuilder;
-use crate::match_engine::event_bridge::ColumnarEvent;
-use crate::match_engine::match_engine::{
+use crate::match_engine::cep::{
     AsofLookup, BindData, CepStateMachine, CloseOutput, CloseReason, EngineHashMap, Event,
     MatchedContext, StepData, StepResult, Value, WindowLookup,
 };
+use crate::match_engine::event_bridge::ColumnarEvent;
 use crate::match_engine::{
     DeferredLeft, DeferredPending, FieldSource, JoinRow, RuleExecutor, TriggerEvent,
     batch_to_events, batch_to_events_filtered, build_field_index,

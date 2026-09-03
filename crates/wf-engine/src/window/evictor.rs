@@ -42,7 +42,7 @@ pub struct EvictReport {
 /// 此），超过即视为死锁倾向。放行 = 宁可窗口瞬时超限驻留（`min_acked`
 /// 保护未读批，不丢数据），也不让上游（mailbox/parse/receiver）因 gate
 /// 永久停车而冻结。
-pub const GATE_PRESSURE_RELEASE_AFTER: Duration = Duration::from_secs(10);
+pub(crate) const GATE_PRESSURE_RELEASE_AFTER: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // EvictionGate

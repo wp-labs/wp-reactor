@@ -18,7 +18,7 @@ use wf_lang::plan::{
     ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, RateSpec, WindowSpec,
 };
 
-use crate::match_engine::match_engine::{
+use crate::match_engine::cep::{
     CepStateMachine, CloseReason, EngineHashMap, Event, MatchedContext, SharedLimits, StepData,
     StepResult, Value, WindowLookup,
 };

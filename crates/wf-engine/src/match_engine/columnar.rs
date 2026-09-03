@@ -49,13 +49,13 @@ use arrow::record_batch::RecordBatch;
 use smol_str::SmolStr;
 use wf_lang::ast::{BinOp, Expr, FieldRef, MatchArm, PathSegment};
 
-use super::match_engine::eval::cmp::{apply_fmt_template, timestamp_nanos_to_utc};
-use super::match_engine::{EngineHashMap, Value, field_ref_name, value_to_string, values_equal};
+use super::cep::eval::cmp::{apply_fmt_template, timestamp_nanos_to_utc};
+use super::cep::{EngineHashMap, Value, field_ref_name, value_to_string, values_equal};
 use crate::match_engine::{WFL_FIELD_TYPE_ARRAY, wfl_structured_field_kind};
 use crate::time::normalize_epoch_timestamp_float_nanos;
 
 /// Three-valued scalar read from an Arrow column — the scalar subset of
-/// [`super::match_engine::Value`], plus `Structured` for a non-null
+/// [`super::cep::Value`], plus `Structured` for a non-null
 /// `Value::Object` / `Value::Array` (e.g. a whole array field read bare).
 /// `Int` carries native integer precision for `Int64` / `Timestamp(Ns)`
 /// columns and integer-valued literals.
@@ -2067,8 +2067,8 @@ mod tests {
     use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
 
+    use crate::match_engine::cep::{Event, Value, eval_expr, eval_expr_ext};
     use crate::match_engine::event_bridge::{batch_to_events, materialize_rows};
-    use crate::match_engine::match_engine::{Event, Value, eval_expr, eval_expr_ext};
 
     fn field(name: &str) -> Expr {
         Expr::Field(FieldRef::Simple(name.to_string()))

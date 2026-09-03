@@ -9,7 +9,7 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use smol_str::SmolStr;
 
-use super::match_engine::{
+use super::cep::{
     EngineHashMap, Event, FieldSource, ScopeKey, Value, extract_scope_key_from_row, field_ref_name,
 };
 use crate::window::scope_key_from_column;
@@ -43,7 +43,7 @@ pub fn batch_time_col_index(batch: &RecordBatch, time_field: Option<&str>) -> Op
 }
 
 /// Read event-time nanos from a resolved time column at `row`, mirroring
-/// [`super::match_engine::CepStateMachine::event_time_nanos`] exactly (including
+/// [`super::cep::CepStateMachine::event_time_nanos`] exactly (including
 /// the f64 round-trip that the eager `extract_event_time` path uses).
 ///
 /// Returns 0 when the column is null or non-numeric.

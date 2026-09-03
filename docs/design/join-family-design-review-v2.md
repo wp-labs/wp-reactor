@@ -22,7 +22,7 @@ v1 的 R1–R6 全部被吸收且**经源码复核成立**；最担心的两处*
 | R | v1 问题 | v2 状态 | 代码坐实（2026-08-22 实测） |
 |---|---|---|---|
 | R1 | on-each 无延迟承载点；Q8/Q9 语法不成立 | ✅ 已吸收入 §2.2/§5.2，明确 deferred 走新 rule_task 分支 + `emit at` 显式标记 | `EachPlan{alias,filter}` 无 window/deadline/watermark（plan.rs:77-80）；`scan_timeouts` `let Some(machine)=…else{return}`（rule_task.rs:1585）；`flush` 同理（rule_task.rs:1747）。路径在 `wf-runtime/src/engine_task/rule_task.rs`（非 doc 旧暗示的 `wf-engine/src/window/`） |
-| R2 | `as winner` + `yield winner.bidder` 裸名冲突 | ✅ 改为 object 注入 + `FieldRef::Path` | `eval_field_value`（match_engine/match_engine/key.rs:371-397）**逐段遍历 `Value::Object`**（`map.get(name)`）—— `winner.bidder`→`Path(["winner","bidder"])` 真实可行；`field_ref_name` 丢限定词已确认（key.rs:338-349） |
+| R2 | `as winner` + `yield winner.bidder` 裸名冲突 | ✅ 改为 object 注入 + `FieldRef::Path` | `eval_field_value`（match_engine/cep/key.rs:371-397）**逐段遍历 `Value::Object`**（`map.get(name)`）—— `winner.bidder`→`Path(["winner","bidder"])` 真实可行；`field_ref_name` 丢限定词已确认（key.rs:338-349） |
 | R3 | `bucket_end` 内建不存在 | ✅ §6.1 已标注为新增内建（R3 接受） | `time_bucket(t,秒)` 确实存在、返回桶起始（builtins.rs:960 / funcs.rs:933 / infer.rs:172 / check_funcs.rs:386） |
 | R4 | oracle 在独立仓库 | ✅ §8 已标注跨仓库 | `wfgen` 在 `warp-fusion/crates/wfgen`（独立于 wp-reactor） |
 | R5 | interval 读路径精确化 | ✅ §5.1 改为复用 `asof_candidates`/`snapshot_with_timestamps` + retain `[lo,hi]` | `asof_candidates` 返回 `Option<Vec<(i64,JoinRow)>>`（types.rs:305-320）；`lookup_timestamped` 返回 `Vec<(i64,JoinRow)>`（buffer/mod.rs:124）；`WindowLookup` trait（types.rs:264），方法 snapshot_with_timestamps:276 / join_lookup:285 / asof_candidates:305 均存在 |

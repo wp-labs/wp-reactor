@@ -745,7 +745,7 @@ impl KeyJoinLookup {
     }
 }
 
-impl crate::match_engine::match_engine::WindowLookup for KeyJoinLookup {
+impl crate::match_engine::cep::WindowLookup for KeyJoinLookup {
     fn snapshot_field_values(&self, _w: &str, _f: &str) -> Option<HashSet<String>> {
         None
     }

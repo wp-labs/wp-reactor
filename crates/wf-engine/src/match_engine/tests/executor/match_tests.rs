@@ -117,7 +117,7 @@ fn execute_match_entity_simple_key() {
 
 #[test]
 fn execute_match_no_keys() {
-    use crate::match_engine::match_engine::{MatchedContext, StepData};
+    use crate::match_engine::cep::{MatchedContext, StepData};
 
     let match_plan = simple_plan(vec![], vec![step(vec![branch("fail", count_ge(1.0))])]);
     // Use a literal string as entity since there are no key fields
@@ -165,7 +165,7 @@ fn execute_match_no_keys() {
 
 #[test]
 fn execute_match_composite_keys() {
-    use crate::match_engine::match_engine::{MatchedContext, StepData};
+    use crate::match_engine::cep::{MatchedContext, StepData};
 
     let match_plan = simple_plan(
         vec![simple_key("sip"), simple_key("dip")],

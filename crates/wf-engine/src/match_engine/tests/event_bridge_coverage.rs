@@ -15,7 +15,7 @@ use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Int64Type, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use crate::match_engine::match_engine::Value;
+use crate::match_engine::cep::Value;
 use crate::match_engine::{
     ColumnarEvent, FieldSource, WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY,
     WFL_FIELD_TYPE_OBJECT, batch_to_events, build_field_index, columnar_join_rows,

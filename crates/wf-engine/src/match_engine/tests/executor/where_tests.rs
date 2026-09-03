@@ -10,8 +10,8 @@ use wf_lang::ast::{BinOp, Expr, FieldRef, JoinMode};
 use wf_lang::plan::{EachPlan, JoinCondPlan, JoinPlan};
 
 use crate::match_engine::RuleExecutor;
+use crate::match_engine::cep::{AsofLookup, EngineHashMap, Event, Value, WindowLookup};
 use crate::match_engine::event_bridge::JoinRow;
-use crate::match_engine::match_engine::{AsofLookup, EngineHashMap, Event, Value, WindowLookup};
 
 use super::super::helpers::*;
 use super::helpers::*;

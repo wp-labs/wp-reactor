@@ -1,3 +1,11 @@
+//! wf-lang —— WFL/WFS/WFG 语言层：解析、检查、编译到执行计划。
+//!
+//! 管道：`*_parser`（wfl/wfs/wfg 语法）→ `ast/` → `checker/`（语义检查）→
+//! `compiler/`（M13：AST → `plan/` 执行计划，`MatchPlan` 等）→ `explain/`。
+//! 纯语义 crate：无 IO/runtime 依赖，可独立单测与 fuzz。
+//! 配套：`preprocess/`（preset/_global 展开）、`yield_preset.rs`、`wfu_meta.rs`
+//! （`__wfu_*` 元字段名）。
+
 pub mod ast;
 mod checker;
 pub mod cidr;

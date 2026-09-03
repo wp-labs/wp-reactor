@@ -1,13 +1,17 @@
+//! 列式表达式后端：在 Arrow 批上求值内建函数（`builtins*` / `coverage_*`），
+//! 供列式执行路径使用；逐事件标量等价物在 `cep/eval/`。
+//! 两套实现语义一致由 `match_engine/tests/` 对拍守护（详见 `cep/eval` 模块文档）。
+
 use std::cell::Cell;
 
 use crate::error::{CoreReason, CoreResult};
-use crate::match_engine::match_engine::{
+use crate::match_engine::cep::{
     EngineHashMap, FieldSource, Value, WindowLookup, eval_expr, eval_expr_ext,
     eval_field_value_src, value_to_string, values_equal,
 };
 
 #[cfg(test)]
-pub(super) use crate::match_engine::match_engine::Event;
+pub(super) use crate::match_engine::cep::Event;
 
 mod builtins;
 #[cfg(test)]

@@ -5,12 +5,12 @@ use wf_lang::ast::{CloseMode, Expr, FieldRef};
 
 use crate::alert::{AlertColumnBuilder, AlertOrigin, OutputRecord};
 use crate::error::CoreResult;
-use crate::match_engine::columnar::{CVec, cscalar_to_value};
-use crate::match_engine::executor::StatsCloseBucket;
-use crate::match_engine::match_engine::{
+use crate::match_engine::cep::{
     CloseOutput, CloseReason, Event, StepData, Value, WindowLookup, eval_field_value,
     field_ref_name, value_to_string,
 };
+use crate::match_engine::columnar::{CVec, cscalar_to_value};
+use crate::match_engine::executor::StatsCloseBucket;
 
 use super::EachDirectBatchStats;
 use super::RuleExecutor;
@@ -1204,15 +1204,15 @@ fn stats_bucket_rows(buckets: &[StatsCloseBucket]) -> usize {
 }
 
 /// 桶键拆解为字段值列表（Pair 先序展开, 顺序与 keys 一致; stats 直写局部版）。
-fn stats_scope_key_to_values(key: &crate::match_engine::match_engine::ScopeKey) -> Vec<Value> {
+fn stats_scope_key_to_values(key: &crate::match_engine::cep::ScopeKey) -> Vec<Value> {
     match key {
-        crate::match_engine::match_engine::ScopeKey::Empty => vec![],
-        crate::match_engine::match_engine::ScopeKey::Int(i) => vec![Value::Number(*i as f64)],
-        crate::match_engine::match_engine::ScopeKey::Float(b) => {
+        crate::match_engine::cep::ScopeKey::Empty => vec![],
+        crate::match_engine::cep::ScopeKey::Int(i) => vec![Value::Number(*i as f64)],
+        crate::match_engine::cep::ScopeKey::Float(b) => {
             vec![Value::Number(f64::from_bits(*b))]
         }
-        crate::match_engine::match_engine::ScopeKey::Str(s) => vec![Value::Str(s.clone())],
-        crate::match_engine::match_engine::ScopeKey::Pair(a, b) => {
+        crate::match_engine::cep::ScopeKey::Str(s) => vec![Value::Str(s.clone())],
+        crate::match_engine::cep::ScopeKey::Pair(a, b) => {
             let mut v = stats_scope_key_to_values(a);
             v.extend(stats_scope_key_to_values(b));
             v
@@ -1308,7 +1308,7 @@ fn annotate_close_step_stages(mut ctx: Event, event_step_count: usize) -> Event 
         };
         ctx.fields.insert(
             format!("_step_{}_stage", step_idx).into(),
-            crate::match_engine::match_engine::Value::Str(stage.into()),
+            crate::match_engine::cep::Value::Str(stage.into()),
         );
     }
     ctx

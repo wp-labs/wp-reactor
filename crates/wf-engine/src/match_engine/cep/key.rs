@@ -95,7 +95,7 @@ pub enum ScopeKey {
 const TWO_POW_53: f64 = 9_007_199_254_740_992.0;
 
 /// Canonical f64 bits (0.0 → +0.0, NaN → canonical NaN), matching
-/// [`canonical_f64_bits`](super::super::match_engine::ValueKey) semantics.
+/// [`canonical_f64_bits`](super::super::cep::ValueKey) semantics.
 fn canonical_bits(n: f64) -> u64 {
     if n == 0.0 {
         0.0f64.to_bits()
@@ -208,14 +208,14 @@ pub(super) struct InstanceKey {
 }
 
 impl InstanceKey {
-    pub fn sliding(scope_key: &ScopeKey) -> Self {
+    pub(crate) fn sliding(scope_key: &ScopeKey) -> Self {
         Self {
             scope_key: scope_key.clone(),
             bucket_start: None,
         }
     }
 
-    pub fn fixed(scope_key: &ScopeKey, bucket_start: i64) -> Self {
+    pub(crate) fn fixed(scope_key: &ScopeKey, bucket_start: i64) -> Self {
         Self {
             scope_key: scope_key.clone(),
             bucket_start: Some(bucket_start),
@@ -223,14 +223,14 @@ impl InstanceKey {
     }
 
     /// Check if this key belongs to the given scope (ignoring bucket).
-    pub fn matches_scope(&self, scope_key: &ScopeKey) -> bool {
+    pub(crate) fn matches_scope(&self, scope_key: &ScopeKey) -> bool {
         &self.scope_key == scope_key
     }
 
     /// Rebuild the scope-key `Value`s from the typed key, for close/match
     /// output. Numeric components come back as `Str` (their Display form),
     /// preserving the pre-refactor type-erased behaviour of the old string key.
-    pub fn scope_key_values(&self) -> Vec<Value> {
+    pub(crate) fn scope_key_values(&self) -> Vec<Value> {
         flatten_scope_values(&self.scope_key)
     }
 }
@@ -611,7 +611,7 @@ fn number_to_string(n: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::match_engine::match_engine::types::Event;
+    use crate::match_engine::cep::types::Event;
     use wf_lang::ast::PathSegment;
 
     fn fields(pairs: &[(&str, Value)]) -> EngineHashMap<smol_str::SmolStr, Value> {

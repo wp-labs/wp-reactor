@@ -15,10 +15,8 @@ use wf_lang::ast::CloseMode;
 use wf_lang::plan::StatsPlan;
 use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
+use crate::match_engine::cep::{BindData, CloseOutput, CloseReason, StepData, WindowLookup};
 use crate::match_engine::executor::stats_exec::StatsExecutor;
-use crate::match_engine::match_engine::{
-    BindData, CloseOutput, CloseReason, StepData, WindowLookup,
-};
 use crate::match_engine::{JoinRow, RuleExecutor, Value};
 
 // ---------------------------------------------------------------------------

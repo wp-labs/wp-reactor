@@ -15,8 +15,8 @@ use wf_lang::ast::{Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan, WindowSpec};
 
 use crate::match_engine::Value;
+use crate::match_engine::cep::ScopeKey;
 use crate::match_engine::executor::stats_exec::{RowFieldLayout, StatsExecutor};
-use crate::match_engine::match_engine::ScopeKey;
 use crate::match_engine::spill::{MemSpillStore, RedbSpillStore, SpillStore};
 
 // ---------------------------------------------------------------------------

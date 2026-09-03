@@ -21,7 +21,7 @@ use std::time::Duration;
 use wf_lang::ast::{BinOp, Expr, FieldRef, ObjectItem, PathSegment};
 use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
-use crate::match_engine::contract::run_test;
+use wf_engine::match_engine::contract::run_test;
 
 fn auth_events_schema() -> WindowSchema {
     WindowSchema {

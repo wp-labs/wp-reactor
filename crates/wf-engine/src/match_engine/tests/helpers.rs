@@ -7,7 +7,7 @@ use wf_lang::plan::{
     WindowSpec, YieldPlan,
 };
 
-use crate::match_engine::match_engine::{Event, Value};
+use crate::match_engine::cep::{Event, Value};
 
 pub fn event(fields: Vec<(&str, Value)>) -> Event {
     Event {

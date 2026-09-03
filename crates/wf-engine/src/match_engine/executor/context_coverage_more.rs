@@ -22,11 +22,9 @@ use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{Bound, BoundVal, Expr, FieldRef, JoinMode, WithinSpec};
 use wf_lang::plan::{BranchPlan, JoinCondPlan, JoinPlan, StepPlan};
 
+use crate::match_engine::cep::{BindData, EngineHashMap, Event, StepData, Value, WindowLookup};
 use crate::match_engine::executor::context::{eval_interval_bound, in_interval};
 use crate::match_engine::executor::{CloseCtxFields, build_eval_context, execute_joins};
-use crate::match_engine::match_engine::{
-    BindData, EngineHashMap, Event, StepData, Value, WindowLookup,
-};
 use crate::match_engine::{JoinRow, columnar_join_rows};
 
 fn num(n: f64) -> Value {

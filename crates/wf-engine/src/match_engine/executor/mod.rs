@@ -22,9 +22,11 @@ mod stats_exec;
 pub use each_exec::{EachDirectBatchStats, PipeEachRow, PipeRowSink};
 // 供 `match_engine::pub use executor::DistinctKey` 转发（stats distinct 键类型）。
 pub use stats_exec::{
-    DistinctKey, DistinctSet, NumericAccum, RowFieldLayout, RowFields, StatsAccum, StatsBucketAccs,
-    StatsCloseBucket, StatsExecutor, StatsMaskCache, StatsWindowState, TopEntry,
+    DistinctKey, DistinctSet, RowFieldLayout, RowFields, StatsAccum, StatsBucketAccs,
+    StatsExecutor, StatsMaskCache, StatsWindowState,
 };
+// 仅 crate 内消费（spill 序列化 / stats 测试），不构成对外契约。
+pub(crate) use stats_exec::{NumericAccum, StatsCloseBucket, TopEntry};
 
 // 供 crate 内 SoA 对照 bench（tests/）访问私有热路径函数。
 #[cfg(test)]
@@ -70,11 +72,11 @@ pub(crate) use self::context::CloseCtxFields;
 use self::eval::eval_bool_expr_with_lookup;
 use crate::alert::AlertOrigin;
 use crate::error::{CoreReason, CoreResult};
+use crate::match_engine::cep::{Event, FieldSource, Value, WindowLookup, field_ref_name};
 use crate::match_engine::columnar::{
     CVec, ColumnExpr, ColumnarBatch, GuardMasks, compile_guard, compile_yield_cvec,
     eval_compiled_guard,
 };
-use crate::match_engine::match_engine::{Event, FieldSource, Value, WindowLookup, field_ref_name};
 use crate::time::normalize_epoch_timestamp_float_nanos;
 use arrow::array::BooleanArray;
 use arrow::datatypes::Schema;
@@ -1016,7 +1018,7 @@ impl RuleExecutor {
     pub(crate) fn build_scope_key(
         &self,
         keys: &[wf_lang::ast::FieldRef],
-        scope_values: &[crate::match_engine::match_engine::Value],
+        scope_values: &[crate::match_engine::cep::Value],
     ) -> Arc<str> {
         use std::fmt::Write as _;
         // 单 String 一次写入（旧实现每 key 一个 format! String + Vec + join
@@ -1029,8 +1031,8 @@ impl RuleExecutor {
             let _ = write!(
                 out,
                 "{}={}",
-                crate::match_engine::match_engine::field_ref_name(k),
-                crate::match_engine::match_engine::value_to_string(v)
+                crate::match_engine::cep::field_ref_name(k),
+                crate::match_engine::cep::value_to_string(v)
             );
         }
         Arc::from(out)

@@ -944,7 +944,7 @@ fn stats_columnar_multiple_batches_accumulate() {
 // P2 复合键分组（group by）: 字段键 / 复合键 / bucket / tier / 列式对拍
 // ---------------------------------------------------------------------------
 
-use crate::match_engine::match_engine::ScopeKey;
+use crate::match_engine::cep::ScopeKey;
 
 /// 带键的 plan（keys 为桶键表达式）。
 fn keyed_plan(keys: Vec<Expr>, measures: Vec<StatsMeasurePlan>) -> StatsPlan {

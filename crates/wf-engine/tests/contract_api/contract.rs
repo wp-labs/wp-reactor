@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
-use crate::match_engine::contract::run_test;
+use wf_engine::match_engine::contract::run_test;
 
 /// Schema for auth_events window.
 fn auth_events_schema() -> WindowSchema {
@@ -64,7 +64,7 @@ fn security_alerts_schema() -> WindowSchema {
 }
 
 /// Parse a WFL source with rule + contract, compile the rule, and run the contract.
-fn run_contract_from_source(source: &str) -> crate::match_engine::contract::TestResult {
+fn run_contract_from_source(source: &str) -> wf_engine::match_engine::contract::TestResult {
     let schemas = vec![auth_events_schema(), security_alerts_schema()];
     let wfl_file = wf_lang::parse_wfl(source).expect("parse should succeed");
     let plans = wf_lang::compile_wfl(&wfl_file, &schemas).expect("compile should succeed");
@@ -582,8 +582,8 @@ test t for r {
         .iter()
         .find(|p| p.name == test.rule_name)
         .expect("rule present");
-    let result =
-        crate::match_engine::contract::run_test(test, plan, None).expect("run_test should succeed");
+    let result = wf_engine::match_engine::contract::run_test(test, plan, None)
+        .expect("run_test should succeed");
     assert!(
         !result.passed,
         "join-key inline test must be rejected by the guard"

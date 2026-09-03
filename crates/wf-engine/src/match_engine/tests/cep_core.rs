@@ -3,7 +3,7 @@
 use wf_lang::ast::{CmpOp, Expr, FieldRef, FieldSelector, Measure, PathSegment, Transform};
 use wf_lang::plan::{AggPlan, BranchPlan, WindowSpec};
 
-use crate::match_engine::match_engine::{CepStateMachine, EngineHashMap, StepResult, Value};
+use crate::match_engine::cep::{CepStateMachine, EngineHashMap, StepResult, Value};
 
 use super::helpers::*;
 

@@ -206,7 +206,7 @@ bench 项：`q5_q7_window_conv_top`。
 
 ### ✅ F1 — conv `sort` O(n²) → O(n log n)（Q5/Q7 A6）
 
-`match_engine/match_engine/conv.rs` `ConvOpPlan::Sort`：旧实现 `outputs.sort_by`
+`match_engine/cep/conv.rs` `ConvOpPlan::Sort`：旧实现 `outputs.sort_by`
 闭包内**每次比较**构建 2 次 eval context（EngineHashMap 分配 + scope key/step
 label 字段插入）+ eval 2 次 → O(n log n) 次分配。Q5/Q7 收口批 ~2k 行时这是
 conv 主成本（数万次分配/批）。修复：每元素预提取排序键值（每 sort key 1 次
@@ -382,7 +382,7 @@ join-then-key）——每事件 advance 都做一次 join 索引 lookup + `value
 集中（50% 热点集中在最近 100 个）→ 一批 ~230 bid 去重后常 < 20 个唯一 auction。
 
 **实现**：
-- `precompute_join_then_keys`（新模块 `match_engine/match_engine/join_then_key.rs`，
+- `precompute_join_then_keys`（新模块 `match_engine/cep/join_then_key.rs`，
   pub 导出）：对一批事件按驱动 key 去重，每唯一 key 一次 lookup；int 左 key 取桶首行
   （索引截断精确、复核恒真）；float 左 key 逐行复核（`1.5` 截断假匹配必须拒绝，与
   `find_matching_row` 一致）；任一环节 miss → `None`（跳过）。

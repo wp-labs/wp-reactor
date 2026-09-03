@@ -66,14 +66,14 @@ use wf_lang::plan::{
 use crate::match_engine::EngineHashSet;
 use crate::match_engine::RuleExecutor;
 use crate::match_engine::StatsAccum;
+use crate::match_engine::cep::{
+    CepStateMachine, EngineHashMap, Event, FieldSource, RollingStats, StepState, Value, ValueKey,
+    accumulate_close_steps, eval_expr_ext,
+};
 use crate::match_engine::event_bridge::{
     ColumnarEvent, batch_event_time_nanos_at, batch_time_col_index,
 };
 use crate::match_engine::executor::StatsExecutor;
-use crate::match_engine::match_engine::{
-    CepStateMachine, EngineHashMap, Event, FieldSource, RollingStats, StepState, Value, ValueKey,
-    accumulate_close_steps, eval_expr_ext,
-};
 
 use super::helpers::{event, num, simple_rule_plan};
 
@@ -303,11 +303,8 @@ fn q15_close_accumulate_components() {
 
     // ---- engine_full：CepStateMachine 完整 advance 路径（实例管理 + 事件步骤 + close
     // 累积 + 窗口推进；生产真实路径，用于与纯 accumulate_close_steps 对比归因） ----
-    let mut sm = crate::match_engine::match_engine::CepStateMachine::new(
-        "q15_bench".to_string(),
-        q15_plan(),
-        None,
-    );
+    let mut sm =
+        crate::match_engine::cep::CepStateMachine::new("q15_bench".to_string(), q15_plan(), None);
     let start = Instant::now();
     for (i, ev) in events.iter().enumerate() {
         std::hint::black_box(sm.advance_at("b", ev, now + i as i64));

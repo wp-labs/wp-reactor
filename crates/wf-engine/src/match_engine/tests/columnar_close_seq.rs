@@ -17,7 +17,7 @@ use wf_lang::ast::{BinOp, CloseMode, Expr, FieldRef};
 use wf_lang::plan::{AggPlan, BranchPlan, MatchPlan, SeqPlan, SeqSkipPlan, SeqStepPlan};
 
 use crate::match_engine::RuleExecutor;
-use crate::match_engine::match_engine::{CepStateMachine, CloseReason, StepResult};
+use crate::match_engine::cep::{CepStateMachine, CloseReason, StepResult};
 
 use super::helpers::{
     branch, count_ge, event, plan_with_close, simple_key, simple_plan, simple_rule_plan, step,

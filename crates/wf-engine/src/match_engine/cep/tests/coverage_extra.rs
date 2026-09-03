@@ -1,4 +1,4 @@
-//! Coverage-extra tests for the `match_engine::match_engine` core: the
+//! Coverage-extra tests for the `match_engine::cep` core: the
 //! submodule branches the feature suites only reach indirectly — `RollingStats`
 //! (ewma/median), `extract_key` key-map fallbacks, step progress threshold
 //! debug strings, cross-type measure ordering, expiry-heap edge cases
@@ -25,8 +25,8 @@ use super::state::BranchState;
 use super::step::{apply_transforms, compute_measure, update_measure};
 use super::types::{CloseOutput, CloseReason, RollingStats, StepData, Value, WindowLookup};
 use super::{CepStateMachine, EngineHashMap, Event, StepResult, apply_conv, close_is_qualified};
+use crate::match_engine::cep::{apply_conv_filtered, throttle_allows};
 use crate::match_engine::columnar::GuardMasks;
-use crate::match_engine::match_engine::{apply_conv_filtered, throttle_allows};
 
 fn event(fields: Vec<(&str, Value)>) -> Event {
     Event {

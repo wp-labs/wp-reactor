@@ -3,7 +3,7 @@ use wf_lang::ast::{BinOp, Expr, FieldRef};
 use crate::match_engine::EngineHashMap;
 use crate::match_engine::RuleExecutor;
 use crate::match_engine::Value;
-use crate::match_engine::match_engine::{MatchedContext, StepData};
+use crate::match_engine::cep::{MatchedContext, StepData};
 
 use super::super::helpers::*;
 use super::helpers::{default_match_plan, default_matched_context};

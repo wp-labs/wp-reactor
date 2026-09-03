@@ -27,13 +27,13 @@ use wf_lang::plan::{
 };
 use wf_lang::{BaseType, FieldType};
 
-use crate::match_engine::executor::{CloseCtxFields, build_eval_context, execute_joins};
-use crate::match_engine::match_engine::{
+use crate::match_engine::cep::{
     AsofLookup, BindData, CloseOutput, CloseReason, EngineHashMap, Event, FieldSource, JoinKey,
     MACHINE_ID, ScopeKey, StepData, Value, ValueKey, WindowLookup, eval_expr, field_ref_name,
     push_i64_exact_decimal, scope_key_from_values, scope_key_shard_index, value_to_string,
     values_equal,
 };
+use crate::match_engine::executor::{CloseCtxFields, build_eval_context, execute_joins};
 use crate::match_engine::{
     ColumnarEvent, JoinRow, RuleExecutor, TriggerEvent, WFL_FIELD_TYPE_ARRAY,
     WFL_FIELD_TYPE_METADATA_KEY, WFL_FIELD_TYPE_OBJECT, apply_conv, batch_event_time_nanos,

@@ -26,7 +26,7 @@ bid 事件本身没有 category，须 join auction 才能拿到。
 | 环节 | 位置 | 现状 |
 |---|---|---|
 | 键声明 | `wf-lang/src/plan.rs` `MatchPlan { keys: Vec<FieldRef>, key_map }` | `match<category:10m>` 的 `category` 编译期解析到**驱动 bind 的字段**；非驱动字段编译报错 |
-| 键提取 | `wf-engine/src/match_engine/match_engine/key.rs::extract_key(event, keys, key_map, alias)` | 从事件 `FieldSource` 取值；缺失 → `None` → `advance_at_with_diagnostics` 返回 `Accumulate`（跳过） |
+| 键提取 | `wf-engine/src/match_engine/cep/key.rs::extract_key(event, keys, key_map, alias)` | 从事件 `FieldSource` 取值；缺失 → `None` → `advance_at_with_diagnostics` 返回 `Accumulate`（跳过） |
 | 窗口路由 | `match_engine/mod.rs` `advance_at_with_diagnostics`（L300+） | `extract_key` → `InstanceKey::sliding/fixed(scope_key, bucket)` |
 | join 执行 | `executor/context.rs::execute_joins`（pub(super)）+ `match_exec.rs` with-joins 富化 | **懒执行**：match/close 命中时才算（`execute_match_with_joins`），事件进窗口前不做 join |
 | 窗口查找 | `match_engine/types.rs` `WindowLookup` trait（snapshot / join_lookup / with_timestamps） | `advance_at_with_masks` 已接收 `windows: Option<&dyn WindowLookup>`——**运行时传真 lookup**，oracle 传 `None` |

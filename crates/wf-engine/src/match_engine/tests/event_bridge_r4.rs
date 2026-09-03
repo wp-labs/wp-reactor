@@ -28,8 +28,8 @@ use arrow::datatypes::{DataType, Field, Int64Type, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use crate::match_engine::EngineHashMap;
+use crate::match_engine::cep::Value;
 use crate::match_engine::event_bridge::extract_field_value;
-use crate::match_engine::match_engine::Value;
 use crate::match_engine::{
     ColumnarEvent, FieldSource, JoinRow, WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY,
     WFL_FIELD_TYPE_OBJECT, batch_event_time_nanos, batch_event_time_nanos_at, batch_raw_ts_nanos,

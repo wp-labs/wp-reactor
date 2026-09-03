@@ -6,8 +6,8 @@ use wf_lang::plan::RulePlan;
 
 use crate::alert::OutputRecord;
 use crate::error::CoreResult;
-use crate::match_engine::match_engine::EngineHashMap;
-use crate::match_engine::match_engine::eval_expr;
+use crate::match_engine::cep::EngineHashMap;
+use crate::match_engine::cep::eval_expr;
 use crate::match_engine::{
     CepStateMachine, CloseReason, Event, RuleExecutor, StepResult, Value, WindowLookup,
 };

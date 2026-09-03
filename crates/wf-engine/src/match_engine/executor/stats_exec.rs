@@ -14,9 +14,9 @@ use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsPlan};
 
+use crate::match_engine::cep::{Event, ScopeKey, field_ref_name};
 use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
 use crate::match_engine::event_bridge::extract_field_value;
-use crate::match_engine::match_engine::{Event, ScopeKey, field_ref_name};
 use crate::match_engine::spill::SpillStore;
 use crate::match_engine::{EngineHashMap, EngineHashSet, Value};
 use crate::window::scope_key_columnar;
@@ -190,7 +190,7 @@ pub struct NumericSoA {
 /// 数值度量聚合类别（SoA 分派用——比 `StatsAggPlan` 全枚举窄的分支宽度）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
 #[moju(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
-pub enum NumericKind {
+pub(crate) enum NumericKind {
     Sum,
     Min,
     Max,
@@ -202,7 +202,7 @@ pub enum NumericKind {
 /// 期从 `measure_field_cols[entries[0].0]` 取一次（组内共享）。
 #[derive(Debug, Clone, ::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
-pub struct SoAColGroup {
+pub(crate) struct SoAColGroup {
     /// 该字段的 (度量 idx, 聚合类别) 列表。
     pub entries: Box<[(usize, NumericKind)]>,
 }
@@ -211,7 +211,7 @@ pub struct SoAColGroup {
 /// 槽映射 + 同字段分组。仅依赖 plan（无批依赖）——窗口重建后不变。
 #[derive(Debug, Clone, ::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
-pub struct NumericSoALayout {
+pub(crate) struct NumericSoALayout {
     /// 度量数（= `counts.len()`）。
     pub n_measures: usize,
     /// 每度量 → sums 槽（None = 非 sum/avg 度量）。
@@ -226,7 +226,7 @@ pub struct NumericSoALayout {
 
 impl NumericSoALayout {
     /// 构建（仅全数值计划调用）。
-    pub fn build(plan: &StatsPlan) -> Self {
+    pub(crate) fn build(plan: &StatsPlan) -> Self {
         let n = plan.measures.len();
         let mut sum_slot: Vec<Option<u32>> = vec![None; n];
         let mut min_slot: Vec<Option<u32>> = vec![None; n];
@@ -285,7 +285,7 @@ impl NumericSoALayout {
     }
 
     /// 全零 SoA（新桶首见）。
-    pub fn zeros(&self) -> NumericSoA {
+    pub(crate) fn zeros(&self) -> NumericSoA {
         NumericSoA {
             counts: vec![0u64; self.n_measures].into_boxed_slice(),
             sums: vec![0i128; self.sum_slot.iter().flatten().count()].into_boxed_slice(),

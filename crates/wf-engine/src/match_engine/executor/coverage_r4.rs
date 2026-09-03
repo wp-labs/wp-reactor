@@ -23,12 +23,12 @@ use wf_lang::plan::{
 use wf_lang::{BaseType, FieldType};
 
 use crate::alert::AlertColumnBuilder;
-use crate::match_engine::executor::context::{
-    build_eval_context, enrich_join_row, execute_joins, in_interval,
-};
-use crate::match_engine::match_engine::{
+use crate::match_engine::cep::{
     BindData, CloseOutput, CloseReason, EngineHashMap, Event, MatchedContext, StepData, Value,
     WindowLookup,
+};
+use crate::match_engine::executor::context::{
+    build_eval_context, enrich_join_row, execute_joins, in_interval,
 };
 use crate::match_engine::{JoinRow, RuleExecutor, TriggerEvent};
 

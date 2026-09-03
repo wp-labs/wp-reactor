@@ -16,7 +16,7 @@ use wf_lang::{BaseType, FieldType};
 
 use super::{CloseCtxFields, plan_close_ctx_fields};
 use crate::match_engine::RuleExecutor;
-use crate::match_engine::match_engine::{EngineHashMap, Value};
+use crate::match_engine::cep::{EngineHashMap, Value};
 
 fn num(n: f64) -> Value {
     Value::Number(n)

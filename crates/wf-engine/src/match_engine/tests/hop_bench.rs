@@ -41,7 +41,7 @@ use wf_lang::plan::{
 };
 
 use crate::match_engine::apply_conv;
-use crate::match_engine::match_engine::{
+use crate::match_engine::cep::{
     CepStateMachine, CloseOutput, CloseReason, EngineHashMap, Event, StepData, StepResult, Value,
 };
 
@@ -317,8 +317,8 @@ fn conv_batch_with_ties(n: usize, tie_every: usize) -> Vec<CloseOutput> {
 // （q5 rules 墙 CPU 采样定位，见 nexmark_pk/docs/Q5_RULES_WALL_PROFILING.md）
 // ---------------------------------------------------------------------------
 
-use crate::match_engine::match_engine::ScopeKey;
-use crate::match_engine::match_engine::key::scope_key_from_values;
+use crate::match_engine::cep::ScopeKey;
+use crate::match_engine::cep::key::scope_key_from_values;
 use foldhash::HashMapExt;
 
 /// H1 键 churn 隔离测量（忠实版）：hop 扇入每窗口的键序列 = `scope_key.clone()`

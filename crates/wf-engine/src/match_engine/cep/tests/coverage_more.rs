@@ -1,4 +1,4 @@
-//! Round-2 coverage-fill tests for the `match_engine::match_engine` core.
+//! Round-2 coverage-fill tests for the `match_engine::cep` core.
 //!
 //! Targets the state-machine branches the earlier suites reach only
 //! indirectly: OR/AND-mode short-circuits after an emit (`event_emitted` /

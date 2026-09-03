@@ -22,7 +22,7 @@ use wf_lang::{BaseType, FieldType};
 
 use crate::alert::AlertColumnBuilder;
 use crate::match_engine::RuleExecutor;
-use crate::match_engine::match_engine::{CloseOutput, CloseReason, EngineHashMap, StepData, Value};
+use crate::match_engine::cep::{CloseOutput, CloseReason, EngineHashMap, StepData, Value};
 
 fn num(n: f64) -> Value {
     Value::Number(n)

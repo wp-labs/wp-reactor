@@ -14,14 +14,14 @@ use crate::alert::{AlertColumnBuilder, EachRowCells};
 use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::MACHINE_ID;
+use crate::match_engine::cep::{
+    CepStateMachine, Event, FieldSource, JoinKey, Value, WindowLookup, eval_field_value,
+    field_ref_name, value_to_string, values_equal,
+};
 use crate::match_engine::columnar::{
     CVec, ColumnarBatch, compile_guard, compile_yield_cvec, cscalar_to_value,
 };
 use crate::match_engine::event_bridge::{ColumnarEvent, JoinRow};
-use crate::match_engine::match_engine::{
-    CepStateMachine, Event, FieldSource, JoinKey, Value, WindowLookup, eval_field_value,
-    field_ref_name, value_to_string, values_equal,
-};
 
 use super::RuleExecutor;
 use super::YieldKind;

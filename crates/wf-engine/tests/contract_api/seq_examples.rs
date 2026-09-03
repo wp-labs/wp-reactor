@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
-use crate::match_engine::contract::run_test;
+use wf_engine::match_engine::contract::run_test;
 
 fn conn_events_schema() -> WindowSchema {
     WindowSchema {

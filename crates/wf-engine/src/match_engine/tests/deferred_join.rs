@@ -10,7 +10,7 @@ use wf_lang::ast::{
 use wf_lang::plan::{EachPlan, JoinCondPlan, JoinPlan, RulePlan, YieldField};
 
 use crate::alert::AlertOrigin;
-use crate::match_engine::match_engine::{Event, Value, WindowLookup};
+use crate::match_engine::cep::{Event, Value, WindowLookup};
 use crate::match_engine::{DeferredLeft, JoinRow, RuleExecutor};
 
 use super::helpers::{event, num};
@@ -114,7 +114,7 @@ impl WindowLookup for BidLookup {
                 .iter()
                 .filter(|(_, row)| {
                     row.field_value(key_field)
-                        .is_some_and(|v| crate::match_engine::match_engine::values_equal(&v, key))
+                        .is_some_and(|v| crate::match_engine::cep::values_equal(&v, key))
                 })
                 .map(|(ts, row)| (*ts, row.clone()))
                 .collect(),

@@ -6,7 +6,7 @@ use super::super::helpers::*;
 
 #[test]
 fn compiled_field_tracking_supports_close_yield_and_l3_expressions() {
-    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+    use crate::match_engine::cep::{CepStateMachine, StepResult};
 
     let input_window = WindowSchema {
         name: "auth_events".to_string(),
@@ -174,4 +174,4 @@ rule tracked_close {
 
 // Bring in CloseReason for the L3 test
 use crate::match_engine::Value;
-use crate::match_engine::match_engine::CloseReason;
+use crate::match_engine::cep::CloseReason;

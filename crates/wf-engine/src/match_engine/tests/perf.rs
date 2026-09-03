@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use wf_lang::ast::MatchMode;
 use wf_lang::plan::{MatchPlan, SeqPlan, SeqSkipPlan, SeqStepPlan, WindowSpec};
 
-use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+use crate::match_engine::cep::{CepStateMachine, StepResult};
 use crate::match_engine::{Event, RuleExecutor, Value};
 
 use super::helpers::*;
@@ -533,7 +533,7 @@ fn deferred_materialization_throughput() {
 /// 退化成分支/复制重算）。
 #[test]
 fn not_guard_eval_overhead_bounded() {
-    use crate::match_engine::match_engine::eval_expr;
+    use crate::match_engine::cep::eval_expr;
     use wf_lang::ast::{BinOp, Expr, FieldRef};
 
     let not_expr = Expr::Not(Box::new(Expr::BinOp {

@@ -23,8 +23,8 @@ use wf_lang::ast::{
 use wf_lang::plan::{EachPlan, JoinCondPlan, JoinPlan, LetPlan, RulePlan, YieldField};
 
 use crate::match_engine::RuleExecutor;
+use crate::match_engine::cep::{EngineHashMap, Event, Value, WindowLookup};
 use crate::match_engine::executor::execute_joins;
-use crate::match_engine::match_engine::{EngineHashMap, Event, Value, WindowLookup};
 use crate::match_engine::{DeferredLeft, FieldSource, JoinRow};
 
 const N: usize = 1_000_000;

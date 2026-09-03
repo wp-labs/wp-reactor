@@ -21,8 +21,8 @@ use wf_lang::ast::{Expr, FieldRef, JoinMode};
 use wf_lang::plan::{JoinCondPlan, JoinPlan, MatchPlan, RulePlan, StepPlan, YieldField};
 use wf_lang::{BaseType, FieldType};
 
+use crate::match_engine::cep::BindData;
 use crate::match_engine::executor::{CloseCtxFields, build_eval_context, execute_joins};
-use crate::match_engine::match_engine::BindData;
 use crate::match_engine::{
     AsofLookup, CepStateMachine, EngineHashMap, Event, JoinRow, MatchedContext, RuleExecutor,
     StepData, StepResult, TriggerEvent, Value, WindowLookup,

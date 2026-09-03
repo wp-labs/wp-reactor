@@ -5,9 +5,7 @@ use sha1::Sha1;
 use sha2::Sha256;
 
 use super::{Value, YieldMeta, eval_expr_with_l3, step_data, utils};
-use crate::match_engine::match_engine::{
-    EngineHashMap, FieldSource, value_to_string, values_equal,
-};
+use crate::match_engine::cep::{EngineHashMap, FieldSource, value_to_string, values_equal};
 use crate::time::{normalize_epoch_timestamp_float_nanos, positive_interval_seconds_to_nanos};
 
 pub(super) fn contains_system_var(expr: &wf_lang::ast::Expr) -> bool {

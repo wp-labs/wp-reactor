@@ -1,3 +1,10 @@
+//! 解释求值器（逐事件标量）：`cep` 状态机的 step / close / conv / key，以及
+//! 列式路径的复杂分支回退（issue #82/#83 多层路径物化）都经此求值。
+//!
+//! 与之对应的**列式批量后端**在 `executor/eval/`（`builtins*` 等）：同名内建
+//! 函数两处各有一份实现，语义必须一致——由 `match_engine/tests/`（eval_coverage、
+//! l2 一致性）对拍守护。新增内建函数时两处同改。
+
 use std::cell::Cell;
 
 use wf_lang::ast::{BinOp, Expr};

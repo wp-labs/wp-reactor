@@ -5,7 +5,7 @@ use std::time::Duration;
 use wf_lang::ast::{CmpOp, Expr, FieldSelector, Measure};
 use wf_lang::plan::{AggPlan, BranchPlan};
 
-use crate::match_engine::match_engine::{CepStateMachine, CloseReason, StepResult};
+use crate::match_engine::cep::{CepStateMachine, CloseReason, StepResult};
 
 use super::helpers::*;
 
@@ -511,7 +511,7 @@ fn field_history_disabled_close_outputs_match_enabled_for_key_only_rule() {
     // must be identical to the history-enabled machine (bind_data aside,
     // which only feeds `_bind_*`/join ctx fields these yields never read).
     let dur = Duration::from_secs(10);
-    let run = |needs_field_history: bool| -> Vec<crate::match_engine::match_engine::CloseOutput> {
+    let run = |needs_field_history: bool| -> Vec<crate::match_engine::cep::CloseOutput> {
         let mut plan = fixed_plan_with_close(
             vec![simple_key("bidder")],
             dur,

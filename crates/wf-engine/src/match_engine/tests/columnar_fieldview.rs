@@ -19,7 +19,7 @@ use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{BinOp, CloseMode, CmpOp, Expr, FieldRef, FieldSelector, MatchMode, Measure};
 use wf_lang::plan::{AggPlan, BranchPlan, MatchPlan, SeqPlan, SeqSkipPlan, SeqStepPlan};
 
-use crate::match_engine::match_engine::{CepStateMachine, CloseReason};
+use crate::match_engine::cep::{CepStateMachine, CloseReason};
 use crate::match_engine::{
     ColumnarEvent, FieldSource, GuardMasks, RuleExecutor, batch_event_time_nanos_at,
     batch_time_col_index, batch_to_events, build_field_index, materialize_rows_filtered,

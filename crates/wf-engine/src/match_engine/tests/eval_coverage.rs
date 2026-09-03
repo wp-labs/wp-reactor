@@ -10,7 +10,7 @@ use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, Measure};
 use wf_lang::plan::{AggPlan, BranchPlan, YieldField};
 
 use crate::match_engine::RuleExecutor;
-use crate::match_engine::match_engine::{
+use crate::match_engine::cep::{
     CepStateMachine, EngineHashMap, Event, MatchedContext, StepData, StepResult, Value, eval_expr,
 };
 

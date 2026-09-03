@@ -11,7 +11,7 @@ use wf_lang::plan::{EachPlan, JoinCondPlan, JoinPlan, YieldField};
 use wf_lang::{BaseType, FieldType};
 
 use crate::alert::AlertColumnBuilder;
-use crate::match_engine::match_engine::WindowLookup;
+use crate::match_engine::cep::WindowLookup;
 use crate::match_engine::{Event, RuleExecutor};
 
 use super::super::helpers::*;

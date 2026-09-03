@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use wf_lang::plan::{MatchPlan, WindowSpec};
 
-use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+use crate::match_engine::cep::{CepStateMachine, StepResult};
 
 use super::helpers::*;
 

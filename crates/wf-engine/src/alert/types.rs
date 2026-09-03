@@ -19,9 +19,12 @@ use crate::match_engine::EngineHashMap;
 use crate::match_engine::Value;
 use crate::time::normalize_epoch_timestamp_float_nanos;
 
-pub use wf_lang::wfu_meta::{
+pub use wf_lang::wfu_meta::WFU_PREFIX;
+// 其余 WFU_* 为 crate 内契约（本文件构造元数据列 + alert 测试导入）；
+// 对外仅经 alert/mod.rs 的 `pub use types::{AlertOrigin, OutputRecord, WFU_PREFIX, ...}` 收敛。
+pub(crate) use wf_lang::wfu_meta::{
     WFU_CLOSE_REASON, WFU_EMIT_TIME, WFU_ENTITY_ID, WFU_ENTITY_TYPE, WFU_FIRED_AT, WFU_ID,
-    WFU_ORIGIN, WFU_PREFIX, WFU_RULE_NAME, WFU_SCORE, WFU_SUMMARY,
+    WFU_ORIGIN, WFU_RULE_NAME, WFU_SCORE, WFU_SUMMARY,
 };
 
 /// Which path produced this alert.

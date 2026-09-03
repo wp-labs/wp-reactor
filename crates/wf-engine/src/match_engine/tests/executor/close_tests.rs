@@ -2,7 +2,7 @@ use wf_lang::ast::{Expr, FieldRef};
 
 use crate::match_engine::EngineHashMap;
 use crate::match_engine::RuleExecutor;
-use crate::match_engine::match_engine::{CloseOutput, CloseReason};
+use crate::match_engine::cep::{CloseOutput, CloseReason};
 
 use super::super::helpers::*;
 use super::helpers::default_match_plan;
@@ -13,7 +13,7 @@ use super::helpers::default_match_plan;
 
 #[test]
 fn execute_close_both_ok() {
-    use crate::match_engine::match_engine::StepData;
+    use crate::match_engine::cep::StepData;
     use wf_lang::ast::CloseMode;
 
     let plan = simple_rule_plan(
@@ -156,7 +156,7 @@ fn execute_close_event_not_ok() {
 
 #[test]
 fn execute_close_score_can_use_count_alias() {
-    use crate::match_engine::match_engine::StepData;
+    use crate::match_engine::cep::StepData;
     use wf_lang::ast::CloseMode;
 
     let plan = simple_rule_plan(
@@ -225,7 +225,7 @@ fn execute_close_yield_nested_path_via_bind_data() {
     use wf_lang::{BaseType, FieldType};
 
     use crate::match_engine::Value;
-    use crate::match_engine::match_engine::{BindData, StepData};
+    use crate::match_engine::cep::{BindData, StepData};
 
     let mut plan = simple_rule_plan(
         "r1",
@@ -331,7 +331,7 @@ fn execute_close_yield_nested_path_missing_bind_omits() {
     use wf_lang::plan::YieldField;
     use wf_lang::{BaseType, FieldType};
 
-    use crate::match_engine::match_engine::StepData;
+    use crate::match_engine::cep::StepData;
 
     let mut plan = simple_rule_plan(
         "r1",
@@ -458,12 +458,12 @@ fn q12_like_plan() -> wf_lang::plan::RulePlan {
 }
 
 fn q12_like_close() -> CloseOutput {
-    use crate::match_engine::match_engine::StepData;
+    use crate::match_engine::cep::StepData;
     use wf_lang::ast::CloseMode;
 
     CloseOutput {
         rule_name: "q12_test".to_string(),
-        scope_key: vec![crate::match_engine::match_engine::Value::Number(42.0)],
+        scope_key: vec![crate::match_engine::cep::Value::Number(42.0)],
         close_reason: CloseReason::Timeout,
         event_ok: true,
         close_ok: true,
@@ -643,7 +643,7 @@ fn columnar_close_general_fmt_columnar_cell_matches_per_record() {
     // 逐位一致（值 + 类型）。
     use crate::alert::AlertColumnBuilder;
     use crate::error::CoreResult;
-    use crate::match_engine::match_engine::Value;
+    use crate::match_engine::cep::Value;
     use wf_lang::plan::YieldField;
     use wp_model_core::model::DataRecord;
 
@@ -694,7 +694,7 @@ fn columnar_close_general_materialize_fail_falls_back_matches_per_record() {
     // 的回退路径（build_eval_context + eval）必须与逐条解释路径逐位一致。
     use crate::alert::AlertColumnBuilder;
     use crate::error::CoreResult;
-    use crate::match_engine::match_engine::Value;
+    use crate::match_engine::cep::Value;
     use wf_lang::plan::YieldField;
     use wp_model_core::model::DataRecord;
 
@@ -881,10 +881,7 @@ fn columnar_close_missing_yield_field_falls_back_to_empty() {
         .iter()
         .find(|(n, _)| &**n == "id")
         .expect("id yield present");
-    assert_eq!(
-        value,
-        &crate::match_engine::match_engine::Value::Str("".into())
-    );
+    assert_eq!(value, &crate::match_engine::cep::Value::Str("".into()));
     let _ = name;
 
     let mut builder = crate::alert::AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
@@ -927,12 +924,12 @@ fn columnar_close_scope_key_short_falls_back_to_field_values() {
 
     let mut close = q12_like_close();
     // scope_key shorter than keys (truncated zip on the per-record path).
-    close.scope_key = vec![crate::match_engine::match_engine::Value::Number(42.0)];
+    close.scope_key = vec![crate::match_engine::cep::Value::Number(42.0)];
     close.event_step_data[0].field_values = {
         let mut m = EngineHashMap::default();
         m.insert(
             "category".to_string(),
-            vec![crate::match_engine::match_engine::Value::Str("cars".into())],
+            vec![crate::match_engine::cep::Value::Str("cars".into())],
         );
         m
     };
@@ -944,10 +941,7 @@ fn columnar_close_scope_key_short_falls_back_to_field_values() {
         .find(|(n, _)| &**n == "id")
         .map(|(_, v)| v.clone())
         .unwrap();
-    assert_eq!(
-        id_val,
-        crate::match_engine::match_engine::Value::Str("cars".into())
-    );
+    assert_eq!(id_val, crate::match_engine::cep::Value::Str("cars".into()));
 
     let mut builder = crate::alert::AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
     let stats = exec.execute_close_direct_batch_columnar(&[close], &mut builder, 1_700_000_000_000);

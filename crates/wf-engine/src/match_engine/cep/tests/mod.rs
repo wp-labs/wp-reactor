@@ -1,4 +1,4 @@
-//! Unit tests for the `match_engine::match_engine` module internals.
+//! Unit tests for the `match_engine::cep` module internals.
 //!
 //! Lives inside the module so tests can reach the private submodules
 //! (key/state/step/close/conv/seq/limits) directly.

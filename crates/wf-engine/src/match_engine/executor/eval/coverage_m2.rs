@@ -18,7 +18,7 @@ use super::{
     eval_yield_expr, eval_yield_expr_with_meta,
 };
 use crate::match_engine::EngineHashMap;
-use crate::match_engine::match_engine::FieldSource;
+use crate::match_engine::cep::FieldSource;
 use wf_lang::ast::{BinOp, Expr, FieldRef};
 
 fn field(name: &str) -> Expr {

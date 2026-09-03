@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wf_lang::ast::FieldRef;
 
 use crate::alert::AlertOrigin;
-use crate::match_engine::match_engine::{
+use crate::match_engine::cep::{
     CloseReason, StepData, Value, field_ref_name, push_i64_exact_decimal, value_to_string,
 };
 
@@ -191,7 +191,7 @@ fn build_wfx_id_iter<'a>(
 #[cfg(test)]
 mod split_tests {
     use super::*;
-    use crate::match_engine::match_engine::{CloseReason, EngineHashMap, StepData};
+    use crate::match_engine::cep::{CloseReason, EngineHashMap, StepData};
 
     /// `build_wfx_id_split` 必须与「先 combine 再 build_wfx_id」字节一致。
     #[test]
@@ -667,7 +667,7 @@ fn wfx_id_from_rule_and_time(
 pub(super) fn build_each_wfx_id(
     rule_name: &str,
     event_time_nanos: i64,
-    _ctx: &crate::match_engine::match_engine::Event,
+    _ctx: &crate::match_engine::cep::Event,
     origin: &AlertOrigin,
     _field_order: &[&smol_str::SmolStr],
 ) -> String {
@@ -679,7 +679,7 @@ pub(super) fn build_each_wfx_id(
 pub(super) fn build_each_wfx_id_reusing(
     rule_name: &str,
     event_time_nanos: i64,
-    _ctx: &crate::match_engine::match_engine::Event,
+    _ctx: &crate::match_engine::cep::Event,
     origin: &AlertOrigin,
     _field_order: &[&smol_str::SmolStr],
     _scratch: &mut String,
@@ -728,12 +728,9 @@ impl EachWfxPrefix {
 /// path. Single source of the 2^53 rendering rule — used by the batch-typed
 /// entity column read in the columnar on-each path (locked by
 /// `flat_int64_fast_path_matches_f64_roundtrip_bytes`).
-pub(crate) fn write_int64_value(
-    scratch: &mut impl crate::match_engine::match_engine::key::StrSink,
-    v: i64,
-) {
+pub(crate) fn write_int64_value(scratch: &mut impl crate::match_engine::cep::key::StrSink, v: i64) {
     if v.unsigned_abs() <= (1i64 << 53) as u64 {
-        crate::match_engine::match_engine::key::push_i64_exact_decimal(scratch, v);
+        crate::match_engine::cep::key::push_i64_exact_decimal(scratch, v);
     } else {
         // |v| > 2^53：f64 Display 渲染（可能有 .0/科学计数——与 value_to_string 字节一致）。
         let rendered = (v as f64).to_string();
@@ -1169,7 +1166,7 @@ mod format_tests {
 
     #[test]
     fn build_summary_matches_reference() {
-        use crate::match_engine::match_engine::EngineHashMap;
+        use crate::match_engine::cep::EngineHashMap;
 
         // Reference: the previous `format!` + `Vec<String>` + `join` shape.
         fn reference_summary(

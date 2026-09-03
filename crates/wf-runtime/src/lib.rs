@@ -1,3 +1,13 @@
+//! wf-runtime —— 引擎运行接线：把 wf-engine 内核接到来源/窗口/sink 与任务
+//! 生命周期。
+//!
+//! 任务视图（`*_task.rs`）：`engine_task`（规则驱动）、`alert_task`、
+//! `evictor_task`（窗口清理）；编排在 `lifecycle/`（mode=batch/daemon 启动关停）；
+//! 数据路径：`receiver/`（来源接收）→ `source/`（connector 适配）→
+//! `schema_bridge.rs`（schema 对齐）→ window（wf-engine）→ `sink_build.rs`
+//! （sink 工厂与路由）。横切：`metrics/`、`perf_diag.rs`、`memory_probe.rs`、
+//! `hot_reload/`（在线 reload/发布）、`external`（外部函数运行时）。
+
 #[macro_use]
 mod log_macros;
 

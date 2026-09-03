@@ -14,7 +14,7 @@ use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+use crate::match_engine::cep::{CepStateMachine, StepResult};
 use crate::match_engine::{ColumnarEvent, build_field_index};
 
 use super::helpers::{branch, count_ge, simple_key, simple_plan, step};

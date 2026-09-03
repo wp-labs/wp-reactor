@@ -18,8 +18,8 @@ use wf_lang::ast::{Bound, BoundVal, Expr, FieldRef, JoinMode, WithinSpec};
 use wf_lang::plan::{JoinCondPlan, JoinPlan};
 
 use crate::match_engine::JoinRow;
+use crate::match_engine::cep::{EngineHashMap, Event, Value, WindowLookup};
 use crate::match_engine::executor::execute_joins;
-use crate::match_engine::match_engine::{EngineHashMap, Event, Value, WindowLookup};
 
 const N: usize = 1_000_000;
 const NOW: i64 = 1_750_000_000_000_000_000;

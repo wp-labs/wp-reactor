@@ -8,7 +8,7 @@ use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
 use crate::match_engine::EngineHashMap;
 use crate::match_engine::Value;
-use crate::match_engine::match_engine::{BindData, CloseOutput, CloseReason, StepData};
+use crate::match_engine::cep::{BindData, CloseOutput, CloseReason, StepData};
 use crate::match_engine::{RuleExecutor, RuleExecutorOptions};
 
 use super::super::helpers::*;
@@ -1409,7 +1409,7 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
 
 #[test]
 fn execute_match_yield_can_use_bind_alias_aggregates() {
-    use crate::match_engine::match_engine::MatchedContext;
+    use crate::match_engine::cep::MatchedContext;
 
     let mut plan = simple_rule_plan(
         "r1",
@@ -1640,7 +1640,7 @@ fn execute_close_yield_can_use_fmt_with_count() {
 /// - Verifies execute_close produces an OutputRecord with the correct field.
 #[test]
 fn execute_close_yield_resolves_tracked_bind_alias_field() {
-    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+    use crate::match_engine::cep::{CepStateMachine, StepResult};
     use std::collections::HashSet;
     use wf_lang::ast::Expr;
     use wf_lang::plan::{BindPlan, EntityPlan, RulePlan, ScorePlan, YieldPlan};
@@ -1746,7 +1746,7 @@ fn execute_close_yield_resolves_tracked_bind_alias_field() {
 
 #[test]
 fn execute_match_yield_can_use_stat_context_functions() {
-    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+    use crate::match_engine::cep::{CepStateMachine, StepResult};
     use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
     let input_window = WindowSchema {
@@ -1893,7 +1893,7 @@ fn evidence_event(event_id: &str) -> Value {
 
 #[test]
 fn execute_match_yield_collects_window_event_ids() {
-    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+    use crate::match_engine::cep::{CepStateMachine, StepResult};
 
     let source = r#"
 rule evidence_rule {
@@ -1974,7 +1974,7 @@ rule evidence_rule {
 fn execute_match_accu_outputs_running_count_and_accumulating_evidence() {
     // `on event<accu>` end-to-end (wp-labs/warp-fusion#65): 5 events, threshold
     // 2 → 4 alerts with event_count 2,3,4,5 and evidence growing each fire.
-    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+    use crate::match_engine::cep::{CepStateMachine, StepResult};
 
     let source = r#"
 rule accu_evidence {
@@ -2065,7 +2065,7 @@ rule accu_evidence {
 
 #[test]
 fn execute_match_yield_dedups_window_event_ids() {
-    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+    use crate::match_engine::cep::{CepStateMachine, StepResult};
 
     let source = r#"
 rule evidence_rule {
@@ -2138,7 +2138,7 @@ rule evidence_rule {
 
 #[test]
 fn execute_match_yield_missing_window_event_ids_returns_empty_evidences() {
-    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+    use crate::match_engine::cep::{CepStateMachine, StepResult};
 
     let source = r#"
 rule evidence_rule {
@@ -2203,7 +2203,7 @@ rule evidence_rule {
 
 #[test]
 fn execute_match_yield_caps_window_event_ids_to_recent_sample() {
-    use crate::match_engine::match_engine::CepStateMachine;
+    use crate::match_engine::cep::CepStateMachine;
 
     let source = r#"
 rule evidence_rule {
@@ -2231,7 +2231,7 @@ rule evidence_rule {
     let mut matched = None;
     for i in 0..2065 {
         let event_id = format!("evt_{:04}", i);
-        if let crate::match_engine::match_engine::StepResult::Matched(ctx) = sm.advance_at(
+        if let crate::match_engine::cep::StepResult::Matched(ctx) = sm.advance_at(
             "s",
             &event(vec![
                 ("sip", str_val("10.0.0.1")),
@@ -2265,7 +2265,7 @@ rule evidence_rule {
 
 #[test]
 fn execute_close_yield_collects_window_event_ids() {
-    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+    use crate::match_engine::cep::{CepStateMachine, StepResult};
 
     let source = r#"
 rule evidence_close_rule {
@@ -2338,7 +2338,7 @@ rule evidence_close_rule {
 
 #[test]
 fn execute_close_yield_can_use_stat_final_value() {
-    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+    use crate::match_engine::cep::{CepStateMachine, StepResult};
     use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
     let input_window = WindowSchema {
@@ -3343,7 +3343,7 @@ fn execute_match_yield_nested_path_inside_object_literal_full_pipeline() {
     // End-to-end: the WFL compiler tracks the root of a path nested inside an
     // `object { }` yield member, so the match context carries `roles_obj` and
     // the structured yield extracts it (wp-labs/warp-fusion#64).
-    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+    use crate::match_engine::cep::{CepStateMachine, StepResult};
 
     let input_window = WindowSchema {
         name: "auth_events".into(),

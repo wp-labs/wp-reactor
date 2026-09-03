@@ -345,7 +345,7 @@ pub trait WindowLookup: Send + Sync {
             rows.into_iter()
                 .filter(|row| {
                     row.field_value(key_field)
-                        .is_some_and(|v| crate::match_engine::match_engine::values_equal(&v, key))
+                        .is_some_and(|v| crate::match_engine::cep::values_equal(&v, key))
                 })
                 .collect(),
         )
@@ -370,7 +370,7 @@ pub trait WindowLookup: Send + Sync {
             rows.into_iter()
                 .filter(|(_, row)| {
                     row.field_value(key_field)
-                        .is_some_and(|v| crate::match_engine::match_engine::values_equal(&v, key))
+                        .is_some_and(|v| crate::match_engine::cep::values_equal(&v, key))
                 })
                 .collect(),
         )

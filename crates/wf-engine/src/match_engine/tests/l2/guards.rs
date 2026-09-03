@@ -188,7 +188,7 @@ fn compound_expr_baseline_in_comparison() {
     };
 
     // Use eval_expr_ext directly with a baselines store to verify context flows
-    use crate::match_engine::match_engine::eval_expr_ext;
+    use crate::match_engine::cep::eval_expr_ext;
     let mut baselines = Map::default();
 
     // Feed varying values to build baseline with nonzero stddev.

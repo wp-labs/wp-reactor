@@ -322,7 +322,7 @@ fn join_anti_allows_non_matching_ip() {
 
 #[test]
 fn join_close_with_joins() {
-    use crate::match_engine::match_engine::{CloseOutput, CloseReason};
+    use crate::match_engine::cep::{CloseOutput, CloseReason};
 
     let match_plan = simple_plan(
         vec![simple_key("sip")],
@@ -605,7 +605,7 @@ fn join_asof_no_timestamp_support_skips() {
 
 #[test]
 fn join_asof_close_uses_last_event_nanos() {
-    use crate::match_engine::match_engine::{CloseOutput, CloseReason};
+    use crate::match_engine::cep::{CloseOutput, CloseReason};
 
     let match_plan = simple_plan(
         vec![simple_key("sip")],
@@ -730,7 +730,7 @@ fn interval_inner_join(window: &str, left_field: &str, right_field: &str) -> Joi
 /// close + interval inner miss → close 输出被抑制（None）。
 #[test]
 fn join_interval_inner_close_miss_suppresses() {
-    use crate::match_engine::match_engine::{CloseOutput, CloseReason};
+    use crate::match_engine::cep::{CloseOutput, CloseReason};
 
     let match_plan = simple_plan(
         vec![simple_key("sip")],
@@ -796,7 +796,7 @@ fn join_interval_inner_close_miss_suppresses() {
 /// close + interval inner 命中 → close 输出（富化后 score 走 join 字段）。
 #[test]
 fn join_interval_inner_close_hit_outputs() {
-    use crate::match_engine::match_engine::{CloseOutput, CloseReason};
+    use crate::match_engine::cep::{CloseOutput, CloseReason};
 
     let match_plan = simple_plan(
         vec![simple_key("sip")],
@@ -866,7 +866,7 @@ fn join_interval_inner_close_hit_outputs() {
 /// close + plain inner（无 within）miss → 抑制 close 输出。
 #[test]
 fn join_plain_inner_close_miss_suppresses() {
-    use crate::match_engine::match_engine::{CloseOutput, CloseReason};
+    use crate::match_engine::cep::{CloseOutput, CloseReason};
 
     let match_plan = simple_plan(
         vec![simple_key("sip")],

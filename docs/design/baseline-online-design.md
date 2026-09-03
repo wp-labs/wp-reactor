@@ -12,7 +12,7 @@
 
 | 项 | 位置 | 现状 |
 |---|---|---|
-| `eval_baseline` 入口 | `wp-reactor/crates/wf-engine/src/match_engine/match_engine/eval/mod.rs:187` | 只读 `args[0]`（expr）与 `args.get(2)`（method，默认 `"mean"`）；**`args[1]`（dur）从未读取** |
+| `eval_baseline` 入口 | `wp-reactor/crates/wf-engine/src/match_engine/cep/eval/mod.rs:187` | 只读 `args[0]`（expr）与 `args.get(2)`（method，默认 `"mean"`）；**`args[1]`（dur）从未读取** |
 | 状态键 | `mod.rs:207` | `format!("{:?}:{}", args[0], method)` —— **不含 dur**，不同 dur 撞同一 tracker |
 | `RollingStats` | `types.rs:375` | 字段 `count/sum/sum_sq/method/ewma/ewma_alpha(0.3)/values(Vec 上限1000)`；`mean` 为实例启动以来全量累积；`ewma` 固定 α=0.3；`median` 最近 1000 值环形缓冲 |
 | 状态挂载 | `state.rs:138` | `baselines: EngineHashMap<String, RollingStats>` 挂在 **match 实例** 上；实例创建默认空（`:178`）；淘汰/重启即 `clear()`（`:304`） |

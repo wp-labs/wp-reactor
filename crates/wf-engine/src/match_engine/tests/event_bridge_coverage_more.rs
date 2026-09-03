@@ -15,7 +15,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use crate::match_engine::match_engine::Value;
+use crate::match_engine::cep::Value;
 use crate::match_engine::{
     ColumnarEvent, FieldSource, batch_to_events, build_field_index, columnar_join_rows,
     columnar_timestamped_join_rows, materialize_rows_filtered,
