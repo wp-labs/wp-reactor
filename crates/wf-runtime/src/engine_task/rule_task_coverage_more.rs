@@ -799,9 +799,7 @@ async fn scan_timeouts_sliding_releases_idle_instances_by_wall_clock() {
         high_threshold_sliding_task(std::time::Duration::from_secs(60));
     let base = 1_700_000_000_000_000_000i64;
     for sec in 0..10 {
-        let sips: Vec<String> = (0..100)
-            .map(|i| format!("10.0.{sec}.{i}"))
-            .collect();
+        let sips: Vec<String> = (0..100).map(|i| format!("10.0.{sec}.{i}")).collect();
         let refs: Vec<&str> = sips.iter().map(|s| s.as_str()).collect();
         win.append(make_batch(&refs, base + sec * 1_000_000_000))
             .unwrap();

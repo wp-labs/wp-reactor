@@ -5577,16 +5577,16 @@ mod row_domain_tests {
 }
 
 #[cfg(test)]
-#[path = "rule_task_bench.rs"]
+#[path = "../rule_task_bench.rs"]
 mod rule_task_bench;
 #[cfg(test)]
-#[path = "rule_task_coverage.rs"]
+#[path = "../rule_task_coverage.rs"]
 mod rule_task_coverage;
 #[cfg(test)]
-#[path = "rule_task_coverage_more.rs"]
+#[path = "../rule_task_coverage_more.rs"]
 mod rule_task_coverage_more;
 #[cfg(test)]
 mod rule_task_key_join_tests;
 #[cfg(test)]
-#[path = "rule_task_r4.rs"]
+#[path = "../rule_task_r4.rs"]
 mod rule_task_r4;
