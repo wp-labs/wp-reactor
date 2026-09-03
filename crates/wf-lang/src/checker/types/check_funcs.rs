@@ -87,7 +87,6 @@ pub(crate) fn check_func_call(
     let scope = ctx.scope;
     let rule_name = ctx.rule_name;
     let allow_l3_funcs = ctx.allow_l3_funcs;
-    let allow_mixed_coalesce = ctx.allow_mixed_coalesce;
 
     if qualifier == Some("stat") && matches!(name, "count" | "value") {
         check_stat_func(name, args, scope, rule_name, errors);
@@ -108,6 +107,26 @@ pub(crate) fn check_func_call(
         return;
     }
 
+    // 内建函数按类别分派（2026-09-03 拆件）：分派集合与各 check_*_func 内
+    // match 由同一类别表生成；新增内建函数须加入对应类别并保持集合同步。
+    if matches!(name, "count" | "sum" | "avg" | "min" | "max" | "collect_set" | "collect_list" | "first" | "last" | "stddev" | "percentile") {
+        check_agg_func(&ctx, name, args, errors);
+    } else if matches!(name, "abs" | "ceil" | "floor" | "round" | "sqrt" | "exp" | "sign" | "trunc" | "is_finite" | "pow" | "log" | "clamp") {
+        check_numeric_func(&ctx, name, args, errors);
+    } else if matches!(name, "time_diff" | "time_bucket" | "bucket_end" | "now" | "now_s" | "now_ms" | "now_us" | "now_ns" | "time_to_s" | "time_to_ms" | "strftime" | "strptime") {
+        check_time_func(&ctx, name, args, errors);
+    } else if matches!(name, "regex_match" | "cidr_match" | "count_char" | "contains" | "startswith" | "endswith" | "startswith_any" | "endswith_any" | "md5" | "sha1" | "sha256" | "hex" | "sha1_n" | "stable_id" | "join" | "join_by" | "substr" | "replace" | "replace_plain" | "trim" | "ltrim" | "rtrim" | "concat" | "indexof" | "lower" | "upper" | "len") {
+        check_str_func(&ctx, name, args, errors);
+    } else if matches!(name, "mvcount" | "mvjoin" | "split" | "mvdedup" | "mvsort" | "mvreverse" | "mvindex" | "mvappend") {
+        check_mv_func(&ctx, name, args, errors);
+    } else if matches!(name, "has" | "baseline" | "coalesce" | "merge" | "isnull" | "isnotnull" | "is_blank" | "null_if_blank" | "default_if_blank") {
+        check_misc_func(&ctx, name, args, errors);
+    }
+}
+/// agg 类内建函数检查（2026-09-03 自 check_func_call 拆出；arm 原样搬移）。
+fn check_agg_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+    let scope = ctx.scope;
+    let rule_name = ctx.rule_name;
     match name {
         "count" => {
             // T4: argument should be a set-level reference (bare alias), not a
@@ -163,130 +182,83 @@ pub(crate) fn check_func_call(
                 errors.push(rule_error(rule_name, format!("{}() requires an orderable field, got {:?}", name, t)));
             }
         }
-        "has" => {
-            // T11-T13: window.has() checks
-            if args.is_empty() || args.len() > 2 {
-                errors.push(rule_error(rule_name, "has() expects 1 or 2 arguments".to_string()));
-            }
-            // T12: second argument must be a string literal
-            if args.len() == 2 && !matches!(args[1], Expr::StringLit(_)) {
-                errors.push(rule_error(rule_name, "has() second argument must be a string literal (field name)".to_string()));
+        "collect_set" | "collect_list" => {
+            // T22: argument must be Column projection (alias.field)
+            if args.len() != 1 {
+                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument: alias.field", name)));
+            } else if !matches!(
+                args[0],
+                Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
+           ) {
+                errors.push(rule_error(rule_name, format!("{}() argument must be a column projection (alias.field)", name)));
             }
         }
-        "baseline" => {
-            // T26: baseline(expr, dur) or baseline(expr, dur, method)
-            if args.len() != 2 && args.len() != 3 {
-                errors.push(rule_error(rule_name, "baseline() requires 2 or 3 arguments: (expr, duration, [method])".to_string()));
+        "first" | "last" => {
+            // T23: argument must be Column projection (alias.field)
+            if args.len() != 1 {
+                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument: alias.field", name)));
+            } else if !matches!(
+                args[0],
+                Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
+           ) {
+                errors.push(rule_error(rule_name, format!("{}() argument must be a column projection (alias.field)", name)));
+            }
+        }
+        // L3 Statistical functions (M28.3)
+        "stddev" => {
+            // T24: field must be digit or float
+            if args.len() != 1 {
+                errors.push(rule_error(rule_name, "stddev() requires exactly 1 argument: alias.field".to_string()));
+            } else if let Some(arg) = args.first() {
+                if let Some(t) = infer_type(arg, scope)
+                    && !is_numeric(&t)
+                {
+                    errors.push(rule_error(rule_name, format!("stddev() requires a numeric field, got {:?}", t)));
+                }
+                // Also check it's a column projection
+                if !matches!(
+                    args[0],
+                    Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
+               ) {
+                    errors.push(rule_error(rule_name, "stddev() argument must be a column projection (alias.field)".to_string()));
+                }
+            }
+        }
+        "percentile" => {
+            // T25: percentile(field, p) where field is numeric, p is 0-100
+            if args.len() != 2 {
+                errors.push(rule_error(rule_name, "percentile() requires exactly 2 arguments: (field, p)".to_string()));
             } else {
-                // First argument must be numeric
+                // First arg must be numeric column
                 if let Some(t) = infer_type(&args[0], scope)
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("baseline() first argument must be numeric, got {:?}", t)));
+                    errors.push(rule_error(rule_name, format!("percentile() field must be numeric, got {:?}", t)));
                 }
-                // Second argument must be a positive number (duration in seconds)
+                if !matches!(
+                    args[0],
+                    Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
+               ) {
+                    errors.push(rule_error(rule_name, "percentile() field must be a column projection (alias.field)".to_string()));
+                }
+                // Second arg must be digit literal 0-100
                 match &args[1] {
-                    Expr::Number(n) if *n > 0.0 => {} // OK
+                    Expr::Number(p) if *p >= 0.0 && *p <= 100.0 => {} // OK
                     _ => {
-                        errors.push(rule_error(rule_name, "baseline() second argument must be a positive duration".to_string()));
-                    }
-                }
-                // Third argument (if present) must be a string literal: "mean", "ewma", or "median"
-                if args.len() == 3 {
-                    match &args[2] {
-                        Expr::StringLit(method) => {
-                            let valid_methods = ["mean", "ewma", "median"];
-                            if !valid_methods.contains(&method.as_str()) {
-                                errors.push(rule_error(rule_name, format!("baseline() method must be one of: mean, ewma, median, got '{}'", method)));
-                            }
-                        }
-                        _ => {
-                            errors.push(rule_error(rule_name, "baseline() method must be a string literal: \"mean\", \"ewma\", or \"median\"".to_string()));
-                        }
+                        errors.push(rule_error(rule_name, "percentile() p must be a number literal 0-100".to_string()));
                     }
                 }
             }
         }
-        "regex_match" => {
-            if args.len() != 2 {
-                errors.push(rule_error(rule_name, "regex_match() requires exactly 2 arguments: (field, pattern)".to_string()));
-            } else {
-                // First argument should be Chars
-                if let Some(t) = infer_type(&args[0], scope)
-                    && !compatible(&t, &ValType::Base(BaseType::Chars))
-                {
-                    errors.push(rule_error(rule_name, format!("regex_match() first argument must be chars, got {:?}", t)));
-                }
-                // Second argument should be a string literal (compile-time regex check)
-                match &args[1] {
-                    Expr::StringLit(pat) => {
-                        if regex_syntax::Parser::new().parse(pat).is_err() {
-                            errors.push(rule_error(rule_name, format!("regex_match() pattern \"{}\" is not valid regex", pat)));
-                        }
-                    }
-                    _ => {
-                        errors.push(rule_error(rule_name,  "regex_match() second argument must be a string literal pattern".to_string()));
-                    }
-                }
-            }
-        }
-        "cidr_match" => {
-            if args.len() != 2 {
-                errors.push(rule_error(rule_name, "cidr_match() requires exactly 2 arguments: (ip, subnet)".to_string()));
-            } else {
-                // First argument: IP 字段（Ip）或字符串（Chars）都可。
-                if let Some(t) = infer_type(&args[0], scope)
-                    && !compatible(&t, &ValType::Base(BaseType::Chars))
-                    && !matches!(t, ValType::Base(BaseType::Ip))
-                {
-                    errors.push(rule_error(rule_name, format!("cidr_match() first argument must be an IP or string field, got {:?}", t)));
-                }
-                // Second argument: 字符串字面量，编译期校验 CIDR 合法性。
-                match &args[1] {
-                    Expr::StringLit(cidr) => {
-                        if crate::cidr::Cidr::parse(cidr).is_none() {
-                            errors.push(rule_error(rule_name, format!("cidr_match() subnet \"{}\" is not a valid CIDR (expect addr/prefix)", cidr)));
-                        }
-                    }
-                    _ => {
-                        errors.push(rule_error(rule_name, "cidr_match() second argument must be a string literal CIDR".to_string()));
-                    }
-                }
-            }
-        }
-        "time_diff" => {
-            if args.len() != 2 {
-                errors.push(rule_error(rule_name, "time_diff() requires exactly 2 arguments: (t1, t2)".to_string()));
-            } else {
-                for (i, arg) in args.iter().enumerate() {
-                    if let Some(t) = infer_type(arg, scope)
-                        && !compatible(&t, &ValType::Base(BaseType::Time))
-                        && !is_numeric(&t)
-                    {
-                        errors.push(rule_error(rule_name, format!("time_diff() argument {} must be time or numeric, got {:?}", i + 1, t)));
-                    }
-                }
-            }
-        }
-        "time_bucket" | "bucket_end" => {
-            if args.len() != 2 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 2 arguments: (time, interval_seconds)", name)));
-            } else {
-                // First argument must be time or numeric
-                if let Some(t) = infer_type(&args[0], scope)
-                    && !compatible(&t, &ValType::Base(BaseType::Time))
-                    && !is_numeric(&t)
-                {
-                    errors.push(rule_error(rule_name, format!("{}() first argument must be time or numeric, got {:?}", name, t)));
-                }
-                // Second argument must be numeric (duration in seconds)
-                if let Some(t) = infer_type(&args[1], scope)
-                    && !is_numeric(&t)
-                {
-                    errors.push(rule_error(rule_name, format!("{}() second argument must be numeric (interval seconds), got {:?}", name, t)));
-                }
-            }
-        }
+        _ => {}
+    }
+}
+
+/// numeric 类内建函数检查（2026-09-03 自 check_func_call 拆出；arm 原样搬移）。
+fn check_numeric_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+    let scope = ctx.scope;
+    let rule_name = ctx.rule_name;
+    match name {
         "abs" | "ceil" | "floor" => {
             if args.len() != 1 {
                 errors.push(rule_error(rule_name, format!("{}() requires exactly 1 numeric argument", name)));
@@ -361,63 +333,45 @@ pub(crate) fn check_func_call(
                 }
             }
         }
-        "coalesce" => {
-            if args.is_empty() {
-                errors.push(rule_error(rule_name, "coalesce() requires at least 1 argument".to_string()));
-            } else if !allow_mixed_coalesce {
-                let mut first_type: Option<ValType> = None;
-                for (idx, arg) in args.iter().enumerate() {
-                    let Some(inferred) = infer_type(arg, scope) else {
-                        continue;
-                    };
-                    if let Some(existing) = &first_type {
-                        if !(compatible(existing, &inferred)
-                            || is_numeric(existing) && is_numeric(&inferred))
-                        {
-                            errors.push(rule_error(rule_name, format!("coalesce() argument {} type {:?} is not compatible with {:?}", idx + 1, inferred, existing)));
-                        }
-                    } else {
-                        first_type = Some(inferred);
-                    }
-                }
-            }
-        }
-        "merge" => {
-            if args.is_empty() {
-                errors.push(rule_error(rule_name, "merge() requires at least 1 argument".to_string()));
-            } else {
-                for (idx, arg) in args.iter().enumerate() {
-                    if let Some(t) = infer_type(arg, scope)
-                        && !compatible(&ValType::Object, &t)
-                    {
-                        errors.push(rule_error(rule_name, format!("merge() argument {} must be object, got {:?}", idx + 1, t)));
-                    }
-                }
-            }
-        }
-        "isnull" | "isnotnull" if args.len() != 1 => {
-            errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument", name)));
-        }
-        "isnull" | "isnotnull" => {}
-        "is_blank" | "null_if_blank" => {
-            if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument", name)));
-            } else if let Some(t) = infer_type(&args[0], scope)
-                && !compatible(&t, &ValType::Base(BaseType::Chars))
-            {
-                errors.push(rule_error(rule_name, format!("{}() argument must be chars, got {:?}", name, t)));
-            }
-        }
-        "default_if_blank" => {
+        _ => {}
+    }
+}
+
+/// time 类内建函数检查（2026-09-03 自 check_func_call 拆出；arm 原样搬移）。
+fn check_time_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+    let scope = ctx.scope;
+    let rule_name = ctx.rule_name;
+    match name {
+        "time_diff" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "default_if_blank() requires exactly 2 arguments: (text, default)".to_string()));
+                errors.push(rule_error(rule_name, "time_diff() requires exactly 2 arguments: (t1, t2)".to_string()));
             } else {
                 for (i, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
-                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                        && !compatible(&t, &ValType::Base(BaseType::Time))
+                        && !is_numeric(&t)
                     {
-                        errors.push(rule_error(rule_name, format!("default_if_blank() argument {} must be chars, got {:?}", i + 1, t)));
+                        errors.push(rule_error(rule_name, format!("time_diff() argument {} must be time or numeric, got {:?}", i + 1, t)));
                     }
+                }
+            }
+        }
+        "time_bucket" | "bucket_end" => {
+            if args.len() != 2 {
+                errors.push(rule_error(rule_name, format!("{}() requires exactly 2 arguments: (time, interval_seconds)", name)));
+            } else {
+                // First argument must be time or numeric
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Time))
+                    && !is_numeric(&t)
+                {
+                    errors.push(rule_error(rule_name, format!("{}() first argument must be time or numeric, got {:?}", name, t)));
+                }
+                // Second argument must be numeric (duration in seconds)
+                if let Some(t) = infer_type(&args[1], scope)
+                    && !is_numeric(&t)
+                {
+                    errors.push(rule_error(rule_name, format!("{}() second argument must be numeric (interval seconds), got {:?}", name, t)));
                 }
             }
         }
@@ -425,20 +379,6 @@ pub(crate) fn check_func_call(
             errors.push(rule_error(rule_name, format!("{}() requires no arguments", name)));
         }
         "now" | "now_s" | "now_ms" | "now_us" | "now_ns" => {}
-        "count_char" => {
-            // count_char(text, ch)：统计 ch 在 text 中的出现次数（Flink q14 UDF 同款）。
-            if args.len() != 2 {
-                errors.push(rule_error(rule_name, "count_char() requires exactly 2 arguments: (text, char)".to_string()));
-            } else {
-                for (i, arg) in args.iter().enumerate() {
-                    if let Some(t) = infer_type(arg, scope)
-                        && !compatible(&t, &ValType::Base(BaseType::Chars))
-                    {
-                        errors.push(rule_error(rule_name, format!("count_char() argument {} must be chars, got {:?}", i + 1, t)));
-                    }
-                }
-            }
-        }
         "time_to_s" | "time_to_ms" => {
             // time 值 → 秒/毫秒 epoch（issue #69）：接受 time 或数值参数，返回 digit。
             if args.len() != 1 {
@@ -477,6 +417,76 @@ pub(crate) fn check_func_call(
                         && !compatible(&t, &ValType::Base(BaseType::Chars))
                     {
                         errors.push(rule_error(rule_name, format!("strptime() argument {} must be chars, got {:?}", i + 1, t)));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// str 类内建函数检查（2026-09-03 自 check_func_call 拆出；arm 原样搬移）。
+fn check_str_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+    let scope = ctx.scope;
+    let rule_name = ctx.rule_name;
+    match name {
+        "regex_match" => {
+            if args.len() != 2 {
+                errors.push(rule_error(rule_name, "regex_match() requires exactly 2 arguments: (field, pattern)".to_string()));
+            } else {
+                // First argument should be Chars
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                {
+                    errors.push(rule_error(rule_name, format!("regex_match() first argument must be chars, got {:?}", t)));
+                }
+                // Second argument should be a string literal (compile-time regex check)
+                match &args[1] {
+                    Expr::StringLit(pat) => {
+                        if regex_syntax::Parser::new().parse(pat).is_err() {
+                            errors.push(rule_error(rule_name, format!("regex_match() pattern \"{}\" is not valid regex", pat)));
+                        }
+                    }
+                    _ => {
+                        errors.push(rule_error(rule_name,  "regex_match() second argument must be a string literal pattern".to_string()));
+                    }
+                }
+            }
+        }
+        "cidr_match" => {
+            if args.len() != 2 {
+                errors.push(rule_error(rule_name, "cidr_match() requires exactly 2 arguments: (ip, subnet)".to_string()));
+            } else {
+                // First argument: IP 字段（Ip）或字符串（Chars）都可。
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    && !matches!(t, ValType::Base(BaseType::Ip))
+                {
+                    errors.push(rule_error(rule_name, format!("cidr_match() first argument must be an IP or string field, got {:?}", t)));
+                }
+                // Second argument: 字符串字面量，编译期校验 CIDR 合法性。
+                match &args[1] {
+                    Expr::StringLit(cidr) => {
+                        if crate::cidr::Cidr::parse(cidr).is_none() {
+                            errors.push(rule_error(rule_name, format!("cidr_match() subnet \"{}\" is not a valid CIDR (expect addr/prefix)", cidr)));
+                        }
+                    }
+                    _ => {
+                        errors.push(rule_error(rule_name, "cidr_match() second argument must be a string literal CIDR".to_string()));
+                    }
+                }
+            }
+        }
+        "count_char" => {
+            // count_char(text, ch)：统计 ch 在 text 中的出现次数（Flink q14 UDF 同款）。
+            if args.len() != 2 {
+                errors.push(rule_error(rule_name, "count_char() requires exactly 2 arguments: (text, char)".to_string()));
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        errors.push(rule_error(rule_name, format!("count_char() argument {} must be chars, got {:?}", i + 1, t)));
                     }
                 }
             }
@@ -684,6 +694,34 @@ pub(crate) fn check_func_call(
                 }
             }
         }
+        "lower" | "upper" => {
+            if args.len() != 1 {
+                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument", name)));
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !compatible(&t, &ValType::Base(BaseType::Chars))
+            {
+                errors.push(rule_error(rule_name, format!("{}() argument must be chars, got {:?}", name, t)));
+            }
+        }
+        "len" => {
+            if args.len() != 1 {
+                errors.push(rule_error(rule_name, "len() requires exactly 1 argument".to_string()));
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !compatible(&t, &ValType::Base(BaseType::Chars))
+            {
+                errors.push(rule_error(rule_name, format!("len() argument must be chars, got {:?}", t)));
+            }
+        }
+        // L3 Collection functions (M28.2)
+        _ => {}
+    }
+}
+
+/// mv 类内建函数检查（2026-09-03 自 check_func_call 拆出；arm 原样搬移）。
+fn check_mv_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+    let scope = ctx.scope;
+    let rule_name = ctx.rule_name;
+    match name {
         "mvcount" => {
             if args.len() != 1 {
                 errors.push(rule_error(rule_name, "mvcount() requires exactly 1 argument".to_string()));
@@ -802,7 +840,99 @@ pub(crate) fn check_func_call(
                 }
             }
         }
-        "lower" | "upper" => {
+        _ => {}
+    }
+}
+
+/// misc 类内建函数检查（2026-09-03 自 check_func_call 拆出；arm 原样搬移）。
+fn check_misc_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+    let scope = ctx.scope;
+    let rule_name = ctx.rule_name;
+    let allow_mixed_coalesce = ctx.allow_mixed_coalesce;
+    match name {
+        "has" => {
+            // T11-T13: window.has() checks
+            if args.is_empty() || args.len() > 2 {
+                errors.push(rule_error(rule_name, "has() expects 1 or 2 arguments".to_string()));
+            }
+            // T12: second argument must be a string literal
+            if args.len() == 2 && !matches!(args[1], Expr::StringLit(_)) {
+                errors.push(rule_error(rule_name, "has() second argument must be a string literal (field name)".to_string()));
+            }
+        }
+        "baseline" => {
+            // T26: baseline(expr, dur) or baseline(expr, dur, method)
+            if args.len() != 2 && args.len() != 3 {
+                errors.push(rule_error(rule_name, "baseline() requires 2 or 3 arguments: (expr, duration, [method])".to_string()));
+            } else {
+                // First argument must be numeric
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !is_numeric(&t)
+                {
+                    errors.push(rule_error(rule_name, format!("baseline() first argument must be numeric, got {:?}", t)));
+                }
+                // Second argument must be a positive number (duration in seconds)
+                match &args[1] {
+                    Expr::Number(n) if *n > 0.0 => {} // OK
+                    _ => {
+                        errors.push(rule_error(rule_name, "baseline() second argument must be a positive duration".to_string()));
+                    }
+                }
+                // Third argument (if present) must be a string literal: "mean", "ewma", or "median"
+                if args.len() == 3 {
+                    match &args[2] {
+                        Expr::StringLit(method) => {
+                            let valid_methods = ["mean", "ewma", "median"];
+                            if !valid_methods.contains(&method.as_str()) {
+                                errors.push(rule_error(rule_name, format!("baseline() method must be one of: mean, ewma, median, got '{}'", method)));
+                            }
+                        }
+                        _ => {
+                            errors.push(rule_error(rule_name, "baseline() method must be a string literal: \"mean\", \"ewma\", or \"median\"".to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        "coalesce" => {
+            if args.is_empty() {
+                errors.push(rule_error(rule_name, "coalesce() requires at least 1 argument".to_string()));
+            } else if !allow_mixed_coalesce {
+                let mut first_type: Option<ValType> = None;
+                for (idx, arg) in args.iter().enumerate() {
+                    let Some(inferred) = infer_type(arg, scope) else {
+                        continue;
+                    };
+                    if let Some(existing) = &first_type {
+                        if !(compatible(existing, &inferred)
+                            || is_numeric(existing) && is_numeric(&inferred))
+                        {
+                            errors.push(rule_error(rule_name, format!("coalesce() argument {} type {:?} is not compatible with {:?}", idx + 1, inferred, existing)));
+                        }
+                    } else {
+                        first_type = Some(inferred);
+                    }
+                }
+            }
+        }
+        "merge" => {
+            if args.is_empty() {
+                errors.push(rule_error(rule_name, "merge() requires at least 1 argument".to_string()));
+            } else {
+                for (idx, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&ValType::Object, &t)
+                    {
+                        errors.push(rule_error(rule_name, format!("merge() argument {} must be object, got {:?}", idx + 1, t)));
+                    }
+                }
+            }
+        }
+        "isnull" | "isnotnull" if args.len() != 1 => {
+            errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument", name)));
+        }
+        "isnull" | "isnotnull" => {}
+        "is_blank" | "null_if_blank" => {
             if args.len() != 1 {
                 errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument", name)));
             } else if let Some(t) = infer_type(&args[0], scope)
@@ -811,80 +941,15 @@ pub(crate) fn check_func_call(
                 errors.push(rule_error(rule_name, format!("{}() argument must be chars, got {:?}", name, t)));
             }
         }
-        "len" => {
-            if args.len() != 1 {
-                errors.push(rule_error(rule_name, "len() requires exactly 1 argument".to_string()));
-            } else if let Some(t) = infer_type(&args[0], scope)
-                && !compatible(&t, &ValType::Base(BaseType::Chars))
-            {
-                errors.push(rule_error(rule_name, format!("len() argument must be chars, got {:?}", t)));
-            }
-        }
-        // L3 Collection functions (M28.2)
-        "collect_set" | "collect_list" => {
-            // T22: argument must be Column projection (alias.field)
-            if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument: alias.field", name)));
-            } else if !matches!(
-                args[0],
-                Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
-           ) {
-                errors.push(rule_error(rule_name, format!("{}() argument must be a column projection (alias.field)", name)));
-            }
-        }
-        "first" | "last" => {
-            // T23: argument must be Column projection (alias.field)
-            if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument: alias.field", name)));
-            } else if !matches!(
-                args[0],
-                Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
-           ) {
-                errors.push(rule_error(rule_name, format!("{}() argument must be a column projection (alias.field)", name)));
-            }
-        }
-        // L3 Statistical functions (M28.3)
-        "stddev" => {
-            // T24: field must be digit or float
-            if args.len() != 1 {
-                errors.push(rule_error(rule_name, "stddev() requires exactly 1 argument: alias.field".to_string()));
-            } else if let Some(arg) = args.first() {
-                if let Some(t) = infer_type(arg, scope)
-                    && !is_numeric(&t)
-                {
-                    errors.push(rule_error(rule_name, format!("stddev() requires a numeric field, got {:?}", t)));
-                }
-                // Also check it's a column projection
-                if !matches!(
-                    args[0],
-                    Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
-               ) {
-                    errors.push(rule_error(rule_name, "stddev() argument must be a column projection (alias.field)".to_string()));
-                }
-            }
-        }
-        "percentile" => {
-            // T25: percentile(field, p) where field is numeric, p is 0-100
+        "default_if_blank" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "percentile() requires exactly 2 arguments: (field, p)".to_string()));
+                errors.push(rule_error(rule_name, "default_if_blank() requires exactly 2 arguments: (text, default)".to_string()));
             } else {
-                // First arg must be numeric column
-                if let Some(t) = infer_type(&args[0], scope)
-                    && !is_numeric(&t)
-                {
-                    errors.push(rule_error(rule_name, format!("percentile() field must be numeric, got {:?}", t)));
-                }
-                if !matches!(
-                    args[0],
-                    Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
-               ) {
-                    errors.push(rule_error(rule_name, "percentile() field must be a column projection (alias.field)".to_string()));
-                }
-                // Second arg must be digit literal 0-100
-                match &args[1] {
-                    Expr::Number(p) if *p >= 0.0 && *p <= 100.0 => {} // OK
-                    _ => {
-                        errors.push(rule_error(rule_name, "percentile() p must be a number literal 0-100".to_string()));
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        errors.push(rule_error(rule_name, format!("default_if_blank() argument {} must be chars, got {:?}", i + 1, t)));
                     }
                 }
             }
@@ -892,6 +957,7 @@ pub(crate) fn check_func_call(
         _ => {}
     }
 }
+
 
 fn is_stat_selector_name(name: &str) -> bool {
     matches!(
