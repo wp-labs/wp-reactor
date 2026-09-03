@@ -13,11 +13,12 @@ use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsP
 
 use crate::match_engine::Value;
 use crate::match_engine::executor::stats_exec::{
-    RowFieldLayout, RowFields, StatsAccum, StatsBucketAccs, StatsExecutor, StatsMaskCache, TopEntry,
+    StatsAccum, StatsBucketAccs, StatsExecutor, StatsMaskCache, TopEntry,
 };
 use crate::match_engine::executor::{
     NumericSoALayout, accumulate_column_row, accumulate_soa, measure_values_soa,
 };
+use wf_cep::rows::{RowFieldLayout, RowFields};
 
 fn num(n: f64) -> Value {
     Value::Number(n)

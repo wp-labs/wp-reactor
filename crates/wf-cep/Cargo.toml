@@ -12,5 +12,6 @@ wf-lang = { path = "../wf-lang" }
 regex = { workspace = true }
 orion-error = { workspace = true }
 moju-derive = { workspace = true }
+arrow = { workspace = true }
 foldhash = { workspace = true }
 smol_str = { workspace = true }

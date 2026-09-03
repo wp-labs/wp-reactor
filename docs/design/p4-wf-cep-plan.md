@@ -103,7 +103,9 @@ builder helpers（供 engine 剩测/bench 使用；避免重复实现）。
   2. ✅ Value 层：Value/EngineHashMap/EngineHashSet/MACHINE_ID -> wf_cep::value
      （Event/FieldSource 留引擎避孤儿；types.rs 别名重导出）；external -> wf_cep
      （engine pub mod shim）
-  3. ⏳ RowFields/RowFieldLayout（纯值类型，解 stats_exec 耦合）
+  3. ✅ RowFields/RowFieldLayout/RowFieldSlot -> wf_cep::rows（arrow 数据面；
+     stats_exec 删除区 + wf_cep::rows import；executor/mod.rs 重导出改源；
+     spill 访问器升 pub(doc hidden)；RowFields::f64_at 所需 value_to_f64 随迁）
   4. ⏳ cep（types 引擎耦合段切留 engine）+ event_bridge（FieldSource 随 Event 迁）
   5. ⏳ executor/columnar（解 alert/spill/window::scope_key_columnar 后）
   6. ⏳ engine 收尾：window/sink/async_persist/spill + 门面收缩；测试归位

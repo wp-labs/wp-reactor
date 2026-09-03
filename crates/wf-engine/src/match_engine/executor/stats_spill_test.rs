@@ -16,8 +16,9 @@ use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsP
 
 use crate::match_engine::Value;
 use crate::match_engine::cep::ScopeKey;
-use crate::match_engine::executor::stats_exec::{RowFieldLayout, StatsExecutor};
+use crate::match_engine::executor::stats_exec::StatsExecutor;
 use crate::match_engine::spill::{MemSpillStore, RedbSpillStore, SpillStore};
+use wf_cep::rows::RowFieldLayout;
 
 // ---------------------------------------------------------------------------
 // helpers（与 stats_exec_test 同款）
