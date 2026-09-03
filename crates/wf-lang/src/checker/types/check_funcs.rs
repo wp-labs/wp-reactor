@@ -429,54 +429,18 @@ fn check_time_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors
 fn check_str_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
     let scope = ctx.scope;
     let rule_name = ctx.rule_name;
+
+    // 字符串族再分派（2026-09-03）：pattern/hash 族抽 check_pattern_func /
+    // check_hash_func；文本核心 arm 留在下方 match。
+    if matches!(name, "regex_match" | "cidr_match" | "contains" | "startswith" | "endswith" | "startswith_any" | "endswith_any") {
+        check_pattern_func(ctx, name, args, errors);
+        return;
+    }
+    if matches!(name, "md5" | "sha1" | "sha256" | "hex" | "sha1_n" | "stable_id") {
+        check_hash_func(ctx, name, args, errors);
+        return;
+    }
     match name {
-        "regex_match" => {
-            if args.len() != 2 {
-                errors.push(rule_error(rule_name, "regex_match() requires exactly 2 arguments: (field, pattern)".to_string()));
-            } else {
-                // First argument should be Chars
-                if let Some(t) = infer_type(&args[0], scope)
-                    && !compatible(&t, &ValType::Base(BaseType::Chars))
-                {
-                    errors.push(rule_error(rule_name, format!("regex_match() first argument must be chars, got {:?}", t)));
-                }
-                // Second argument should be a string literal (compile-time regex check)
-                match &args[1] {
-                    Expr::StringLit(pat) => {
-                        if regex_syntax::Parser::new().parse(pat).is_err() {
-                            errors.push(rule_error(rule_name, format!("regex_match() pattern \"{}\" is not valid regex", pat)));
-                        }
-                    }
-                    _ => {
-                        errors.push(rule_error(rule_name,  "regex_match() second argument must be a string literal pattern".to_string()));
-                    }
-                }
-            }
-        }
-        "cidr_match" => {
-            if args.len() != 2 {
-                errors.push(rule_error(rule_name, "cidr_match() requires exactly 2 arguments: (ip, subnet)".to_string()));
-            } else {
-                // First argument: IP 字段（Ip）或字符串（Chars）都可。
-                if let Some(t) = infer_type(&args[0], scope)
-                    && !compatible(&t, &ValType::Base(BaseType::Chars))
-                    && !matches!(t, ValType::Base(BaseType::Ip))
-                {
-                    errors.push(rule_error(rule_name, format!("cidr_match() first argument must be an IP or string field, got {:?}", t)));
-                }
-                // Second argument: 字符串字面量，编译期校验 CIDR 合法性。
-                match &args[1] {
-                    Expr::StringLit(cidr) => {
-                        if crate::cidr::Cidr::parse(cidr).is_none() {
-                            errors.push(rule_error(rule_name, format!("cidr_match() subnet \"{}\" is not a valid CIDR (expect addr/prefix)", cidr)));
-                        }
-                    }
-                    _ => {
-                        errors.push(rule_error(rule_name, "cidr_match() second argument must be a string literal CIDR".to_string()));
-                    }
-                }
-            }
-        }
         "count_char" => {
             // count_char(text, ch)：统计 ch 在 text 中的出现次数（Flink q14 UDF 同款）。
             if args.len() != 2 {
@@ -487,94 +451,6 @@ fn check_str_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors:
                         && !compatible(&t, &ValType::Base(BaseType::Chars))
                     {
                         errors.push(rule_error(rule_name, format!("count_char() argument {} must be chars, got {:?}", i + 1, t)));
-                    }
-                }
-            }
-        }
-        "contains" => {
-            if args.len() != 2 {
-                errors.push(rule_error(rule_name, "contains() requires exactly 2 arguments: (haystack, needle)".to_string()));
-            } else {
-                for (i, arg) in args.iter().enumerate() {
-                    if let Some(t) = infer_type(arg, scope)
-                        && !compatible(&t, &ValType::Base(BaseType::Chars))
-                    {
-                        errors.push(rule_error(rule_name, format!("contains() argument {} must be chars, got {:?}", i + 1, t)));
-                    }
-                }
-            }
-        }
-        "startswith" | "endswith" => {
-            if args.len() != 2 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 2 arguments: (text, prefix_or_suffix)", name)));
-            } else {
-                for (i, arg) in args.iter().enumerate() {
-                    if let Some(t) = infer_type(arg, scope)
-                        && !compatible(&t, &ValType::Base(BaseType::Chars))
-                    {
-                        errors.push(rule_error(rule_name, format!("{}() argument {} must be chars, got {:?}", name, i + 1, t)));
-                    }
-                }
-            }
-        }
-        "startswith_any" | "endswith_any" => {
-            if args.len() < 2 {
-                errors.push(rule_error(rule_name, format!("{}() requires at least 2 arguments: (text, prefix_or_suffix, ...)", name)));
-            } else {
-                for (i, arg) in args.iter().enumerate() {
-                    if let Some(t) = infer_type(arg, scope)
-                        && !compatible(&t, &ValType::Base(BaseType::Chars))
-                    {
-                        errors.push(rule_error(rule_name, format!("{}() argument {} must be chars, got {:?}", name, i + 1, t)));
-                    }
-                }
-            }
-        }
-        "md5" | "sha1" | "sha256" | "hex" => {
-            if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument", name)));
-            } else if let Some(t) = infer_type(&args[0], scope)
-                && !compatible(&t, &ValType::Base(BaseType::Chars))
-            {
-                errors.push(rule_error(rule_name, format!("{}() argument must be chars, got {:?}", name, t)));
-            }
-        }
-        "sha1_n" => {
-            if args.len() != 2 {
-                errors.push(rule_error(rule_name, "sha1_n() requires exactly 2 arguments: (text, length)".to_string()));
-            } else {
-                if let Some(t) = infer_type(&args[0], scope)
-                    && !compatible(&t, &ValType::Base(BaseType::Chars))
-                {
-                    errors.push(rule_error(rule_name, format!("sha1_n() first argument must be chars, got {:?}", t)));
-                }
-                if let Some(t) = infer_type(&args[1], scope)
-                    && !is_numeric(&t)
-                {
-                    errors.push(rule_error(rule_name, format!("sha1_n() second argument must be numeric, got {:?}", t)));
-                }
-                match &args[1] {
-                    Expr::Number(n)
-                        if n.is_finite() && n.fract() == 0.0 && *n >= 1.0 && *n <= 40.0 => {}
-                    Expr::Number(_) => errors.push(rule_error(rule_name, "sha1_n() length must be an integer from 1 to 40".to_string())),
-                    _ => {}
-                }
-            }
-        }
-        "stable_id" => {
-            if args.len() < 2 {
-                errors.push(rule_error(rule_name, "stable_id() requires at least 2 arguments: (prefix, value, ...)".to_string()));
-            } else {
-                if let Some(t) = infer_type(&args[0], scope)
-                    && !compatible(&t, &ValType::Base(BaseType::Chars))
-                {
-                    errors.push(rule_error(rule_name, format!("stable_id() prefix must be chars, got {:?}", t)));
-                }
-                for (i, arg) in args.iter().enumerate().skip(1) {
-                    if let Some(t) = infer_type(arg, scope)
-                        && !is_scalar_stringable_type(&t)
-                    {
-                        errors.push(rule_error(rule_name, format!("stable_id() argument {} must be scalar, got {:?}", i + 1, t)));
                     }
                 }
             }
@@ -713,6 +589,159 @@ fn check_str_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors:
             }
         }
         // L3 Collection functions (M28.2)
+        _ => {}
+    }
+}
+
+/// pattern 类内建函数检查（2026-09-03 自 check_str_func 拆出；arm 原样搬移）。
+fn check_pattern_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+    let scope = ctx.scope;
+    let rule_name = ctx.rule_name;
+    match name {
+        "regex_match" => {
+            if args.len() != 2 {
+                errors.push(rule_error(rule_name, "regex_match() requires exactly 2 arguments: (field, pattern)".to_string()));
+            } else {
+                // First argument should be Chars
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                {
+                    errors.push(rule_error(rule_name, format!("regex_match() first argument must be chars, got {:?}", t)));
+                }
+                // Second argument should be a string literal (compile-time regex check)
+                match &args[1] {
+                    Expr::StringLit(pat) => {
+                        if regex_syntax::Parser::new().parse(pat).is_err() {
+                            errors.push(rule_error(rule_name, format!("regex_match() pattern \"{}\" is not valid regex", pat)));
+                        }
+                    }
+                    _ => {
+                        errors.push(rule_error(rule_name,  "regex_match() second argument must be a string literal pattern".to_string()));
+                    }
+                }
+            }
+        }
+        "cidr_match" => {
+            if args.len() != 2 {
+                errors.push(rule_error(rule_name, "cidr_match() requires exactly 2 arguments: (ip, subnet)".to_string()));
+            } else {
+                // First argument: IP 字段（Ip）或字符串（Chars）都可。
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    && !matches!(t, ValType::Base(BaseType::Ip))
+                {
+                    errors.push(rule_error(rule_name, format!("cidr_match() first argument must be an IP or string field, got {:?}", t)));
+                }
+                // Second argument: 字符串字面量，编译期校验 CIDR 合法性。
+                match &args[1] {
+                    Expr::StringLit(cidr) => {
+                        if crate::cidr::Cidr::parse(cidr).is_none() {
+                            errors.push(rule_error(rule_name, format!("cidr_match() subnet \"{}\" is not a valid CIDR (expect addr/prefix)", cidr)));
+                        }
+                    }
+                    _ => {
+                        errors.push(rule_error(rule_name, "cidr_match() second argument must be a string literal CIDR".to_string()));
+                    }
+                }
+            }
+        }
+        "contains" => {
+            if args.len() != 2 {
+                errors.push(rule_error(rule_name, "contains() requires exactly 2 arguments: (haystack, needle)".to_string()));
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        errors.push(rule_error(rule_name, format!("contains() argument {} must be chars, got {:?}", i + 1, t)));
+                    }
+                }
+            }
+        }
+        "startswith" | "endswith" => {
+            if args.len() != 2 {
+                errors.push(rule_error(rule_name, format!("{}() requires exactly 2 arguments: (text, prefix_or_suffix)", name)));
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        errors.push(rule_error(rule_name, format!("{}() argument {} must be chars, got {:?}", name, i + 1, t)));
+                    }
+                }
+            }
+        }
+        "startswith_any" | "endswith_any" => {
+            if args.len() < 2 {
+                errors.push(rule_error(rule_name, format!("{}() requires at least 2 arguments: (text, prefix_or_suffix, ...)", name)));
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        errors.push(rule_error(rule_name, format!("{}() argument {} must be chars, got {:?}", name, i + 1, t)));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// hash 类内建函数检查（2026-09-03 自 check_str_func 拆出；arm 原样搬移）。
+fn check_hash_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+    let scope = ctx.scope;
+    let rule_name = ctx.rule_name;
+    match name {
+        "md5" | "sha1" | "sha256" | "hex" => {
+            if args.len() != 1 {
+                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument", name)));
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !compatible(&t, &ValType::Base(BaseType::Chars))
+            {
+                errors.push(rule_error(rule_name, format!("{}() argument must be chars, got {:?}", name, t)));
+            }
+        }
+        "sha1_n" => {
+            if args.len() != 2 {
+                errors.push(rule_error(rule_name, "sha1_n() requires exactly 2 arguments: (text, length)".to_string()));
+            } else {
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                {
+                    errors.push(rule_error(rule_name, format!("sha1_n() first argument must be chars, got {:?}", t)));
+                }
+                if let Some(t) = infer_type(&args[1], scope)
+                    && !is_numeric(&t)
+                {
+                    errors.push(rule_error(rule_name, format!("sha1_n() second argument must be numeric, got {:?}", t)));
+                }
+                match &args[1] {
+                    Expr::Number(n)
+                        if n.is_finite() && n.fract() == 0.0 && *n >= 1.0 && *n <= 40.0 => {}
+                    Expr::Number(_) => errors.push(rule_error(rule_name, "sha1_n() length must be an integer from 1 to 40".to_string())),
+                    _ => {}
+                }
+            }
+        }
+        "stable_id" => {
+            if args.len() < 2 {
+                errors.push(rule_error(rule_name, "stable_id() requires at least 2 arguments: (prefix, value, ...)".to_string()));
+            } else {
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                {
+                    errors.push(rule_error(rule_name, format!("stable_id() prefix must be chars, got {:?}", t)));
+                }
+                for (i, arg) in args.iter().enumerate().skip(1) {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !is_scalar_stringable_type(&t)
+                    {
+                        errors.push(rule_error(rule_name, format!("stable_id() argument {} must be scalar, got {:?}", i + 1, t)));
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
