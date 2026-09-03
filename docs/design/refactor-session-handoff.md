@@ -1,11 +1,11 @@
-# 结构性重构：任务进展交接（2026-09-03 v3 快照 — H 拆分 + 行循环基准落地后）
+# 结构性重构：任务进展交接（2026-09-03 v4 快照 — §4.2 拆件推进后）
 
 > 本文件记录 wp-reactor/warp-fusion 结构性重构进行中状态，供新 session 直接续接。
 > 配套方案文档：`docs/design/p4-wf-cep-plan.md`；发布条目：`CHANGELOG.md [2.0.17]`。
 
-## 0. 仓库与分支状态（2026-09-03，H 拆分两笔已提交、未 push）
+## 0. 仓库与分支状态（2026-09-03，§4.2 拆件多笔已提交、未 push）
 
-- **wp-reactor @ main = `0011d4f`**，**领先 origin/main 3 笔未 push**：`e9d020a` docs 交接 v2 快照 · `b201c19` refactor: process_batch 行循环 H-1..H-5 拆分 · `0011d4f` test: row_loop 行循环 release 基准。origin/main 仍停 `af58c2c`（v2.0.17）。工作树干净。
+- **wp-reactor @ main = `f69784e`**，**领先 origin/main 9 笔未 push**（`e9d020a` … `f69784e`，见 §6）。origin/main 仍停 `af58c2c`（v2.0.17）。工作树干净（本文档提交后）。
 - **tags `v2.0.16` + `v2.0.17` 均已推 origin**。工作树干净（moju 产物已提交）。
 - **warp-fusion @ alpha**：仍为**本地 path 依赖**（`@gxl:block(local_reactor)`，git tag 块注释停 v2.0.15）；工作树 `M Cargo.toml` + `M Cargo.lock` **未提交**（会破坏他人构建）。**下一步：切 `tag = "v2.0.17"` 并定本地块去留**（需用户决策）。
 - wf-skills 已同步。
@@ -39,14 +39,22 @@
 - `a491018` 目录化；`f218947` 拆 accum.rs/state.rs（含混合 doc 归属重组、`super::eval::` 相对路径改绝对）；`f942040` 拆 exec.rs/eval.rs 收口；`17377f7` StatsBucket root re-export 降 pub(crate) 对齐 unreachable_pub。
 - 终态：mod.rs 35 行（re-export 面），masks 137 / accum 388 / state 1182 / exec 1376 / eval 1136；executor/mod.rs 转发与测试深路径**零改动**。
 
+## 3.5 已完成：§4.2 拆件候选推进（大测试外移 + 文件拆组 + 样板收口/切片）
+
+- `perf_diag.rs` 1938 → 744（`4536c3f`，tests ~1190 外移 `perf_diag_tests.rs`，#[path] cfg(test) 子模块先例）。
+- `lifecycle/spawn.rs` 2007 → 1554（`66e3fe4`，receiver/source 组 475 行 → `spawn_receiver.rs`：spawn_receiver_task 提 `pub(crate)` + spawn.rs `pub(super) use` 保接口；仅测试消费 helper 用 `#[allow(unused_imports)] use` 组合）。
+- `lifecycle/compile.rs` 1876 → 795（`8b91c0e` tests 外移 `compile_tests.rs` + `d663f9c` 诊断/源码定位组 408 行 → `compile_diag.rs`，27 fn `pub(super)` + 顶层 allow-use）。
+- `checker/types/check_funcs.rs` 1966 → 1124：`f69784e` 样板收口（145 处统一 `errors.push(CheckError{…})` → `rule_error(rule_name, message)`，−920）；`052c285` 分类切片（`check_func_call` 815 → 58 行 else-if 分派 + agg 130 / numeric 81 / time 86 / str 290 / mv 125 / misc 112，56 arm 原样搬移）。
+- 门禁：每笔 wf-lang 1051 / wf-runtime 606 + clippy all-targets + clippy2（-W unreachable_pub）0。
+
 ## 4. 待办积压（按优先级）
 
 1. **#1 H 尾 — machine 行内 emit 相位（~90 行）**：close/match emit 块仍内联在 `process_batch_machine_rows`（含 `&self` async `stage_or_emit_record` + `lookup`）。拆法 A = 每行 &mut self 方法 → 逐行 async future（热点不取）；拆法 B = 按 ALERT_BATCH_SIZE 批外收口 emit 节奏（需改 emit 时序 + 对拍）。当前评估：维持现状，勿为拆而拆。
-2. **可选拆件候选**（沿用 stats_exec 流程，但先与 P4 立项对表避免拆了又搬）：`match_engine/columnar.rs` 3684L、`executor/each_exec.rs` 3200L、`lifecycle/spawn.rs` 2007L、`lifecycle/compile.rs` 1876L、`perf_diag.rs` 1938L、`checker/types/check_funcs.rs` 1965L。
+2. **可选拆件候选**（剩余）：`match_engine/columnar.rs` 3684L、`executor/each_exec.rs` 3200L（以上与 P4 片4-6 重叠，先立项对表）；`lifecycle/spawn.rs` 1554L（metrics 组 1745+ 约 70 行可再拆）；`check_funcs.rs` 1124L（str helper 290 行可再按 hash/mv 分；分类切片待提交）。
 3. **P4 片4-6**（cep/event_bridge/key/eval 同步执行核下沉 wf-cep）：搁置；前置 = 「列式行表示抽象化」设计立项（孤儿规则 + TriggerEvent 持 Arc<RecordBatch> 不可约层）。
 4. **warp-fusion 收尾**：切 `tag = "v2.0.17"` + 本地 path 块去留 + 重锁后 `cargo test --workspace` 复验。
 5. **fmt 存量漂移清理**（另会话）：固定 rustfmt 版本或一次性全仓格式化单独立提交，避免与 CI 打架。
-6. **push wp-reactor**：main 领先 origin 3 笔（e9d020a/b201c19/0011d4f）。
+6. **push wp-reactor**：main 领先 origin 10 笔（e9d020a…052c285）。
 
 ## 5. 关键坑（再会话必读，含本会话新增）
 
@@ -72,6 +80,12 @@
 20. **性能对拍方法论**：顺序 A/B 有温升/调度伪差（本会话曾误报 3–12%「变快」，交替后归零）——必须**交替跑取中位**；`-p wf-runtime` 全套 debug 与 release 同为 ~30s = 固定 sleep 主导、无计算敏感性；行循环基准须「无 sleep + 直驱 process_batch」。
 21. **大块搬移脚本切片坑**：锚点匹配用 `.strip()`（`rstrip` 漏前导空格）；`startswith("12 空格")` 会误中 16 空格行；for 块 `[start:end-1]` 切片会把 for-close 之后的行吞进新 fn（H-4 案例：profile 尾行进函数体、括号失衡）——搬完先对目标 fn 做括号平衡校验再编译；fn 尾是循环时要补返回值。
 22. **r4 测试 harness 已 `pub(super)`**（`Spec`/`make_task`/`machine_rule`/`make_window`/`run_with_dispatch` 等）——行循环/机器路径新测试直接 `use super::rule_task_r4::{...}`，勿重复造 RuleTaskConfig/窗口基建。
+23. **re-export 到父层的可见级**：子模块 fn 以 `pub(super)`（=父）re-export 到父的 `pub(super)`（=祖）会 E0364——源需 `pub(crate)`（spawn_receiver_task 先例）。
+24. **`#[path]` sibling 文件模块（不目录化）**：文件模块内 `#[path="x.rs"] mod x;` 指向同目录 sibling（相对当前文件目录）；可见性组合——生产消费的项 `pub(super) use`、仅测试消费的项 `#[allow(unused_imports)] use`（StatsBucket 先例）；**私有 use 绑定可被子模块 `use super::*` glob 导入**（spawn_coverage/compile_tests 靠此不写 use 列表）；lib 构建的 allow 不误伤。
+25. **`private_interfaces`**：`pub(super)` fn 返回/使用 private struct → 报错；struct 与字段需同步提 `pub(super)`（compile_diag 的 YieldPresetDeclLocation 案例）。
+26. **同文件多刀分笔提交 + detached HEAD 陷阱**：`git add -p` 按 hunk 分离同文件两刀为两笔（compile.rs tests 外移 vs diag 拆出案例）；**中间态提交后必须 checkout 验证可编译；但 `git checkout <hash>` 会 detached HEAD——验证完要 `git checkout main`（或 `git branch -f main` + 切回），否则后续提交落在游离头**（f69784e 事故：main 停 d663f9c，detached 上多一笔后 ff-only 修复）。
+27. **check_funcs 样板收口/切片方法**：① 先统计 severity/rule/test 变体确认样板 100% 统一再抽 helper（145 push 全 Error/Some(rule_name)/None）；② match 按类别切片时 **arm 正则须支持 guard arm**（`"now" | … if cond =>`），否则 guard arm 被并入前一 arm 段、随错误类别搬走静默丢检查（now 无参检查丢失→2 测试挂）；③ 原 match 尾 `_ => {}` catch-all 会并入最后 arm 段——生成 catch-all 前先查重；④ 入口残留已搬变量的解构要删；⑤ dispatch 用 else-if 链避免 needless_return；⑥ 收口/切片的 message 内容零改动靠 checker 大量消息断言测试兜底。
+28. wf-lang 单 crate 测试 ~0.02s（1051），样板/切片刀可全量快速验证；改动被下游消费时复验 `-p wf-runtime --lib`（606）。
 
 ## 6. 自 v2.0.16 起提交清单
 
@@ -79,4 +93,7 @@ v2.0.17 内容（15 笔 + release）：
 
 `d66b2f2` 导航文档 · `515ea83` fanout 目录化 · `2fca9ed` rule_task 目录化 · `b9a1338` debug.rs · `e7af387` stager.rs · `56da04c` S3-1 columnar_each · `b3e3811` S3-2 build_deferred_rows · `a491018` stats_exec 目录化 · `f218947` accum/state · `f942040` exec/eval · `17377f7` StatsBucket 门禁 · `f135a67` handoff 快照 · `a189431` moju 产物 · `0a7ba41` S3-3 builder_for · `98dd085` S3-4 诊断块 · `af58c2c` chore: release v2.0.17（tag）
 
-v2.0.17 后（3 笔，**未 push**）：`e9d020a` docs: handoff v2 快照 · `b201c19` refactor: process_batch 行循环 H-1..H-5 · `0011d4f` test: row_loop 行循环基准
+v2.0.17 后（9 笔，**未 push**）：
+`e9d020a` docs: handoff v2 快照 · `b201c19` refactor: process_batch 行循环 H-1..H-5 · `0011d4f` test: row_loop 行循环基准 · `715ba85` docs: handoff v3 快照 · `4536c3f` test: perf_diag tests 外移 · `66e3fe4` refactor: spawn receiver 拆出 · `8b91c0e` test: compile tests 外移 · `d663f9c` refactor: compile diag 拆出 · `f69784e` refactor: check_funcs 样板收口
+
+`052c285` refactor: check_func_call 按类别切片 6 helper
