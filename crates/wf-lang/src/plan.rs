@@ -120,7 +120,13 @@ pub struct BindPlan {
 // ---------------------------------------------------------------------------
 
 /// The match plan: keys, window spec, event steps, close steps, key mapping, and close mode.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+///
+/// 构造约定（2026-09 P3）：本类型已实现 `Default`（空计划占位）。**新增字段时**
+/// 给**空安全默认类型**（Vec/Option/bool/…），既有构造点（引擎测试 / wfgen
+/// datagen/oracle，两仓库 60+ 字面量）即可免于逐点改——需要全字段字面量的地方
+/// 在加字段当次按需更新即可。注意：clippy `needless_struct_update` 禁止
+/// 「全字段字面量 + `..Default::default()`」写法，勿用该模式规避。
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Default)]
 #[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct MatchPlan {
     pub keys: Vec<FieldRef>,
@@ -274,6 +280,14 @@ pub enum WindowSpec {
     /// (size % slide == 0). Each event belongs to `size/slide` overlapping
     /// windows aligned to epoch slide boundaries.
     Hop { size: Duration, slide: Duration },
+}
+
+// 构造占位默认（Duration::ZERO 无窗口语义）：仅供测试/扩展用 Default；
+// 真实运行必须显式给 window_spec。tuple variant 无法用 #[default]，手写。
+impl Default for WindowSpec {
+    fn default() -> Self {
+        WindowSpec::Sliding(Duration::ZERO)
+    }
 }
 
 /// One match step containing one or more OR branches.

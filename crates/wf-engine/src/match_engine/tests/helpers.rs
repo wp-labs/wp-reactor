@@ -36,6 +36,7 @@ pub fn simple_key(name: &str) -> FieldRef {
     FieldRef::Simple(name.to_string())
 }
 
+#[allow(clippy::needless_update)] // P3 定点加固：全字段字面量 + Default spread，防新增字段逐点改
 pub fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
     MatchPlan {
         keys,
@@ -54,6 +55,8 @@ pub fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
         accu: false,
         needs_field_history: false,
         trigger_event_needed: false,
+
+        ..Default::default()
     }
 }
 
@@ -81,6 +84,7 @@ pub fn step(branches: Vec<BranchPlan>) -> StepPlan {
     StepPlan { branches }
 }
 
+#[allow(clippy::needless_update)] // P3 定点加固：全字段字面量 + Default spread，防新增字段逐点改
 pub fn plan_with_close(
     keys: Vec<FieldRef>,
     event_steps: Vec<StepPlan>,
@@ -104,9 +108,12 @@ pub fn plan_with_close(
         accu: false,
         needs_field_history: false,
         trigger_event_needed: false,
+
+        ..Default::default()
     }
 }
 
+#[allow(clippy::needless_update)] // P3 定点加固：全字段字面量 + Default spread，防新增字段逐点改
 pub fn fixed_plan(keys: Vec<FieldRef>, dur: Duration, steps: Vec<StepPlan>) -> MatchPlan {
     MatchPlan {
         keys,
@@ -125,9 +132,12 @@ pub fn fixed_plan(keys: Vec<FieldRef>, dur: Duration, steps: Vec<StepPlan>) -> M
         accu: false,
         needs_field_history: false,
         trigger_event_needed: false,
+
+        ..Default::default()
     }
 }
 
+#[allow(clippy::needless_update)] // P3 定点加固：全字段字面量 + Default spread，防新增字段逐点改
 pub fn hop_plan(
     keys: Vec<FieldRef>,
     size: Duration,
@@ -151,9 +161,12 @@ pub fn hop_plan(
         accu: false,
         needs_field_history: false,
         trigger_event_needed: false,
+
+        ..Default::default()
     }
 }
 
+#[allow(clippy::needless_update)] // P3 定点加固：全字段字面量 + Default spread，防新增字段逐点改
 pub fn fixed_plan_with_close(
     keys: Vec<FieldRef>,
     dur: Duration,
@@ -177,6 +190,8 @@ pub fn fixed_plan_with_close(
         accu: false,
         needs_field_history: false,
         trigger_event_needed: false,
+
+        ..Default::default()
     }
 }
 

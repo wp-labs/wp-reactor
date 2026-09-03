@@ -22,10 +22,11 @@ pub enum WindowMode {
 }
 
 /// Close block mode: OR (independent paths) or AND (both required).
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
 pub enum CloseMode {
     /// `on close { ... }` — event path and close path fire independently.
+    #[default]
     Or,
     /// `and close { ... }` — both event and close paths must satisfy.
     And,
@@ -40,10 +41,11 @@ pub struct CloseBlock {
 }
 
 /// Ordering mode of an `on event` block.
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
 pub enum MatchMode {
     /// Ordered (default): step i+1 evaluates only after step i completes.
+    #[default]
     Seq,
     /// Unordered co-occurrence: all steps must be satisfied, order irrelevant.
     Any,
