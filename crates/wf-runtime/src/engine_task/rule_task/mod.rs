@@ -199,6 +199,28 @@ struct PendingAlertColumns {
     count: usize,
 }
 
+impl PendingAlertColumns {
+    /// 目标列 builder get-or-create（emit 路径 8 处同构，集中实现）：
+    /// targets 少，线性扫；未命中尾插新建。返回借自 `self`（不借 target）。
+    fn builder_for(&mut self, target: &Arc<str>) -> &mut AlertColumnBuilder {
+        let idx = self
+            .by_target
+            .iter()
+            .position(|(existing, _)| existing == target);
+        let idx = match idx {
+            Some(idx) => idx,
+            None => {
+                self.by_target.push((
+                    std::sync::Arc::clone(target),
+                    AlertColumnBuilder::new(std::sync::Arc::clone(target)),
+                ));
+                self.by_target.len() - 1
+            }
+        };
+        &mut self.by_target[idx].1
+    }
+}
+
 /// P3：deferred join（`emit at`）运行时状态——挂起队列 + 事件时间 watermark。
 ///
 /// 驱动事件到达时挂起（expiry = `emit at` 求值），watermark ≥ expiry 时到期评估
@@ -2031,22 +2053,7 @@ impl RuleTask {
                 match_rows.iter().collect();
             let (outcome, should_flush) = {
                 let mut pending = self.pending_alerts.lock().unwrap();
-                let target = self.executor.static_yield_target();
-                let slot = pending
-                    .by_target
-                    .iter_mut()
-                    .find(|(existing, _)| *existing == *target);
-                let builder = match slot {
-                    Some((_, builder)) => builder,
-                    None => {
-                        pending.by_target.push((
-                            std::sync::Arc::clone(target),
-                            AlertColumnBuilder::new(std::sync::Arc::clone(target)),
-                        ));
-                        let last = pending.by_target.len() - 1;
-                        &mut pending.by_target[last].1
-                    }
-                };
+                let builder = pending.builder_for(self.executor.static_yield_target());
                 let mut appended_idx = Vec::new();
                 let outcome = self.executor.execute_match_direct_batch_columnar(
                     &row_refs,
@@ -2077,22 +2084,7 @@ impl RuleTask {
             let _close_exec_start = rule_profiling();
             let (outcome, should_flush) = {
                 let mut pending = self.pending_alerts.lock().unwrap();
-                let target = self.executor.static_yield_target();
-                let slot = pending
-                    .by_target
-                    .iter_mut()
-                    .find(|(existing, _)| *existing == *target);
-                let builder = match slot {
-                    Some((_, builder)) => builder,
-                    None => {
-                        pending.by_target.push((
-                            std::sync::Arc::clone(target),
-                            AlertColumnBuilder::new(std::sync::Arc::clone(target)),
-                        ));
-                        let last = pending.by_target.len() - 1;
-                        &mut pending.by_target[last].1
-                    }
-                };
+                let builder = pending.builder_for(self.executor.static_yield_target());
                 let outcome = self.executor.execute_close_direct_batch_columnar(
                     &columnar_closes,
                     builder,
@@ -3234,23 +3226,7 @@ impl RuleTask {
         let _append_start = time_this.then(Instant::now);
         let (append_result, should_flush) = {
             let mut pending = self.pending_alerts.lock().unwrap();
-            // Linear target lookup (targets are few); avoids hashing the
-            // target string for every appended record.
-            let slot = pending
-                .by_target
-                .iter_mut()
-                .find(|(target, _)| *target == record.yield_target);
-            let builder = match slot {
-                Some((_, builder)) => builder,
-                None => {
-                    pending.by_target.push((
-                        std::sync::Arc::clone(&record.yield_target),
-                        AlertColumnBuilder::new(std::sync::Arc::clone(&record.yield_target)),
-                    ));
-                    let last = pending.by_target.len() - 1;
-                    &mut pending.by_target[last].1
-                }
-            };
+            let builder = pending.builder_for(&record.yield_target);
             let result = builder.append_record(&record);
             if result.is_ok() {
                 pending.count += 1;
@@ -3358,22 +3334,7 @@ impl RuleTask {
         let _append_start = time_this.then(Instant::now);
         let should_flush = {
             let mut pending = self.pending_alerts.lock().unwrap();
-            let target = &sink_records[0].yield_target;
-            let slot = pending
-                .by_target
-                .iter_mut()
-                .find(|(existing, _)| *existing == *target);
-            let builder = match slot {
-                Some((_, builder)) => builder,
-                None => {
-                    pending.by_target.push((
-                        std::sync::Arc::clone(target),
-                        AlertColumnBuilder::new(std::sync::Arc::clone(target)),
-                    ));
-                    let last = pending.by_target.len() - 1;
-                    &mut pending.by_target[last].1
-                }
-            };
+            let builder = pending.builder_for(&sink_records[0].yield_target);
             let mut failed = 0usize;
             for record in &sink_records {
                 if builder.append_record(record).is_err() {
@@ -3460,24 +3421,7 @@ impl RuleTask {
         let _append_start = time_this.then(Instant::now);
         let (result, should_flush) = {
             let mut pending = self.pending_alerts.lock().unwrap();
-            // Linear target lookup via the plan-constant Arc (targets are
-            // few); first append creates the builder.
-            let target = self.executor.static_yield_target();
-            let slot = pending
-                .by_target
-                .iter_mut()
-                .find(|(existing, _)| **existing == **target);
-            let builder = match slot {
-                Some((_, builder)) => builder,
-                None => {
-                    pending.by_target.push((
-                        std::sync::Arc::clone(target),
-                        AlertColumnBuilder::new(std::sync::Arc::clone(target)),
-                    ));
-                    let last = pending.by_target.len() - 1;
-                    &mut pending.by_target[last].1
-                }
-            };
+            let builder = pending.builder_for(self.executor.static_yield_target());
             let result = self.executor.execute_each_direct(
                 event,
                 event_nanos,
@@ -3575,24 +3519,7 @@ impl RuleTask {
             let _append_start = time_this.then(Instant::now);
             let (outcome, should_flush) = {
                 let mut pending = self.pending_alerts.lock().unwrap();
-                // Linear target lookup via the plan-constant Arc — same as
-                // the per-event path.
-                let target = self.executor.static_yield_target();
-                let slot = pending
-                    .by_target
-                    .iter_mut()
-                    .find(|(existing, _)| **existing == **target);
-                let builder = match slot {
-                    Some((_, builder)) => builder,
-                    None => {
-                        pending.by_target.push((
-                            std::sync::Arc::clone(target),
-                            AlertColumnBuilder::new(std::sync::Arc::clone(target)),
-                        ));
-                        let last = pending.by_target.len() - 1;
-                        &mut pending.by_target[last].1
-                    }
-                };
+                let builder = pending.builder_for(self.executor.static_yield_target());
                 let outcome = self.executor.execute_each_direct_batch(
                     segment,
                     lookup,
@@ -3690,22 +3617,7 @@ impl RuleTask {
             let _append_start = time_this.then(Instant::now);
             let (outcome, should_flush) = {
                 let mut pending = self.pending_alerts.lock().unwrap();
-                let target = self.executor.static_yield_target();
-                let slot = pending
-                    .by_target
-                    .iter_mut()
-                    .find(|(existing, _)| **existing == **target);
-                let builder = match slot {
-                    Some((_, builder)) => builder,
-                    None => {
-                        pending.by_target.push((
-                            std::sync::Arc::clone(target),
-                            AlertColumnBuilder::new(std::sync::Arc::clone(target)),
-                        ));
-                        let last = pending.by_target.len() - 1;
-                        &mut pending.by_target[last].1
-                    }
-                };
+                let builder = pending.builder_for(self.executor.static_yield_target());
                 let outcome = self.executor.execute_each_direct_batch_columnar_with(
                     segment,
                     batch_emit_nanos,
@@ -3796,22 +3708,7 @@ impl RuleTask {
             let _append_start = time_this.then(Instant::now);
             let (outcome, should_flush) = {
                 let mut pending = self.pending_alerts.lock().unwrap();
-                let target = self.executor.static_yield_target();
-                let slot = pending
-                    .by_target
-                    .iter_mut()
-                    .find(|(existing, _)| **existing == **target);
-                let builder = match slot {
-                    Some((_, builder)) => builder,
-                    None => {
-                        pending.by_target.push((
-                            std::sync::Arc::clone(target),
-                            AlertColumnBuilder::new(std::sync::Arc::clone(target)),
-                        ));
-                        let last = pending.by_target.len() - 1;
-                        &mut pending.by_target[last].1
-                    }
-                };
+                let builder = pending.builder_for(self.executor.static_yield_target());
                 let outcome = self.executor.execute_each_direct_batch_columnar_join(
                     segment,
                     lookup,
