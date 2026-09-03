@@ -113,7 +113,8 @@ impl FieldSource for Event {
 /// hashable (f64/recursive), so join lookups convert the key field to this
 /// concrete scalar form. Object/array values map to `None` (rejected at
 /// compile time — see checker join key constraint).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 pub enum JoinKey {
     Int(i64),
     Str(String),
@@ -231,7 +232,8 @@ pub struct StepData {
 }
 
 /// Snapshot of all events accepted by a bound alias within the current instance.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct BindData {
     pub alias: String,
     pub count: u64,
@@ -395,7 +397,8 @@ pub trait WindowLookup: Send + Sync {
 }
 
 /// Outcome of the asof-join O(1) fast path ([`WindowLookup::asof_lookup_max`]).
-#[derive(Clone)]
+#[derive(Clone, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 pub enum AsofLookup {
     /// Fast-path hit: the unique row whose timestamp is the maximum within
     /// `[event_time - within, event_time]`.
@@ -416,7 +419,8 @@ pub enum AsofLookup {
 
 /// Cumulative statistics tracker for `baseline()` function.
 /// Supports three methods: mean (standard deviation), ewma (exponential weighted), median.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub(crate) struct RollingStats {
     count: u64,
     sum: f64,

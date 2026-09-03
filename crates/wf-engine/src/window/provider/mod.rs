@@ -13,6 +13,8 @@ use crate::match_engine::{EngineHashMap, Event, JoinKey, JoinRow, Value};
 ///
 /// Data is loaded once (or on refresh) into a local HashMap. All lookups are
 /// in-memory. Per-event SQL queries are explicitly prohibited by design.
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct ProviderWindow {
     /// knowdb table name this window maps to.
     pub table: String,

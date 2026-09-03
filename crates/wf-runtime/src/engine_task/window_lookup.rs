@@ -20,6 +20,8 @@ use wf_engine::window::Router;
 /// visibility ceiling for the batch being processed (see
 /// `window-actor-pull-model.md` §3.5). `None` reads the full window (legacy
 /// behavior).
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.EngineTask")]
 pub(super) struct RegistryLookup<'a> {
     router: &'a Router,
     /// Visibility ceiling: only batches with `seq <= max_seq` are seen across

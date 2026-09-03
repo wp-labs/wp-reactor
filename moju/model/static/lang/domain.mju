@@ -51,12 +51,20 @@ struct WflFile {
   uses: List<UseDecl>
   patterns: List<PatternDecl>
   yield_presets: List<YieldPresetDecl>
+  lists: List<ListDecl>
   rules: List<RuleDecl>
   tests: List<TestBlock>
 }
 
 struct UseDecl {
   path: String
+}
+
+// `name = ("a", "b", ...)`——顶层命名字面列表声明（issue #73）：
+// 规则以 `expr in <name>` 引用，编译期展开为字面列表。
+struct ListDecl {
+  name: String
+  items: List<Expr>
 }
 
 struct RuleDecl {
@@ -251,7 +259,9 @@ state Expr {
   Object
   Array
   InList
+  ListRef
   IfThenElse
+  Match
 }
 
 state FieldRef {
@@ -305,6 +315,13 @@ state SystemVar {
 struct ObjectItem {
   targets: List<String>
   type_hint: String?
+  value: Expr
+}
+
+// 模式匹配分支（issue #79）：`pat1 | pat2 => value`——模式求值后与 subject
+// 按值比较，命中即返回对应 arm。
+struct MatchArm {
+  patterns: List<Expr>
   value: Expr
 }
 

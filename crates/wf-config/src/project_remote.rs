@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 ///   managed dirs.
 /// - **Dual-repo**: `models` and/or `infra` set — each group owns a subset
 ///   (`models` → `models/`; `infra` → `conf`,`topology`,`connectors`).
-#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize, Clone, ::moju_derive::MoJu)]
 #[serde(deny_unknown_fields)]
+#[moju(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
 pub struct ProjectRemoteConf {
     #[serde(default, alias = "enable")]
     pub enabled: bool,
@@ -33,8 +34,9 @@ pub struct ProjectRemoteConf {
 
 /// One remote group in dual-repo mode (`[project_remote.models]` /
 /// `[project_remote.infra]`).
-#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize, Clone, ::moju_derive::MoJu)]
 #[serde(deny_unknown_fields)]
+#[moju(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
 pub struct RepoGroupConf {
     #[serde(default)]
     pub repo: String,

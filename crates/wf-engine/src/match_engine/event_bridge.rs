@@ -400,6 +400,8 @@ pub fn build_field_index(batch: &RecordBatch) -> Arc<FieldIndex> {
 /// materialization entirely (design doc §3.5「`on each` 规则完全不物化」) and by
 /// the match state machine's columnar entry (P3 FieldView) so hit rows never
 /// build a HashMap.
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.ColumnarBatch")]
 pub struct ColumnarEvent<'a> {
     batch: &'a RecordBatch,
     row: usize,
@@ -624,7 +626,8 @@ impl FieldSource for ColumnarEvent<'_> {
 /// materialization — fields are read on demand) or a pre-materialized [`Event`]
 /// (provider / join-index rows). Lets the join executor evaluate conditions and
 /// enrich the eval context without materializing the whole referenced window.
-#[derive(Clone)]
+#[derive(Clone, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Engine", module = "Engine.ColumnarBatch")]
 pub enum JoinRow {
     Columnar {
         batch: Arc<RecordBatch>,

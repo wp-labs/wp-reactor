@@ -20,7 +20,8 @@ pub(crate) use schema::{maybe_resolve_stream_schema, resolve_stream_schema};
 
 pub const DEFAULT_STREAM_TAG_FIELD: &str = "wp_oml_name";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.Receiver")]
 pub struct ReplayRoute<'a> {
     pub stream_name: &'a str,
     pub stream_tag_field: &'a str,

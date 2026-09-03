@@ -17,6 +17,8 @@ use crate::lifecycle::compile::{
 };
 use crate::lifecycle::types::RunRule;
 
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.HotReload")]
 pub(super) struct CompiledReloadArtifacts {
     pub(super) run_rules: Vec<RunRule>,
     pub(super) intermediate_targets: HashSet<String>,

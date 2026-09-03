@@ -9,7 +9,8 @@ use wp_model_core::model::{DataRecord, DataType};
 use crate::alert::{AlertColumnBatch, WFU_PREFIX};
 use crate::error::{CoreReason, CoreResult};
 
-#[derive(Clone)]
+#[derive(Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.SinkDispatch")]
 pub struct WfMetaDisableMatcher {
     patterns: Vec<WildMatch>,
 }

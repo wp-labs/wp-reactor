@@ -306,7 +306,8 @@ fn perf_stages() -> Arc<Vec<PerfStage>> {
 // ---------------------------------------------------------------------------
 
 /// 一条哨兵测量记录（四元组齐备，EPS 直接可算）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.PerfDiagnostics")]
 pub struct SentinelRecord {
     /// wfgen 轮次（= 诊断档下标）。
     pub round: i64,
@@ -445,14 +446,16 @@ pub fn wall_nanos() -> i64 {
 // ---------------------------------------------------------------------------
 
 /// 规则子集热 reload 的基线（`runtime.rules` 变化时用现有 reload 通道）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.PerfDiagnostics")]
 struct ReloadBaseline {
     raw: RawFusionConfigTree,
     config: FusionConfig,
 }
 
 /// 一次切换的结果（供哨兵任务写 `stage{current}` 完成信号）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.PerfDiagnostics")]
 pub struct AppliedStage {
     /// 已生效诊断档下标（= 完成信号的 `current` 值）。
     pub index: usize,
@@ -465,6 +468,8 @@ pub struct AppliedStage {
 ///
 /// 同步语义：`on_sentinel` 返回时点 k+1 已生效（含 reload 完成）——wfgen 读到
 /// `sentinel{round=k}` 记录时点 k+1 已切换，无竞态。
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.PerfDiagnostics")]
 pub struct PerfDiagController {
     stages: Arc<Vec<PerfStage>>,
     current: AtomicUsize,
@@ -589,6 +594,8 @@ impl PerfDiagController {
 // ---------------------------------------------------------------------------
 
 /// 哨兵任务配置。
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.PerfDiagnostics")]
 pub(crate) struct SentinelTaskConfig {
     pub router: Arc<Router>,
     pub sink_fanout: Arc<SinkFanout>,

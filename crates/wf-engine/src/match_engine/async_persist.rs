@@ -45,7 +45,8 @@ fn watchdog_timeout() -> Duration {
 }
 
 /// 持久化提交错误。
-#[derive(Debug)]
+#[derive(Debug, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Engine", module = "Engine.SpillStore")]
 pub enum PersistError {
     /// 队列字节预算已满——调用方应退化为同步写（背压兜底）。
     Backpressure,
@@ -84,6 +85,8 @@ pub trait BatchWriter<T> {
 /// 目标恒由同一 worker 串行写（redb 单写者约束），不同目标并行写（总吞吐
 /// 不塌方）。对比：单 worker（无并行，小写量浪费并行度）与每目标一 worker
 /// （N 路并发写共享磁盘 → 单批延迟退化 3.6x 实测）。
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.SpillStore")]
 pub struct AsyncPersister<T, B> {
     txs: Vec<SyncSender<(Vec<T>, usize)>>,
     /// 队列字节预算（背压阈值；全局共享）。

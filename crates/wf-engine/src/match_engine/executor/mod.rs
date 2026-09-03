@@ -656,7 +656,7 @@ fn visit_output_expr(
 /// L2 rules with joins use `execute_match_with_joins` / `execute_close_with_joins`
 /// which accept a [`WindowLookup`] for resolving join data.
 #[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.RuleExecution")]
 pub struct RuleExecutor {
     plan: RulePlan,
     /// 列式 join 富化计划（each + 单 Snapshot join 的列式执行描述）；`None` =

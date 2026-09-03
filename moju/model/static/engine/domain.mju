@@ -283,7 +283,7 @@ struct WindowEvictCount {
 
 struct RuleFanout {
   table: String
-  window_sharding: String
+  window_sharding: Map<String,WindowShardPartition>
 }
 
 struct RulePush {
@@ -293,6 +293,21 @@ struct RulePush {
   materialize_fields: List<String>?
   seq: Int
   shard_rows: List<Int>?
+}
+
+// 每窗 fanout 分片键规格（issue #80 rule_shards）——keys + 逐位对齐的派生
+// 表达式槽。普通字段/嵌套路径 key 只填 keys；表达式派生 key（如 concat 的
+// let）在 key_exprs 位求值后哈希分片，同 key 事件必然落入同一 rule task，
+// 窗口跨事件聚合状态不被切碎。
+struct ShardKeySpec {
+  keys: List<String>
+  key_exprs: List<String>
+}
+
+// 一窗的 key 分区（键哈希分片或空键行号均匀切分）与片数。
+struct WindowShardPartition {
+  spec: ShardKeySpec
+  shard_count: Int
 }
 
 state Subscription {

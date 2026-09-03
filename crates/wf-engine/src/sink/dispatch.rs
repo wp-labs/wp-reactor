@@ -34,7 +34,8 @@ pub struct SinkDispatcher {
     all_sinks: Vec<Arc<SinkRuntime>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.SinkDispatch")]
 struct WildmatchMatcher {
     patterns: Vec<WildMatch>,
 }
@@ -62,7 +63,8 @@ impl std::fmt::Debug for WildmatchMatcher {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.SinkDispatch")]
 struct SinkRouteBinding {
     matcher: WildmatchMatcher,
     sinks: Vec<Arc<SinkRuntime>>,

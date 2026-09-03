@@ -79,7 +79,8 @@ fn canonical_f64_bits(value: f64) -> u64 {
 /// (including `Timestamp(Ns)`, read as `i64`), so a columnar `Int64` column and
 /// the row-based `Value::Number(f64)` (integer, `<2^53`) produce the **same**
 /// variant and hash equal.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 pub enum ScopeKey {
     #[default]
     Empty,

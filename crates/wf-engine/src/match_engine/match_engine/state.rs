@@ -78,7 +78,8 @@ impl BranchState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub(super) struct AliasState {
     pub(super) count: u64,
     /// Lazy, boxed — only aliases with tracked bind fields allocate.

@@ -20,11 +20,9 @@ use crate::vars::{ConfigVarContext, expand_value};
 use crate::window::{WindowConfig, WindowDefaults, WindowOverride};
 use toml::Value as TomlValue;
 
-#[derive(
-    ::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default,
-)]
+#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
-#[moju(kind = "state", domain = "Config", module = "Config.ConfigLoader")]
+#[moju(kind = "state", domain = "Config", module = "Config.FusionConfig")]
 pub enum FusionMode {
     #[default]
     Daemon,
@@ -35,7 +33,8 @@ pub enum FusionMode {
 // Raw TOML structure (intermediate representation)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Config", module = "Config.FusionConfig")]
 struct FusionConfigRaw {
     #[serde(default)]
     mode: FusionMode,
@@ -77,7 +76,7 @@ struct FusionConfigRaw {
 // ---------------------------------------------------------------------------
 
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq)]
-#[moju(kind = "struct", domain = "Config", module = "Config.ConfigLoader")]
+#[moju(kind = "struct", domain = "Config", module = "Config.FusionConfig")]
 pub struct FusionConfig {
     pub mode: FusionMode,
     pub runtime: RuntimeConfig,
@@ -309,7 +308,8 @@ impl FromStr for FusionConfig {
 }
 
 /// Minimal struct to deserialize a standalone windows.toml file.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Config", module = "Config.FusionConfig")]
 struct WindowFileRaw {
     window_defaults: WindowDefaults,
     #[serde(default)]

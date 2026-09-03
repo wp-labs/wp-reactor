@@ -33,9 +33,9 @@ module WindowEviction {
 
 module RuleFanout {
   layer DataFusion
-  owns RuleFanout, RulePush, Subscription
+  owns RuleFanout, RulePush, ShardKeySpec, WindowShardPartition, Subscription
 
-  responsible_for "Fan out window appends to subscribed rules with single, sharded, and round-robin delivery modes"
+  responsible_for "Fan out window appends to subscribed rules with single, key-sharded, and round-robin delivery modes; per-window key partition specs for rule_shards parallelism"
 }
 
 module MatchEngine {

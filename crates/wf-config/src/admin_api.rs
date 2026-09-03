@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 // Admin API config (mirrors warp-parse admin_api pattern)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize, Clone, ::moju_derive::MoJu)]
 #[serde(deny_unknown_fields)]
+#[moju(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
 pub struct AdminApiTlsConf {
     #[serde(default, alias = "enable")]
     pub enabled: bool,
@@ -15,8 +16,9 @@ pub struct AdminApiTlsConf {
     pub key_file: String,
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone, ::moju_derive::MoJu)]
 #[serde(deny_unknown_fields)]
+#[moju(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
 pub struct AdminApiAuthConf {
     #[serde(default = "default_admin_api_auth_mode")]
     pub mode: String,
@@ -41,8 +43,9 @@ fn default_admin_api_token_file() -> String {
     "${HOME}/.wfusion/admin_api.token".to_string()
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone, ::moju_derive::MoJu)]
 #[serde(deny_unknown_fields)]
+#[moju(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
 pub struct AdminApiConf {
     #[serde(default, alias = "enable")]
     pub enabled: bool,

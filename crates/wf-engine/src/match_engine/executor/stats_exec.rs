@@ -49,7 +49,8 @@ type MaskCacheMap =
 /// 批级时间信息缓存表: key = (首列 Arc 指针, 行数), value = (批 Arc, max_time)。
 type TimeCacheMap = std::collections::HashMap<(usize, usize), (Arc<RecordBatch>, i64)>;
 
-#[derive(Debug)]
+#[derive(Debug, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct StatsMaskCache {
     inner: std::sync::Mutex<MaskCacheMap>,
     time_inner: std::sync::Mutex<TimeCacheMap>,
@@ -157,7 +158,8 @@ impl StatsMaskCache {
 
 /// 数值累加器（count/sum/avg/min/max 度量共享）。avg 不作状态——输出时
 /// sum/count 求得（D6）。Box 化后每度量仅 8B 指针（2026-08-26 q18 紧凑化）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct NumericAccum {
     pub count: u64,
     pub sum: i128,
@@ -172,7 +174,8 @@ pub struct NumericAccum {
 /// 仅用于**全 Count/Sum/Avg/Min/Max** 计划（q17 形态）；含 distinct/last/top
 /// 的计划仍走 [`StatsAccum`]（[`StatsBucketAccs::Classic`]）。索引映射与同列分
 /// 组见 [`NumericSoALayout`]（executor 构造期预计算，热路径零计算）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct NumericSoA {
     /// 每度量 count（索引 = 度量 idx；含 where 过滤；avg 输出时 sum/count）。
     pub counts: Box<[u64]>,
@@ -185,7 +188,8 @@ pub struct NumericSoA {
 }
 
 /// 数值度量聚合类别（SoA 分派用——比 `StatsAggPlan` 全枚举窄的分支宽度）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
 pub enum NumericKind {
     Sum,
     Min,
@@ -196,7 +200,8 @@ pub enum NumericKind {
 /// sum+avg+min+max 4 度量共享 1 次 [`column_i128_at`]——旧路径每度量 1 次
 /// 重复读取同一列）。组内度量同一字段（plan 静态, 构造期分组）；列索引运行
 /// 期从 `measure_field_cols[entries[0].0]` 取一次（组内共享）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct SoAColGroup {
     /// 该字段的 (度量 idx, 聚合类别) 列表。
     pub entries: Box<[(usize, NumericKind)]>,
@@ -204,7 +209,8 @@ pub struct SoAColGroup {
 
 /// 纯数值计划的 SoA 布局（executor 构造期预计算一次）：每度量到紧凑数组的
 /// 槽映射 + 同字段分组。仅依赖 plan（无批依赖）——窗口重建后不变。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct NumericSoALayout {
     /// 度量数（= `counts.len()`）。
     pub n_measures: usize,
@@ -302,7 +308,8 @@ impl NumericSoALayout {
 ///
 /// 热路径经 [`StatsAccum::numeric_mut`] 等按调用点已分派的 `measure.agg` 取
 /// 对应变体（变体不符 = plan/构造不一致的内部错误，panic 尽早暴露）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
 pub enum StatsAccum {
     Numeric(Box<NumericAccum>),
     Distinct(Box<DistinctSet>),
@@ -407,7 +414,8 @@ impl StatsAccum {
 }
 
 /// top-N 条目: 排序键 + 行字段紧凑存储（yield 经 field_values 注入读 `b.*`）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct TopEntry {
     /// 排序键（数值; 与行式 `value_to_f64` 同口径）。
     pub key: f64,
@@ -418,7 +426,8 @@ pub struct TopEntry {
 
 /// Distinct key: 从列式原生值构造（i64/timestamp 域内哈希, D7）——
 /// 禁止 f64 化（ValueKey::from_value 的 >2^53 分歧）。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
 pub enum DistinctKey {
     Int(i64),
     /// 非整数数值（小数）—— 保持原 f64 位（canonical）。
@@ -429,7 +438,8 @@ pub enum DistinctKey {
 /// 行字段槽型（2026-08-26 q18/q19：stats last/top 行字段紧凑化）。
 /// 每字段一个槽位：数字→`numeric`（f64 8B）、字符串→`strings`（SmolStr 24B
 /// 内联）、其它→`others`（原 `Option<Value>` 万能盒回退）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
 pub enum RowFieldSlot {
     Numeric(usize),
     Str(usize),
@@ -438,7 +448,8 @@ pub enum RowFieldSlot {
 
 /// 字段类型分派表（executor 级，所有桶共享；列式从 batch schema 构建，
 /// 行式无静态类型时退化为全 Other——不紧凑但正确）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct RowFieldLayout {
     slots: Vec<RowFieldSlot>,
     n_numeric: usize,
@@ -531,7 +542,8 @@ impl RowFieldLayout {
 /// 数字 8B / 字符串 24B（内联）/ 其它回退。null 由 `null_mask` 位标记
 /// （numeric 的 NaN 与 strings 的空串都是合法数据，不能作哨兵）。
 /// 自包含 layout（Arc），下游（stats_task 注入）可独立读取。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct RowFields {
     layout: std::sync::Arc<RowFieldLayout>,
     numeric: Box<[f64]>,
@@ -673,7 +685,8 @@ impl RowFields {
 /// bidder/auction 主战场）走 `HashSet<i64>`（8B/项）——原 enum `DistinctKey`
 /// 因 `Box<str>` 变体占 16B/项；Float/Str 键保留 enum 集合。两集合语义互斥
 /// （insert 按类型路由），len/merge 各自合并。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct DistinctSet {
     ints: EngineHashSet<i64>,
     others: EngineHashSet<DistinctKey>,
@@ -780,12 +793,15 @@ impl DistinctKey {
 /// 惰性 spill store 创建规格（P0 修复 2026-08-27）：路径 + 行字段 layout。
 /// 纯数据（`PathBuf` + `Arc<RowFieldLayout>`，天然 Send + Sync）——首次驱逐时
 /// 才 `RedbSpillStore::create`（零驱逐窗口不建库/不起写 worker，零开销）。
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 struct SpillCreateSpec {
     path: std::path::PathBuf,
     layout: std::sync::Arc<RowFieldLayout>,
 }
 
-#[derive(Default)]
+#[derive(Default, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct StatsWindowState {
     pub buckets: EngineHashMap<u64, Vec<StatsBucket>>,
     pub window_start_nanos: i64,
@@ -1566,7 +1582,8 @@ fn account_bucket_allowed(
 /// 形态）; 含 distinct/last/top → [`Classic`](StatsBucketAccs::Classic)（原有
 /// [`StatsAccum`] 数组）。分派在累积/读取/合并入口各一次（每行, 非每度量）。
 /// spill 序列化以 [`StatsWindowState::accs_to_spill_vec`] 统一转 `Vec<StatsAccum>`。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
 pub enum StatsBucketAccs {
     Numeric(NumericSoA),
     Classic(Vec<StatsAccum>),
@@ -1574,7 +1591,8 @@ pub enum StatsBucketAccs {
 
 /// 单桶: 完整 [`ScopeKey`]（close 排序/输出; 每桶一次构建）+ 累加器载体 +
 /// 时钟二次机会计数。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct StatsBucket {
     pub scope_key: ScopeKey,
     pub accs: StatsBucketAccs,
@@ -1922,6 +1940,8 @@ impl StatsWindowState {
 }
 
 /// 执行器: 消费行/批次, 按 StatsPlan 归并, 窗口 close 时产出度量值。
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct StatsExecutor {
     pub plan: StatsPlan,
     /// 窗口状态（桶表; 空键规则仅 Empty 桶）。
@@ -3844,14 +3864,16 @@ fn measure_values(
 /// 每桶输出条目: 度量值 + 可选行字段紧凑存储（last/top 注入 yield 用; 标量 =
 /// None）。行字段为 Arc（与状态共享, close 零拷贝; 构造 alert 时才逐值构造）。
 /// 列序 = `StatsExecutor::row_field_names()`（None 子集 = schema 列序）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct StatsCloseEntry {
     pub measure_value: f64,
     pub row_fields: Option<std::sync::Arc<RowFields>>,
 }
 
 /// 每桶 close 输出: 每度量一个值列表（标量 = 1; top = N, 按 rank 序）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct StatsCloseBucket {
     pub key: ScopeKey,
     pub measures: Vec<Vec<StatsCloseEntry>>,

@@ -42,8 +42,9 @@ pub struct FieldAssign {
 }
 
 /// Statement inside an `expect { ... }` block.
-#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangTest")]
 pub enum ExpectStmt {
     /// `hits cmp_op INTEGER;`
     Hits { cmp: CmpOp, count: usize },
@@ -52,8 +53,9 @@ pub enum ExpectStmt {
 }
 
 /// Assertion on a specific hit output.
-#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangTest")]
 pub enum HitAssert {
     /// `score cmp_op NUMBER`
     Score { cmp: CmpOp, value: f64 },
@@ -72,8 +74,9 @@ pub enum HitAssert {
 }
 
 /// Options for a test block.
-#[derive(Debug, Clone, PartialEq, Default)]
 #[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Default, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangTest")]
 pub struct TestOptions {
     pub close_trigger: Option<CloseTrigger>,
     pub eval_mode: Option<EvalMode>,

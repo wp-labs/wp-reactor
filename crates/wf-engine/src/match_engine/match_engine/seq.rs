@@ -24,6 +24,8 @@ pub(super) struct NegCheck {
 }
 
 /// Chain semantics for one rule, precomputed from `MatchPlan.seq`.
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub(super) struct SeqRuntime {
     /// `within` per event-step index (aligned with `plan.event_steps`).
     pub(super) within: Vec<Option<Duration>>,

@@ -2,7 +2,8 @@ use orion_error::conversion::ToStructError;
 
 use crate::vars::{SourceAtom, TracedValue, VarsReason, VarsResult};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Config", module = "Config.ConfigVars")]
 enum TemplatePart<'a> {
     Literal(&'a str),
     Var {

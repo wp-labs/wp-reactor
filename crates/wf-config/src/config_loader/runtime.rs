@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::types::HumanDuration;
 
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[moju(kind = "struct", domain = "Config", module = "Config.ConfigLoader")]
+#[moju(kind = "struct", domain = "Config", module = "Config.FusionConfig")]
 pub struct RuntimeConfig {
     /// **Deprecated, ignored**（decode-route-merge 2026-08-31）：parse worker
     /// 池已移除，route 并入源任务内联执行（design: decode-route-merge-design.md）。

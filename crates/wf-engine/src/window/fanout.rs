@@ -23,7 +23,8 @@ use arrow::record_batch::RecordBatch;
 /// `seq` is the window-assigned batch sequence number; consumers ack
 /// `seq + 1` on the window's [`WindowProgress`](crate::window::WindowProgress)
 /// slot after processing, which gates time-based eviction.
-#[derive(Clone)]
+#[derive(Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.RuleFanout")]
 pub struct RulePush {
     pub window_name: Arc<str>,
     /// Pre-parsed events, when the producer materialized them. `None` means the
@@ -57,7 +58,8 @@ pub struct RulePush {
 /// 求值经 `extract_scope_key_mixed`（与机器内 advance 同构：同一 `ScopeKey` →
 /// 同一 shard），故同派生 key 的事件必然落在同一 rule task，窗口跨事件聚合
 /// 状态不被切碎。
-#[derive(Clone, Default)]
+#[derive(Clone, Default, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.RuleFanout")]
 pub struct ShardKeySpec {
     pub keys: Arc<[FieldRef]>,
     /// 表达式槽；空 = 无表达式键（纯字段分片）。非空时与 `keys` 逐位对齐。
@@ -94,6 +96,8 @@ impl PartialEq for ShardKeySpec {
 /// (the window actor's broadcast awaits a full channel) instead of buffering
 /// unboundedly — 50M sustained inject with unbounded channels let RSS grow to
 /// ~13GB (wp-labs/wp-reactor long-run test, 2026-08-14).
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Engine", module = "Engine.RuleFanout")]
 enum Subscription {
     Single(mpsc::Sender<RulePush>),
     Sharded {
@@ -147,6 +151,8 @@ impl Clone for Subscription {
 /// 空键 = **输入行索引分区**（`row % shard_count`, 2026-08-24 q15 空键 stats
 /// 输入分片用——按行号均匀切分, 各片独立累加, close 时归并）; 非空 = 按键
 /// 哈希分区（`partition_rows_by_key`/表达式分片, 同 key 同片）。
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.RuleFanout")]
 pub struct WindowShardPartition {
     pub spec: ShardKeySpec,
     pub shard_count: usize,
@@ -164,7 +170,8 @@ pub fn partition_rows_by_index(batch: &RecordBatch, shard_count: usize) -> Vec<V
     per
 }
 
-#[derive(Default)]
+#[derive(Default, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.RuleFanout")]
 pub struct RuleFanout {
     table: RwLock<HashMap<String, Vec<Subscription>>>,
     /// window_name → (match keys, shard count) for the key-partitioned

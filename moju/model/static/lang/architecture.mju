@@ -11,7 +11,7 @@ module LangSchema {
 
 module LangRule {
   layer DataFusion
-  owns WflFile, UseDecl, RuleDecl, MetaBlock, MetaEntry, PatternDecl, PipelineStage, LetDecl, EventsBlock, EventDecl, YieldPresetDecl, YieldPresetParam, PatternOrigin
+  owns WflFile, UseDecl, ListDecl, RuleDecl, MetaBlock, MetaEntry, PatternDecl, PipelineStage, LetDecl, EventsBlock, EventDecl, YieldPresetDecl, YieldPresetParam, PatternOrigin
   responsible_for "WFL rule file structure — rule declarations, metadata, events, and pipeline stages"
 }
 
@@ -23,7 +23,7 @@ module LangMatch {
 
 module LangExpr {
   layer DataFusion
-  owns Expr, FieldRef, FieldSelector, CmpOp, BinOp, SystemVar, ObjectItem, PathSegment, WfuMetaField, WfuIntermediateMetaField
+  owns Expr, FieldRef, FieldSelector, CmpOp, BinOp, SystemVar, ObjectItem, MatchArm, PathSegment, WfuMetaField, WfuIntermediateMetaField
   responsible_for "WFL expression language — field references, comparison/arithmetic operators, and expression tree nodes"
 }
 

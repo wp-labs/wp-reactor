@@ -12,7 +12,7 @@ use tokio::sync::Notify;
 
 /// Per-window eviction counts.
 #[derive(::moju_derive::MoJu, Debug, Clone)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowEviction")]
 pub struct WindowEvictCount {
     pub window_name: String,
     pub time_evicted: usize,
@@ -20,7 +20,7 @@ pub struct WindowEvictCount {
 
 /// Summary of a single [`Evictor::run_once`] call.
 #[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowEviction")]
 pub struct EvictReport {
     pub windows_scanned: usize,
     pub batches_time_evicted: usize,
@@ -67,6 +67,8 @@ pub const GATE_PRESSURE_RELEASE_AFTER: Duration = Duration::from_secs(10);
 /// （规则无事可做）立即放行，memory_pressure 持续超时（默认 10s）兜底
 /// 放行——宁可窗口瞬时超限驻留（`min_acked` 保护未读批，不丢数据），
 /// 也不让数据流停死。全局回落 cap 以下后清除，恢复正常背压。
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowEviction")]
 pub struct EvictionGate {
     /// Global memory budget across all windows (bytes).
     pub max_total_bytes: usize,
@@ -122,6 +124,8 @@ impl EvictionGate {
 
 /// Periodic evictor that enforces time-based and global-memory-based eviction
 /// across all windows in a [`WindowRegistry`].
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowEviction")]
 pub struct Evictor {
     gate: Arc<EvictionGate>,
 }

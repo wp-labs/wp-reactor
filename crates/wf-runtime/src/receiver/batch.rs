@@ -32,6 +32,8 @@ pub(crate) fn build_record_batch_from_json(
     )
 }
 
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Runtime", module = "Runtime.Receiver")]
 enum ColumnBuilder {
     Utf8(Vec<Option<String>>),
     Int64(Vec<Option<i64>>),

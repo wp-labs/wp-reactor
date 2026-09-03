@@ -31,6 +31,8 @@ use crate::receiver::{
 /// and exposed via [`last_stream_tag`](Self::last_stream_tag) so the runtime
 /// can route batches to the correct window when no explicit `stream` is
 /// configured.
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.DataSource")]
 pub struct DataSourceBatchSource {
     id: String,
     inner: Box<dyn DataSource>,

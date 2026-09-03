@@ -16,7 +16,8 @@ use crate::{ConfigReason, ConfigResult};
 ///
 /// 入口是 `--perf-diag` 启动参数本身（wfgen 侧 `--diag`）——文件只承载诊断档
 /// 列表；顶层门控/总开关是历史遗留（实际永远被 `stages[0]` 覆盖或不可达），已删。
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
 pub struct PerfConfig {
     /// 诊断档列表（sentinel 驱动依次应用）。缺省/空 = 仅初始门控（无切换）。
     #[serde(default)]
@@ -24,7 +25,8 @@ pub struct PerfConfig {
 }
 
 /// 一个诊断档 = 禁止开关组合 + 可选规则子集文件（触发热 reload）。
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
 pub struct PerfStage {
     /// 档名称（墙表输出用，如 `floor` / `rules` / `full`）。
     #[serde(default)]

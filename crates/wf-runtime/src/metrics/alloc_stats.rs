@@ -32,7 +32,8 @@ use std::sync::OnceLock;
 /// macOS 上 `current_rss`/`peak_rss` 由 mimalloc 精确报告；`commit` 是
 /// mimalloc 保留的可读写内存（macOS 为估算）——**它才是"分配器实际持有"的
 /// 口径**，与 `window_bytes` 对比即可分账。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
 pub struct AllocStats {
     /// 当前工作集（已触碰页）字节。
     pub current_rss: u64,

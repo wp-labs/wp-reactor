@@ -24,6 +24,8 @@ const PIPE_WINDOW_PREFIX: &str = "__wf_pipe_";
 const PIPE_EVENT_TIME_FIELD: &str = "__wf_pipe_ts";
 const RULE_PRELUDE_FILE: &str = "_global.wfl";
 
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.ReactorLifecycle")]
 struct ParsedRuleFile {
     path: PathBuf,
     source: String,

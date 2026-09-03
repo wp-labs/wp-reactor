@@ -353,6 +353,8 @@ fn collect_active_external_sources_in_value(
     Ok(())
 }
 
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Config", module = "Config.ConfigVars")]
 struct ConfigVarResolver<'a> {
     raw: &'a HashMap<String, String>,
     raw_origins: &'a HashMap<String, Option<PathBuf>>,

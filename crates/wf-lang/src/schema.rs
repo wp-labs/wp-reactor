@@ -50,7 +50,8 @@ pub struct WindowSchema {
 
 /// A static (provider-backed) window schema. No stream, time, or over.
 /// Data comes from an external source (knowdb), not event streams.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangSchema")]
 pub struct StaticWindowSchema {
     pub name: String,
     pub fields: Vec<FieldDef>,

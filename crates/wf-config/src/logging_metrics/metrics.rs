@@ -6,7 +6,7 @@ use crate::types::HumanDuration;
 ///
 /// When disabled, runtime metrics collection/export is skipped entirely.
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Deserialize)]
-#[moju(kind = "struct", domain = "Config", module = "Config.LoggingMetrics")]
+#[moju(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
 pub struct MetricsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -26,7 +26,7 @@ pub struct MetricsConfig {
 
 /// Optional Top-N diagnostics settings.
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Deserialize)]
-#[moju(kind = "struct", domain = "Config", module = "Config.LoggingMetrics")]
+#[moju(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
 pub struct MetricsTopNConfig {
     #[serde(default)]
     pub enabled: bool,

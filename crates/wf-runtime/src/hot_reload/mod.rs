@@ -15,7 +15,7 @@ mod topology;
 pub use prepare::{prepare_reload, prepare_reload_with_cached};
 
 #[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Orchestra", module = "Orchestra.HotReload")]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.HotReload")]
 pub struct PreparedRuleReload {
     pub plan: FusionReloadPlan,
     pub next_raw: RawFusionConfigTree,
@@ -44,7 +44,7 @@ pub struct PreparedRuleReload {
 }
 
 #[derive(::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Orchestra", module = "Orchestra.HotReload")]
+#[moju(kind = "state", domain = "Runtime", module = "Runtime.HotReload")]
 pub enum ReloadPreparation {
     Ready(Box<PreparedRuleReload>),
     Blocked(FusionReloadPlan),

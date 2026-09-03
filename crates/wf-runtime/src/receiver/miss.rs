@@ -10,7 +10,8 @@ pub(crate) const WINDOW_MISS_WINDOW_NAME: &str = "__window_miss";
 const MAX_PAYLOAD_SAMPLE_BYTES: usize = 512;
 const MAX_WINDOW_MISS_ROWS: usize = 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Runtime", module = "Runtime.Receiver")]
 pub(crate) enum WindowMissReason {
     UnknownStreamSchema,
     MissingStreamTagField,
@@ -25,7 +26,8 @@ impl WindowMissReason {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.Receiver")]
 pub(crate) struct WindowMiss {
     pub(crate) stream_tag_field: String,
     pub(crate) stream_tag: Option<String>,

@@ -60,6 +60,8 @@ use std::sync::{Arc, RwLock, Weak};
 /// Time eviction (`over`) deliberately ignores pins: `over` is the retention the
 /// query *declares*, so dropping rows past it is semantics, not resource
 /// pressure (see [`crate::window::Window::evict_expired`]).
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct WindowProgress {
     /// Whole-batch consumers: a batch is fully consumed by exactly one such
     /// slot (single worker, or round-robin shards — each batch is delivered to

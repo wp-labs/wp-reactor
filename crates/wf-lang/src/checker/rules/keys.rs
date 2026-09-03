@@ -538,6 +538,8 @@ fn field_ref_field_type<'a>(
 }
 
 /// K1b result of resolving a simple key to a snapshot join right window.
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangChecker")]
 pub(super) enum JoinKeySource<'a> {
     /// Exactly one snapshot join's target window provides the key field.
     Resolved { join_idx: usize },

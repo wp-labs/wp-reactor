@@ -55,6 +55,8 @@ use types::TimedBatch;
 ///
 /// deferred_bench `index_contention` 实测：写者活跃时读者吞吐 0.15M→6.9M
 /// ops/s（43–46×，达无写者天花板的 ~86%）。
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub(super) struct JoinIndex {
     key_field: SmolStr,
     /// The window's `materialize_fields` projection: enrich reads only these
@@ -82,7 +84,8 @@ const JOIN_INDEX_SHARDS: usize = 64;
 
 /// The indexed rows for one join key, plus the maximum raw timestamp among them
 /// (`None` when the key has no timestamped rows).
-#[derive(Default)]
+#[derive(Default, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 struct KeyedRows {
     rows: Vec<IndexedRow>,
     max_ts: Option<i64>,
@@ -91,6 +94,8 @@ struct KeyedRows {
 /// A columnar row locator: `(batch, row)` plus the batch-level field index and
 /// the row's raw timestamp. The join index holds these instead of materialized
 /// `Event`s.
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 struct IndexedRow {
     ts_nanos: Option<i64>,
     batch: Arc<RecordBatch>,

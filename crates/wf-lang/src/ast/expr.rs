@@ -3,16 +3,18 @@
 // ---------------------------------------------------------------------------
 
 /// Field selector within a step branch: `.ident` or `["string"]`.
-#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum FieldSelector {
     Dot(String),
     Bracket(String),
 }
 
 /// Field reference in expressions.
-#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum FieldRef {
     /// Bare identifier, e.g. `sip`.
     Simple(String),
@@ -35,8 +37,9 @@ pub enum FieldRef {
 }
 
 /// One step of a nested field path: a member name or an array index.
-#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum PathSegment {
     Field(String),
     Index(usize),

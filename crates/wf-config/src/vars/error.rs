@@ -1,7 +1,7 @@
 use orion_error::{OrionError, StructError, UnifiedReason};
 
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, OrionError)]
-#[moju(kind = "state", domain = "Config", module = "Config.VarResolver")]
+#[moju(kind = "state", domain = "Config", module = "Config.ConfigError")]
 pub enum VarsReason {
     #[orion_error(
         message = "variable resolution error",

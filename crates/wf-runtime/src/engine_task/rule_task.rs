@@ -355,6 +355,8 @@ impl RuleBatchDebugStats {
 /// Holds all mutable state for one rule's processing loop.
 ///
 /// Each `RuleTask` owns its `CepStateMachine` exclusively (no `Arc<Mutex>`).
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.EngineTask")]
 pub(super) struct RuleTask {
     pub(super) task_id: String,
     machine: Option<CepStateMachine>,

@@ -25,8 +25,9 @@ pub struct EntityClause {
     pub id_expr: Expr,
 }
 
-#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangClauses")]
 pub enum EntityTypeVal {
     Ident(String),
     StringLit(String),
@@ -55,8 +56,9 @@ pub struct YieldPresetRef {
     pub args: Vec<Expr>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangClauses")]
 pub struct NamedArg {
     pub name: String,
     pub value: Expr,

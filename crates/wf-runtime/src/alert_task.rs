@@ -52,7 +52,8 @@ const SINK_DRAIN_BUDGET: Duration = crate::lifecycle::types::GROUP_JOIN_TIMEOUT;
 /// throughput loss). The columnar form keeps that property: dropping a
 /// column batch frees a handful of contiguous buffers instead of millions
 /// of small per-row allocations.
-#[derive(Clone)]
+#[derive(Clone, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Runtime", module = "Runtime.AlertDispatch")]
 pub enum AlertBatch {
     /// Row-oriented payload (escalation forwards whatever form it received;
     /// also the test/legacy call form). Not constructed by the emit path.
@@ -79,6 +80,8 @@ impl AlertBatch {
 /// `(sink_ptr, channels)` where `channels` are the sink's `parallel` writers.
 type ResolvedChannels = Arc<Vec<(usize, Arc<Vec<mpsc::Sender<AlertBatch>>>)>>;
 
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.AlertDispatch")]
 pub struct SinkFanout {
     /// `Arc<SinkRuntime>` pointer identity → its parallel writers.
     pub(crate) by_sink: HashMap<usize, Vec<mpsc::Sender<AlertBatch>>>,

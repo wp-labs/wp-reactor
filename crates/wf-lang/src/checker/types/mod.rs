@@ -13,7 +13,8 @@ use crate::schema::BaseType;
 // ValType — lightweight type representation for semantic checks
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangChecker")]
 pub enum ValType {
     /// A known scalar base type (Chars, Digit, Float, Time, Ip, Hex).
     Base(BaseType),

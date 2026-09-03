@@ -6,7 +6,8 @@
 
 use wf_engine::match_engine::Value;
 
-#[derive(Default)]
+#[derive(Default, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.ExternalRuntime")]
 pub(crate) struct RedisBackend;
 
 impl RedisBackend {

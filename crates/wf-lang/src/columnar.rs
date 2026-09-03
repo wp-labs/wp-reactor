@@ -27,7 +27,8 @@ use crate::ast::{BinOp, Expr, FieldRef, PathSegment};
 /// 门控（[`expr_is_columnar`]）与 wf-engine 的 `compile_expr` 都基于此枚举
 /// 判断函数是否可列式化及其参数形态，避免函数名清单在两处各自维护而 drift：
 /// 新增可列式函数只需在这里加一个分类。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangColumnar")]
 pub enum ColumnarFunc {
     /// `cidr_match(field, "addr/prefix")` — 第二参数必须是 STRING 字面量。
     CidrMatch,
@@ -78,7 +79,8 @@ pub fn columnar_func_args_ok(func: ColumnarFunc, args: &[Expr]) -> bool {
 /// 列式**输出**（yield cell）原生支持的内置函数分类 —— 与 [`ColumnarFunc`]
 /// （守卫）并列的单一权威清单。这些函数产生字符串/数值 cell（而非布尔守卫），
 /// 供列式输出路径（on-each / match / close 的 yield 批量 cell 求值）编译。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangColumnar")]
 pub enum ColumnarOutputFunc {
     /// `fmt(template, v1, ...)` — 字面量模板 + 列式标量参数，批量渲染 `{}`。
     Fmt,

@@ -14,7 +14,7 @@ pub const WFU_EMIT_TIME: &str = "__wfu_emit_time";
 pub const WFU_SUMMARY: &str = "__wfu_summary";
 
 #[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.WfuMeta")]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum WfuMetaField {
     Id,
     RuleName,
@@ -42,7 +42,7 @@ pub const WFU_META_FIELDS: &[WfuMetaField] = &[
 ];
 
 #[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.WfuIntermediateMeta")]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum WfuIntermediateMetaField {
     RuleName,
     Score,

@@ -32,3 +32,21 @@
 1. 人工审查 `ExprPlan`、`ResolvedSinkSpec` 两处引用完整性。
 2. `moju verify moju/draft` 通过后，逐域校对 module owns 与 dependency_rule。
 3. 提升到 `moju/model/`，运行 `moju-code diff` 评估与代码注解的一致性（当前代码无 `#[moju]` 注解，diff 会全量报告"模型有、代码无注解"，属预期）。
+
+---
+
+## 同步记录 2026-09-03
+
+代码更新（issue #73/#79/#80/#83 等）同步到模型：
+
+- **lang**：`WflFile` 加 `lists`；新增 `ListDecl`（顶层命名字面列表，LangRule）；新增 `MatchArm`（模式匹配分支，LangExpr）；`Expr` 加 `ListRef`/`Match` 变体。
+- **engine**：`RuleFanout` 新增 key 分片概念 —— `ShardKeySpec`（keys + 派生表达式槽）、`WindowShardPartition`；`RuleFanout.window_sharding` 类型化。
+- **runtime**：`RuleTaskConfig` 加 `key_partitioned`（本规则是否自己 key 分片消费）。
+- **未同步（模型策略性排除）**：executor 执行内部（`ExecutionPath`/`RowSource`/`RowCtx`/`TriggerEvent`/`DeferredLeft` 等）、RuleTask/StatsTask 新增内部计数字段（wall_advance_ns/last_bailed_frontier 等）、lifecycle ingest（parse_pool 内部改名）。metrics parse_* 已随代码删除（建模时已排除）。
+
+### 预存漂移（非本次代码更新造成，需另行处理）
+代码中的 `#[moju]` 注解（建模前已存在）使用旧模型残留模块名，与新模型模块结构不一致：
+- `Orchestra.*`（wf-runtime 类型注解为 Orchestra 域，新模型为 `runtime` 域）
+- `Lang.LangExePlan` / `Lang.WfuMeta` / `Lang.WfuIntermediateMeta`（新模型并入 LangCompile / LangExpr）
+- `Config.VarResolver` / `Config.LoggingMetrics` / `Config.OutputConfig` / `Config.SourceConfig`（新模型为 ConfigVars / ConfigIo）
+- 若要 `moju-code diff`/`align` 干净，需 `moju-code align --write` 按新模型改写代码注解，或调整模型模块名对齐注解——由负责人决定方向。

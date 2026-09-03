@@ -23,7 +23,7 @@ pub struct StatsClause {
 
 /// 窗口规格：`<dur[:mode]>`。
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangStats")]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangStats")]
 pub struct StatsWindow {
     pub duration: Duration,
     pub mode: StatsWindowMode,

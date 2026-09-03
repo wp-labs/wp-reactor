@@ -29,7 +29,8 @@ use arrow::datatypes::SchemaRef;
 /// The schema is used to crop / type the output row (the role the output
 /// "window" previously served); `time_col_index` is the position of the time
 /// field in `schema`, so the relay can place the event time on the right column.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.PipeExecution")]
 pub struct Pipe {
     pub name: String,
     pub schema: SchemaRef,
@@ -42,7 +43,8 @@ pub struct Pipe {
 
 /// Registry of pipes by name. Built at bootstrap from the compiled yield
 /// topology (output targets + `|>` intermediate stages).
-#[derive(Default)]
+#[derive(Default, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.PipeExecution")]
 pub struct PipeRegistry {
     pipes: RwLock<HashMap<String, Pipe>>,
 }

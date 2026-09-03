@@ -6,6 +6,8 @@ use crate::schema::{BaseType, FieldType, WindowSchema};
 use super::types::ValType;
 
 /// Scope built from a rule's events block, `let` bindings and join clauses.
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangChecker")]
 pub struct Scope<'a> {
     /// Event alias → WindowSchema mapping.
     pub aliases: HashMap<&'a str, &'a WindowSchema>,
@@ -20,14 +22,16 @@ pub struct Scope<'a> {
     pub reduce_labels: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangChecker")]
 pub struct StatLabelInfo {
     pub stage: StatLabelStage,
     pub uses_distinct: bool,
     pub measure: Measure,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangChecker")]
 pub enum StatLabelStage {
     Event,
     Close,

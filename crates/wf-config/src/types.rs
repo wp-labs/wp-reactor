@@ -14,7 +14,7 @@ use orion_error::conversion::ToStructError;
 
 /// A duration parsed from a human-readable string like `"30s"`, `"5m"`, `"1h"`, `"2d"`.
 #[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "struct", domain = "Config", module = "Config.WindowConfig")]
+#[moju(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
 pub struct HumanDuration(Duration);
 
 impl HumanDuration {
@@ -111,7 +111,7 @@ impl<'de> Deserialize<'de> for HumanDuration {
 
 /// A byte size parsed from a human-readable string like `"256MB"`, `"2GB"`, `"64KB"`, `"1024B"`.
 #[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "struct", domain = "Config", module = "Config.WindowConfig")]
+#[moju(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
 pub struct ByteSize(usize);
 
 impl ByteSize {

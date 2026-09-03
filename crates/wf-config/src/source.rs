@@ -28,7 +28,7 @@ use toml::Value as TomlValue;
 /// When `connect` is set, `type` is optional — the kind is resolved from the
 /// connector registry at runtime via [`SourceConfig::resolve_kind`].
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Serialize)]
-#[moju(kind = "struct", domain = "Config", module = "Config.SourceConfig")]
+#[moju(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
 pub struct SourceConfig {
     #[serde(default, alias = "key")]
     pub name: Option<String>,

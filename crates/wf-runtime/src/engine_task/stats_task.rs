@@ -96,6 +96,8 @@ type PendingStatsPull = (
 );
 
 /// stats 任务: 消费批次 → 归并 → 固定窗口 close → alert。
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Runtime", module = "Runtime.EngineTask")]
 pub(super) struct StatsTask {
     task_id: String,
     stats: StatsExecutor,

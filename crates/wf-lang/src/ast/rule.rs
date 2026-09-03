@@ -64,7 +64,8 @@ pub struct PatternDecl {
 }
 
 /// Tracks which pattern was used to generate the match clause (for `wf explain`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct PatternOrigin {
     pub pattern_name: String,
     pub args: Vec<String>,

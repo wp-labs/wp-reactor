@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use wf_lang::plan::RateSpec;
 
 /// Cross-shard rate-limit and budget state for one rule.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct SharedLimits {
     /// Collective emit count within the current throttle window.
     emit_count: AtomicU64,

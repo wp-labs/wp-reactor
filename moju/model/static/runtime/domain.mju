@@ -222,6 +222,7 @@ struct RuleTaskConfig {
   push_rx: String?
   shard_index: Int?
   shard_count: Int
+  key_partitioned: Bool
   progress: Map<String,Int>
   conv_sink: String?
 }

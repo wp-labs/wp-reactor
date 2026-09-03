@@ -137,14 +137,16 @@ pub struct PipeChain {
     pub threshold: Expr,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
 pub enum Transform {
     Distinct,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
 pub enum Measure {
     Count,
     Sum,

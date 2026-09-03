@@ -8,6 +8,8 @@ use arrow::record_batch::RecordBatch;
 use crate::match_engine::{Event, batch_to_events, batch_to_events_filtered};
 
 /// Result of a watermark-aware append.
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "state", domain = "Engine", module = "Engine.WindowManager")]
 pub enum AppendOutcome {
     Appended,
     DroppedLate,
