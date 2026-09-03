@@ -2,6 +2,17 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [2.0.16] -- latest
+
+### Changed
+
+- **工程内务（公开 API 与行为不变）**：
+  - `wf-engine`：`match_engine` 内层模块归位为 `cep/`（单实例 CEP 状态机），目录结构如实表达依赖分层；
+  - pub 面收敛：三 crate 收敛 60+ 对外不可达的 `pub` 为 `pub(crate)`，CI 新增 lib 目标 `unreachable_pub` 门禁；
+  - `wf-lang`：`MatchPlan` 等核心 plan 类型支持 `Default`（测试/扩展构造约定，新增字段不再要求逐构造点同步）；
+  - 新增 `wf-cep` crate：沉淀纯逻辑单元（time / 缓存 / error / Value 层 / external / 行字段存储），`wf-engine` 公开路径经 shim 重导出保持不变；
+- **测试/CI**：黑盒契约测试移至 crate 级集成测试；`wf-cep` 依赖墙（禁 tokio，允许 arrow 数据面）。
+
 ## [2.0.15] -- latest
 
 ### Added
