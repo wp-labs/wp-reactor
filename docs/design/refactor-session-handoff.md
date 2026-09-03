@@ -73,7 +73,8 @@
 **#1 S3 部分**（process_batch ~1300 行内抽，读-first 已完成全段精读）：
 - `56da04c` columnar_each 快路径早退 → `async fn process_batch_columnar_each`。
 - `b3e3811` DeferredRows 构造（L2 延迟物化相位）→ `fn build_deferred_rows`。
-- 剩余候选（未动，风险递增）：行循环主相位 H（630 行，借网交织）、尾部 match/close 列式落库双块（~90 行×2，含 4 处 pending-builder get-or-create 重复可抽共享助手）、E/L 诊断块。每刀后门禁：wf-runtime 606 全绿 + clippy 0。
+- `0a7ba41` `PendingAlertColumns::builder_for` 收口 emit 路径 **8 处同构 get-or-create**（背压相位去重，−133 行；借 index 再索引形态绕开跨臂可变借用）。
+- 剩余候选（未动，风险递增）：行循环主相位 H（~600 行，借网交织）、E/L 诊断块（批摘要日志/墙钟注入，可打包回传 struct 抽 begin_batch）。每刀后门禁：wf-runtime 606 全绿 + clippy 0。
 
 **#3 stats_exec.rs 拆件完成**（图谱 → 目录化 → 逐簇切出，全部门禁绿）：
 - `a491018` 目录化：stats_exec.rs → stats_exec/mod.rs；`f218947` 拆 `accum.rs` + `state.rs`（含混合 doc 归属重组、super::eval 相对路径改绝对）；`f942040` 拆 `exec.rs`（执行器核）与 `eval.rs`（求值簇）收口。

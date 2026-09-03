@@ -1207,22 +1207,14 @@ impl RuleTask {
         } else {
             None
         };
-        if debug_enabled {
-            let instances_before = self.instance_count();
-            wf_debug!(pipe,
-                rule = %rule_name_for_log,
-                stage = 0,
-                window = %window_name,
-                batch_seq = batch_seq,
-                rows = input_events,
-                aliases = %aliases_for_log.as_deref().unwrap_or(""),
-                instances_before = instances_before,
-                "rule batch started"
-            );
-        }
-        if let Some(metrics) = &self.metrics {
-            metrics.add_rule_events(self.executor.plan().name.as_str(), input_events);
-        }
+        self.log_batch_start(
+            debug_enabled,
+            window_name,
+            batch_seq,
+            input_events,
+            rule_name_for_log,
+            aliases_for_log.as_deref(),
+        );
         // Track the last wall-clock moment events were processed, so the
         // periodic timeout scan can advance the watermark across idle gaps.
         if input_events > 0 {
@@ -2010,41 +2002,13 @@ impl RuleTask {
                 d.publish_retention_floor();
             }
         }
-        if debug_enabled {
-            let instances_after = self.instance_count();
-            wf_debug!(pipe,
-                rule = %rule_name_for_log,
-                stage = 0,
-                window = %window_name,
-                batch_seq = batch_seq,
-                input = stats.input_events,
-                alias_passed = stats.alias_passed,
-                alias_rejected = stats.alias_rejected,
-                accumulated = stats.accumulated,
-                advanced = stats.advanced,
-                matched = stats.matched,
-                outputs = stats.output_emitted,
-                output_none = stats.output_none,
-                intermediate_outputs = stats.intermediate_emitted,
-                errors = stats.errors,
-                instances_after = instances_after,
-                detail_logged = stats.detail_logged,
-                detail_suppressed = stats.detail_suppressed,
-                "rule batch summary"
-            );
-            if stats.detail_suppressed > 0 {
-                wf_debug!(pipe,
-                    rule = %rule_name_for_log,
-                    stage = 0,
-                    window = %window_name,
-                    batch_seq = batch_seq,
-                    detail_logged = stats.detail_logged,
-                    detail_suppressed = stats.detail_suppressed,
-                    "rule event details suppressed"
-                );
-            }
-        }
-        self.dump_profiling();
+        self.log_batch_summary(
+            debug_enabled,
+            window_name,
+            batch_seq,
+            rule_name_for_log,
+            &stats,
+        );
         // Columnar match emit (q6 形态): one pending lock, one target lookup,
         // one columnar batch commit — no per-match OutputRecord. Metrics mirror
         // the per-record path (exact totals; append-failed for eval failures).
@@ -2302,6 +2266,82 @@ impl RuleTask {
         if !self.each_direct {
             self.flush_pipes().await;
         }
+    }
+
+    /// 批前诊断（E 相位）：debug 下输出 `rule batch started`（含 instances_before），
+    /// 并上报本批事件数指标。纯 `&self`——调用点可能仍持 `self.aliases` 借用。
+    fn log_batch_start(
+        &self,
+        debug_enabled: bool,
+        window_name: &str,
+        batch_seq: u64,
+        input_events: usize,
+        rule_name_for_log: &str,
+        aliases_for_log: Option<&str>,
+    ) {
+        if debug_enabled {
+            let instances_before = self.instance_count();
+            wf_debug!(pipe,
+                rule = %rule_name_for_log,
+                stage = 0,
+                window = %window_name,
+                batch_seq = batch_seq,
+                rows = input_events,
+                aliases = %aliases_for_log.unwrap_or(""),
+                instances_before = instances_before,
+                "rule batch started"
+            );
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.add_rule_events(self.executor.plan().name.as_str(), input_events);
+        }
+    }
+
+    /// 批尾诊断（L 相位）：debug 下输出 `rule batch summary`（含 detail 抑制提示），
+    /// 并节流 dump 相位耗时累计。统计字段读自 `stats`（行循环已累计）。
+    fn log_batch_summary(
+        &mut self,
+        debug_enabled: bool,
+        window_name: &str,
+        batch_seq: u64,
+        rule_name_for_log: &str,
+        stats: &RuleBatchDebugStats,
+    ) {
+        if debug_enabled {
+            let instances_after = self.instance_count();
+            wf_debug!(pipe,
+                rule = %rule_name_for_log,
+                stage = 0,
+                window = %window_name,
+                batch_seq = batch_seq,
+                input = stats.input_events,
+                alias_passed = stats.alias_passed,
+                alias_rejected = stats.alias_rejected,
+                accumulated = stats.accumulated,
+                advanced = stats.advanced,
+                matched = stats.matched,
+                outputs = stats.output_emitted,
+                output_none = stats.output_none,
+                intermediate_outputs = stats.intermediate_emitted,
+                errors = stats.errors,
+                instances_after = instances_after,
+                detail_logged = stats.detail_logged,
+                detail_suppressed = stats.detail_suppressed,
+                "rule batch summary"
+            );
+            if stats.detail_suppressed > 0 {
+                wf_debug!(pipe,
+                    rule = %rule_name_for_log,
+                    stage = 0,
+                    window = %window_name,
+                    batch_seq = batch_seq,
+                    detail_logged = stats.detail_logged,
+                    detail_suppressed = stats.detail_suppressed,
+                    "rule event details suppressed"
+                );
+            }
+        }
+        self.dump_profiling();
     }
 
     /// Log the cumulative advance/scan/emit profiler accumulators once per
