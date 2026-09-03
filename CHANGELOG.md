@@ -2,7 +2,20 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [2.0.14] -- latest
+## [2.0.15] -- latest
+
+### Added
+
+- **wf-lang / wf-engine: `match` 分组 key 支持函数/字面量派生表达式（issue #80）**——`let k = coalesce(s.a, s.b, "none")` / `concat` / `case` / 字面量等表达式求值结果可作为窗口分组 key（`match<k:10m>`），事件按派生值进入实例；求值失败/缺失与普通 key 缺失行为一致，该事件不进入任何实例；纯字段形态 `let` key（#83）仍内联为等值字段、聚合结果与直接写嵌套路径 key 一致；
+  - v1 边界：派生表达式须为无状态纯事件函数（窗口统计/查询类与 `now*` 时间相关函数不可作 key）；`let` 与 join 右窗字段同名时 `let` 优先；
+- **wf-engine / wf-runtime: 表达式派生 key 规则支持 `rule_shards` 分片（issue #80）**——分片按派生键逐行求值哈希，同派生键事件恒入同一分片（窗口跨事件聚合状态完整），表达式 key 规则不再退化为单路串行；
+  - v1 边界：表达式分片为逐行求值（未向量化）；分片键含表达式的规则与普通字段键规则不共享同一窗口分片配置（自动回退单 worker 保证正确）；
+
+### Fixed
+
+- **wf-engine: 异步落盘等待看门狗**——`flush` / 背压等待超时（60s）快速失败并输出诊断，不再无限挂起。
+
+## [2.0.14]
 
 ### Added
 
