@@ -23,6 +23,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
+
+/// condvar 等待看门狗（2026-09 review）：worker 是 `std::thread`，系统过载时
+/// 可能长时间得不到调度——`flush`/背压等待若无线索会**无限挂起**（测试侧表现
+/// 为 runner 报 "running for over 60 seconds"）。超时后直接 panic 快速失败，
+/// 把静默挂起变成可诊断错误。阈值 60s > 最坏单批写（q18 实测 25s/批）×2；
+/// 测试态缩到 200ms 以便验证 watchdog 路径（见 `watchdog_timeout`）。
+#[cfg(not(test))]
+const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn watchdog_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        Duration::from_millis(200)
+    }
+    #[cfg(not(test))]
+    {
+        WATCHDOG_TIMEOUT
+    }
+}
 
 /// 持久化提交错误。
 #[derive(Debug)]
@@ -190,7 +210,17 @@ impl<T: Send + 'static, B: BatchWriter<T> + Send + 'static> AsyncPersister<T, B>
                 // 队列已空但字节没扣完（竞态）——直接放行。
                 break;
             }
-            idle_guard = cvar.wait(idle_guard).expect("async-persist budget wait");
+            let (guard, timed_out) = cvar
+                .wait_timeout(idle_guard, watchdog_timeout())
+                .expect("async-persist budget wait");
+            idle_guard = guard;
+            if timed_out.timed_out() {
+                panic!(
+                    "async-persist 背压等待超过 {:?}：worker 线程可能饿死或死锁（queued_bytes={}）",
+                    watchdog_timeout(),
+                    self.queued_bytes.load(Ordering::SeqCst)
+                );
+            }
         }
         // 路由到 worker（同一 route 恒同 worker）；通道满 → 阻塞（背压）。
         let idx = route as usize % self.txs.len();
@@ -211,7 +241,17 @@ impl<T: Send + 'static, B: BatchWriter<T> + Send + 'static> AsyncPersister<T, B>
         let (lock, cvar) = &*self.idle;
         let mut idle_guard = lock.lock().expect("async-persist flush lock");
         while !*idle_guard {
-            idle_guard = cvar.wait(idle_guard).expect("async-persist flush wait");
+            let (guard, timed_out) = cvar
+                .wait_timeout(idle_guard, watchdog_timeout())
+                .expect("async-persist flush wait");
+            idle_guard = guard;
+            if timed_out.timed_out() {
+                panic!(
+                    "async-persist flush 等待超过 {:?}：worker 线程可能饿死或死锁（queued_bytes={}）",
+                    watchdog_timeout(),
+                    self.queued_bytes.load(Ordering::SeqCst)
+                );
+            }
         }
         Ok(())
     }
@@ -390,5 +430,36 @@ mod tests {
         assert!(backend0.all().is_empty(), "route 未命中 worker0");
         assert!(backend2.all().is_empty(), "route 未命中 worker2");
         p.shutdown();
+    }
+
+    /// write_batch 永久阻塞的后端（模拟后端 IO 挂起 / worker 被饿死的极端形态）。
+    struct HangBackend;
+
+    impl BatchWriter<u64> for HangBackend {
+        fn write_batch(&mut self, _items: Vec<u64>) -> Result<(), String> {
+            std::thread::park(); // 永不返回
+            unreachable!()
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "flush 等待超过")]
+    fn flush_watchdog_panics_when_worker_stalls() {
+        // worker 卡在写 → idle 恒 false → flush 看门狗（测试态 200ms）触发 panic，
+        // 不再让 runner 无限挂（"running for over 60 seconds" 场景）。
+        let p =
+            AsyncPersister::<u64, HangBackend>::new(vec![HangBackend], 1 << 20, 4, 1 << 16, None);
+        p.submit_batch(0, vec![1], 8).unwrap();
+        p.flush().unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "背压等待超过")]
+    fn submit_backpressure_watchdog_panics_when_worker_stalls() {
+        // budget = 8B：第一批占满后第二批进入背压等待；worker 卡写永不扣减
+        // → submit 看门狗触发 panic。
+        let p = AsyncPersister::<u64, HangBackend>::new(vec![HangBackend], 8, 4, 1 << 16, None);
+        p.submit_batch(0, vec![1], 8).unwrap();
+        p.submit_batch(0, vec![2], 8).unwrap(); // 背压等待 → 200ms 后 panic
     }
 }
