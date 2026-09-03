@@ -1309,100 +1309,14 @@ impl RuleTask {
         // row passes, exactly like `event_matches_alias` with no filter).
         if columnar_each {
             let batch = batch.expect("columnar each requires the raw batch");
-            let num_rows = batch.num_rows();
-            let mut hit = vec![false; num_rows];
-            // 非列式 bind filter 的批级视图索引（逐行解释用，免 per-call
-            // schema 线性扫）；无非列式 filter 时不构建。
-            let needs_row_filter = aliases.iter().any(|alias| {
-                !columnar_masks.contains_key(alias) && self.executor.bind_filter_present(alias)
-            });
-            let row_index = needs_row_filter.then(|| build_field_index(batch));
-            for alias in aliases.iter() {
-                match columnar_masks.get(alias) {
-                    Some(Some(mask)) => {
-                        for (row, h) in hit.iter_mut().enumerate() {
-                            *h |= mask.value(row);
-                        }
-                    }
-                    _ => {
-                        if self.executor.bind_filter_present(alias) {
-                            // 非列式 bind filter（gap-4 2026-09-02）：逐行
-                            // `event_matches_alias` 解释（ColumnarEvent 视图直读
-                            // 列，与行式路径字节一致）——不再 hit.fill(true)
-                            // 静默丢过滤子集。index 缺失（防御）= 无视图，
-                            // 走无 index 直读（schema 线性扫，正确性不变）。
-                            let index = row_index.as_ref();
-                            for (row, h) in hit.iter_mut().enumerate() {
-                                if !*h {
-                                    let ev = match index {
-                                        Some(index) => {
-                                            ColumnarEvent::with_index(batch, row, Arc::clone(index))
-                                        }
-                                        None => ColumnarEvent::new(batch, row),
-                                    };
-                                    *h = self.executor.event_matches_alias(
-                                        alias,
-                                        &ev,
-                                        Some(&lookup),
-                                    );
-                                }
-                            }
-                        } else {
-                            hit.fill(true); // 无 filter：全放行（与 event_matches_alias 无 filter 一致）
-                        }
-                    }
-                }
-            }
-            let hit_indices: Vec<u32> = (0..num_rows)
-                .filter(|&row| hit[row])
-                .map(|row| row as u32)
-                .collect();
-            let time_col_index = batch_time_col_index(batch, self.each_time_field.as_deref());
-            let col_events: Vec<ColumnarEvent<'_>> = hit_indices
-                .iter()
-                .map(|&row| ColumnarEvent::new(batch, row as usize))
-                .collect();
-            let rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
-                .iter()
-                .zip(hit_indices.iter())
-                .map(|(ev, &row)| {
-                    let row = row as usize;
-                    let event_nanos = time_col_index
-                        .map(|col| batch_event_time_nanos_at(batch, col, row))
-                        .unwrap_or(0);
-                    (ev, event_nanos)
-                })
-                .collect();
-            // Metrics parity: the eager path reported the input count before
-            // the loop; the unconditional add with 0 is a no-op, so add the
-            // real count here.
-            if let Some(metrics) = &self.metrics {
-                metrics.add_rule_events(self.executor.plan().name.as_str(), rows.len());
-            }
-            // 列式 each 分流：无活 join（q1 等）走无 join 列式路径；活 join
-            // （q20 等，each_join_plan 已解析）走列式 join 富化路径（批级
-            // join_lookup + 列式右窗字段读，免每事件 Event clone —— 2026-08-23
-            // 列式 join 富化，q20 2.5M/s → 列式量级）。中间管道目标（q13a）
-            // 走 pipe 列式装载（2026-08-25 q13a 列式化）。
-            if self.executor.live_joins().is_empty() {
-                if self.each_direct {
-                    self.emit_each_direct_batch_columnar(&rows, batch_emit_nanos)
-                        .await;
-                } else {
-                    self.emit_each_pipe_batch_columnar(&rows, batch_emit_nanos)
-                        .await;
-                }
-            } else {
-                self.emit_each_direct_batch_columnar_join(&rows, &lookup, batch_emit_nanos)
-                    .await;
-            }
-            // 列式分支早退：pipe 路径已在此装载中间行，必须同批收口（与行式
-            // 路径的 flush_pipes 节奏一致）。sink 目标（each_direct）无 pipe
-            // 装载——不调用，避免给 q1 等高频规则每批新增一次 pipe_state 锁
-            // 争用（2026-08-25 review R2）。
-            if !self.each_direct {
-                self.flush_pipes().await;
-            }
+            self.process_batch_columnar_each(
+                batch,
+                aliases,
+                &columnar_masks,
+                &lookup,
+                batch_emit_nanos,
+            )
+            .await;
             return;
         }
         // Plan C2 batching: when the per-event detail logs are off, collect
@@ -2273,6 +2187,109 @@ impl RuleTask {
         self.flush_alerts().await;
         // Same latency bound for staged intermediate (pipe) rows.
         self.flush_pipes().await;
+    }
+    /// On-each columnar fast path（2026-08-25 q13a 列式化）：命中行来自
+    /// （缺席或列式的）bind-filter 掩码，整批向量化装载/直发——完全跳过行
+    /// 循环。`process_batch` 的 columnar_each 分支早退委托（含 pipe 装载的
+    /// flush_pipes 同批收口节奏，与行式路径一致）。
+    async fn process_batch_columnar_each(
+        &self,
+        batch: &RecordBatch,
+        aliases: &[String],
+        columnar_masks: &HashMap<String, Option<BooleanArray>>,
+        lookup: &RegistryLookup<'_>,
+        batch_emit_nanos: i64,
+    ) {
+        let num_rows = batch.num_rows();
+        let mut hit = vec![false; num_rows];
+        // 非列式 bind filter 的批级视图索引（逐行解释用，免 per-call
+        // schema 线性扫）；无非列式 filter 时不构建。
+        let needs_row_filter = aliases.iter().any(|alias| {
+            !columnar_masks.contains_key(alias) && self.executor.bind_filter_present(alias)
+        });
+        let row_index = needs_row_filter.then(|| build_field_index(batch));
+        for alias in aliases.iter() {
+            match columnar_masks.get(alias) {
+                Some(Some(mask)) => {
+                    for (row, h) in hit.iter_mut().enumerate() {
+                        *h |= mask.value(row);
+                    }
+                }
+                _ => {
+                    if self.executor.bind_filter_present(alias) {
+                        // 非列式 bind filter（gap-4 2026-09-02）：逐行
+                        // `event_matches_alias` 解释（ColumnarEvent 视图直读
+                        // 列，与行式路径字节一致）——不再 hit.fill(true)
+                        // 静默丢过滤子集。index 缺失（防御）= 无视图，
+                        // 走无 index 直读（schema 线性扫，正确性不变）。
+                        let index = row_index.as_ref();
+                        for (row, h) in hit.iter_mut().enumerate() {
+                            if !*h {
+                                let ev = match index {
+                                    Some(index) => {
+                                        ColumnarEvent::with_index(batch, row, Arc::clone(index))
+                                    }
+                                    None => ColumnarEvent::new(batch, row),
+                                };
+                                *h = self.executor.event_matches_alias(alias, &ev, Some(lookup));
+                            }
+                        }
+                    } else {
+                        hit.fill(true); // 无 filter：全放行（与 event_matches_alias 无 filter 一致）
+                    }
+                }
+            }
+        }
+        let hit_indices: Vec<u32> = (0..num_rows)
+            .filter(|&row| hit[row])
+            .map(|row| row as u32)
+            .collect();
+        let time_col_index = batch_time_col_index(batch, self.each_time_field.as_deref());
+        let col_events: Vec<ColumnarEvent<'_>> = hit_indices
+            .iter()
+            .map(|&row| ColumnarEvent::new(batch, row as usize))
+            .collect();
+        let rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
+            .iter()
+            .zip(hit_indices.iter())
+            .map(|(ev, &row)| {
+                let row = row as usize;
+                let event_nanos = time_col_index
+                    .map(|col| batch_event_time_nanos_at(batch, col, row))
+                    .unwrap_or(0);
+                (ev, event_nanos)
+            })
+            .collect();
+        // Metrics parity: the eager path reported the input count before
+        // the loop; the unconditional add with 0 is a no-op, so add the
+        // real count here.
+        if let Some(metrics) = &self.metrics {
+            metrics.add_rule_events(self.executor.plan().name.as_str(), rows.len());
+        }
+        // 列式 each 分流：无活 join（q1 等）走无 join 列式路径；活 join
+        // （q20 等，each_join_plan 已解析）走列式 join 富化路径（批级
+        // join_lookup + 列式右窗字段读，免每事件 Event clone —— 2026-08-23
+        // 列式 join 富化，q20 2.5M/s → 列式量级）。中间管道目标（q13a）
+        // 走 pipe 列式装载（2026-08-25 q13a 列式化）。
+        if self.executor.live_joins().is_empty() {
+            if self.each_direct {
+                self.emit_each_direct_batch_columnar(&rows, batch_emit_nanos)
+                    .await;
+            } else {
+                self.emit_each_pipe_batch_columnar(&rows, batch_emit_nanos)
+                    .await;
+            }
+        } else {
+            self.emit_each_direct_batch_columnar_join(&rows, lookup, batch_emit_nanos)
+                .await;
+        }
+        // 列式分支早退：pipe 路径已在此装载中间行，必须同批收口（与行式
+        // 路径的 flush_pipes 节奏一致）。sink 目标（each_direct）无 pipe
+        // 装载——不调用，避免给 q1 等高频规则每批新增一次 pipe_state 锁
+        // 争用（2026-08-25 review R2）。
+        if !self.each_direct {
+            self.flush_pipes().await;
+        }
     }
 
     /// Log the cumulative advance/scan/emit profiler accumulators once per
