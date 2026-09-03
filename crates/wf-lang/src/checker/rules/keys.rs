@@ -748,7 +748,10 @@ pub fn check_key_mapping_clause(
 /// - 窗口统计/历史：first / last / collect_set / collect_list / stddev /
 ///   percentile（需 instance 历史或窗口收集）；
 /// - 窗口事件查询：has()（需 window lookup）；
-/// - rolling 基线：baseline()（需跨事件 RollingStats 状态）。
+/// - rolling 基线：baseline()（需跨事件 RollingStats 状态）；
+/// - 求值时刻：now/now_s/now_ms/now_us/now_ns（infer 为 Time/Digit 属 key 标量，
+///   但结果依赖求值墙钟——fanout 分片（parse 线程）与机器 advance（task 线程）
+///   求值时刻不同 → 同键事件可能散到不同分片切碎状态；按时刻分组也无意义）。
 ///
 /// 递归检查嵌套调用（concat/case/… 参数内部命中同样拒绝）。
 fn key_expr_has_state_dependent_func(expr: &Expr) -> bool {
@@ -761,6 +764,11 @@ fn key_expr_has_state_dependent_func(expr: &Expr) -> bool {
         "percentile",
         "has",
         "baseline",
+        "now",
+        "now_s",
+        "now_ms",
+        "now_us",
+        "now_ns",
     ];
     match expr {
         Expr::FuncCall { name, args, .. } => {

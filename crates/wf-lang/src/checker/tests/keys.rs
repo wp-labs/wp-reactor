@@ -262,6 +262,7 @@ fn let_derived_match_key_rejects_state_dependent_func() {
         "first(a.src)",
         "has(a.dport, 443)",
         "collect_set(a.src)",
+        "now_s()",
         "concat(a.src, first(a.dst))", // 嵌套命中同样拒绝
     ] {
         let input = format!(

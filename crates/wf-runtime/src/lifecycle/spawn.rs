@@ -1010,6 +1010,12 @@ pub(super) fn spawn_rule_tasks(
                 let has_inline_conv = conv_plan.is_some() && conv_window.is_none();
                 let conv_to_pipe =
                     conv_window.is_some() && intermediate_targets.contains(yield_target.as_str());
+                // issue #80：分片键规格 = keys + 逐位对齐的表达式槽（fanout 对带
+                // 表达式键的规则逐行求值分片，普通字段规则 key_exprs 为空 = 现状）。
+                let key_spec = wf_engine::window::ShardKeySpec {
+                    keys: match_plan.keys.clone().into(),
+                    key_exprs: match_plan.key_exprs.clone().into(),
+                };
                 let shardable = !match_plan.keys.is_empty()
                     && !has_inline_conv
                     && !conv_to_pipe
@@ -1017,14 +1023,14 @@ pub(super) fn spawn_rule_tasks(
                     // 2026-08-29 q11/q6：窗口分片是单一 (keys) 配置，多规则不同
                     // key 分片同一窗口互相覆盖（bidder/auction/seller 三组注册
                     // bid_events）→ 后注册者回退单 worker 保正确（先注册者用分片）。
+                    // 2026-09 表达式键感知：keys 与 key_exprs 全等才算不冲突。
                     && !window_sources.iter().any(|s| {
                         router
                             .fanout()
-                            .window_sharding_conflicts(&s.window_name, &match_plan.keys)
+                            .window_sharding_conflicts_with_exprs(&s.window_name, &key_spec)
                     });
 
                 if shardable {
-                    let keys: Arc<[FieldRef]> = match_plan.keys.clone().into();
                     // M1 pull model: register the window's key partition so the
                     // parse stage computes the per-shard row subset once and
                     // stores it on the log (P2 zero re-partition). The pull
@@ -1032,9 +1038,9 @@ pub(super) fn spawn_rule_tasks(
                     // Harmless in push mode (the broadcast path resolves the
                     // partition from its own delivery subscription instead).
                     for source in &window_sources {
-                        router.fanout().register_window_sharding(
+                        router.fanout().register_window_sharding_with_exprs(
                             &source.window_name,
-                            Arc::clone(&keys),
+                            key_spec.clone(),
                             shard_count,
                         );
                     }
@@ -1052,7 +1058,7 @@ pub(super) fn spawn_rule_tasks(
                             let stage_config = ConvStageConfig {
                                 executor: rule.executor.clone(),
                                 conv_plan: conv_plan.clone(),
-                                keys: Arc::clone(&keys),
+                                keys: Arc::clone(&key_spec.keys),
                                 over: cw.over,
                                 // hop：桶对齐 = slide（封口长度仍 = over = size）。
                                 bucket_align: cw.slide.unwrap_or(cw.over),
@@ -1139,10 +1145,10 @@ pub(super) fn spawn_rule_tasks(
                     }
                     if use_push {
                         for source in &window_sources {
-                            router.fanout().register_sharded(
+                            router.fanout().register_sharded_with_exprs(
                                 &source.window_name,
                                 shard_txs.clone(),
-                                Arc::clone(&keys),
+                                key_spec.clone(),
                             );
                         }
                     }
