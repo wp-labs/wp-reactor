@@ -10,6 +10,9 @@
 //!   `process_push` ack progress slot。
 use std::sync::Arc;
 
+use super::stager::{
+    record_wfu_intermediate_meta_value, record_window_fields, value_to_json, value_to_json_string,
+};
 use super::*;
 
 use std::sync::atomic::AtomicU64;
