@@ -3,6 +3,10 @@
 //! 引擎任务总览见 `crate` lib.rs 的 `//!` 导航；相关设计：
 //! `docs/design/concurrency-scaling.md`、`columnar-execution-design.md`。
 
+mod debug;
+
+use debug::RuleBatchDebugStats;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -42,7 +46,6 @@ use super::task_types::{RuleTaskConfig, WindowSource};
 use super::window_lookup::RegistryLookup;
 
 const PIPE_EVENT_TIME_FIELD: &str = "__wf_pipe_ts";
-const DEBUG_DETAIL_LIMIT: usize = 20;
 
 // 规则相位 profile 计时开关（scan/advance/emit/close_exec/exec 每行 Instant::now
 // + elapsed，仅为 dump_profiling 日志服务）。采样实测（qradar c_* 家族）时钟调用
@@ -311,46 +314,6 @@ fn wall_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
-}
-
-#[derive(Debug, Default)]
-struct RuleBatchDebugStats {
-    input_events: usize,
-    alias_passed: usize,
-    alias_rejected: usize,
-    accumulated: usize,
-    advanced: usize,
-    matched: usize,
-    output_emitted: usize,
-    output_none: usize,
-    intermediate_emitted: usize,
-    errors: usize,
-    detail_logged: usize,
-    detail_suppressed: usize,
-}
-
-impl RuleBatchDebugStats {
-    fn can_log_detail(&self) -> bool {
-        self.detail_logged < DEBUG_DETAIL_LIMIT
-    }
-
-    fn allow_detail(&mut self) -> bool {
-        if self.detail_logged < DEBUG_DETAIL_LIMIT {
-            self.detail_logged += 1;
-            true
-        } else {
-            self.detail_suppressed += 1;
-            false
-        }
-    }
-
-    fn count_output(&mut self, record: &OutputRecord, intermediate_targets: &HashSet<String>) {
-        if intermediate_targets.contains(&*record.yield_target) {
-            self.intermediate_emitted += 1;
-        } else {
-            self.output_emitted += 1;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4932,6 +4895,7 @@ fn value_to_json(value: &wf_engine::match_engine::Value) -> RuntimeResult<serde_
 
 #[cfg(test)]
 mod debug_stats_tests {
+    use super::debug::DEBUG_DETAIL_LIMIT;
     use super::*;
     use wf_engine::alert::AlertOrigin;
 
