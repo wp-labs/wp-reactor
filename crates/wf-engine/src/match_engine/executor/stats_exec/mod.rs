@@ -19,9 +19,10 @@ pub(crate) use accum::{NumericAccum, NumericKind, NumericSoA, NumericSoALayout, 
 mod state;
 pub use state::{StatsBucketAccs, StatsWindowState};
 // StatsBucket 仅 stats_soa_bench 经 executor:: 转发消费（lib 无生产引用）——
-// re-export 链保留，避免在 lib cfg 下误报 unused。
+// pub(crate) 声明 = 可达上限（不触发 unreachable_pub）；lib 下 re-export 链无
+// 生产消费者，允许 unused。
 #[allow(unused_imports)]
-pub use state::StatsBucket;
+pub(crate) use state::StatsBucket;
 
 mod exec;
 pub use exec::StatsExecutor;
