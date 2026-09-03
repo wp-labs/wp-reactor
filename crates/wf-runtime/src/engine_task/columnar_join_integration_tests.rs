@@ -94,6 +94,7 @@ fn q20_shape_executor() -> RuleExecutor {
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::ZERO),
@@ -191,6 +192,7 @@ fn q13b_shape_executor() -> RuleExecutor {
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::ZERO),

@@ -525,6 +525,12 @@ impl FieldSource for ColumnarEvent<'_> {
             let mut acc: Option<ScopeKey> = None;
             let mut row_path = false;
             for key in keys {
+                // issue #83：嵌套路径 key 需要 walk 叶值，不能列直读 root（会把
+                // 整个 root 列当 key）——统一回退行式提取。
+                if matches!(key, FieldRef::Path { .. }) {
+                    row_path = true;
+                    break;
+                }
                 let name = field_ref_name(key);
                 if name.is_empty() {
                     row_path = true;

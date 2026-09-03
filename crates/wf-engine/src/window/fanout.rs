@@ -7,12 +7,12 @@ use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
 use tokio::sync::mpsc;
-use wf_lang::ast::FieldRef;
+use wf_lang::ast::{Expr, FieldRef};
 
-use crate::match_engine::event_bridge::extract_field_value;
+use crate::match_engine::event_bridge::{ColumnarEvent, extract_field_value};
 use crate::match_engine::{
-    Event, ScopeKey, Value, extract_key_simple, field_ref_name, scope_key_from_values,
-    scope_key_shard_index,
+    Event, ScopeKey, Value, extract_key_simple, extract_scope_key_mixed, field_ref_name,
+    scope_key_from_values, scope_key_shard_index,
 };
 use arrow::record_batch::RecordBatch;
 
@@ -48,6 +48,44 @@ pub struct RulePush {
     pub shard_rows: Option<Arc<Vec<u32>>>,
 }
 
+/// 每窗 fanout 的**分片键规格**（issue #80）：`keys` + 逐位对齐的表达式槽。
+///
+/// 普通字段/嵌套路径 key：只填 `keys`（`key_exprs` 空），分片走列直读快路径；
+/// 表达式派生 key（#80，如 `concat(src,":",dst)` 的 let）：`keys[i]` 保留逻辑名、
+/// `key_exprs[i] = Some(expr)`，fanout 对每行事件求值后哈希分片。
+///
+/// 求值经 `extract_scope_key_mixed`（与机器内 advance 同构：同一 `ScopeKey` →
+/// 同一 shard），故同派生 key 的事件必然落在同一 rule task，窗口跨事件聚合
+/// 状态不被切碎。
+#[derive(Clone, Default)]
+pub struct ShardKeySpec {
+    pub keys: Arc<[FieldRef]>,
+    /// 表达式槽；空 = 无表达式键（纯字段分片）。非空时与 `keys` 逐位对齐。
+    pub key_exprs: Arc<[Option<Expr>]>,
+}
+
+impl ShardKeySpec {
+    pub fn new(keys: Arc<[FieldRef]>) -> Self {
+        Self {
+            keys,
+            key_exprs: Arc::from([]),
+        }
+    }
+
+    /// 是否含表达式键位（决定分片是否走逐行求值）。
+    pub fn has_exprs(&self) -> bool {
+        self.key_exprs.iter().any(Option::is_some)
+    }
+}
+
+/// 全等比较：冲突检测必须把表达式槽纳入（同 keys、一方带 expr 一方不带 =
+/// 分区方式不同，同窗口并存会互相覆盖注册导致状态切碎）。
+impl PartialEq for ShardKeySpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.keys == other.keys && self.key_exprs == other.key_exprs
+    }
+}
+
 /// A subscription for one window: a single (unsharded) rule channel, N shard
 /// channels with a key partition (rule sharding, P2a), or N worker channels
 /// with whole-batch round-robin (stateless `on each` sharding, R4).
@@ -60,7 +98,7 @@ enum Subscription {
     Single(mpsc::Sender<RulePush>),
     Sharded {
         shards: Vec<mpsc::Sender<RulePush>>,
-        keys: Arc<[FieldRef]>,
+        spec: ShardKeySpec,
     },
     RoundRobin {
         shards: Vec<mpsc::Sender<RulePush>>,
@@ -76,9 +114,9 @@ impl Clone for Subscription {
     fn clone(&self) -> Self {
         match self {
             Subscription::Single(tx) => Subscription::Single(tx.clone()),
-            Subscription::Sharded { shards, keys } => Subscription::Sharded {
+            Subscription::Sharded { shards, spec } => Subscription::Sharded {
                 shards: shards.clone(),
-                keys: Arc::clone(keys),
+                spec: spec.clone(),
             },
             Subscription::RoundRobin { shards, next } => Subscription::RoundRobin {
                 shards: shards.clone(),
@@ -108,8 +146,11 @@ impl Clone for Subscription {
 ///
 /// 空键 = **输入行索引分区**（`row % shard_count`, 2026-08-24 q15 空键 stats
 /// 输入分片用——按行号均匀切分, 各片独立累加, close 时归并）; 非空 = 按键
-/// 哈希分区（`partition_rows_by_key`, 同 key 同片）。
-pub type WindowShardPartition = (Arc<[FieldRef]>, usize);
+/// 哈希分区（`partition_rows_by_key`/表达式分片, 同 key 同片）。
+pub struct WindowShardPartition {
+    pub spec: ShardKeySpec,
+    pub shard_count: usize,
+}
 
 /// 输入行索引分区: `row % shard_count` 均匀切分（空键 stats 输入分片）。
 /// 行序保持（每片内行索引升序）, 时间分布均匀（各片窗口对齐）。
@@ -231,12 +272,31 @@ impl RuleFanout {
         shards: Vec<mpsc::Sender<RulePush>>,
         keys: Arc<[FieldRef]>,
     ) {
+        self.register_sharded_with_exprs(window_name, shards, ShardKeySpec::new(keys));
+    }
+
+    /// [`Self::register_sharded`] 的表达式键变体（issue #80）：`spec.key_exprs`
+    /// 非空时，广播按逐行表达式求值结果分片（缺失/求值失败 → shard 0，与
+    /// 机器内 skip 语义对齐）。
+    pub fn register_sharded_with_exprs(
+        &self,
+        window_name: &str,
+        shards: Vec<mpsc::Sender<RulePush>>,
+        spec: ShardKeySpec,
+    ) {
         debug_assert!(!shards.is_empty());
+        if spec.has_exprs() {
+            debug_assert_eq!(
+                spec.keys.len(),
+                spec.key_exprs.len(),
+                "keys 与 key_exprs 必须逐位对齐"
+            );
+        }
         let mut table = self.table.write().expect("fanout lock poisoned");
         table
             .entry(window_name.to_string())
             .or_default()
-            .push(Subscription::Sharded { shards, keys });
+            .push(Subscription::Sharded { shards, spec });
     }
 
     /// Register N worker channels for `window_name` served whole batches in
@@ -272,12 +332,33 @@ impl RuleFanout {
         keys: Arc<[FieldRef]>,
         shard_count: usize,
     ) {
+        self.register_window_sharding_with_exprs(window_name, ShardKeySpec::new(keys), shard_count);
+    }
+
+    /// [`Self::register_window_sharding`] 的表达式键变体（issue #80）：pull 模型
+    /// 的 parse 预计算分片同样支持逐行表达式求值。
+    pub fn register_window_sharding_with_exprs(
+        &self,
+        window_name: &str,
+        spec: ShardKeySpec,
+        shard_count: usize,
+    ) {
         debug_assert!(shard_count > 0);
+        if spec.has_exprs() {
+            debug_assert_eq!(
+                spec.keys.len(),
+                spec.key_exprs.len(),
+                "keys 与 key_exprs 必须逐位对齐"
+            );
+        }
         let mut reg = self
             .window_sharding
             .write()
             .expect("fanout sharding lock poisoned");
-        reg.insert(window_name.to_string(), (keys, shard_count));
+        reg.insert(
+            window_name.to_string(),
+            WindowShardPartition { spec, shard_count },
+        );
     }
 
     /// Whether `window_name` has a key-partitioned (sharded) subscription
@@ -291,19 +372,41 @@ impl RuleFanout {
     }
 
     /// 窗口分片冲突检测（2026-08-29 q11/q6 多规则根因）：`window_sharding` 是
-    /// **每窗口单一 (keys, shard_count) 配置**（覆盖式 insert），多个规则以
-    /// **不同 keys** 分片同一窗口时互相覆盖——后注册规则的 shard 拉取按被覆盖的
-    /// key 分片，同 key 事件分散到不同 shard → 有状态规则状态被切碎（q11
-    /// bidder session 单规则 17081 → all 118234、q6 872913 → 787704）。
-    /// 注册方（spawn）用它判定：窗口已被不同 keys 注册 → 本规则回退单 worker
-    /// （整批处理，正确性优先）。同 keys（如 q11/q12 都按 bidder）不算冲突。
+    /// **每窗口单一 (keys) 配置**（覆盖式 insert），多个规则以**不同 keys** 分片
+    /// 同一窗口时互相覆盖——后注册规则的 shard 拉取按被覆盖的 key 分片，同 key
+    /// 事件分散到不同 shard → 有状态规则状态被切碎（q11 bidder session 单规则
+    /// 17081 → all 118234、q6 872913 → 787704）。注册方（spawn）用它判定：窗口
+    /// 已被不同 keys 注册 → 本规则回退单 worker（整批处理，正确性优先）。
+    /// 同 keys（如 q11/q12 都按 bidder）不算冲突。
     pub fn window_sharding_conflicts(&self, window_name: &str, keys: &[FieldRef]) -> bool {
         let reg = self
             .window_sharding
             .read()
             .expect("fanout sharding lock poisoned");
         match reg.get(window_name) {
-            Some((existing, _)) => existing.as_ref() != keys,
+            Some(existing) => {
+                // keys 不同，或已注册者是表达式分片（分区方式含求值，即使 keys
+                // 相同也不兼容——覆盖式注册会切碎状态）→ 冲突。
+                existing.spec.keys.as_ref() != keys || existing.spec.has_exprs()
+            }
+            None => false,
+        }
+    }
+
+    /// 表达式键感知的冲突检测（issue #80）：分区规格（keys **且** key_exprs）
+    /// 全等才算不冲突——同 keys、一方带表达式槽一方不带 = 分区方式不同，若
+    /// 误判不冲突会被覆盖式注册切碎状态。
+    pub fn window_sharding_conflicts_with_exprs(
+        &self,
+        window_name: &str,
+        spec: &ShardKeySpec,
+    ) -> bool {
+        let reg = self
+            .window_sharding
+            .read()
+            .expect("fanout sharding lock poisoned");
+        match reg.get(window_name) {
+            Some(existing) => existing.spec != *spec,
             None => false,
         }
     }
@@ -316,7 +419,13 @@ impl RuleFanout {
             .window_sharding
             .write()
             .expect("fanout sharding lock poisoned");
-        reg.insert(window_name.to_string(), (Arc::new([]), shard_count));
+        reg.insert(
+            window_name.to_string(),
+            WindowShardPartition {
+                spec: ShardKeySpec::default(),
+                shard_count,
+            },
+        );
     }
 
     /// Broadcast `events` (window batch with sequence `seq`) to every rule
@@ -409,34 +518,32 @@ impl RuleFanout {
         window_name: &str,
         batch: &RecordBatch,
     ) -> Option<Arc<[Vec<u32>]>> {
-        let (keys, shard_count) = {
+        let (spec, shard_count) = {
             let subs = self.table.read().expect("fanout lock poisoned");
             let fanout = subs.get(window_name).and_then(|list| {
                 list.iter().find_map(|s| match s {
-                    Subscription::Sharded { shards, keys } => {
-                        Some((Arc::clone(keys), shards.len()))
-                    }
+                    Subscription::Sharded { shards, spec } => Some((spec.clone(), shards.len())),
                     _ => None,
                 })
             });
-            if let Some((keys, n)) = fanout {
-                (keys, n)
+            if let Some((spec, n)) = fanout {
+                (spec, n)
             } else {
                 let reg = self
                     .window_sharding
                     .read()
                     .expect("fanout sharding lock poisoned");
                 let entry = reg.get(window_name)?;
-                (Arc::clone(&entry.0), entry.1)
+                (entry.spec.clone(), entry.shard_count)
             }
         };
-        let per = if keys.is_empty() {
+        let per = if spec.keys.is_empty() {
             // 空键 = 输入行索引分区（q15 空键 stats 输入分片）: 均匀按行号切分。
             partition_rows_by_index(batch, shard_count)
         } else {
-            partition_rows_by_key(batch, &keys, shard_count).unwrap_or_else(|| {
+            partition_rows(batch, &spec, shard_count).unwrap_or_else(|| {
                 // Key column absent from schema → every row missing → all shard 0
-                // (matches row-based).
+                // (matches row-based). 表达式键规则永不走到这里（逐行求值分片）。
                 let mut v = Vec::with_capacity(shard_count);
                 v.resize_with(shard_count, Vec::new);
                 v[0] = (0..batch.num_rows()).map(|r| r as u32).collect();
@@ -484,12 +591,12 @@ impl RuleFanout {
                     let tx = tx.clone();
                     sends.push(Box::pin(async move { tx.send(push).await.is_err() }));
                 }
-                Subscription::Sharded { shards, keys } => {
+                Subscription::Sharded { shards, spec } => {
                     match (events, batch_arc.as_ref()) {
                         // Row-based (pre-materialized events), **no batch**:
                         // keep the existing per-event key partition.
                         (Some(events), None) => {
-                            sharded_sends(shards, keys, &window_name, events, seq, &mut sends);
+                            sharded_sends(shards, spec, &window_name, events, seq, &mut sends);
                         }
                         // Batch available (with or without pre-materialized
                         // events): partition the raw batch by key and send each
@@ -512,10 +619,11 @@ impl RuleFanout {
                             };
                             let per: Arc<[Vec<u32>]> = match pre {
                                 Some(pre) => Arc::from(pre),
-                                None => partition_rows_by_key(batch, keys, shards.len())
+                                None => partition_rows(batch, spec, shards.len())
                                     .unwrap_or_else(|| {
                                         // Key column absent from schema → every row
                                         // missing → all shard 0 (matches row-based).
+                                        // 表达式键规则永不走到这里。
                                         let mut v = vec![Vec::new(); shards.len()];
                                         v[0] = (0..batch.num_rows()).map(|r| r as u32).collect();
                                         v
@@ -729,12 +837,48 @@ fn partition_rows_by_key(
     Some(per)
 }
 
+/// 统一的分片入口（issue #80）：表达式键规则（`spec.has_exprs()`）逐行求值
+/// 分片——`ColumnarEvent::new(batch, row)` 把行变成 `FieldSource`，经
+/// [`extract_scope_key_mixed`]（与机器内 advance 同构的键构建）得到 `ScopeKey`
+/// 后哈希；求值失败/缺字段行 → shard 0（机器在 advance 再按 key 缺失跳过，
+/// 不丢行）。表达式分片**永不**因「键列缺失」返回 `None`（表达式键不看列名）。
+///
+/// 纯字段规则走 [`partition_rows_by_key`] 列直读快路径（保持原行为：整 schema
+/// 缺键列 → `None`，调用方回退全 shard 0）。
+fn partition_rows(
+    batch: &RecordBatch,
+    spec: &ShardKeySpec,
+    shard_count: usize,
+) -> Option<Vec<Vec<u32>>> {
+    if !spec.has_exprs() {
+        return partition_rows_by_key(batch, spec.keys.as_ref(), shard_count);
+    }
+    debug_assert_eq!(
+        spec.keys.len(),
+        spec.key_exprs.len(),
+        "keys 与 key_exprs 必须逐位对齐"
+    );
+    // 批级字段名→列索引提升一次（review：ColumnarEvent::new 无 index 时每次
+    // field_value 线性扫 schema，逐行循环会把它放大成 O(rows × cols)）。
+    let index = crate::match_engine::build_field_index(batch);
+    let mut per: Vec<Vec<u32>> = (0..shard_count).map(|_| Vec::new()).collect();
+    for row in 0..batch.num_rows() {
+        let ce = ColumnarEvent::with_index(batch, row, Arc::clone(&index));
+        let idx = extract_scope_key_mixed(&ce, spec.keys.as_ref(), spec.key_exprs.as_ref(), "")
+            .map(|key| scope_key_shard_index(&key, shard_count))
+            .unwrap_or(0);
+        per[idx].push(row as u32);
+    }
+    Some(per)
+}
+
 /// Partition a batch by match key and push one send future per non-empty
 /// shard into `sends`. Awaits full shard channels via the caller's join
-/// (backpressure).
+/// (backpressure). `spec.has_exprs()` 时逐事件表达式求值（与 [`partition_rows`]
+/// 列式逐行同一哈希 → 同 key 同 shard）。
 fn sharded_sends(
     shards: &[mpsc::Sender<RulePush>],
-    keys: &[FieldRef],
+    spec: &ShardKeySpec,
     window_name: &Arc<str>,
     events: &Arc<Vec<Arc<Event>>>,
     seq: u64,
@@ -743,10 +887,21 @@ fn sharded_sends(
     let n = shards.len();
     let mut sub_batches: Vec<Vec<Arc<Event>>> = (0..n).map(|_| Vec::new()).collect();
     for event in events.iter() {
-        // Missing key → shard 0; the rule's state machine skips it anyway.
-        let idx = extract_key_simple(event.as_ref(), keys)
-            .map(|scope_key| scope_key_shard_index(&scope_key_from_values(&scope_key), n))
-            .unwrap_or(0);
+        // Missing key / 求值失败 → shard 0; the rule's state machine skips it anyway.
+        let idx = if spec.has_exprs() {
+            extract_scope_key_mixed(
+                event.as_ref(),
+                spec.keys.as_ref(),
+                spec.key_exprs.as_ref(),
+                "",
+            )
+            .map(|key| scope_key_shard_index(&key, n))
+            .unwrap_or(0)
+        } else {
+            extract_key_simple(event.as_ref(), spec.keys.as_ref())
+                .map(|scope_key| scope_key_shard_index(&scope_key_from_values(&scope_key), n))
+                .unwrap_or(0)
+        };
         sub_batches[idx].push(Arc::clone(event));
     }
 
@@ -1537,5 +1692,488 @@ mod tests {
         rx1.recv().await.unwrap();
         rx1.recv().await.unwrap();
         assert_eq!(fanout.queued_items("w"), Some((1, 8)), "消费后排队须回落");
+    }
+
+    // =========================================================================
+    // issue #80 — 表达式派生 key 分片（fanout 逐行求值）
+    // =========================================================================
+
+    /// `concat(src, ":", dst)` 表达式键规格：keys 保留逻辑名 pair，槽位存表达式。
+    fn pair_expr_spec() -> ShardKeySpec {
+        use wf_lang::ast::Expr;
+        ShardKeySpec {
+            keys: Arc::from(vec![FieldRef::Simple("pair".into())].into_boxed_slice()),
+            key_exprs: Arc::from(
+                vec![Some(Expr::FuncCall {
+                    qualifier: None,
+                    name: "concat".into(),
+                    args: vec![
+                        Expr::Field(FieldRef::Qualified("s".into(), "src".into())),
+                        Expr::StringLit(":".into()),
+                        Expr::Field(FieldRef::Qualified("s".into(), "dst".into())),
+                    ],
+                })]
+                .into_boxed_slice(),
+            ),
+        }
+    }
+
+    /// src/dst UTF8 批：rows = [a:b, a:b, c:d, 缺 src, a:b, 缺 dst]。
+    fn expr_batch() -> RecordBatch {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("src", DataType::Utf8, true),
+            Field::new("dst", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("a"),
+                    Some("c"),
+                    None, // 缺 src → concat None
+                    Some("a"),
+                    Some("x"),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("b"),
+                    Some("b"),
+                    Some("d"),
+                    Some("e"),
+                    Some("b"),
+                    None, // 缺 dst → concat None
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn expr_partition_rows_matches_row_based_per_row() {
+        // 列式表达式分片必须与行式（batch_to_events + extract_scope_key_mixed）
+        // 逐行落在同一 shard：缺 src/dst（求值 None）→ 双方都 shard 0。
+        use crate::match_engine::batch_to_events;
+        let batch = expr_batch();
+        let spec = pair_expr_spec();
+        let shards = 3usize;
+
+        let per = partition_rows(&batch, &spec, shards).expect("expr 分片永不 None");
+        let col_shard = |row: usize| -> usize {
+            per.iter()
+                .position(|rows| rows.contains(&(row as u32)))
+                .unwrap()
+        };
+        let events = batch_to_events(&batch);
+        let row_shard = |row: usize| -> usize {
+            extract_scope_key_mixed(
+                &events[row],
+                spec.keys.as_ref(),
+                spec.key_exprs.as_ref(),
+                "",
+            )
+            .map(|key| scope_key_shard_index(&key, shards))
+            .unwrap_or(0)
+        };
+        for row in 0..batch.num_rows() {
+            assert_eq!(
+                col_shard(row),
+                row_shard(row),
+                "row {row}: 列式表达式分片与行式不一致"
+            );
+        }
+        // 无丢失/重复：覆盖全部 6 行。
+        let mut flat: Vec<u32> = per.iter().flatten().copied().collect();
+        flat.sort_unstable();
+        assert_eq!(flat, vec![0, 1, 2, 3, 4, 5]);
+        // 同派生值 a:b 必须同片（行 0/1/4）。
+        let s = col_shard(0);
+        assert_eq!(col_shard(1), s);
+        assert_eq!(col_shard(4), s);
+    }
+
+    #[test]
+    fn expr_partition_rows_equals_precomputed_field_column() {
+        // 最强正确性锁：表达式分片 == 「上游预计算 pair 列 + 纯字段分片」。
+        // 同一批行的派生键分片与直接按 pair 列分片逐 shard 一致。
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let expr_b = expr_batch();
+        // 预计算列版本：第 3 行 src 缺 → pair = "none"（避免与 expr None 的
+        // 缺字段行分片位不同：缺 src/dst 行在 expr 侧求值 None → shard0，
+        // 预计算侧若给非空 pair 会落别的片——故对照只在两批**都有值**的行上做）。
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("src", DataType::Utf8, true),
+            Field::new("dst", DataType::Utf8, true),
+            Field::new("pair", DataType::Utf8, true),
+        ]));
+        let pair_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("a"),
+                    Some("c"),
+                    None,
+                    Some("a"),
+                    Some("x"),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("b"),
+                    Some("b"),
+                    Some("d"),
+                    Some("e"),
+                    Some("b"),
+                    None,
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("a:b"),
+                    Some("a:b"),
+                    Some("c:d"),
+                    None, // 与 expr 侧 None（shard0）对应
+                    Some("a:b"),
+                    None, // 同上
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let spec = pair_expr_spec();
+        let shards = 3usize;
+        let expr_per = partition_rows(&expr_b, &spec, shards).expect("expr partition");
+        let field_per =
+            partition_rows_by_key(&pair_batch, &[FieldRef::Simple("pair".into())], shards)
+                .expect("pair column present");
+        let expr_shard = |row: usize| -> usize {
+            expr_per
+                .iter()
+                .position(|rows| rows.contains(&(row as u32)))
+                .unwrap()
+        };
+        let field_shard = |row: usize| -> usize {
+            field_per
+                .iter()
+                .position(|rows| rows.contains(&(row as u32)))
+                .unwrap()
+        };
+        for row in 0..6 {
+            assert_eq!(
+                expr_shard(row),
+                field_shard(row),
+                "row {row}: 表达式分片与预计算列分片不一致"
+            );
+        }
+    }
+
+    #[test]
+    fn precompute_shard_rows_equals_partition_rows_expr() {
+        // pull 模型注册（with_exprs）后 parse 预计算分片 == 广播内部 partition_rows。
+        let fanout = RuleFanout::new();
+        let batch = expr_batch();
+        let spec = pair_expr_spec();
+        let (txs, _rxs): (Vec<_>, Vec<_>) = (0..3).map(|_| mpsc::channel::<RulePush>(8)).unzip();
+        fanout.register_sharded_with_exprs("win_e", txs, spec.clone());
+
+        let pre = fanout
+            .precompute_shard_rows("win_e", &batch)
+            .expect("sharded window");
+        let internal = partition_rows(&batch, &spec, 3).expect("expr partition");
+        assert_eq!(pre.len(), internal.len());
+        for i in 0..3 {
+            assert_eq!(pre[i].as_ref() as &[u32], internal[i].as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn expr_sharded_broadcast_routes_same_key_together() {
+        // push 模式：表达式键广播后，同派生 key 的事件必须到同一分片通道。
+        use crate::match_engine::batch_to_events;
+        let fanout = RuleFanout::new();
+        let batch = expr_batch();
+        let events: Arc<Vec<Arc<Event>>> =
+            Arc::new(batch_to_events(&batch).into_iter().map(Arc::new).collect());
+        let (tx0, mut rx0) = mpsc::channel::<RulePush>(16);
+        let (_tx1, _rx1) = mpsc::channel::<RulePush>(16);
+        fanout.register_sharded_with_exprs("win_b", vec![tx0, _tx1], pair_expr_spec());
+
+        // 每行事件 → 预期 shard（与 fanout 同构计算）。
+        let spec = pair_expr_spec();
+        let row_shard = |event: &Event| -> usize {
+            extract_scope_key_mixed(event, spec.keys.as_ref(), spec.key_exprs.as_ref(), "")
+                .map(|k| scope_key_shard_index(&k, 2))
+                .unwrap_or(0)
+        };
+        // 广播只带事件（行式路径 sharded_sends）。
+        fanout.broadcast("win_b", &events, 0).await;
+        // 收通道 0 的全部：应只含 shard==0 的行（同派生 key 同片）。
+        let mut got = Vec::new();
+        while let Ok(push) = rx0.try_recv() {
+            if let Some(evs) = push.events {
+                for e in evs.iter() {
+                    got.push(row_shard(e));
+                }
+            }
+        }
+        assert!(!got.is_empty(), "shard 0 至少收到行");
+        assert!(got.iter().all(|&s| s == 0), "通道 0 只应收到 shard0 的行");
+        // 补验：a:b 三行若落在 shard1，则通道 0 为空时 shard1 应有全部——
+        // 用实例覆盖断言：所有行要么全在 0 要么全在 1（按预期 shard 归并）。
+        let expected_in_0: usize = (0..6)
+            .map(|row| row_shard(&batch_to_events(&batch)[row]))
+            .filter(|&s| s == 0)
+            .count();
+        assert_eq!(got.len(), expected_in_0, "通道 0 行数 = 预期 shard0 行数");
+    }
+
+    #[test]
+    fn window_sharding_conflicts_accounts_expr_slots() {
+        let fanout = RuleFanout::new();
+        let keys: Arc<[FieldRef]> = Arc::from(vec![FieldRef::Simple("pair".into())]);
+        let plain = ShardKeySpec::new(keys.clone());
+        let expr = pair_expr_spec();
+        // 同 keys、一方带表达式 → 冲突（分区方式不同）。
+        fanout.register_window_sharding_with_exprs("w", plain.clone(), 4);
+        assert!(
+            fanout.window_sharding_conflicts_with_exprs("w", &expr),
+            "expr 与纯字段分区方式不同 → 必须判冲突"
+        );
+        // 相同 spec 再注册 → 不冲突（覆盖式同值，共享分片）。
+        let fanout2 = RuleFanout::new();
+        fanout2.register_window_sharding_with_exprs("w", expr.clone(), 4);
+        assert!(!fanout2.window_sharding_conflicts_with_exprs("w", &expr));
+        // keys-only 入口对已注册 expr spec 也判冲突。
+        assert!(fanout2.window_sharding_conflicts("w", &[FieldRef::Simple("pair".into())]));
+    }
+
+    #[test]
+    fn expr_numeric_partition_matches_precomputed_int_column() {
+        // review 3：数值表达式键（Int64 相加）分片 == 预计算 Int64 列分片——
+        // typed key（Int）在 fanout 层与列直读同构（数字不能因路径不同塌缩出
+        // 不同 shard）。
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use wf_lang::ast::{BinOp, Expr};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let expr_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    None,
+                    Some(1),
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![
+                    Some(10),
+                    Some(20),
+                    Some(30),
+                    Some(40),
+                    None,
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        // 预计算 sum 列版本（缺 a/b 的行 sum 也为 null，与 expr 侧 None→shard0 对应）。
+        let sum_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+            Field::new("sum", DataType::Int64, true),
+        ]));
+        let sum_batch = RecordBatch::try_new(
+            sum_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    None,
+                    Some(1),
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![
+                    Some(10),
+                    Some(20),
+                    Some(30),
+                    Some(40),
+                    None,
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![
+                    Some(11),
+                    Some(22),
+                    Some(33),
+                    None,
+                    None,
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let add = Expr::BinOp {
+            op: BinOp::Add,
+            left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "a".into()))),
+            right: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "b".into()))),
+        };
+        let spec = ShardKeySpec {
+            keys: Arc::from(vec![FieldRef::Simple("sum".into())].into_boxed_slice()),
+            key_exprs: Arc::from(vec![Some(add)].into_boxed_slice()),
+        };
+        let shards = 3usize;
+        let expr_per = partition_rows(&expr_batch, &spec, shards).expect("expr partition");
+        let field_per =
+            partition_rows_by_key(&sum_batch, &[FieldRef::Simple("sum".into())], shards)
+                .expect("sum column present");
+        for row in 0..5 {
+            let es = expr_per
+                .iter()
+                .position(|rows| rows.contains(&(row as u32)))
+                .unwrap();
+            let fs = field_per
+                .iter()
+                .position(|rows| rows.contains(&(row as u32)))
+                .unwrap();
+            assert_eq!(es, fs, "row {row}: 数值表达式分片与预计算 Int 列分片不一致");
+        }
+    }
+
+    #[test]
+    fn expr_mixed_key_partition_matches_row_based() {
+        // review 3：混合键（普通字段位 None + 表达式位 Some）列式分片 == 行式
+        // 逐行 extract_scope_key_mixed（None 槽按字段读、expr 槽按行求值）。
+        use crate::match_engine::batch_to_events;
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use wf_lang::ast::Expr;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("grp", DataType::Utf8, true),
+            Field::new("port", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    Some("x"),
+                    Some("y"),
+                    None,
+                    Some("z"),
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    Some(4),
+                    None,
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        // 表达式槽：port + 10（读 Int64 列，null → None）。
+        let plus = Expr::BinOp {
+            op: wf_lang::ast::BinOp::Add,
+            left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "port".into()))),
+            right: Box::new(Expr::Number(10.0)),
+        };
+        let spec = ShardKeySpec {
+            keys: Arc::from(
+                vec![
+                    FieldRef::Simple("grp".into()),
+                    FieldRef::Simple("port_k".into()),
+                ]
+                .into_boxed_slice(),
+            ),
+            key_exprs: Arc::from(vec![None, Some(plus)].into_boxed_slice()),
+        };
+        let shards = 3usize;
+        let per = partition_rows(&batch, &spec, shards).expect("expr partition");
+        let events = batch_to_events(&batch);
+        for (row, ev) in events.iter().enumerate() {
+            let col_s = per
+                .iter()
+                .position(|rows| rows.contains(&(row as u32)))
+                .unwrap();
+            let row_s =
+                extract_scope_key_mixed(ev, spec.keys.as_ref(), spec.key_exprs.as_ref(), "")
+                    .map(|k| scope_key_shard_index(&k, shards))
+                    .unwrap_or(0);
+            assert_eq!(col_s, row_s, "row {row}: 混合键列式与行式分片不一致");
+        }
+    }
+
+    /// 100k 行 src/dst UTF8 批（派生 key 值域 1024，避免字符串缓存/热点失真）。
+    fn big_expr_batch(n: usize) -> RecordBatch {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("src", DataType::Utf8, true),
+            Field::new("dst", DataType::Utf8, true),
+        ]));
+        let src: Vec<String> = (0..n)
+            .map(|i| format!("10.{}.{}.{}", (i / 65_536) % 256, (i / 256) % 256, i % 256))
+            .collect();
+        let dst: Vec<String> = (0..n).map(|i| format!("dst{}", i % 1024)).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(src)) as ArrayRef,
+                Arc::new(StringArray::from(dst)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    /// `partition_rows` 表达式分片是 parse/broadcast 单 writer 路径上的逐行
+    /// eval 热点（issue #80）——吞吐必须有界，防止逐行 eval 退化（review R1 的
+    /// 批级 field index 提升是它的主要杠杆）。与纯字段版
+    /// `precompute_shard_rows_throughput_is_bounded` 对称。
+    #[test]
+    fn expr_partition_rows_throughput_is_bounded() {
+        use std::time::{Duration, Instant};
+        let batch = big_expr_batch(100_000);
+        let spec = pair_expr_spec();
+        let _ = partition_rows(&batch, &spec, 8).expect("expr partition");
+
+        let n = 10u32;
+        let t0 = Instant::now();
+        for _ in 0..n {
+            let per = partition_rows(&batch, &spec, 8).expect("expr partition");
+            assert_eq!(per.len(), 8);
+        }
+        let per = t0.elapsed() / n;
+        // 预算 = 实测量级 ×3 余量（CI 抖动）；超限说明逐行求值路径出现量级退化。
+        assert!(
+            per < Duration::from_millis(900),
+            "expr 列式分片 100k rows took {per:?}; 逐行 eval 路径异常"
+        );
+    }
+
+    /// pull parse 预计算路径（`precompute_shard_rows` + 表达式 spec）同样有界。
+    #[test]
+    fn expr_precompute_shard_rows_throughput_is_bounded() {
+        use std::time::{Duration, Instant};
+        let batch = big_expr_batch(100_000);
+        let fanout = RuleFanout::new();
+        fanout.register_window_sharding_with_exprs("win", pair_expr_spec(), 10);
+        let _ = fanout.precompute_shard_rows("win", &batch);
+
+        let n = 10u32;
+        let t0 = Instant::now();
+        for _ in 0..n {
+            let rows = fanout
+                .precompute_shard_rows("win", &batch)
+                .expect("sharded window must partition");
+            assert_eq!(rows.len(), 10);
+        }
+        let per = t0.elapsed() / n;
+        assert!(
+            per < Duration::from_millis(900),
+            "expr precompute_shard_rows 100k rows took {per:?}; parse 阶段逐行 eval 异常"
+        );
     }
 }

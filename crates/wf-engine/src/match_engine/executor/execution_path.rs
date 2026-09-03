@@ -122,6 +122,7 @@ mod tests {
     fn empty_match_plan() -> MatchPlan {
         MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(300)),

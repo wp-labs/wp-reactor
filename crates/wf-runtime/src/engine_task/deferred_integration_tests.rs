@@ -259,6 +259,7 @@ fn make_deferred_join_task_with_over(
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::ZERO),
@@ -951,6 +952,7 @@ fn make_q8_task() -> (
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::ZERO),

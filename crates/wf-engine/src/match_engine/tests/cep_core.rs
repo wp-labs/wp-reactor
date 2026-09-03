@@ -1,9 +1,9 @@
 //! M14 core CEP state machine tests (1–11).
 
-use wf_lang::ast::{CmpOp, Expr, FieldSelector, Measure, Transform};
-use wf_lang::plan::{AggPlan, BranchPlan};
+use wf_lang::ast::{CmpOp, Expr, FieldRef, FieldSelector, Measure, PathSegment, Transform};
+use wf_lang::plan::{AggPlan, BranchPlan, WindowSpec};
 
-use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+use crate::match_engine::match_engine::{CepStateMachine, EngineHashMap, StepResult, Value};
 
 use super::helpers::*;
 
@@ -145,6 +145,163 @@ fn evidence_time_ignores_events_not_consumed_by_current_step() {
     // 候选事件跨度：scan@1s 已进入实例（作为 step2 的早期事件）→ 计入。
     assert_eq!(ctx.event_first_time_nanos, 1_000_000_000);
     assert_eq!(ctx.event_last_time_nanos, 20_000_000_000);
+}
+
+/// `roles_obj` 为含 `id` 叶的结构化对象值（嵌套 key 测试用）。
+fn obj_roles(id: &str) -> Value {
+    Value::Object(EngineHashMap::<smol_str::SmolStr, Value>::from_iter([(
+        "id".into(),
+        Value::Str(id.into()),
+    )]))
+}
+
+#[test]
+fn event_span_tracks_arrival_order_first_and_time_max_last() {
+    // issue #82 方案 A：候选跨度 = 到达序首条事件时间 + 时间序最大。乱序到达
+    // （先 9s 后 3s）时 event_first=9s（首条到达）、event_last=9s（时间 max）；
+    // 证据跨度按 branch 记录的时间 min/max = [3s, 9s]——两组独立可辨。
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(2.0))])],
+    );
+    let mut sm = CepStateMachine::new("rule_out_of_order".to_string(), plan, None);
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+
+    assert_eq!(
+        sm.advance_at("fail", &e, 9_000_000_000),
+        StepResult::Accumulate
+    );
+    let StepResult::Matched(ctx) = sm.advance_at("fail", &e, 3_000_000_000) else {
+        panic!("expected match on second (out-of-order) event");
+    };
+    assert_eq!(ctx.event_first_time_nanos, 9_000_000_000);
+    assert_eq!(ctx.event_last_time_nanos, 9_000_000_000);
+    assert_eq!(ctx.evidence_first_time_nanos, 3_000_000_000);
+    assert_eq!(ctx.evidence_last_time_nanos, 9_000_000_000);
+}
+
+#[test]
+fn nested_path_match_key_groups_by_leaf_value() {
+    // issue #83：嵌套路径作为 match key —— 按叶值分组，同叶值事件进入同一
+    // 实例累积；缺 root/叶的事件按现有缺失 key 语义跳过。
+    let plan = simple_plan(
+        vec![FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("id".into()),
+            ],
+        }],
+        vec![step(vec![branch("e", count_ge(2.0))])],
+    );
+    let mut sm = CepStateMachine::new("rule_path_key".to_string(), plan, None);
+    let ev_a = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("roles_obj", obj_roles("k1")),
+    ]);
+
+    // 同叶 `k1` 两个事件 → 同一实例计数到 2 → 命中。
+    assert_eq!(
+        sm.advance_at("e", &ev_a, 1_000_000_000),
+        StepResult::Accumulate
+    );
+    let StepResult::Matched(ctx) = sm.advance_at("e", &ev_a, 2_000_000_000) else {
+        panic!("同叶第二事件应命中同一实例");
+    };
+    assert_eq!(ctx.scope_key, vec![str_val("k1")], "分组键 = 路径叶值");
+
+    // 不同叶 `k2` → 独立实例（第一条仅累积）。
+    let ev_b = event(vec![
+        ("sip", str_val("10.0.0.2")),
+        ("roles_obj", obj_roles("k2")),
+    ]);
+    assert_eq!(
+        sm.advance_at("e", &ev_b, 3_000_000_000),
+        StepResult::Accumulate
+    );
+    let StepResult::Matched(ctx) = sm.advance_at("e", &ev_b, 4_000_000_000) else {
+        panic!("不同叶 k2 的第二事件应命中 k2 实例");
+    };
+    assert_eq!(ctx.scope_key, vec![str_val("k2")]);
+}
+
+#[test]
+fn nested_path_match_key_missing_root_skips_event() {
+    // 嵌套 key 的 root 字段缺失 → 与普通 key 缺失一致：事件跳过、不建实例。
+    let plan = simple_plan(
+        vec![FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("id".into()),
+            ],
+        }],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+    );
+    let mut sm = CepStateMachine::new("rule_path_key_missing".to_string(), plan, None);
+    let ev_no_root = event(vec![("sip", str_val("10.0.0.1"))]);
+    assert_eq!(
+        sm.advance_at("e", &ev_no_root, 1_000_000_000),
+        StepResult::Accumulate,
+        "root 缺失 → 跳过（不 fire、不建实例）"
+    );
+    assert_eq!(sm.instance_count(), 0);
+}
+
+#[test]
+fn nested_path_key_object_leaf_skips_event() {
+    // 路径少写一段（叶是 object）→ 事件跳过、不建实例（不聚到 [object]）。
+    let plan = simple_plan(
+        vec![FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("attacker".into()),
+            ],
+        }],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+    );
+    let mut sm = CepStateMachine::new("rule_path_key_object_leaf".to_string(), plan, None);
+    let ev = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("roles_obj", obj_roles("k1")),
+    ]);
+    assert_eq!(
+        sm.advance_at("e", &ev, 1_000_000_000),
+        StepResult::Accumulate,
+        "object 叶 → key 缺失跳过"
+    );
+    assert_eq!(sm.instance_count(), 0);
+}
+
+#[test]
+fn nested_path_key_groups_within_fixed_window_bucket() {
+    // fixed 窗口 + 嵌套 key：同桶（桶起点对齐）内同叶事件进入同一实例计数。
+    let mut plan = simple_plan(
+        vec![FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("id".into()),
+            ],
+        }],
+        vec![step(vec![branch("e", count_ge(2.0))])],
+    );
+    plan.window_spec = WindowSpec::Fixed(std::time::Duration::from_secs(10));
+    let mut sm = CepStateMachine::new("rule_path_key_fixed".to_string(), plan, None);
+    let ev = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("roles_obj", obj_roles("k1")),
+    ]);
+    // 桶 [0s,10s)：t=1s 与 t=2s 同桶 → 同实例累积到 2。
+    assert_eq!(
+        sm.advance_at("e", &ev, 1_000_000_000),
+        StepResult::Accumulate
+    );
+    let StepResult::Matched(ctx) = sm.advance_at("e", &ev, 2_000_000_000) else {
+        panic!("同桶第二事件应命中同一实例");
+    };
+    assert_eq!(ctx.scope_key, vec![str_val("k1")]);
 }
 
 #[test]

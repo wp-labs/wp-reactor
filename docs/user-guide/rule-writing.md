@@ -87,6 +87,17 @@ rule brute_force {
 
 定义匹配窗口：按 `sip` 分组（不同 IP 独立计数），滑动窗口 5 分钟。`<sip:5m>` 读作"按 sip 分组的 5 分钟窗口"。
 
+分组 key 除顶层/单层字段外，还支持**多层嵌套路径**与 **`let` 派生字段**（issue #83）：嵌套路径按叶值分组（root 需为结构化 object/array 字段），`let` 派生字段在事件进入窗口前求值后参与分组，二者结果一致。半结构化日志（如安全发现对象 `s.source_finding_obj.attacker.endpoint.ip`）建议优先在接入/解码层把关键字段上提为顶层字段（性能最优）；源不可控时用规则内嵌套/派生 key：
+
+```wfl
+let attacker_ip = s.source_finding_obj.attacker.endpoint.ip
+match<attacker_ip:1d:fixed> {
+    on event<accu> { s | count >= 1; }
+}
+```
+
+派生/嵌套 key 的缺失、为空或路径中途漏写段 → 该事件不进入任何实例（与普通 key 缺失行为一致）。v1 限制：仅单事件源规则；与 `rule_shards > 1`、`conv`、pipeline stage 组合暂不支持（详见语言参考）。
+
 **`on event { failed_hits: fail | count >= 3; }`**
 
 事件触发条件。`failed_hits` 是 step label，用于在 `yield` 中稳定引用这一步的统计值；`fail` 引用 events 中绑定的别名，`|` 后是聚合条件：`fail` 事件的 `count`（累积计数）达到 3。

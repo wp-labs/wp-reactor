@@ -70,6 +70,7 @@ fn minimal_plan() -> RulePlan {
         lets: vec![],
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(60)),
@@ -241,6 +242,7 @@ fn machine_rule() -> (RulePlan, CepStateMachine) {
     use wf_lang::plan::{AggPlan, BranchPlan, StepPlan};
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(300)),

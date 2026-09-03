@@ -58,6 +58,7 @@ fn step(branches: Vec<BranchPlan>) -> wf_lang::plan::StepPlan {
 fn simple_plan(mode: MatchMode, accu: bool) -> MatchPlan {
     MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(60)),
@@ -80,6 +81,7 @@ fn simple_plan(mode: MatchMode, accu: bool) -> MatchPlan {
 fn plan_with_close_mode(close_mode: CloseMode) -> MatchPlan {
     MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(60)),
@@ -105,6 +107,7 @@ fn plan_with_close() -> MatchPlan {
 fn plan_seq_fixed_accu() -> MatchPlan {
     MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(10)),
@@ -126,6 +129,7 @@ fn plan_seq_fixed_accu() -> MatchPlan {
 fn plan_seq_accu_with_throttle() -> MatchPlan {
     MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(60)),
@@ -176,6 +180,11 @@ fn first_match_records_wall_on_first_fire_and_keeps_across_accu() {
     sm.set_processing_wall(WALL_1);
     let ctx1 = expect_matched(&mut sm, "e", &sip_ev(), 1_000_000_000);
     assert_eq!(ctx1.first_match_time_nanos, Some(WALL_1));
+    // 候选/证据：单事件实例两组都 = [1s,1s]。
+    assert_eq!(ctx1.event_first_time_nanos, 1_000_000_000);
+    assert_eq!(ctx1.event_last_time_nanos, 1_000_000_000);
+    assert_eq!(ctx1.evidence_first_time_nanos, 1_000_000_000);
+    assert_eq!(ctx1.evidence_last_time_nanos, 1_000_000_000);
 
     sm.set_processing_wall(WALL_2);
     let ctx2 = expect_matched(&mut sm, "e", &sip_ev(), 2_000_000_000);
@@ -184,6 +193,12 @@ fn first_match_records_wall_on_first_fire_and_keeps_across_accu() {
         Some(WALL_1),
         "accu 重复命中必须保持首次命中墙钟，而不是当前批次墙钟"
     );
+    // accu 重复 fire：候选跨度随窗口累积增长 [1s,2s]；证据同样累积——branch
+    // 状态跨 rearm 保留（step_states kept），StepData 证据起点仍是窗口首事件。
+    assert_eq!(ctx2.event_first_time_nanos, 1_000_000_000);
+    assert_eq!(ctx2.event_last_time_nanos, 2_000_000_000);
+    assert_eq!(ctx2.evidence_first_time_nanos, 1_000_000_000);
+    assert_eq!(ctx2.evidence_last_time_nanos, 2_000_000_000);
 
     // 窗口到期 close：实例从未 reset，first_match 保持首次 fire 的墙钟。
     sm.set_processing_wall(WALL_3);
@@ -194,6 +209,11 @@ fn first_match_records_wall_on_first_fire_and_keeps_across_accu() {
         Some(WALL_1),
         "accu 实例 close 输出保留首次命中墙钟"
     );
+    // Or 模式无 close 步：close 证据回退到实例最后事件；候选保持窗口跨度。
+    assert_eq!(outs[0].event_first_time_nanos, 1_000_000_000);
+    assert_eq!(outs[0].event_last_time_nanos, 2_000_000_000);
+    assert_eq!(outs[0].evidence_first_time_nanos, 2_000_000_000);
+    assert_eq!(outs[0].evidence_last_time_nanos, 2_000_000_000);
 }
 
 #[test]

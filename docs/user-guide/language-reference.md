@@ -192,7 +192,33 @@ match<sip:5m> {
 - key 可为空、单 key、复合 key
 - 支持滑动窗口、固定窗口、会话窗口、HOP 滑动窗口
 - key 支持点字段和下标字段，例如 `match<e["detail.sha256"]:5m>`
+- key 支持**多层嵌套路径**（root 必须是结构化 object/array 字段），例如 `match<s.extensions_obj.obj.id:1d:fixed>`——按路径叶值分组，等价于把该叶先提取为顶层字段再用其分组；嵌套路径可含数组索引段（`s.roles_obj.related[0].uid`）
+- key 可引用**`let` 派生字段**（issue #83）：事件先按 `let` 定义求值再参与分组，要求 `let` 定义为纯字段/嵌套路径形态、派生值类型为标量（digit/chars/bool/time/ip/hex，float/object/array 除外）
 - 多步是顺序关系，前一步命中后才进入后一步
+
+派生 / 嵌套 key 示例：
+
+```wfl
+let attacker_ip  = s.source_finding_obj.attacker.endpoint.ip
+let victim_ip    = s.source_finding_obj.victim.endpoint.ip
+let category     = s.source_finding_obj.category_code
+
+match<attacker_ip, victim_ip, category:1d:fixed> {
+    on event<accu> { s | count >= 1; }
+}
+```
+
+```wfl
+match<s.extensions_obj.obj.id:1d:fixed> {
+    on event<accu> { s | count >= 1; }
+}
+```
+
+语义要点：
+
+- 直接写嵌套路径与先用 `let` 取别名再作 key **聚合结果一致**（编译为同一分组表达式）；`let` 名与事件源字段同名时，`let` 绑定优先（与表达式解析一致）
+- 嵌套/派生 key 缺失、为空、或路径中途是数组/对象（漏写叶段）→ 与普通 key 缺失行为一致：该事件不进入任何实例
+- v1 边界：派生/嵌套 key 仅支持单事件源规则；`let` 定义暂不接受函数/字面量派生作 key；与 `rule_shards > 1` 分片、`conv`、pipeline stage 组合暂不支持
 
 固定窗口示例：
 
@@ -598,6 +624,8 @@ rule alert_entity_rule {
 
 - **候选事件跨度**（`@event_first_time` / `@event_last_time`）：窗口内进入该实例的全部被接受事件的首尾——适合 `first_seen` / `last_seen` 一类“该实体在窗口内何时开始/最后出现”的字段。
 - **证据跨度**（`@evidence_start_time` / `@evidence_end_time`）：实际构成这次命中的事件跨度。对阈值规则，若窗口里还有更多事件尚未达到触发即到达（或 guard 拒绝），证据终点可能早于候选终点；两类规则一致时两组相等。
+- `on event<accu>` 规则：分支证据状态跨 rearm 累积（`collect_set` 等证据逐条递增）→ 证据起点通常就是窗口首条证据事件，候选与证据随窗口共同推进。
+- 乱序到达（事件时间回退）：候选 `first` 取到达序首条事件、`last` 取事件时间最大；证据 `start/end` 取分支记录的事件时间 min/max。
 - **事件时间**来自输入事件字段，**处理墙钟**（`@first_match_time`）来自引擎处理时刻，不应混用。
 
 推荐在输出 window 中显式声明业务字段：

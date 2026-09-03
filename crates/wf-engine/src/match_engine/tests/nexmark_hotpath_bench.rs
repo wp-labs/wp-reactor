@@ -241,6 +241,7 @@ fn agg(measure: Measure, cmp: CmpOp, threshold: f64) -> AggPlan {
 fn q4_q6_plan(fixed: bool) -> MatchPlan {
     MatchPlan {
         keys: vec![FieldRef::Simple("category".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: Some(JoinKeyPlan {
             join_idx: 0,
@@ -315,6 +316,7 @@ fn q4_q6_plan(fixed: bool) -> MatchPlan {
 fn q5_q7_plan(max_measure: bool) -> MatchPlan {
     MatchPlan {
         keys: vec![FieldRef::Simple("auction".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(10)),
@@ -366,6 +368,7 @@ fn q5_q7_plan(max_measure: bool) -> MatchPlan {
 fn q11_q12_plan(session: bool) -> MatchPlan {
     MatchPlan {
         keys: vec![FieldRef::Simple("bidder".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: if session {
@@ -413,6 +416,7 @@ fn q13_rule() -> RulePlan {
         "q13_bench",
         MatchPlan {
             keys: vec![FieldRef::Simple("bidder".into())],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(600)),
@@ -628,6 +632,7 @@ fn q16_plan() -> MatchPlan {
     ];
     MatchPlan {
         keys: vec![FieldRef::Simple("channel".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(1800)),
@@ -699,6 +704,7 @@ fn q17_plan() -> MatchPlan {
     ];
     MatchPlan {
         keys: vec![FieldRef::Simple("auction".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(1800)),
@@ -742,6 +748,7 @@ fn q18_plan() -> MatchPlan {
             FieldRef::Simple("bidder".into()),
             FieldRef::Simple("auction".into()),
         ],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(1800)),

@@ -121,6 +121,15 @@ pub struct BindPlan {
 #[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct MatchPlan {
     pub keys: Vec<FieldRef>,
+    /// 派生 key 表达式槽（issue #80）：与 `keys` 逐位对齐——`Some(expr)` 表示
+    /// 该 key 不是事件字段，而是要对**触发事件**求值的派生表达式（`let` 定义
+    /// 编译期展开为纯事件字段表达式）。`None` = 普通字段/嵌套路径 key（按
+    /// `keys[i]` 从事件提取）。
+    ///
+    /// 与 #83 纯字段 let key（编译期内联成等值 FieldRef、此处为 None）不同，
+    /// 函数/字面量派生 let 无法内联成 FieldRef，故保留 `keys[i] = Simple(let 名)`
+    /// 作逻辑名（ctx 注入/输出/摘要按此名配对 scope_key 值），引擎按本槽求值。
+    pub key_exprs: Vec<Option<ExprPlan>>,
     pub key_map: Option<Vec<KeyMapPlan>>,
     /// join-then-key (Path A): the match key comes from a snapshot join's right
     /// window (e.g. `match<category:10m>` where `category` is on auction_events

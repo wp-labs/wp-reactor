@@ -67,6 +67,7 @@ impl WindowLookup for MockAuctionLookup {
 fn q4_key_join_plan() -> _Plan {
     _Plan {
         keys: vec![FieldRef::Simple("category".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: Some(JoinKeyPlan {
             join_idx: 0,

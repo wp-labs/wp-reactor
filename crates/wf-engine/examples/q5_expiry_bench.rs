@@ -31,6 +31,7 @@ fn event(auction: f64) -> Event {
 fn build_plan(window_dur: Duration) -> MatchPlan {
     MatchPlan {
         keys: vec![FieldRef::Simple("auction".to_string())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(window_dur),

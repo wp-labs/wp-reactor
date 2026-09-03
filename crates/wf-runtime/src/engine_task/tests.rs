@@ -345,6 +345,7 @@ fn make_task_inner(
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -522,6 +523,7 @@ fn make_pipeline_stage_task_opts(
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -659,6 +661,7 @@ fn make_each_task_with_bind_filter(
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
@@ -748,6 +751,7 @@ fn make_filtered_match_task() -> (
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -862,6 +866,7 @@ fn make_filtered_close_config() -> (
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -1011,6 +1016,7 @@ fn make_filtered_each_task() -> (
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
@@ -1114,6 +1120,7 @@ fn make_intermediate_each_task() -> (
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
@@ -1242,6 +1249,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
@@ -1355,6 +1363,7 @@ fn make_intermediate_score_tasks() -> (
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
@@ -1440,6 +1449,7 @@ fn make_intermediate_score_tasks() -> (
 
     let downstream_match = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(1)),
@@ -1622,6 +1632,7 @@ fn make_intermediate_score_band_tasks() -> (
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
@@ -1707,6 +1718,7 @@ fn make_intermediate_score_band_tasks() -> (
 
     let downstream_match = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(1)),
@@ -1930,6 +1942,7 @@ fn make_filtered_bind_alias_match_task() -> (
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -2110,6 +2123,7 @@ fn make_window_has_match_task() -> (
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -2404,6 +2418,8 @@ async fn columnar_bind_filter_matches_interpreted_path() {
     );
 
     // Columnar path: the push carries the raw batch → bind filter is a mask.
+    // 用 await 收单条（带超时）而非 drain+try_recv：emit 与断言之间无
+    // 确定性同步点，立即排空在全量并发下会偶发 Empty（2026-09 实测 flake）。
     let (mut task, mut alert_rx, _win, _notify) = make_filter_task(filter.clone());
     task.process_push(RulePush {
         window_name: "auth_events".into(),
@@ -2414,7 +2430,7 @@ async fn columnar_bind_filter_matches_interpreted_path() {
         seq: u64::MAX,
     })
     .await;
-    let columnar_ids = drain_alert_entity_ids(&mut alert_rx);
+    let columnar = take_alert_recv_timeout(&mut alert_rx).await;
 
     // Interpreted path: no raw batch → per-event `event_matches_alias`.
     let (mut task2, mut alert_rx2, _win2, _notify2) = make_filter_task(filter);
@@ -2428,11 +2444,27 @@ async fn columnar_bind_filter_matches_interpreted_path() {
             seq: u64::MAX,
         })
         .await;
-    let interpreted_ids = drain_alert_entity_ids(&mut alert_rx2);
+    let interpreted = take_alert_recv_timeout(&mut alert_rx2).await;
 
-    assert_eq!(columnar_ids, interpreted_ids);
+    assert_eq!(
+        field_str(&columnar, "__wfu_entity_id"),
+        field_str(&interpreted, "__wfu_entity_id"),
+        "列式与解释路径实体一致"
+    );
     // Only sip == "10.0.0.1" passes the filter; 3 of them reach count>=3 → one fire.
-    assert_eq!(columnar_ids, vec!["10.0.0.1".to_string()]);
+    assert_eq!(field_str(&columnar, "__wfu_entity_id"), "10.0.0.1");
+    assert_eq!(field_str(&interpreted, "__wfu_entity_id"), "10.0.0.1");
+}
+
+/// `take_alert_recv` 带 5s 超时版：测试收不到输出时快速失败而非挂起。
+async fn take_alert_recv_timeout(
+    rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>,
+) -> Arc<wp_model_core::model::DataRecord> {
+    let batch = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("5s 内未收到 alert（emit 未发生或投递竞态）")
+        .expect("alert channel closed");
+    first_record(&batch)
 }
 
 #[tokio::test]
@@ -3233,6 +3265,7 @@ fn make_sharded_match_tasks(
     for shard_index in 0..shard_count {
         let match_plan = MatchPlan {
             keys: vec![FieldRef::Simple("sip".into())],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
@@ -3444,6 +3477,7 @@ async fn round_robin_pulls_whole_batch_despite_foreign_window_sharding() {
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Fixed(std::time::Duration::ZERO),
@@ -3579,6 +3613,7 @@ async fn round_robin_shard_acks_processed_not_read_position() {
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Fixed(std::time::Duration::ZERO),
@@ -4165,6 +4200,7 @@ async fn port_scan_rule_triggers_close_alert() {
     // port_scan-like MatchPlan
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Qualified("c".into(), "sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(10)),
@@ -4397,6 +4433,86 @@ async fn pure_relay_broadcasts_to_sharded_downstream() {
     );
 }
 
+/// issue #80 e2e：表达式派生 key（`concat("net-", sip)` 的 let 展开）在真实
+/// relay push 链路上按逐行求值结果分片——同派生值不跨片、跨批稳定落同一片
+/// （spawn 装配产物的 spec 同构：keys=[Simple(k)] + key_exprs=[Some(expr)]）。
+#[tokio::test]
+async fn expr_key_sharded_relay_routes_derived_key_together() {
+    init_tracing();
+    use wf_lang::ast::Expr;
+    let (mut task, _alert_rx, router) = make_pipeline_stage_task();
+    let (shard_a_tx, mut shard_a_rx) = mpsc::channel::<wf_engine::window::RulePush>(8);
+    let (shard_b_tx, mut shard_b_rx) = mpsc::channel::<wf_engine::window::RulePush>(8);
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "concat".into(),
+        args: vec![
+            Expr::StringLit("net-".into()),
+            Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+        ],
+    };
+    router.fanout().register_sharded_with_exprs(
+        "__wf_pipe_pipe_s1_w1",
+        vec![shard_a_tx, shard_b_tx],
+        wf_engine::window::ShardKeySpec {
+            keys: std::sync::Arc::from([FieldRef::Simple("k".into())]),
+            key_exprs: std::sync::Arc::from([Some(expr)]),
+        },
+    );
+
+    let ts = 1_700_000_000_123_000_000i64;
+    let schema = test_schema();
+    let source = router.registry().get_window("auth_events").unwrap();
+    // 两个不同派生 key：可能同片或异片，但每个 key 只能出现在一个片内。
+    let batch = make_batch(&schema, &["10.0.0.8", "10.0.0.9"], ts);
+    source.append(batch).unwrap();
+    task.pull_and_advance().await;
+    let drain = |rx: &mut mpsc::Receiver<wf_engine::window::RulePush>| -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .flat_map(|p| {
+                // 分片 push 携带全量 events + shard_rows 子集（消费方按子集取行）：
+                // 该片实际拥有的行 = shard_rows 索引（无 shard_rows 的行式 push
+                // = 整批归属）。events 与 batch 行序一致。
+                let owned: Vec<usize> = match p.shard_rows {
+                    Some(rows) => rows.iter().map(|&r| r as usize).collect(),
+                    None => (0..p.events.as_ref().map(|e| e.len()).unwrap_or(0)).collect(),
+                };
+                let evs = p.events.expect("relay push carries events");
+                owned
+                    .into_iter()
+                    .filter_map(|i| match evs.get(i).and_then(|e| e.fields.get("sip")) {
+                        Some(wf_engine::match_engine::Value::Str(s)) => Some(s.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    let mut a = drain(&mut shard_a_rx);
+    let mut b = drain(&mut shard_b_rx);
+    let sip_in_8 = |list: &[String]| list.iter().any(|s| s == "10.0.0.8");
+    // 同派生 key 不跨片：8/9 各自只出现在一片。
+    assert!(!(sip_in_8(&a) && sip_in_8(&b)), "10.0.0.8 不得跨片");
+    assert!(
+        !(a.iter().any(|s| s == "10.0.0.9") && b.iter().any(|s| s == "10.0.0.9")),
+        "10.0.0.9 不得跨片"
+    );
+    // 全部两行都送达（不丢行）。
+    let mut all = a.clone();
+    all.extend(b.clone());
+    assert_eq!(all.len(), 2, "两行都必须被送达");
+    let key_shard: usize = if sip_in_8(&a) { 0 } else { 1 };
+
+    // 跨批稳定：第二批 10.0.0.8 必须仍落在同一片。
+    let batch2 = make_batch(&schema, &["10.0.0.8"], ts + 1_000_000);
+    source.append(batch2).unwrap();
+    task.pull_and_advance().await;
+    a.extend(drain(&mut shard_a_rx));
+    b.extend(drain(&mut shard_b_rx));
+    let landed = if key_shard == 0 { a } else { b };
+    assert!(sip_in_8(&landed), "同派生 key 跨批必须稳定落同一片");
+}
+
 /// An input batch that produces no intermediate rows must not broadcast:
 /// flushing an empty stager is a no-op on the pipe channel.
 #[tokio::test]
@@ -4510,6 +4626,7 @@ fn make_conv_sink_task() -> (
     let (win_arc, notify_arc) = make_window("auth_events", &schema, usize::MAX);
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(60)),
@@ -4692,6 +4809,7 @@ async fn conv_stage_emits_sealed_close_to_sink() {
     init_tracing();
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(60)),
@@ -4832,6 +4950,7 @@ async fn conv_stage_emits_sealed_close_to_sink() {
 fn conv_stage_test_executor() -> RuleExecutor {
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(60)),

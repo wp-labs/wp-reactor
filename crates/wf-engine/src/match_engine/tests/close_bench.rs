@@ -198,6 +198,7 @@ fn q15_close_steps() -> Vec<StepPlan> {
 fn q15_plan() -> MatchPlan {
     MatchPlan {
         keys: vec![],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(1800)),

@@ -122,6 +122,7 @@ fn make_join_where_task() -> (
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(300)),
@@ -253,6 +254,7 @@ fn make_dual_join_task() -> (
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(300)),
@@ -727,6 +729,7 @@ fn make_key_join_task() -> (
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("category".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: Some(JoinKeyPlan {
             join_idx: 0,
@@ -981,6 +984,7 @@ fn make_each_join_where_task() -> (
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: WindowSpec::Fixed(std::time::Duration::ZERO),
@@ -1086,6 +1090,7 @@ fn make_interval_join_task() -> (
 
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(300)),

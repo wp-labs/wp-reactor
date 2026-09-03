@@ -21,7 +21,7 @@ pub use buffer::{
 pub use evictor::{EvictReport, EvictionGate, Evictor, WindowEvictCount};
 pub(crate) use fanout::scope_key_columnar;
 pub(crate) use fanout::scope_key_from_column;
-pub use fanout::{RuleFanout, RulePush};
+pub use fanout::{RuleFanout, RulePush, ShardKeySpec};
 pub use progress::WindowProgress;
 pub use provider::ProviderWindow;
 pub use registry::{WindowDef, WindowRegistry};

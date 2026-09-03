@@ -72,6 +72,7 @@ fn step(branches: Vec<BranchPlan>) -> wf_lang::plan::StepPlan {
 fn simple_plan(keys: Vec<FieldRef>, steps: Vec<wf_lang::plan::StepPlan>) -> MatchPlan {
     MatchPlan {
         keys,
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),

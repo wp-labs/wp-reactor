@@ -83,6 +83,7 @@ fn q13a_plan_rule_plan() -> RulePlan {
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::ZERO),
@@ -806,6 +807,7 @@ fn q13b_production_path_bench() {
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::ZERO),
@@ -1134,6 +1136,7 @@ fn q13b_concurrent_lock_bench() {
             lets: Vec::new(),
             match_plan: MatchPlan {
                 keys: vec![],
+                key_exprs: Vec::new(),
                 key_map: None,
                 key_join: None,
                 window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::ZERO),
@@ -2033,6 +2036,7 @@ fn stats_close_rule_executor_const_detail() -> wf_engine::match_engine::RuleExec
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::from_secs(86400)),
@@ -2132,6 +2136,7 @@ fn stats_close_rule_executor() -> wf_engine::match_engine::RuleExecutor {
         lets: Vec::new(),
         match_plan: MatchPlan {
             keys: vec![],
+            key_exprs: Vec::new(),
             key_map: None,
             key_join: None,
             window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::from_secs(86400)),

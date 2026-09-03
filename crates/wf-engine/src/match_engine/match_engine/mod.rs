@@ -24,7 +24,8 @@ pub use key::{ScopeKey, field_ref_name};
 #[allow(unused_imports)] // key.rs 内部用全限定路径；重导出由 executor::eval 等模块消费
 pub(crate) use key::{
     eval_field_value, eval_field_value_src, extract_key_simple, extract_scope_key_from_row,
-    push_i64_exact_decimal, scope_key_from_values, scope_key_shard_index, value_to_string,
+    extract_scope_key_mixed, push_i64_exact_decimal, scope_key_from_values, scope_key_shard_index,
+    value_to_string,
 };
 
 pub use conv::apply_conv;
@@ -494,6 +495,16 @@ impl CepStateMachine {
                 scope_key
             };
             scope_key_from_values(&scope_key)
+        } else if self.plan.key_map.is_none() && self.plan.key_exprs.iter().any(Option::is_some) {
+            // issue #80 派生 key（表达式 let，如 coalesce/concat/case 结果作 key）：
+            // 无法列式直读，逐位混提——有表达式槽的键位对触发事件求值，None 键位
+            // 按普通字段/路径提取；任一键缺失/求值失败 → skip（与普通 key 缺失语义一致）。
+            // key_map 存在时禁用（编译器保证 key_exprs 只在 key_map.is_none() 时装配，
+            // 此条件防御手工构造的 plan 并存）。
+            match extract_scope_key_mixed(event, &self.plan.keys, &self.plan.key_exprs, alias) {
+                Some(skey) => skey,
+                None => return step_outcome(StepResult::Accumulate, None),
+            }
         } else {
             match event.extract_scope_key(&self.plan.keys, self.plan.key_map.as_deref(), alias) {
                 Some(skey) => skey,

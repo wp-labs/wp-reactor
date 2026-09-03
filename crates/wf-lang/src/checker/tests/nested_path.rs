@@ -76,9 +76,10 @@ rule r {
 }
 
 #[test]
-fn nested_path_in_match_key_is_parse_error_not_silent() {
-    // Match keys are single-level; a nested path is rejected at parse time so
-    // it can never reach the checker as a FieldRef::Path.
+fn nested_path_in_match_key_is_rejected_by_checker_not_parse() {
+    // issue #83：match key 现支持多段嵌套路径（root 校验在 checker/编译期）。
+    // 该旧用例改为验证：root 缺失（`roles_obj` 不存在于 auth_events）→ checker
+    // 报字段缺失，而不是 parse error。
     let input = r#"
 rule r {
     events { a : auth_events }
@@ -87,11 +88,10 @@ rule r {
     yield out (x = a.sip)
 }
 "#;
-    let err = parse_wfl(input).expect_err("nested path in match key must fail to parse");
-    assert!(
-        format!("{:?}", err).contains("match"),
-        "expected a parse error mentioning the match clause, got: {:?}",
-        err
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "field `roles_obj` not found in window",
     );
 }
 

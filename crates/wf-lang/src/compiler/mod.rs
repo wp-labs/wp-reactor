@@ -98,6 +98,7 @@ fn compile_rule(
 fn empty_match_plan() -> MatchPlan {
     MatchPlan {
         keys: Vec::new(),
+        key_exprs: Vec::new(),
         key_map: None,
         key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(0)),
@@ -230,6 +231,113 @@ fn compile_stats_rule(
     }
 }
 
+/// 把 match key 引用的 let 表达式递归展开为纯事件字段表达式（issue #80）。
+/// `FieldRef::Simple(let 名)` → 该 let 的 RHS（继续递归，支持 let 链）；
+/// 非 let 引用（事件字段 / Qualified / Path 等）保持原样——引擎求值时按
+/// 事件字段解析。`visiting` 防自引用死循环：引用自身时保留原引用（引擎
+/// eval 读缺字段 → None → 事件按 key 缺失跳过，与解释路径语义一致）。
+fn expand_let_expr(expr: &Expr, lets: &[LetDecl], visiting: &mut Vec<String>) -> Expr {
+    match expr {
+        Expr::Field(FieldRef::Simple(name)) => {
+            if !visiting.iter().any(|v| v == name)
+                && let Some(rhs) = lets.iter().find(|l| &l.name == name)
+            {
+                visiting.push(name.clone());
+                let out = expand_let_expr(&rhs.expr, lets, visiting);
+                visiting.pop();
+                return out;
+            }
+            expr.clone()
+        }
+        Expr::BinOp { op, left, right } => Expr::BinOp {
+            op: *op,
+            left: Box::new(expand_let_expr(left, lets, visiting)),
+            right: Box::new(expand_let_expr(right, lets, visiting)),
+        },
+        Expr::Neg(inner) => Expr::Neg(Box::new(expand_let_expr(inner, lets, visiting))),
+        Expr::Not(inner) => Expr::Not(Box::new(expand_let_expr(inner, lets, visiting))),
+        Expr::Array(items) => Expr::Array(
+            items
+                .iter()
+                .map(|i| expand_let_expr(i, lets, visiting))
+                .collect(),
+        ),
+        Expr::InList {
+            expr: target,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(expand_let_expr(target, lets, visiting)),
+            list: list
+                .iter()
+                .map(|i| expand_let_expr(i, lets, visiting))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => Expr::IfThenElse {
+            cond: Box::new(expand_let_expr(cond, lets, visiting)),
+            then_expr: Box::new(expand_let_expr(then_expr, lets, visiting)),
+            else_expr: Box::new(expand_let_expr(else_expr, lets, visiting)),
+        },
+        Expr::Match {
+            expr: subject,
+            arms,
+            default,
+        } => Expr::Match {
+            expr: Box::new(expand_let_expr(subject, lets, visiting)),
+            arms: arms
+                .iter()
+                .map(|arm| MatchArm {
+                    patterns: arm
+                        .patterns
+                        .iter()
+                        .map(|p| expand_let_expr(p, lets, visiting))
+                        .collect(),
+                    value: expand_let_expr(&arm.value, lets, visiting),
+                })
+                .collect(),
+            default: default
+                .as_ref()
+                .map(|d| Box::new(expand_let_expr(d, lets, visiting))),
+        },
+        Expr::Object(items) => Expr::Object(
+            items
+                .iter()
+                .map(|it| crate::ast::ObjectItem {
+                    targets: it.targets.clone(),
+                    type_hint: it.type_hint.clone(),
+                    value: expand_let_expr(&it.value, lets, visiting),
+                })
+                .collect(),
+        ),
+        Expr::FuncCall {
+            qualifier,
+            name,
+            args,
+        } => Expr::FuncCall {
+            qualifier: qualifier.clone(),
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| expand_let_expr(a, lets, visiting))
+                .collect(),
+        },
+        // 叶子/无需展开：非 Simple 字段引用与字面量保持原样。
+        Expr::Field(_)
+        | Expr::Number(_)
+        | Expr::StringLit(_)
+        | Expr::Bool(_)
+        | Expr::SystemVar(_)
+        | Expr::WfuMeta(_)
+        | Expr::PresetParam(_)
+        | Expr::ListRef(_) => expr.clone(),
+    }
+}
+
 fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema]) -> RulePlan {
     // stats 形态: 声明式窗口统计, 无 match/score/join
     if let Some(stats) = &rule.stats_clause {
@@ -246,6 +354,64 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
     let yield_plan = compile_yield(&rule.yield_clause, file, &labels);
     let binds = compile_binds(&rule.events);
     let mut match_plan = compile_match(&rule.match_clause, false, &binds, &rule.joins, schemas);
+    // issue #83/#80：派生 key（match key 引用 let 绑定）编译装配。
+    // - 纯字段/嵌套路径 let（#83）：内联为等值 FieldRef（与直接写嵌套路径 key
+    //   聚合结果一致），key_exprs 槽位为 None——引擎按普通字段/路径提取。
+    // - 表达式 let（#80，函数/字面量派生如 coalesce/concat）：无法内联成
+    //   FieldRef——keys[i] 保留 `Simple(let 名)` 作逻辑名（ctx 注入/输出/摘要
+    //   按此名配对 scope_key 值），key_exprs[i] 存 let RHS（递归内联引用链，
+    //   得纯事件字段表达式）由引擎对事件求值。key_mapping 的 logical key 不内联。
+    if match_plan.key_map.is_none() {
+        // 先收集 key 名及原下标（避免遍历时可变借用 keys），再逐位内联/展开。
+        // 必须保留原始位置：keys 里可能混有 Path/Qualified 键，下标错位会
+        // 让 key_exprs 与 keys 错配（引擎按位 zip 提取）。
+        let named: Vec<(usize, String)> = match_plan
+            .keys
+            .iter()
+            .enumerate()
+            .filter_map(|(i, k)| match k {
+                FieldRef::Simple(name) => Some((i, name.clone())),
+                _ => None,
+            })
+            .collect();
+        // key_exprs 只在真正出现表达式键时分配（保持普通规则的
+        // 空 Vec —— 引擎热路径与列式直读不受影响）。
+        let mut key_exprs: Option<Vec<Option<ExprPlan>>> = None;
+        // 被 let 派生化处理的键名集合：join-then-key 的 resolve_join_key 看不见
+        // let（只看 schema 字段），若键名同时命中 join 右窗字段会产生 stale
+        // key_join 与 key_exprs 并存——advance 会优先走 key_join 分支而忽略
+        // 派生 key（review 1 发现）。命中后 key_join 必须让位清空。
+        let mut let_derived: std::collections::HashSet<&str> = Default::default();
+        for (i, name) in named.iter() {
+            let Some(decl) = rule.lets.iter().find(|l| l.name.as_str() == name.as_str()) else {
+                continue;
+            };
+            let_derived.insert(name.as_str());
+            // 统一先展开 let 引用链（支持 `let a = b; let c = a` 逐级别名）；
+            // 展开到纯字段/嵌套路径 → 内联为等值 FieldRef（#83，列式直读
+            // 路径不变）；展开结果是复合表达式（函数/字面量派生，#80）→
+            // 保留 `Simple(let 名)` 作逻辑名，表达式存进 key_exprs 槽位。
+            let expanded = expand_let_expr(&decl.expr, &rule.lets, &mut Vec::new());
+            match expanded {
+                Expr::Field(fr) => match_plan.keys[*i] = fr,
+                expr => {
+                    key_exprs.get_or_insert_with(|| vec![None; match_plan.keys.len()])[*i] =
+                        Some(expr);
+                }
+            }
+        }
+        if match_plan.key_join.is_some()
+            && match_plan
+                .key_join
+                .as_ref()
+                .is_some_and(|kj| let_derived.contains(kj.key_name.as_str()))
+        {
+            match_plan.key_join = None;
+        }
+        match_plan.key_exprs = key_exprs.unwrap_or_default();
+    } else {
+        match_plan.key_exprs = Vec::new();
+    }
     let bind_tracking = collect_rule_bind_tracking(
         &score_plan.expr,
         &entity_plan.entity_id_expr,
@@ -544,6 +710,7 @@ fn compile_match(
 
     MatchPlan {
         keys,
+        key_exprs: Vec::new(), // 调用方（compile_regular_rule #83/#80 内联装配）填充
         key_map,
         key_join,
         window_spec: match mc.window_mode {

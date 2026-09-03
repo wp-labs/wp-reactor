@@ -35,4 +35,6 @@ pub use match_engine::{
     WindowLookup, field_ref_name, precompute_join_then_keys, values_equal,
 };
 pub use match_engine::{EngineHashMap, EngineHashSet};
-pub(crate) use match_engine::{extract_key_simple, scope_key_from_values, scope_key_shard_index};
+pub(crate) use match_engine::{
+    extract_key_simple, extract_scope_key_mixed, scope_key_from_values, scope_key_shard_index,
+};
