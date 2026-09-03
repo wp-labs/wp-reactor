@@ -110,3 +110,23 @@ builder helpers（供 engine 剩测/bench 使用；避免重复实现）。
   5. ⏳ executor/columnar（解 alert/spill/window::scope_key_columnar 后）
   6. ⏳ engine 收尾：window/sink/async_persist/spill + 门面收缩；测试归位
 - 每片完成 = wf-cep 编译 + engine 编译 + 全量测试 + 两道 clippy 门禁。
+
+---
+
+## 收口决定（2026-09-03）：P4 停于片 3，wf-cep v0.2 交付
+
+- **不可约层判定**：片 4 起（Event/FieldSource/ScopeKey/key/eval/WindowLookup/
+  event_bridge）依赖闭包闭环——孤儿规则（Event 与 FieldSource 同 crate）、
+  FieldSource 默认方法 → key.rs → eval_expr_ext → WindowLookup → JoinRow/
+  TriggerEvent（Arc<RecordBatch>）互相咬合，最小可搬集 ≈ 12-15k 行 +
+  types.rs 切分 = 独立批次（1-2 天），非「片」级改动。
+- **已交付（wf-cep v0.2）**：
+  - 纯叶：time / regex_cache / cidr_cache / error
+  - value：Value / EngineHashMap / EngineHashSet / MACHINE_ID
+  - external（全局 OnceLock 单例随迁）
+  - rows：RowFieldSlot / RowFieldLayout / RowFields（arrow 数据面）
+  - 依赖墙：禁 tokio/async/网络/持久化 IO，arrow 数据面允许（CI 校验）
+  - engine 全部经 shim/别名重导出，公开路径零变化；测试总量对齐
+- **片 4-6（搁置，需独立排期）**：cep types 切分 + event_bridge/key/eval 下沉
+  同步执行核；若未来要「语义层独立秒测」，前提是**列式行表示抽象化设计**
+  （泛型/擦除 ColumnarEvent 句柄），应单独立项评审后再动。
