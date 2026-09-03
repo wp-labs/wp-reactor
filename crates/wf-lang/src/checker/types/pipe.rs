@@ -8,7 +8,7 @@ use crate::checker::scope::Scope;
 use crate::checker::{CheckError, Severity};
 
 /// Type-check a match step branch's pipe chain.
-pub fn check_pipe_chain(
+pub(crate) fn check_pipe_chain(
     branch: &StepBranch,
     scope: &Scope<'_>,
     rule_name: &str,

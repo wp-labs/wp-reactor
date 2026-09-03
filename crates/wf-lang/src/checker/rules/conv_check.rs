@@ -2,7 +2,7 @@ use crate::ast::{FieldRef, RuleDecl, WindowMode};
 
 use crate::checker::{CheckError, Severity};
 
-pub fn check_conv(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckError>) {
+pub(crate) fn check_conv(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckError>) {
     // conv 自动聚合窗按 match key 建字段（类型取 schema 字段）；派生/嵌套路径
     // key（issue #83）的值由事件域表达式产生、conv 窗 schema 无法静态定字段名/
     // 类型 → v1 拒绝组合。

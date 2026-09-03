@@ -15,7 +15,7 @@ type VersionEntry = Vec<(String, BTreeSet<String>)>;
 /// - **Warning** when a higher version *removes* fields (consumers may depend on them)
 ///
 /// Rules without an explicit `@vN` version are skipped.
-pub fn check_yield_versions(file: &WflFile, errors: &mut Vec<CheckError>) {
+pub(crate) fn check_yield_versions(file: &WflFile, errors: &mut Vec<CheckError>) {
     // Group rules by yield target, then by version.
     let mut by_target: BTreeMap<String, BTreeMap<u32, VersionEntry>> = BTreeMap::new();
 

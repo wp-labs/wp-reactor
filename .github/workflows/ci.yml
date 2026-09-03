@@ -45,6 +45,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # pub 面门禁：lib 目标上 unreachable_pub 必须为 0（孤儿 pub = 对外宣称 API 却无人可达）
+      - name: Clippy (unreachable-pub gate on lib)
+        run: cargo clippy --lib --workspace --all-features -- -D warnings -W unreachable_pub
 
   security:
     name: Security Audit

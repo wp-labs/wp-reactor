@@ -10,7 +10,7 @@ use crate::checker::{CheckError, Severity};
 use super::check_funcs::{FuncCheckCtx, check_func_call};
 
 /// Type-check an expression, emitting errors into `errors`.
-pub fn check_expr_type(
+pub(crate) fn check_expr_type(
     expr: &Expr,
     scope: &Scope<'_>,
     rule_name: &str,
@@ -21,7 +21,7 @@ pub fn check_expr_type(
 
 /// Type-check a yield expression while allowing target-field coercion to
 /// resolve mixed `coalesce(...)` result types.
-pub fn check_yield_expr_type_with_system_vars(
+pub(crate) fn check_yield_expr_type_with_system_vars(
     expr: &Expr,
     scope: &Scope<'_>,
     rule_name: &str,
@@ -31,7 +31,7 @@ pub fn check_yield_expr_type_with_system_vars(
 }
 
 /// Type-check a guard expression. Guard context does not allow L3 functions.
-pub fn check_guard_expr_type(
+pub(crate) fn check_guard_expr_type(
     expr: &Expr,
     scope: &Scope<'_>,
     rule_name: &str,

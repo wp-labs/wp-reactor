@@ -4,7 +4,7 @@ use crate::checker::scope::Scope;
 use crate::checker::types::{check_expr_type, infer_type, is_numeric, is_scalar_identity};
 use crate::checker::{CheckError, Severity};
 
-pub fn check_score(rule: &RuleDecl, scope: &Scope<'_>, errors: &mut Vec<CheckError>) {
+pub(crate) fn check_score(rule: &RuleDecl, scope: &Scope<'_>, errors: &mut Vec<CheckError>) {
     let name = &rule.name;
     check_expr_type(&rule.score.expr, scope, name, errors);
 
@@ -20,7 +20,7 @@ pub fn check_score(rule: &RuleDecl, scope: &Scope<'_>, errors: &mut Vec<CheckErr
     }
 }
 
-pub fn check_entity(rule: &RuleDecl, scope: &Scope<'_>, errors: &mut Vec<CheckError>) {
+pub(crate) fn check_entity(rule: &RuleDecl, scope: &Scope<'_>, errors: &mut Vec<CheckError>) {
     let name = &rule.name;
     check_expr_type(&rule.entity.id_expr, scope, name, errors);
 

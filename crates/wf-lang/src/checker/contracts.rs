@@ -3,7 +3,7 @@ use crate::ast::{InputStmt, WflFile};
 use super::{CheckError, Severity};
 
 /// Check all test blocks in a WflFile.
-pub fn check_tests(file: &WflFile, errors: &mut Vec<CheckError>) {
+pub(crate) fn check_tests(file: &WflFile, errors: &mut Vec<CheckError>) {
     for test in &file.tests {
         let tname = &test.name;
 

@@ -5,7 +5,7 @@ use crate::checker::types::{ValType, compatible};
 use crate::checker::{CheckError, Severity};
 use crate::schema::{BaseType, FieldType};
 
-pub fn check_session_gap_clause(
+pub(crate) fn check_session_gap_clause(
     match_clause: &MatchClause,
     rule_name: &str,
     errors: &mut Vec<CheckError>,
@@ -22,7 +22,7 @@ pub fn check_session_gap_clause(
     }
 }
 
-pub fn check_match_keys_clause(
+pub(crate) fn check_match_keys_clause(
     match_clause: &MatchClause,
     joins_list: &[crate::ast::JoinClause],
     scope: &Scope<'_>,
@@ -662,7 +662,7 @@ fn check_key_type_consistency(
     }
 }
 
-pub fn check_key_mapping_clause(
+pub(crate) fn check_key_mapping_clause(
     match_clause: &MatchClause,
     scope: &Scope<'_>,
     rule_name: &str,

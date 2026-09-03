@@ -4,8 +4,8 @@ mod infer;
 mod pipe;
 
 pub(crate) use check_expr::{check_expr_type, check_yield_expr_type_with_system_vars, format_type};
-pub use infer::infer_type;
-pub use pipe::check_pipe_chain;
+pub(crate) use infer::infer_type;
+pub(crate) use pipe::check_pipe_chain;
 
 use crate::schema::BaseType;
 
@@ -15,7 +15,7 @@ use crate::schema::BaseType;
 
 #[derive(Debug, Clone, PartialEq, Eq, ::moju_derive::MoJu)]
 #[moju(kind = "state", domain = "Lang", module = "Lang.LangChecker")]
-pub enum ValType {
+pub(crate) enum ValType {
     /// A known scalar base type (Chars, Digit, Float, Time, Ip, Hex).
     Base(BaseType),
     /// Heterogeneous structured array.
@@ -36,7 +36,7 @@ pub enum ValType {
 // Type compatibility helpers
 // ---------------------------------------------------------------------------
 
-pub fn compatible(expected: &ValType, actual: &ValType) -> bool {
+pub(crate) fn compatible(expected: &ValType, actual: &ValType) -> bool {
     match (expected, actual) {
         (ValType::Base(a), ValType::Base(b)) => a == b,
         (ValType::ArrayAny, ValType::ArrayAny) => true,
@@ -57,7 +57,7 @@ pub fn compatible(expected: &ValType, actual: &ValType) -> bool {
     }
 }
 
-pub fn yield_assignable(expected: &ValType, actual: &ValType) -> bool {
+pub(crate) fn yield_assignable(expected: &ValType, actual: &ValType) -> bool {
     if compatible(expected, actual) {
         return true;
     }
@@ -97,14 +97,14 @@ pub(super) fn unify_array_element_type(left: &BaseType, right: &BaseType) -> Opt
     None
 }
 
-pub fn is_numeric(t: &ValType) -> bool {
+pub(crate) fn is_numeric(t: &ValType) -> bool {
     matches!(
         t,
         ValType::Base(BaseType::Digit) | ValType::Base(BaseType::Float) | ValType::Numeric
     )
 }
 
-pub fn is_orderable(t: &ValType) -> bool {
+pub(crate) fn is_orderable(t: &ValType) -> bool {
     matches!(
         t,
         ValType::Base(BaseType::Digit)
@@ -116,7 +116,7 @@ pub fn is_orderable(t: &ValType) -> bool {
 }
 
 /// Whether a type is a scalar identity type usable as entity id (T33).
-pub fn is_scalar_identity(t: &ValType) -> bool {
+pub(crate) fn is_scalar_identity(t: &ValType) -> bool {
     matches!(
         t,
         ValType::Base(BaseType::Chars)
@@ -128,7 +128,7 @@ pub fn is_scalar_identity(t: &ValType) -> bool {
 }
 
 /// Numeric promotion: if both sides are numeric, compute the result type.
-pub fn numeric_promote(a: &ValType, b: &ValType) -> Option<ValType> {
+pub(crate) fn numeric_promote(a: &ValType, b: &ValType) -> Option<ValType> {
     if !is_numeric(a) || !is_numeric(b) {
         return None;
     }

@@ -4,7 +4,7 @@ use std::path::Path;
 use serde::Deserialize;
 use toml::Value as TomlValue;
 
-pub use wp_connector_api::{ConnectorDef, ConnectorScope};
+use wp_connector_api::{ConnectorDef, ConnectorScope};
 
 use super::types::ParamMap;
 use crate::error::{ConfigReason, ConfigResult};

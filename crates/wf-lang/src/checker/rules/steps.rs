@@ -6,7 +6,7 @@ use crate::checker::scope::Scope;
 use crate::checker::types::check_pipe_chain;
 use crate::checker::{CheckError, Severity};
 
-pub fn check_match_steps<'a>(
+pub(crate) fn check_match_steps<'a>(
     steps: &'a [MatchStep],
     scope: &Scope<'_>,
     rule_name: &str,

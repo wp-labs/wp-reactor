@@ -18,7 +18,7 @@ use crate::receiver::schema::window_schema_to_arrow;
 /// compiled rules (see `wf_lang::field_usage`). Windows whose rules may scan
 /// all fields keep `materialize_fields = None` (full materialization); the
 /// rest materialize only the fields rules actually read.
-pub fn schema_to_window_def(
+pub(crate) fn schema_to_window_def(
     ws: &WindowSchema,
     config: &WindowConfig,
     usage: &WindowFieldUsage,
@@ -67,7 +67,7 @@ pub fn schema_to_window_def(
 /// Resolve each `WindowSchema` against the matching `WindowConfig` (by name).
 ///
 /// Returns an error if a schema's window name has no corresponding config entry.
-pub fn schemas_to_window_defs(
+pub(crate) fn schemas_to_window_defs(
     schemas: &[WindowSchema],
     configs: &[WindowConfig],
     usage: &WindowFieldUsage,

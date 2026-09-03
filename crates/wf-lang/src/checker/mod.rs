@@ -1,6 +1,6 @@
 mod contracts;
 mod intermediate;
-pub mod lint;
+pub(crate) mod lint;
 mod rules;
 mod scope;
 mod types;

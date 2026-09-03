@@ -6,7 +6,7 @@ use crate::checker::scope::Scope;
 
 /// Infer the type of an expression within the given scope.
 /// Returns None for expressions whose type cannot be statically determined.
-pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
+pub(crate) fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
     match expr {
         Expr::Number(n) => {
             if n.fract() == 0.0 {

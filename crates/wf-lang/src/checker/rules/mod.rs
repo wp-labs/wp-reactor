@@ -25,7 +25,7 @@ use super::{CheckError, Severity};
 const PIPE_IN_ALIAS: &str = "_in";
 
 /// Check a single rule declaration against the provided schemas.
-pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<CheckError>) {
+pub(crate) fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<CheckError>) {
     let name = &rule.name;
 
     if rule.events.decls.iter().any(|d| d.alias == PIPE_IN_ALIAS) {

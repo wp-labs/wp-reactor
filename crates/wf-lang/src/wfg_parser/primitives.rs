@@ -10,7 +10,7 @@ use crate::wfg_ast::{Rate, RateUnit};
 // ---------------------------------------------------------------------------
 
 /// Skip whitespace and `// ...` line comments.
-pub fn ws_skip(input: &mut &str) -> ModalResult<()> {
+pub(crate) fn ws_skip(input: &mut &str) -> ModalResult<()> {
     loop {
         let _ = multispace0.parse_next(input)?;
         if opt(literal("//")).parse_next(input)?.is_some() {
@@ -26,7 +26,7 @@ pub fn ws_skip(input: &mut &str) -> ModalResult<()> {
 // Rate: NUMBER "/" ("s"|"m"|"h")
 // ---------------------------------------------------------------------------
 
-pub fn rate(input: &mut &str) -> ModalResult<Rate> {
+pub(crate) fn rate(input: &mut &str) -> ModalResult<Rate> {
     let num = crate::parse_utils::number_literal(input)?;
     let count = num as u64;
     literal("/").parse_next(input)?;
@@ -43,7 +43,7 @@ pub fn rate(input: &mut &str) -> ModalResult<Rate> {
 // Percent: NUMBER "%"
 // ---------------------------------------------------------------------------
 
-pub fn percent(input: &mut &str) -> ModalResult<f64> {
+pub(crate) fn percent(input: &mut &str) -> ModalResult<f64> {
     let num = crate::parse_utils::number_literal(input)?;
     literal("%").parse_next(input)?;
     Ok(num)

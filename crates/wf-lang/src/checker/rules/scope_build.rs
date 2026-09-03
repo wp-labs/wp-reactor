@@ -7,7 +7,7 @@ use crate::checker::scope::Scope;
 use crate::checker::types::check_expr_type;
 use crate::checker::{CheckError, Severity};
 
-pub fn build_scope<'a>(
+pub(crate) fn build_scope<'a>(
     rule: &'a RuleDecl,
     schemas: &'a [WindowSchema],
     rule_name: &str,
@@ -79,7 +79,7 @@ pub fn build_scope<'a>(
 }
 
 /// 将 joins 的 `reduce ... as label` 标签注册进 scope（object 别名）。
-pub fn register_reduce_labels(scope: &mut Scope<'_>, joins: &[crate::ast::JoinClause]) {
+pub(crate) fn register_reduce_labels(scope: &mut Scope<'_>, joins: &[crate::ast::JoinClause]) {
     for join in joins {
         if let Some(label) = join.reduce.as_ref().and_then(|r| r.label.as_ref())
             && !scope.reduce_labels.iter().any(|l| l == label)

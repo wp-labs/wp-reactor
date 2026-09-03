@@ -15,7 +15,7 @@ use crate::metrics::RuntimeMetrics;
 /// Bounded channel capacity for each sink's delivery channel.
 /// Sized to absorb brief sink slowdowns; under sustained backlog the sender
 /// blocks (backpressure) rather than buffering infinitely.
-pub const SINK_CHANNEL_CAPACITY: usize = 2048;
+pub(crate) const SINK_CHANNEL_CAPACITY: usize = 2048;
 
 /// Max wall time the sink consumers may keep flushing a buffered alert
 /// backlog after cancel before dropping the rest.
@@ -54,7 +54,7 @@ const SINK_DRAIN_BUDGET: Duration = crate::lifecycle::types::GROUP_JOIN_TIMEOUT;
 /// of small per-row allocations.
 #[derive(Clone, ::moju_derive::MoJu)]
 #[moju(kind = "state", domain = "Runtime", module = "Runtime.AlertDispatch")]
-pub enum AlertBatch {
+pub(crate) enum AlertBatch {
     /// Row-oriented payload (escalation forwards whatever form it received;
     /// also the test/legacy call form). Not constructed by the emit path.
     #[allow(dead_code)]
@@ -63,7 +63,7 @@ pub enum AlertBatch {
 }
 
 impl AlertBatch {
-    pub fn len(&self) -> usize {
+pub(crate) fn len(&self) -> usize {
         match self {
             AlertBatch::Rows(rows) => rows.len(),
             AlertBatch::Columns(cols) => cols.len(),
@@ -72,7 +72,7 @@ impl AlertBatch {
 
     #[allow(dead_code)]
     #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
+pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
@@ -82,7 +82,7 @@ type ResolvedChannels = Arc<Vec<(usize, Arc<Vec<mpsc::Sender<AlertBatch>>>)>>;
 
 #[derive(::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Runtime", module = "Runtime.AlertDispatch")]
-pub struct SinkFanout {
+pub(crate) struct SinkFanout {
     /// `Arc<SinkRuntime>` pointer identity → its parallel writers.
     pub(crate) by_sink: HashMap<usize, Vec<mpsc::Sender<AlertBatch>>>,
     /// Per-sink round-robin index (across the sink's parallel writers).
@@ -136,7 +136,7 @@ impl SinkFanout {
     ///
     /// Each entry is `(sink_ptr, channels)` where `channels` are that sink's
     /// `parallel` writers — the emit path round-robins across them.
-    pub fn resolve(&self, window_name: &str) -> ResolvedChannels {
+pub(crate) fn resolve(&self, window_name: &str) -> ResolvedChannels {
         if let Some(groups) = self
             .cache
             .read()
@@ -167,7 +167,7 @@ impl SinkFanout {
     }
 
     /// Next round-robin writer index for a sink's parallel channels.
-    pub fn next_index(&self, sink_ptr: usize, writer_count: usize) -> usize {
+pub(crate) fn next_index(&self, sink_ptr: usize, writer_count: usize) -> usize {
         if writer_count <= 1 {
             return 0;
         }
@@ -184,7 +184,7 @@ impl SinkFanout {
     }
 
     /// Warn once-per-target when a yield_target has no sink at all.
-    pub fn warn_if_no_sink(&self, window_name: &str) {
+pub(crate) fn warn_if_no_sink(&self, window_name: &str) {
         let mut warned = self.warned_no_sink.lock().expect("warned lock poisoned");
         if warned.insert(window_name.to_string()) {
             wf_warn!(
@@ -206,7 +206,7 @@ impl SinkFanout {
 /// [`SINK_DRAIN_BUDGET`], then drops the rest and stops the sink — a large
 /// alert backlog can't extend graceful shutdown indefinitely (the
 /// wait_grace_down_with_timeout pattern).
-pub async fn run_sink_consumer(
+pub(crate) async fn run_sink_consumer(
     mut rx: mpsc::Receiver<AlertBatch>,
     sink: Arc<SinkRuntime>,
     error_txs: Arc<Vec<mpsc::Sender<AlertBatch>>>,
@@ -324,7 +324,7 @@ async fn dispatch_batch(
 /// 历史教训：旧判定按 sink 名（`sentinel_out`）匹配，哨兵记录实际经名不同的
 /// sink 写出 → 匹配失败 → cut_sink_write 档把哨兵切掉 → wfgen 等哨兵超时 →
 /// 7 档墙梯假死。改为按批次目标判定后，哨兵批无论经哪个 sink 都稳定豁免。
-pub fn is_sentinel_batch(batch: &AlertBatch) -> bool {
+pub(crate) fn is_sentinel_batch(batch: &AlertBatch) -> bool {
     match batch {
         AlertBatch::Columns(cols) => {
             cols.target().as_ref() == crate::perf_diag::PERF_SENTINEL_WINDOW

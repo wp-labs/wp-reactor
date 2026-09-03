@@ -17,7 +17,7 @@ const VALID_ON_EXCEED: &[&str] = &["throttle", "drop_oldest", "fail_rule"];
 
 const VALID_SPILL: &[&str] = &["redb"];
 
-pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckError>) {
+pub(crate) fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckError>) {
     let limits = match &rule.limits {
         Some(l) => l,
         None => {

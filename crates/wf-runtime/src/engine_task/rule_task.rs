@@ -46,7 +46,7 @@ const DEBUG_DETAIL_LIMIT: usize = 20;
 static RULE_PROFILING: AtomicBool = AtomicBool::new(true);
 
 /// 开关规则相位计时（false = 热路径免 clock_gettime，相位日志归零）。
-pub fn set_rule_profiling(enabled: bool) {
+pub(crate) fn set_rule_profiling(enabled: bool) {
     RULE_PROFILING.store(enabled, Ordering::Relaxed);
 }
 

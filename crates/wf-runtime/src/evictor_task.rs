@@ -9,7 +9,7 @@ use crate::metrics::RuntimeMetrics;
 
 /// Run the evictor periodically until cancelled.
 #[tracing::instrument(name = "evictor", skip_all)]
-pub async fn run_evictor(
+pub(crate) async fn run_evictor(
     evictor: Evictor,
     router: Arc<Router>,
     interval: Duration,

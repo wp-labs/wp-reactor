@@ -9,7 +9,7 @@ use crate::checker::{CheckError, Severity};
 
 use super::WFU_PREFIX;
 
-pub fn check_yield(
+pub(crate) fn check_yield(
     rule: &RuleDecl,
     schemas: &[WindowSchema],
     scope: &Scope<'_>,

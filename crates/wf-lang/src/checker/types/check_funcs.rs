@@ -69,7 +69,7 @@ pub(super) struct FuncCheckCtx<'a, 'scope> {
     pub allow_mixed_coalesce: bool,
 }
 
-pub fn check_func_call(
+pub(crate) fn check_func_call(
     qualifier: Option<&str>,
     name: &str,
     args: &[Expr],

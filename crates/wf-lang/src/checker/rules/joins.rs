@@ -7,7 +7,7 @@ use crate::checker::scope::Scope;
 use crate::checker::types::check_expr_type;
 use crate::checker::{CheckError, Severity};
 
-pub fn check_joins_list(
+pub(crate) fn check_joins_list(
     joins: &[crate::ast::JoinClause],
     schemas: &[WindowSchema],
     scope: &Scope<'_>,

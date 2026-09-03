@@ -8,7 +8,7 @@ use super::types::ValType;
 /// Scope built from a rule's events block, `let` bindings and join clauses.
 #[derive(::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Lang", module = "Lang.LangChecker")]
-pub struct Scope<'a> {
+pub(crate) struct Scope<'a> {
     /// Event alias → WindowSchema mapping.
     pub aliases: HashMap<&'a str, &'a WindowSchema>,
     /// Per-event `let` bindings → value type (referenced by bare name).
@@ -24,7 +24,7 @@ pub struct Scope<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Lang", module = "Lang.LangChecker")]
-pub struct StatLabelInfo {
+pub(crate) struct StatLabelInfo {
     pub stage: StatLabelStage,
     pub uses_distinct: bool,
     pub measure: Measure,
@@ -32,13 +32,13 @@ pub struct StatLabelInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
 #[moju(kind = "state", domain = "Lang", module = "Lang.LangChecker")]
-pub enum StatLabelStage {
+pub(crate) enum StatLabelStage {
     Event,
     Close,
 }
 
 impl<'a> Scope<'a> {
-    pub fn new() -> Self {
+pub(crate) fn new() -> Self {
         Scope {
             aliases: HashMap::new(),
             let_types: HashMap::new(),
@@ -51,7 +51,7 @@ impl<'a> Scope<'a> {
     /// Resolve a FieldRef to a ValType using this scope.
     /// Returns Ok(Some(t)) for scalar fields, Ok(None) for set-level alias references,
     /// and Err(message) for invalid references.
-    pub fn resolve_field_ref(&self, fref: &FieldRef) -> Result<Option<ValType>, String> {
+pub(crate) fn resolve_field_ref(&self, fref: &FieldRef) -> Result<Option<ValType>, String> {
         match fref {
             FieldRef::Simple(name) => self.resolve_simple(name),
             FieldRef::Qualified(alias, field) => {
@@ -128,14 +128,14 @@ impl<'a> Scope<'a> {
     }
 
     /// Check whether a field exists in a specific alias's window.
-    pub fn alias_has_field(&self, alias: &str, field: &str) -> bool {
+pub(crate) fn alias_has_field(&self, alias: &str, field: &str) -> bool {
         self.aliases
             .get(alias)
             .is_some_and(|s| s.fields.iter().any(|f| f.name == field))
     }
 
     /// Get the field type for a field that exists in a specific alias.
-    pub fn get_field_type_for_alias(&self, alias: &str, field: &str) -> Option<ValType> {
+pub(crate) fn get_field_type_for_alias(&self, alias: &str, field: &str) -> Option<ValType> {
         self.aliases.get(alias).and_then(|s| {
             s.fields
                 .iter()
@@ -146,7 +146,7 @@ impl<'a> Scope<'a> {
 }
 
 /// Convert a schema FieldType to our ValType.
-pub fn field_type_to_val(ft: &FieldType) -> ValType {
+pub(crate) fn field_type_to_val(ft: &FieldType) -> ValType {
     match ft {
         FieldType::Base(bt) => match bt {
             BaseType::Bool => ValType::Bool,

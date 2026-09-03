@@ -5,7 +5,7 @@ use crate::checker::{CheckError, Severity};
 use crate::schema::{FieldDef, FieldType, WindowSchema};
 use crate::wfu_meta::WFU_INTERMEDIATE_META_FIELDS;
 
-pub fn effective_schemas_for_rules(
+pub(crate) fn effective_schemas_for_rules(
     rules: &[RuleDecl],
     schemas: &[WindowSchema],
 ) -> Vec<WindowSchema> {
@@ -29,7 +29,7 @@ pub fn effective_schemas_for_rules(
         .collect()
 }
 
-pub fn check_intermediate_target_graph(
+pub(crate) fn check_intermediate_target_graph(
     rules: &[RuleDecl],
     errors: &mut Vec<CheckError>,
     rule_name: Option<&str>,
