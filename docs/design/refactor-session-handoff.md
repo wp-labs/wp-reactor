@@ -1,11 +1,11 @@
-# 结构性重构：任务进展交接（2026-09-03 v4 快照 — §4.2 拆件推进后）
+# 结构性重构：任务进展交接（2026-09-04 v5 快照 — §4.2 str 子切片 + spawn metrics 两刀收尾后）
 
 > 本文件记录 wp-reactor/warp-fusion 结构性重构进行中状态，供新 session 直接续接。
 > 配套方案文档：`docs/design/p4-wf-cep-plan.md`；发布条目：`CHANGELOG.md [2.0.17]`。
 
 ## 0. 仓库与分支状态（2026-09-03，§4.2 拆件多笔已提交、未 push）
 
-- **wp-reactor @ main = `f69784e`**，**领先 origin/main 9 笔未 push**（`e9d020a` … `f69784e`，见 §6）。origin/main 仍停 `af58c2c`（v2.0.17）。工作树干净（本文档提交后）。
+- **wp-reactor @ main = `f15c0ef`**，**领先 origin/main 13 笔未 push**（`e9d020a` … `f15c0ef`，见 §6）。origin/main 仍停 `af58c2c`（v2.0.17）。工作树干净（本文档提交后）。
 - **tags `v2.0.16` + `v2.0.17` 均已推 origin**。工作树干净（moju 产物已提交）。
 - **warp-fusion @ alpha**：仍为**本地 path 依赖**（`@gxl:block(local_reactor)`，git tag 块注释停 v2.0.15）；工作树 `M Cargo.toml` + `M Cargo.lock` **未提交**（会破坏他人构建）。**下一步：切 `tag = "v2.0.17"` 并定本地块去留**（需用户决策）。
 - wf-skills 已同步。
@@ -45,16 +45,18 @@
 - `lifecycle/spawn.rs` 2007 → 1554（`66e3fe4`，receiver/source 组 475 行 → `spawn_receiver.rs`：spawn_receiver_task 提 `pub(crate)` + spawn.rs `pub(super) use` 保接口；仅测试消费 helper 用 `#[allow(unused_imports)] use` 组合）。
 - `lifecycle/compile.rs` 1876 → 795（`8b91c0e` tests 外移 `compile_tests.rs` + `d663f9c` 诊断/源码定位组 408 行 → `compile_diag.rs`，27 fn `pub(super)` + 顶层 allow-use）。
 - `checker/types/check_funcs.rs` 1966 → 1124：`f69784e` 样板收口（145 处统一 `errors.push(CheckError{…})` → `rule_error(rule_name, message)`，−920）；`052c285` 分类切片（`check_func_call` 815 → 58 行 else-if 分派 + agg 130 / numeric 81 / time 86 / str 290 / mv 125 / misc 112，56 arm 原样搬移）。
+- `checker/types/check_funcs.rs` 1124 → 1140（`17eae54`）：`check_str_func` 子切片——pattern 族（regex_match/cidr_match/contains/startswith/endswith/startswith_any/endswith_any）→ `check_pattern_func` 95 行、hash 族（md5/sha1/sha256/hex/sha1_n/stable_id）→ `check_hash_func` 58 行，str 文本核心 arm 留 `check_str_func`（290 → 168）；dispatch 双 `matches!`+return 置于 fn 中段（非尾表达式，needless_return 不触发）；三 fn 各带独立 catch-all 无重复。
+- `lifecycle/spawn.rs` 1554 → 1489（`f15c0ef`）：metrics 组 75 行 → `spawn_metrics.rs`（`spawn_metrics_task` 提 `pub(crate)` + spawn.rs `pub(super) use` 保接口，`run_monitor_consumer`/`metrics_record_to_data_record` 随迁，`use super::*` glob 引父层绑定），与 `spawn_receiver.rs` 先例同构。
 - 门禁：每笔 wf-lang 1051 / wf-runtime 606 + clippy all-targets + clippy2（-W unreachable_pub）0。
 
 ## 4. 待办积压（按优先级）
 
 1. **#1 H 尾 — machine 行内 emit 相位（~90 行）**：close/match emit 块仍内联在 `process_batch_machine_rows`（含 `&self` async `stage_or_emit_record` + `lookup`）。拆法 A = 每行 &mut self 方法 → 逐行 async future（热点不取）；拆法 B = 按 ALERT_BATCH_SIZE 批外收口 emit 节奏（需改 emit 时序 + 对拍）。当前评估：维持现状，勿为拆而拆。
-2. **可选拆件候选**（剩余）：`match_engine/columnar.rs` 3684L、`executor/each_exec.rs` 3200L（以上与 P4 片4-6 重叠，先立项对表）；`lifecycle/spawn.rs` 1554L（metrics 组 1745+ 约 70 行可再拆）；`check_funcs.rs` 1124L（str helper 290 行可再按 hash/mv 分；分类切片待提交）。
+2. **可选拆件候选**（剩余）：`match_engine/columnar.rs` 3684L、`executor/each_exec.rs` 3200L（以上与 P4 片4-6 重叠，先立项对表）。`spawn.rs` receiver/metrics 两组已拆出（现 1489L，无再拆件候选）；`check_funcs.rs` 1140L（str 族已按 pattern/hash 子切片，各 fn 均 < 170 行；stat/label 组 143 行暂不动）。
 3. **P4 片4-6**（cep/event_bridge/key/eval 同步执行核下沉 wf-cep）：搁置；前置 = 「列式行表示抽象化」设计立项（孤儿规则 + TriggerEvent 持 Arc<RecordBatch> 不可约层）。
 4. **warp-fusion 收尾**：切 `tag = "v2.0.17"` + 本地 path 块去留 + 重锁后 `cargo test --workspace` 复验。
 5. **fmt 存量漂移清理**（另会话）：固定 rustfmt 版本或一次性全仓格式化单独立提交，避免与 CI 打架。
-6. **push wp-reactor**：main 领先 origin 10 笔（e9d020a…052c285）。
+6. **push wp-reactor**：main 领先 origin 13 笔（e9d020a…f15c0ef）。
 
 ## 5. 关键坑（再会话必读，含本会话新增）
 
@@ -97,3 +99,5 @@ v2.0.17 后（9 笔，**未 push**）：
 `e9d020a` docs: handoff v2 快照 · `b201c19` refactor: process_batch 行循环 H-1..H-5 · `0011d4f` test: row_loop 行循环基准 · `715ba85` docs: handoff v3 快照 · `4536c3f` test: perf_diag tests 外移 · `66e3fe4` refactor: spawn receiver 拆出 · `8b91c0e` test: compile tests 外移 · `d663f9c` refactor: compile diag 拆出 · `f69784e` refactor: check_funcs 样板收口
 
 `052c285` refactor: check_func_call 按类别切片 6 helper
+
+v2.0.17 后续（4 笔，未 push）：`f3c3482` docs: 交接文档 v4 快照 · `17eae54` refactor(wf-lang): check_str_func 子切片 pattern/hash 族 · `f15c0ef` refactor(wf-runtime): spawn metrics 任务组拆出 spawn_metrics.rs ·（v5 快照本文档提交后）
