@@ -181,3 +181,20 @@ builder helpers（供 engine 剩测/bench 使用；避免重复实现）。
 - **S1 边界确认已完成（2026-09-04，见 `p4-wf-cep-s1-boundary.md`）**：阻塞点收敛为 B1-B4 四个
   arrow 数据面类型（GuardMasks/JoinRow/TriggerEvent/ColumnarEvent）的归属决策，推荐 B0 批次
   随迁；cep 生产实测 7.6k 行（旧 11.8k 口径含测试）；批次重排 B0-B3 ≈ 2-3 天。
+
+---
+
+## 执行记录（2026-09-04，v0.4）：B0 拆为数据面小刀推进，B0-1/B0-2 已绿闸
+
+- `8e7094e` **B0-1**：GuardMasks 下沉 `wf_cep::masks`（columnar.rs:189 → wf-cep，engine
+  columnar.rs `pub use` shim 保路径；零依赖自包含，走通跨 crate 搬迁机制）。
+- `08d1eaa` **B0-2**：值提取核心下沉 `wf_cep::value_extract`（event_bridge.rs 的
+  extract_field_value 族 + WFL_FIELD_TYPE_* 常量 + wfl_structured_field_kind + serde_json
+  依赖入 wf-cep；event_bridge.rs shim re-export，31 个消费文件零改动）。
+- 门禁：每刀 wf-engine 1334+73 / wf-runtime 606+15 / clippy×2 0 / fmt 0——测试数完全守恒。
+- **批次修正（孤儿规则实证）**：S1 §6 的 B0「载具 + 其 FieldSource impl 下沉」在孤儿规则下
+  不可独立完成——FieldSource 仍在 engine（cep/types.rs），impl 若留 engine 会因跨 crate
+  私有字段访问失败（E0616），若随载具迁 wf-cep 则 extract_scope_key 回退依赖
+  extract_scope_key_from_row（cep/key.rs，B1 才迁）。→ **B0-3 三载具下沉并入 B1**（cep
+  同步核整迁时与 FieldSource/types.rs 同批搬，孤儿自然消解）；B0 剩余可选小刀 =
+  scope_key_from_column 归位（依赖 ScopeKey，同样等 B1）。
