@@ -30,9 +30,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # 固定 minor（1.98 = 本仓格式化产出所用 rustfmt 1.9.0）：stable 每次升级可能改 rustfmt
+      # 规则导致 fmt job 与已格式化代码漂移刷红（2026-09 历史：全仓 18 文件存量漂移即由此积出）。
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.98
           components: rustfmt
+      - run: rustfmt --version
       - run: cargo fmt --all -- --check
 
   clippy:
