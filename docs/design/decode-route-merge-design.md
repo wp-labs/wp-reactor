@@ -6,11 +6,9 @@
 >
 > 关联：
 > - [`concurrency-scaling.md`](concurrency-scaling.md)（六维并行度模型 + 两道墙）——本文是其"W-PDP 待墙打破后重测"的延续回答；
-> - [`window-push-implementation-plan.md`](archive/window-push-implementation-plan.md)（R2 起源：`route` 拆 `route_parse` + `route_commit`）；
 > - [`window-channel-actor-design.md`](window-channel-actor-design.md)（单写者 actor + mailbox 字节预算）；
-> - [`preread-budget-design.md`](preread-budget-design.md)（第一道墙：深度节流）。
 >
-> 前情（2026-08-31 qradar_pk 诊断，数据快照见 [`../issues/parse-parallelism-qradar-diagnosis.md`](../issues/parse-parallelism-qradar-diagnosis.md)）：`parse_parallelism` 三线合流——**命名误称**（不是解析）、
+> 前情（2026-08-31 qradar_pk 诊断，结论见下）：`parse_parallelism` 三线合流——**命名误称**（不是解析）、
 > **无正据**（主文档自标"待墙打破后重测"，无任何 A/B 记录证明 p>1 有用）、**默认伤**
 > （p=2 实测 -33%，qradar 1M：p=1=75k vs p=2=50k，受控 A/B 多轮复现）。
 > 本文提出：**把 route 阶段并入 decode（源）任务，整体移除 parse 池这一层**。

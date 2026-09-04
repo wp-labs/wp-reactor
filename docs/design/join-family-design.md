@@ -3,7 +3,7 @@
 > 状态：设计评审稿 v2（2026-08-22；v2 吸收 review R1/R2/R3/R4/R5/R6：emit at 显式 deferred、
 > as-label 改 object+Path 注入、bucket_end 内建、oracle 跨仓库、读路径复用 asof_candidates、origin 语义）
 > 前置：`docs/stats-executor-design.md`（v6 统一桶键模型）——stats 与 join 是**正交能力**
-> 配套评审：`docs/design/join-family-design-review.md`（v1，2026-08-22）
+> 配套评审：join-family-design-review v1/v2（2026-08，结论已并入本文件后随 docs 清理归档）
 > 痛点：NEXMark join 家族涉及 **Q3/Q8/Q9/Q13/Q20/Q21/Q22 共 7 个**（snapshot/asof/anti/interval），
 > 现有仅 Snapshot/Asof/Anti 三种——Q8/Q9 长期未对齐的根因是 **interval（时间窗口 join）缺失**。
 > （口径：Q5/Q7 移出归 stats P5 桶内回查，Q4 归 stats 两级聚合；Q21 anti 计入但已有）

@@ -107,5 +107,4 @@ rule 消费 ── push 通道（RulePush 带 seq，处理完 ack；Drop 释放 
 
 - [window-channel-actor-design.md](window-channel-actor-design.md) —— push 拓扑
   与 RSS 诊断链全记录（SkipMap 实验留档在附录）
-- [preread-budget-design.md](preread-budget-design.md) —— 入口侧的内存上界
 - 仓库根 `TASK_PK_FLINK.md` §9.3/9.5/9.6 —— A/B 数据与决策过程

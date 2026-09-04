@@ -183,9 +183,5 @@ yield）→ 常量列折叠省 8-11GB 分配总量 → 30M/100M RSS 双达标（
 
 ## 8. 参考
 
-- 本案完整排查记录：`docs/issues/q13-memory-peak-scales-with-volume.md`
-  （9 次假设否决 + 每步数据）
 - 吞吐定位方法论：`docs/PERF_BISECTION_METHOD.md`（墙梯机制）
 - 诊断模式设计：`docs/design/perf-diag-mode-design.md`
-- 反压设计先例：`docs/issues/window-overload-drop-vs-backpressure.md`
-  （窗口满时丢 vs 反压，与 churn 属不同问题但共享"先分账再动手"纪律）

@@ -3,8 +3,7 @@
 > **状态：Proposed（方案，未实现）**
 >
 > 2026-08-21 · 前置：[window-log-eviction-design.md](window-log-eviction-design.md)
-> （消费感知驱逐 + ack floor）、[window-actor-pull-model.md](window-actor-pull-model.md)
-> （pull 模型规则任务）、[window-memory-control.md](archive/window-memory-control.md)（旧版两层驱逐）
+> （消费感知驱逐 + ack floor）
 
 ---
 
@@ -269,7 +268,3 @@ lossy = false            # 告警类：慢后端背压
 
 - [window-log-eviction-design.md](window-log-eviction-design.md) —— ack floor 的
   现状与「消费感知驱逐」的来龙去脉
-- [window-actor-pull-model.md](window-actor-pull-model.md) —— pull 规则任务的
-  `gap_detected` 跳过语义
-- [window-memory-control.md](archive/window-memory-control.md) —— 旧版两层驱逐（本文
-  的 per-window 背压是其细化）

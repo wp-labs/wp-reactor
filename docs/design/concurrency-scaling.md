@@ -5,10 +5,7 @@
 > 整合自:规则分片(进程内单规则 key 分片 P2a/P2b/P2c,已实施)、
 > 实例分片(部署级多实例水平扩展,企业版预研)、窗口并行证伪(六维并行度模型)。
 >
-> 关联:[window-push-model-design.md](archive/window-push-model-design.md)(push 架构)、
 > [window-channel-actor-design.md](window-channel-actor-design.md)(window 单写者 actor)、
-> [rule-sharding-p2a-plan.md](rule-sharding-p2a-plan.md)(P2a 实施计划)、
-> [preread-budget-design.md](preread-budget-design.md)(预算/深度节流)、
 > [PERF_BISECTION_METHOD.md](../PERF_BISECTION_METHOD.md)(瓶颈定位方法论)
 
 ---

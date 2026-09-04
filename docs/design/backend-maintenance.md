@@ -540,6 +540,6 @@ wf-runtime/src/
 ## 13. 相关文档
 
 - External Function 设计 → [external-function-design.md](external-function-design.md)
-- 并发架构 → [architecture.md](architecture.md)
+- 并发架构（push 单写者 actor）→ [window-channel-actor-design.md](window-channel-actor-design.md)
 - 错误处理 → [error-handling.md](error-handling.md)
 - wp-motor 错误分析 → [wp-motor-error-analysis.md](wp-motor-error-analysis.md)
