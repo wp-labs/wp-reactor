@@ -24,8 +24,8 @@ use super::{
     CepStateMachine, accumulate_close_steps, fail_rule, should_track_bind_alias, step_outcome,
     throttle_allows,
 };
-use crate::match_engine::columnar::GuardMasks;
-use crate::match_engine::event_bridge::TriggerEvent;
+use crate::masks::GuardMasks;
+use crate::row_views::TriggerEvent;
 
 impl CepStateMachine {
     /// Process one event against one window instance (fixed/hop buckets

@@ -10,7 +10,7 @@ use super::types::{EngineHashMap, FieldSource, RollingStats, Value};
 
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Hash)]
 #[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
-pub(crate) enum ValueKey {
+pub enum ValueKey {
     Number(u64),
     Str(String),
     Bool(bool),
@@ -19,7 +19,7 @@ pub(crate) enum ValueKey {
 }
 
 impl ValueKey {
-    pub(crate) fn from_value(value: &Value) -> Self {
+    pub fn from_value(value: &Value) -> Self {
         match value {
             Value::Number(n) => Self::Number(canonical_f64_bits(*n)),
             Value::Str(s) => Self::Str(s.to_string()),
@@ -36,7 +36,7 @@ impl ValueKey {
         }
     }
 
-    pub(super) fn estimated_bytes(&self) -> usize {
+    pub fn estimated_bytes(&self) -> usize {
         match self {
             Self::Number(_) | Self::Bool(_) => 8,
             Self::Str(s) => s.len() + 24,
@@ -111,7 +111,7 @@ impl ScopeKey {
     /// numbers (and full-precision integers) → `Int`; fractional / huge floats
     /// → `Float`; strings → `Str`. Structured values fall back to their string
     /// form so they still shard deterministically.
-    pub(crate) fn from_value(value: &Value) -> Self {
+    pub fn from_value(value: &Value) -> Self {
         match value {
             Value::Number(n) => {
                 if n.fract() == 0.0 && n.abs() < TWO_POW_53 {
@@ -134,7 +134,7 @@ impl ScopeKey {
 /// `extract_key_simple` output), in plan field order. Mirrors
 /// [`crate::window::fanout::scope_key_columnar`]'s pairing order so both
 /// columnar and row-based paths produce the same key.
-pub(crate) fn scope_key_from_values(scope_key: &[Value]) -> ScopeKey {
+pub fn scope_key_from_values(scope_key: &[Value]) -> ScopeKey {
     let mut acc: Option<ScopeKey> = None;
     for v in scope_key {
         let k = ScopeKey::from_value(v);
@@ -150,7 +150,7 @@ pub(crate) fn scope_key_from_values(scope_key: &[Value]) -> ScopeKey {
 /// and independent of `HashMap`'s random seed, like the old string-hash
 /// [`shard_index`] it replaces — but it hashes the **typed** key (tag + raw
 /// payload) instead of a re-serialized string, so building the key is cheap.
-pub(crate) fn scope_key_shard_index(key: &ScopeKey, shard_count: usize) -> usize {
+pub fn scope_key_shard_index(key: &ScopeKey, shard_count: usize) -> usize {
     if shard_count <= 1 {
         return 0;
     }
@@ -344,7 +344,7 @@ fn path_tail_walk(value: &Value, segments: &[PathSegment]) -> Option<Value> {
     Some(value.clone())
 }
 
-pub(crate) fn extract_key_simple<E: FieldSource + ?Sized>(
+pub fn extract_key_simple<E: FieldSource + ?Sized>(
     event: &E,
     keys: &[FieldRef],
 ) -> Option<Vec<Value>> {
@@ -388,7 +388,7 @@ pub(crate) fn extract_key_simple<E: FieldSource + ?Sized>(
 /// the columnar fast-path fallback: extract the key fields as owned [`Value`]s
 /// then convert to the typed [`ScopeKey`]. `None` when any key field is missing
 /// / null (the event is skipped).
-pub(crate) fn extract_scope_key_from_row<E: FieldSource + ?Sized>(
+pub fn extract_scope_key_from_row<E: FieldSource + ?Sized>(
     source: &E,
     keys: &[FieldRef],
     key_map: Option<&[wf_lang::plan::KeyMapPlan]>,
@@ -405,7 +405,7 @@ pub(crate) fn extract_scope_key_from_row<E: FieldSource + ?Sized>(
 /// 仅在存在表达式键位时使用（全 None 走 `extract_scope_key_from_row` 快速
 /// 路径）；事件源统一走 `FieldSource`（Event 行式 / ColumnarEvent 列读逐行），
 /// 表达式求值结果经 `ScopeKey::from_value` 与字段键同构进 typed key。
-pub(crate) fn extract_scope_key_mixed<E: FieldSource>(
+pub fn extract_scope_key_mixed<E: FieldSource>(
     source: &E,
     keys: &[FieldRef],
     key_exprs: &[Option<Expr>],
@@ -490,7 +490,7 @@ pub(crate) fn field_ref_leaf_name(fr: &FieldRef) -> Option<&str> {
 /// nested `object` / `array` values; any missing member, out-of-bounds index, or
 /// type mismatch yields `None` (which the yield layer degrades to an omitted
 /// field). Other variants use the existing flat lookup.
-pub(crate) fn eval_field_value(
+pub fn eval_field_value(
     fields: &EngineHashMap<smol_str::SmolStr, Value>,
     fr: &FieldRef,
 ) -> Option<Value> {
@@ -508,7 +508,7 @@ pub(crate) fn eval_field_value(
 /// view). The `FieldRef::Path` walk is identical — the root field is read from
 /// the source (a columnar source JSON-parses structured fields exactly like
 /// `batch_to_events`), then the nested object/array walk applies unchanged.
-pub(crate) fn eval_field_value_src(src: &dyn FieldSource, fr: &FieldRef) -> Option<Value> {
+pub fn eval_field_value_src(src: &dyn FieldSource, fr: &FieldRef) -> Option<Value> {
     let FieldRef::Path { segments, .. } = fr else {
         return src.field_value(field_ref_name(fr));
     };
@@ -527,7 +527,7 @@ pub(crate) fn eval_field_value_src(src: &dyn FieldSource, fr: &FieldRef) -> Opti
 /// / `write_int64_value` 泛型化的目标（2026-08-26 q13b per-row churn 消减：
 /// entity_id 直接写进 SmolStr 内联缓冲，免 String 中转）。smol_str 0.3 的
 /// `fmt::Write` 只给 `SmolStrBuilder`，故用自家小 trait 统一两个具体类型。
-pub(crate) trait StrSink {
+pub trait StrSink {
     fn push_str(&mut self, s: &str);
     fn push_char(&mut self, c: char);
 }
@@ -552,7 +552,7 @@ impl StrSink for SmolStrBuilder {
     }
 }
 
-pub(crate) fn push_i64_exact_decimal(scratch: &mut impl StrSink, mut v: i64) {
+pub fn push_i64_exact_decimal(scratch: &mut impl StrSink, mut v: i64) {
     if v == i64::MIN {
         scratch.push_str("-9223372036854775808");
         return;
@@ -579,7 +579,7 @@ pub(crate) fn push_i64_exact_decimal(scratch: &mut impl StrSink, mut v: i64) {
 /// Deterministic shard index for a scope key (superseded by
 /// [`scope_key_shard_index`], which hashes the typed [`ScopeKey`] instead of a
 /// re-serialized string). Kept inline for reference / legacy tests.
-pub(crate) fn value_to_string(v: &Value) -> String {
+pub fn value_to_string(v: &Value) -> String {
     match v {
         Value::Number(n) => number_to_string(*n),
         Value::Str(s) => s.to_string(),
@@ -608,10 +608,85 @@ fn number_to_string(n: f64) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Columnar scope-key direct read (rule_shards) — 2026-09-04 P4-B1 迁自
+// engine `window/fanout/scope_key.rs`：从批列直读原生 Arrow 值构 typed
+// `ScopeKey`（不经 `Value` 舍入、与行式路径同 variant），fanout 分片
+// （`partition_rows_by_key`）与机器 / 归并键共用同一键序；不支持列型回退
+// 行式值转换（与 `extract_field_value` 字节一致）。
+// ---------------------------------------------------------------------------
+
+use arrow::record_batch::RecordBatch;
+
+/// Extract a field from a batch at a pre-resolved column index, byte-identical
+/// to the row-based `Event.fields.get(name)` used by [`extract_key_simple`].
+fn column_scalar(batch: &RecordBatch, col_idx: usize, row: usize) -> Option<Value> {
+    let col = batch.column(col_idx);
+    if col.is_null(row) {
+        return None;
+    }
+    crate::value_extract::extract_field_value(batch.schema().field(col_idx), col.as_ref(), row)
+}
+
+/// Build a [`ScopeKey`] from a batch column at `row` (columnar key path), **without
+/// rounding through [`Value`]** — reads the native Arrow value straight into the
+/// typed key. Produces the **same** variant as `ScopeKey::from_value` on the
+/// row-based `Value`, so both paths shard identically.
+///
+/// Returns `None` when the cell is null / missing (row → shard 0). Unsupported
+/// column types fall back to reading via [`column_scalar`] → [`ScopeKey::from_value`]
+/// so they still shard deterministically.
+pub fn scope_key_from_column(batch: &RecordBatch, col_idx: usize, row: usize) -> Option<ScopeKey> {
+    use arrow::datatypes::{DataType, TimeUnit};
+    let col = batch.column(col_idx);
+    if col.is_null(row) {
+        return None;
+    }
+    match col.data_type() {
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .map(|a| ScopeKey::Int(a.value(row))),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => col
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .map(|a| ScopeKey::Int(a.value(row))),
+        DataType::Float64 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .map(|a| a.value(row));
+            v.map(|f| ScopeKey::from_value(&Value::Number(f)))
+        }
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .map(|a| ScopeKey::Str(a.value(row).into())),
+        DataType::Boolean => col
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .map(|a| ScopeKey::Str(if a.value(row) { "true" } else { "false" }.into())),
+        _ => column_scalar(batch, col_idx, row).map(|v| ScopeKey::from_value(&v)),
+    }
+}
+
+/// Build a [`ScopeKey`] for a row's match-key fields, in plan field order. `None`
+/// iff any key column is null / missing (row lands shard 0).
+pub fn scope_key_columnar(batch: &RecordBatch, col_idx: &[usize], row: usize) -> Option<ScopeKey> {
+    let mut acc: Option<ScopeKey> = None;
+    for &ci in col_idx {
+        let v = scope_key_from_column(batch, ci, row)?;
+        acc = Some(match acc {
+            None => v,
+            Some(prev) => ScopeKey::Pair(Box::new(prev), Box::new(v)),
+        });
+    }
+    Some(acc.unwrap_or(ScopeKey::Empty))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::match_engine::cep::types::Event;
+    use crate::cep::types::Event;
     use wf_lang::ast::PathSegment;
 
     fn fields(pairs: &[(&str, Value)]) -> EngineHashMap<smol_str::SmolStr, Value> {

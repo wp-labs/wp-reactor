@@ -745,11 +745,11 @@ impl KeyJoinLookup {
     }
 }
 
-impl crate::match_engine::cep::WindowLookup for KeyJoinLookup {
+impl crate::cep::WindowLookup for KeyJoinLookup {
     fn snapshot_field_values(&self, _w: &str, _f: &str) -> Option<HashSet<String>> {
         None
     }
-    fn snapshot(&self, _w: &str) -> Option<Vec<crate::match_engine::JoinRow>> {
+    fn snapshot(&self, _w: &str) -> Option<Vec<crate::row_views::JoinRow>> {
         None
     }
     fn join_lookup(
@@ -757,16 +757,16 @@ impl crate::match_engine::cep::WindowLookup for KeyJoinLookup {
         _w: &str,
         key_field: &str,
         key: &Value,
-    ) -> Option<Vec<crate::match_engine::JoinRow>> {
+    ) -> Option<Vec<crate::row_views::JoinRow>> {
         Some(
             self.rows
                 .iter()
                 .filter(|r| {
                     r.field(key_field)
-                        .is_some_and(|v| crate::match_engine::values_equal(&v, key))
+                        .is_some_and(|v| crate::cep::values_equal(&v, key))
                 })
                 .map(|r| {
-                    crate::match_engine::JoinRow::Event(Arc::new(Event {
+                    crate::row_views::JoinRow::Event(Arc::new(Event {
                         fields: r.fields.clone(),
                     }))
                 })

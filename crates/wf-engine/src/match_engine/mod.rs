@@ -12,7 +12,36 @@
 //! - `contract` / `tests` —— 对外契约与两后端一致性对拍（tests/l2·l3·regression）。
 
 pub mod async_persist;
-mod cep;
+// cep 同步执行核 2026-09-04 下沉 wf_cep::cep（P4-B1）：对外 pub 面见下方
+// `pub use wf_cep::cep::…`；本 pub(crate) shim 保 crate 内 `match_engine::cep::…`
+// 旧路径（含 eval/key/cmp 子模块深路径），零剩码改动。
+pub(crate) mod cep {
+    #[allow(unused_imports)] // shim：只承接 engine 实际引用的旧路径子集
+    pub(crate) use wf_cep::cep::{
+        AsofLookup, BindData, CepStateMachine, CloseOutput, CloseReason, EngineHashMap,
+        EngineHashSet, Event, FieldSource, JoinKey, MACHINE_ID, MatchedContext, RollingStats,
+        ScopeKey, SharedLimits, StepData, StepOutcome, StepProgress, StepResult, StepState, Value,
+        ValueKey, WindowLookup, accumulate_close_steps, apply_conv, close_is_qualified, eval_expr,
+        eval_expr_ext, eval_field_value, eval_field_value_src, extract_key_simple,
+        extract_scope_key_from_row, extract_scope_key_mixed, field_ref_name,
+        precompute_join_then_keys, push_i64_exact_decimal, scope_key_from_values,
+        scope_key_shard_index, value_to_string, values_equal,
+    };
+    pub(crate) mod eval {
+        #[allow(unused_imports)]
+        pub(crate) use wf_cep::cep::eval::{eval_expr, eval_expr_ext, values_equal};
+        pub(crate) mod cmp {
+            pub(crate) use wf_cep::cep::eval::cmp::{apply_fmt_template, timestamp_nanos_to_utc};
+        }
+    }
+    pub(crate) mod key {
+        #[allow(unused_imports)]
+        pub(crate) use wf_cep::cep::key::{
+            ScopeKey, StrSink, ValueKey, field_ref_name, push_i64_exact_decimal,
+            scope_key_from_values, scope_key_shard_index,
+        };
+    }
+}
 mod cidr_cache {
     pub(crate) use wf_cep::cidr_cache::*;
 }
@@ -29,17 +58,6 @@ pub mod spill;
 #[cfg(test)]
 mod tests;
 
-pub use cep::apply_conv;
-pub use cep::close_is_qualified;
-pub use cep::{
-    AsofLookup, BindData, CepStateMachine, CloseOutput, CloseReason, Event, FieldSource, JoinKey,
-    MACHINE_ID, MatchedContext, ScopeKey, SharedLimits, StepData, StepOutcome, StepProgress,
-    StepResult, Value, WindowLookup, field_ref_name, precompute_join_then_keys, values_equal,
-};
-pub use cep::{EngineHashMap, EngineHashSet};
-pub(crate) use cep::{
-    extract_key_simple, extract_scope_key_mixed, scope_key_from_values, scope_key_shard_index,
-};
 pub use columnar::{GuardMasks, mask_to_indices};
 pub use event_bridge::{
     ColumnarEvent, FieldIndex, JoinRow, TriggerEvent, WFL_FIELD_TYPE_ARRAY,
@@ -54,4 +72,15 @@ pub use executor::{
     ExecutionPathContext, PipeEachRow, PipeRowSink, RowFieldLayout, RowFields, RuleExecutor,
     RuleExecutorOptions, StatsAccum, StatsBucketAccs, StatsExecutor, StatsMaskCache,
     StatsWindowState,
+};
+pub use wf_cep::cep::apply_conv;
+pub use wf_cep::cep::close_is_qualified;
+pub use wf_cep::cep::{
+    AsofLookup, BindData, CepStateMachine, CloseOutput, CloseReason, Event, FieldSource, JoinKey,
+    MACHINE_ID, MatchedContext, ScopeKey, SharedLimits, StepData, StepOutcome, StepProgress,
+    StepResult, Value, WindowLookup, field_ref_name, precompute_join_then_keys, values_equal,
+};
+pub use wf_cep::cep::{EngineHashMap, EngineHashSet};
+pub(crate) use wf_cep::cep::{
+    extract_key_simple, extract_scope_key_mixed, scope_key_from_values, scope_key_shard_index,
 };

@@ -7,7 +7,7 @@ use super::eval::{eval_expr_ext, try_eval_expr_to_f64, try_eval_expr_to_value};
 use super::key::ValueKey;
 use super::state::{AliasState, BranchState, StepState};
 use super::types::{EngineHashMap, FieldSource, RollingStats, StepProgress, Value, WindowLookup};
-use crate::match_engine::columnar::GuardMasks;
+use crate::masks::GuardMasks;
 
 // ---------------------------------------------------------------------------
 // Step evaluation
@@ -363,7 +363,7 @@ pub(super) fn apply_transforms(
             };
             if !bs
                 .distinct_set
-                .get_or_insert_with(|| Box::new(crate::match_engine::EngineHashSet::default()))
+                .get_or_insert_with(|| Box::new(crate::value::EngineHashSet::default()))
                 .insert(key)
             {
                 return false; // duplicate

@@ -25,8 +25,8 @@ use super::state::BranchState;
 use super::step::{apply_transforms, compute_measure, update_measure};
 use super::types::{CloseOutput, CloseReason, RollingStats, StepData, Value, WindowLookup};
 use super::{CepStateMachine, EngineHashMap, Event, StepResult, apply_conv, close_is_qualified};
-use crate::match_engine::cep::{apply_conv_filtered, throttle_allows};
-use crate::match_engine::columnar::GuardMasks;
+use crate::cep::{apply_conv_filtered, throttle_allows};
+use crate::masks::GuardMasks;
 
 fn event(fields: Vec<(&str, Value)>) -> Event {
     Event {
@@ -1186,7 +1186,7 @@ fn machine_id_extraction_and_fail_latch_on_missing_key() {
 fn window_lookup_default_asof_candidates_with_ts_snapshot() {
     // Drive the default `asof_candidates` over a timestamped snapshot and the
     // `join_lookup` fallback with a structured key (never matches).
-    use crate::match_engine::JoinRow;
+    use crate::row_views::JoinRow;
     use std::collections::HashMap;
     struct TsLookup {
         rows: Vec<(i64, HashMap<String, Value>)>,

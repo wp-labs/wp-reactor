@@ -12,7 +12,7 @@ use wf_lang::plan::{BranchPlan, MatchPlan, SeqStepPlan};
 use super::eval::eval_expr_ext;
 use super::state::Instance;
 use super::types::{FieldSource, Value, WindowLookup};
-use crate::match_engine::columnar::GuardMasks;
+use crate::masks::GuardMasks;
 
 /// A negation step: the event must NOT match within its window.
 pub(super) struct NegCheck {

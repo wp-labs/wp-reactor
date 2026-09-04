@@ -12,8 +12,8 @@ use wf_lang::plan::WindowSpec;
 use super::key::{ScopeKey, extract_scope_key_mixed, scope_key_from_values};
 use super::types::{Event, FieldSource, StepOutcome, StepResult, Value, WindowLookup};
 use super::{CepStateMachine, merge_step_outcome, resolve_key_join_scope_key, step_outcome};
-use crate::match_engine::columnar::GuardMasks;
-use crate::match_engine::event_bridge::TriggerEvent;
+use crate::masks::GuardMasks;
+use crate::row_views::TriggerEvent;
 
 impl CepStateMachine {
     /// Feed one event (arriving on `alias`) into the state machine.

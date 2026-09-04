@@ -303,7 +303,7 @@ fn expr_key_numeric_and_bool_results_type_consistently() {
 fn expr_key_machine_columnar_source_groups_like_row_source() {
     // 列式事件源（ColumnarEvent，deferred 快照路径）：mixed 提取逐行经
     // `FieldSource::field_value` 读列，与行式 Event 命中模式/实例数一致。
-    use crate::match_engine::event_bridge::ColumnarEvent;
+    use crate::row_views::ColumnarEvent;
     use arrow::array::{ArrayRef, StringArray, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field as ArrowField, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_OUTPUT_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
+pub const DEFAULT_OUTPUT_TIME_FORMAT: &str = wf_lang::DEFAULT_OUTPUT_TIME_FORMAT;
 
 #[derive(
     ::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default,

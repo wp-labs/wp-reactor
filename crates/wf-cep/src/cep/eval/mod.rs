@@ -12,7 +12,8 @@ use wf_lang::ast::{BinOp, Expr};
 use super::key::{eval_field_value_src, field_ref_leaf_name, value_to_string};
 use super::types::{EngineHashMap, FieldSource, RollingStats, Value, WindowLookup};
 
-pub(crate) mod cmp;
+pub mod cmp; // engine columnar_eval 跨 crate 消费
+
 mod funcs;
 
 use cmp::{coerce_to_f64, compare_values};
@@ -60,7 +61,7 @@ fn with_eval_time_scope<T>(f: impl FnOnce() -> T) -> T {
 ///
 /// Supports: literals, field refs, BinOp (And/Or/comparisons/arithmetic),
 /// Neg, InList, and basic FuncCall (contains, startswith, endswith, substr, replace, trim, lower, upper, len, mvcount, mvjoin, mvindex, mvappend, split, mvdedup, abs, round, ceil, floor, sqrt, pow, log, exp, clamp, sign, trunc, is_finite, ltrim, rtrim, concat, join, join_by, indexof, replace_plain, startswith_any, endswith_any, coalesce, merge, isnull, isnotnull, is_blank, null_if_blank, default_if_blank, md5, sha1, sha1_n, sha256, hex, stable_id, mvsort, mvreverse, now, now_s, now_ms, now_us, now_ns, strftime, strptime, has, baseline).
-pub(crate) fn eval_expr(expr: &Expr, event: &dyn FieldSource) -> Option<Value> {
+pub fn eval_expr(expr: &Expr, event: &dyn FieldSource) -> Option<Value> {
     with_eval_time_scope(|| {
         let mut empty = EngineHashMap::default();
         eval_expr_ext(expr, event, None, &mut empty)
@@ -71,7 +72,7 @@ pub(crate) fn eval_expr(expr: &Expr, event: &dyn FieldSource) -> Option<Value> {
 ///
 /// All recursive calls go through this function (not `eval_expr`) to preserve
 /// the `windows` and `baselines` context through compound expressions.
-pub(crate) fn eval_expr_ext(
+pub fn eval_expr_ext(
     expr: &Expr,
     event: &dyn FieldSource,
     windows: Option<&dyn WindowLookup>,

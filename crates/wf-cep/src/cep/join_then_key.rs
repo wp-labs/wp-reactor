@@ -23,8 +23,8 @@ use std::collections::HashMap;
 
 use wf_lang::plan::JoinKeyPlan;
 
-use crate::match_engine::cep::{JoinKey, Value, WindowLookup, field_ref_name, values_equal};
-use crate::match_engine::event_bridge::ColumnarEvent;
+use crate::cep::{JoinKey, Value, WindowLookup, field_ref_name, values_equal};
+use crate::row_views::ColumnarEvent;
 
 /// 批级 join-then-key scope key 预解析（见模块文档）。
 pub fn precompute_join_then_keys(

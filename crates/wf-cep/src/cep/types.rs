@@ -4,12 +4,12 @@ use std::time::Duration;
 use smol_str::SmolStr;
 
 use super::key::{ScopeKey, extract_scope_key_from_row};
-use crate::match_engine::event_bridge::{JoinRow, TriggerEvent};
+use crate::row_views::{JoinRow, TriggerEvent};
 use wf_lang::ast::FieldRef;
 use wf_lang::plan::KeyMapPlan;
 
 // Value 层已下沉 wf-cep（P4-A 片 1）；此处别名重导出保持 engine 内路径不变。
-pub use wf_cep::value::{EngineHashMap, EngineHashSet, MACHINE_ID, Value};
+pub use crate::value::{EngineHashMap, EngineHashSet, MACHINE_ID, Value};
 
 // ---------------------------------------------------------------------------
 // Public types — Event & Value
@@ -30,7 +30,7 @@ pub struct Event {
 // ---------------------------------------------------------------------------
 
 /// A per-row source of named fields: either a materialized [`Event`] or a
-/// columnar view over one Arrow row ([`crate::match_engine::ColumnarEvent`]).
+/// columnar view over one Arrow row ([`crate::row_views::ColumnarEvent`]).
 ///
 /// The match state machine consumes this instead of a concrete `&Event`, so hit
 /// rows never need a per-row `HashMap` materialization on the deferred path
@@ -286,7 +286,7 @@ pub struct CloseOutput {
     /// `resolve_close_field` / `build_eval_context` 按需 `value_at` 读。
     /// `All` ctx（L3 函数 `_step_i_field_*`）仍每度量注入 field_values（不受影响）。
     /// None = 无行字段（CEP 路径/标量度量）。
-    pub row_fields: Option<std::sync::Arc<crate::match_engine::executor::RowFields>>,
+    pub row_fields: Option<std::sync::Arc<crate::rows::RowFields>>,
     /// 行字段列名（与 `row_fields` 配套, 按此列序 `value_at`; None = 无）。
     pub row_field_names: Option<std::sync::Arc<Vec<String>>>,
 }
@@ -324,7 +324,7 @@ pub trait WindowLookup: Send + Sync {
             rows.into_iter()
                 .filter(|row| {
                     row.field_value(key_field)
-                        .is_some_and(|v| crate::match_engine::cep::values_equal(&v, key))
+                        .is_some_and(|v| crate::cep::values_equal(&v, key))
                 })
                 .collect(),
         )
@@ -349,7 +349,7 @@ pub trait WindowLookup: Send + Sync {
             rows.into_iter()
                 .filter(|(_, row)| {
                     row.field_value(key_field)
-                        .is_some_and(|v| crate::match_engine::cep::values_equal(&v, key))
+                        .is_some_and(|v| crate::cep::values_equal(&v, key))
                 })
                 .collect(),
         )
@@ -400,7 +400,7 @@ pub enum AsofLookup {
 /// Supports three methods: mean (standard deviation), ewma (exponential weighted), median.
 #[derive(Debug, Clone, ::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
-pub(crate) struct RollingStats {
+pub struct RollingStats {
     count: u64,
     sum: f64,
     sum_sq: f64,
@@ -412,9 +412,15 @@ pub(crate) struct RollingStats {
     values: Vec<f64>, // stores recent values for median calculation
 }
 
+impl Default for RollingStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RollingStats {
     #[allow(dead_code)]
-    pub(super) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             count: 0,
             sum: 0.0,
@@ -426,7 +432,7 @@ impl RollingStats {
         }
     }
 
-    pub(super) fn new_with_method(method: &str) -> Self {
+    pub fn new_with_method(method: &str) -> Self {
         Self {
             count: 0,
             sum: 0.0,
@@ -438,7 +444,7 @@ impl RollingStats {
         }
     }
 
-    pub(super) fn update(&mut self, value: f64) {
+    pub fn update(&mut self, value: f64) {
         self.count += 1;
         self.sum += value;
         self.sum_sq += value * value;
@@ -509,7 +515,7 @@ impl RollingStats {
 
     /// Calculate deviation based on method.
     /// Returns z-score for mean, relative deviation for ewma/median.
-    pub(super) fn deviation(&self, value: f64) -> f64 {
+    pub fn deviation(&self, value: f64) -> f64 {
         match self.method.as_str() {
             "ewma" => {
                 let baseline = self.ewma();

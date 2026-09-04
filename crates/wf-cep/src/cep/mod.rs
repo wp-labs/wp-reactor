@@ -4,10 +4,12 @@
 mod advance;
 mod close;
 mod conv;
-pub(crate) mod eval;
+pub mod eval; // 2026-09-04 P4-B1：engine 剩码经 shim 跨 crate 消费
+
 mod expiry;
 mod join_then_key;
-pub(crate) mod key;
+pub mod key; // 同上
+
 mod limits;
 mod seq;
 mod state;
@@ -24,11 +26,11 @@ pub use types::{
 pub use types::{EngineHashMap, EngineHashSet};
 
 // Re-export pub(crate) items
-pub(crate) use eval::eval_expr;
+pub use eval::eval_expr;
 pub use eval::values_equal;
 pub use key::{ScopeKey, field_ref_name};
 #[allow(unused_imports)] // key.rs 内部用全限定路径；重导出由 executor::eval 等模块消费
-pub(crate) use key::{
+pub use key::{
     eval_field_value, eval_field_value_src, extract_key_simple, extract_scope_key_from_row,
     extract_scope_key_mixed, push_i64_exact_decimal, scope_key_from_values, scope_key_shard_index,
     value_to_string,
@@ -37,17 +39,15 @@ pub(crate) use key::{
 pub use conv::apply_conv;
 pub use join_then_key::precompute_join_then_keys;
 
-pub(crate) use eval::eval_expr_ext;
+pub use eval::eval_expr_ext;
 
 // Test-only re-exports: the `tests` sibling module sits outside `match_engine`,
 // so private submodules (close/key/state/types) are not directly reachable.
 // Benchmarks measure the production hot path without widening production APIs.
-#[cfg(test)]
-pub(crate) use key::ValueKey;
-#[cfg(test)]
-pub(crate) use state::StepState;
-#[cfg(test)]
-pub(crate) use types::RollingStats;
+// engine 剩测/bench（close_bench 等）跨 crate 消费——常驻 pub（doc hidden 语义）。
+pub use key::ValueKey;
+pub use state::StepState;
+pub use types::RollingStats;
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -55,7 +55,7 @@ use std::collections::BinaryHeap;
 use wf_lang::ast::CloseMode;
 use wf_lang::plan::{ConvPlan, JoinKeyPlan, LimitsPlan, MatchPlan, RateSpec, WindowSpec};
 
-pub(crate) use close::accumulate_close_steps;
+pub use close::accumulate_close_steps;
 use key::InstanceKey;
 use seq::SeqRuntime;
 use state::Instance;
@@ -299,7 +299,7 @@ impl CepStateMachine {
     /// Extract a string field from an event source, returning empty string if
     /// not found. Generic over [`FieldSource`] so the columnar path reads it
     /// straight from the batch.
-    pub(crate) fn extract_event_str<E: FieldSource>(event: &E, field: &str) -> String {
+    pub fn extract_event_str<E: FieldSource>(event: &E, field: &str) -> String {
         event.field_value_str(field)
     }
 
@@ -401,7 +401,7 @@ impl CepStateMachine {
         self.estimated_memory_bytes = exact;
     }
 
-    #[cfg(test)]
+    /// Test-only estimate hook（2026-09-04 P4-B1：engine 剩测跨 crate 消费，常驻）。
     pub fn estimated_memory_bytes_for_test(&self) -> usize {
         self.estimated_memory_bytes
     }

@@ -102,12 +102,12 @@ impl AliasState {
 
 #[derive(::moju_derive::MoJu, Debug, Clone)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
-pub(crate) struct StepState {
+pub struct StepState {
     pub(super) branch_states: Vec<BranchState>,
 }
 
 impl StepState {
-    pub(crate) fn new(branch_count: usize) -> Self {
+    pub fn new(branch_count: usize) -> Self {
         Self {
             branch_states: (0..branch_count).map(|_| BranchState::new()).collect(),
         }

@@ -882,7 +882,7 @@ pub(super) fn eval_func_call(
                     _ => return None,
                 }
             } else {
-                wf_config::DEFAULT_OUTPUT_TIME_FORMAT.to_string()
+                wf_lang::DEFAULT_OUTPUT_TIME_FORMAT.to_string()
             };
             let dt = timestamp_nanos_to_utc(ts_nanos)?;
             Some(Value::Str(dt.format(&fmt).to_string().into()))
@@ -914,7 +914,7 @@ pub(super) fn eval_func_call(
                 Value::Str(s) => s,
                 _ => return None,
             };
-            let re = crate::match_engine::regex_cache::cached_regex(&pat)?;
+            let re = crate::regex_cache::cached_regex(&pat)?;
             Some(Value::Bool(re.is_match(&hay)))
         }
         "cidr_match" => {
@@ -929,7 +929,7 @@ pub(super) fn eval_func_call(
                 Value::Str(s) => s,
                 _ => return None,
             };
-            let net = crate::match_engine::cidr_cache::cached_cidr(&cidr)?;
+            let net = crate::cidr_cache::cached_cidr(&cidr)?;
             Some(Value::Bool(net.contains(&ip)))
         }
         "time_diff" => {

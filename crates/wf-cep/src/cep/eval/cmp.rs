@@ -75,7 +75,7 @@ impl FromBinOp for CmpOp {
 /// numeric literals).  Returns `None` for expressions that cannot be
 /// statically resolved to a number (field refs, function calls, etc.)
 /// — callers must fall back to value-based comparison.
-pub(crate) fn try_eval_expr_to_f64(expr: &Expr) -> Option<f64> {
+pub fn try_eval_expr_to_f64(expr: &Expr) -> Option<f64> {
     match expr {
         Expr::Number(n) => Some(*n),
         Expr::Neg(inner) => try_eval_expr_to_f64(inner).map(|v| -v),
@@ -111,7 +111,7 @@ pub(crate) fn try_eval_expr_to_f64(expr: &Expr) -> Option<f64> {
 /// Returns `Some` for literal constants (Number, String, Bool) and
 /// constant arithmetic (Neg, BinOp on numeric literals).
 /// Returns `None` for non-constant expressions (field refs, func calls, etc.).
-pub(crate) fn try_eval_expr_to_value(expr: &Expr) -> Option<Value> {
+pub fn try_eval_expr_to_value(expr: &Expr) -> Option<Value> {
     match expr {
         Expr::Number(n) => Some(Value::Number(*n)),
         Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
@@ -180,7 +180,7 @@ pub(super) fn round_with_precision(value: f64, precision: i64) -> Option<f64> {
     }
 }
 
-pub(crate) fn timestamp_nanos_to_utc(timestamp_nanos: i64) -> Option<DateTime<Utc>> {
+pub fn timestamp_nanos_to_utc(timestamp_nanos: i64) -> Option<DateTime<Utc>> {
     let secs = timestamp_nanos.div_euclid(1_000_000_000);
     let nanos = timestamp_nanos.rem_euclid(1_000_000_000) as u32;
     DateTime::<Utc>::from_timestamp(secs, nanos)
@@ -249,7 +249,7 @@ pub(super) fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Optio
     Some(())
 }
 
-pub(crate) fn apply_fmt_template(template: &str, values: &[Value]) -> Option<String> {
+pub fn apply_fmt_template(template: &str, values: &[Value]) -> Option<String> {
     let placeholders = template.matches("{}").count();
     if placeholders != values.len() {
         return None;

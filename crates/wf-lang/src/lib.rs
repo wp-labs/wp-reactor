@@ -40,3 +40,8 @@ pub use schema::{BaseType, FieldDef, FieldType, StaticWindowSchema, WindowSchema
 pub use wfg_parser::parse_wfg;
 pub use wfl_parser::parse_wfl;
 pub use wfs_parser::{parse_static_wfs, parse_wfs};
+
+/// 引擎输出 / `strftime` 无参默认时间格式（2026-09-04 P4-B1 上移公共底座：
+/// `wf_config::output` 默认与 `wf_cep::cep::eval` strftime 共用同源，避免
+/// cep 语义核反向依赖配置层）。
+pub const DEFAULT_OUTPUT_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
