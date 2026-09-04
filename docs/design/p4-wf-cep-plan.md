@@ -178,3 +178,6 @@ builder helpers（供 engine 剩测/bench 使用；避免重复实现）。
 | S4 | CHANGELOG 2.1.0 候选 → tag → warp-fusion 升依赖跨仓验证 | 跨仓库绿 |
 
 - 工作量重估：S1 主体 1-2 天（沿用 2026-09-03 判定）；S2 0.5-1 天（以最终清单为准）。
+- **S1 边界确认已完成（2026-09-04，见 `p4-wf-cep-s1-boundary.md`）**：阻塞点收敛为 B1-B4 四个
+  arrow 数据面类型（GuardMasks/JoinRow/TriggerEvent/ColumnarEvent）的归属决策，推荐 B0 批次
+  随迁；cep 生产实测 7.6k 行（旧 11.8k 口径含测试）；批次重排 B0-B3 ≈ 2-3 天。
