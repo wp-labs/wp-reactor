@@ -7,7 +7,8 @@
 //! - `value`：`Value` 与热路径哈希别名（P4-A 片 1）；
 //! - `external`：外部函数全局注册（P4-A 片 2）；
 //! - `rows`：行字段紧凑存储 `RowFieldLayout` / `RowFields`（P4-A 片 3）；
-//! - `masks`：列式 branch-guard 掩码 `GuardMasks`（P4-B0）。
+//! - `masks`：列式 branch-guard 掩码 `GuardMasks`（P4-B0）；
+//! - `value_extract`：Arrow 列 → `Value` 值提取核心（P4-B0，structured JSON 判定）。
 //!
 //! 本 crate 为内部构建块，模块即公开面（引擎经 shim 重导出）；
 //! 依赖墙：**允许 arrow 纯数据面**；禁止 tokio / async / 网络 / 持久化 IO
@@ -22,3 +23,4 @@ pub mod regex_cache;
 pub mod rows;
 pub mod time;
 pub mod value;
+pub mod value_extract;

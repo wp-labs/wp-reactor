@@ -2,7 +2,7 @@
 //! 2026-09-04 原样外移（#[path] sibling，`super` = event_bridge 根不变）。
 
 use super::*;
-use arrow::array::ArrayRef;
+use arrow::array::{ArrayRef, BooleanArray, ListArray, StringArray, StructArray};
 use arrow::datatypes::{Field, Int64Type, Schema};
 use std::collections::HashSet;
 use std::sync::Arc;
