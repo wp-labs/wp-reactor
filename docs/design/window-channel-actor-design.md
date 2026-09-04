@@ -375,7 +375,7 @@ pull 路径收缩为 bootstrap 补拉。收益是归属更纯净，代价是内�
     2,714,786 / routed=0 / 零 P-DIAG，process_batch 从未被调用），
     根因待查，见 §8 Q4；
   - q1 单轮回归（确认无回退）；
-- 提交前移除 P-DIAG 诊断面包屑（rule_task.rs 三处 wf_warn）。
+- 提交前移除 P-DIAG 诊断面包屑（rule_task.rs 三处 wf_warn；该文件 2026-09 P4 已目录化为 `engine_task/rule_task/`）。
 
 ### A.3 驱逐入 actor（未排期）
 

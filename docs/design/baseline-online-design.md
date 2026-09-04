@@ -12,11 +12,11 @@
 
 | 项 | 位置 | 现状 |
 |---|---|---|
-| `eval_baseline` 入口 | `wp-reactor/crates/wf-engine/src/match_engine/cep/eval/mod.rs:187` | 只读 `args[0]`（expr）与 `args.get(2)`（method，默认 `"mean"`）；**`args[1]`（dur）从未读取** |
-| 状态键 | `mod.rs:207` | `format!("{:?}:{}", args[0], method)` —— **不含 dur**，不同 dur 撞同一 tracker |
-| `RollingStats` | `types.rs:375` | 字段 `count/sum/sum_sq/method/ewma/ewma_alpha(0.3)/values(Vec 上限1000)`；`mean` 为实例启动以来全量累积；`ewma` 固定 α=0.3；`median` 最近 1000 值环形缓冲 |
-| 状态挂载 | `state.rs:138` | `baselines: EngineHashMap<String, RollingStats>` 挂在 **match 实例** 上；实例创建默认空（`:178`）；淘汰/重启即 `clear()`（`:304`） |
-| 内存记账 | `state.rs:244` | `size += self.baselines.len() * 128` |
+| `eval_baseline` 入口 | `crates/wf-cep/src/cep/eval/mod.rs` | 只读 `args[0]`（expr）与 `args.get(2)`（method，默认 `"mean"`）；**`args[1]`（dur）从未读取** |
+| 状态键 | `crates/wf-cep/src/cep/eval/mod.rs` | `format!("{:?}:{}", args[0], method)` —— **不含 dur**，不同 dur 撞同一 tracker |
+| `RollingStats` | `crates/wf-cep/src/cep/types.rs` | 字段 `count/sum/sum_sq/method/ewma/ewma_alpha(0.3)/values(Vec 上限1000)`；`mean` 为实例启动以来全量累积；`ewma` 固定 α=0.3；`median` 最近 1000 值环形缓冲 |
+| 状态挂载 | `crates/wf-cep/src/cep/state.rs` | `baselines: EngineHashMap<String, RollingStats>` 挂在 **match 实例** 上；实例创建默认空；淘汰/重启即 `clear()` |
+| 内存记账 | `crates/wf-cep/src/cep/state.rs` | `size += self.baselines.len() * 128` |
 
 **结论**：当前 `baseline(x, 30d, "ewma")` 的 `30d` 不产生任何"过去 30 天"语义，实为"实例启动以来累积统计量"；实例淘汰即从零冷启动。对外文档此前据此夸大，本方案收敛之。
 
@@ -210,7 +210,7 @@ baseline(4小时, none,"ewma",     qps)      # 无周期：单滚动窗口内连
 
 ### 6.1 数据结构变更
 
-`types.rs:375` 的 `RollingStats` 扩展：
+`crates/wf-cep/src/cep/types.rs` 的 `RollingStats` 扩展：
 
 ```rust
 pub(crate) struct RollingStats {
@@ -266,7 +266,7 @@ pub(crate) struct RollingStats {
 
 ### 6.3 求值流程变更
 
-`eval/mod.rs:187` 新签名（线程化事件时间 + 规则级基线表）：
+`crates/wf-cep/src/cep/eval/mod.rs` 新签名（线程化事件时间 + 规则级基线表）：
 
 ```rust
 fn eval_baseline(
@@ -286,12 +286,12 @@ fn eval_baseline(
 
 ### 6.4 状态归属变更（规则级续命）
 
-现状 `baselines` 挂在 match 实例、`clear()` 于淘汰（state.rs:304）导致冷启动。改为：
+现状 `baselines` 挂在 match 实例、`clear()` 于淘汰（crates/wf-cep/src/cep/state.rs）导致冷启动。改为：
 
 - 在**规则级**引入 `RuleBaselines`（`EngineHashMap<BaselineKey, RollingStats>`），由规则任务持有，生命周期长于单个 match 实例。
 - match 实例通过 `entity_key` 在 `RuleBaselines` 中查找/创建自己的 tracker。
 - **实例淘汰不清 `RuleBaselines`**；仅规则卸载时整体清空。
-- 内存记账迁移到规则级 map（state.rs:244 改为统计 `RuleBaselines.len()`，并加 `median` 元组容量 `MEDIAN_CAP * 16` 字节/项）。
+- 内存记账迁移到规则级 map（crates/wf-cep/src/cep/state.rs 改为统计 `RuleBaselines.len()`，并加 `median` 元组容量 `MEDIAN_CAP * 16` 字节/项）。
 
 > 此改动使"实体重新活跃"可从已有基线续命（warm restart）；配合 §4.5 的 redb 持久化，进程重启亦可 warm start。
 

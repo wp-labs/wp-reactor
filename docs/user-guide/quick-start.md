@@ -109,7 +109,7 @@ framing = "len"
 data_format = "arrow_framed"
 
 [runtime]
-executor_parallelism = 2
+rule_shards = 1          # 规则并行分片（旧 executor_parallelism 键已移除）
 rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules   = "rules/*.wfl"

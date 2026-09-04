@@ -26,10 +26,10 @@ bid 事件本身没有 category，须 join auction 才能拿到。
 | 环节 | 位置 | 现状 |
 |---|---|---|
 | 键声明 | `wf-lang/src/plan.rs` `MatchPlan { keys: Vec<FieldRef>, key_map }` | `match<category:10m>` 的 `category` 编译期解析到**驱动 bind 的字段**；非驱动字段编译报错 |
-| 键提取 | `wf-engine/src/match_engine/cep/key.rs::extract_key(event, keys, key_map, alias)` | 从事件 `FieldSource` 取值；缺失 → `None` → `advance_at_with_diagnostics` 返回 `Accumulate`（跳过） |
-| 窗口路由 | `match_engine/mod.rs` `advance_at_with_diagnostics`（L300+） | `extract_key` → `InstanceKey::sliding/fixed(scope_key, bucket)` |
+| 键提取 | `crates/wf-cep/src/cep/key.rs::extract_key(event, keys, key_map, alias)` | 从事件 `FieldSource` 取值；缺失 → `None` → `advance_at_with_diagnostics` 返回 `Accumulate`（跳过） |
+| 窗口路由 | `crates/wf-cep/src/cep/advance.rs` `advance_at_with_diagnostics` | `extract_key` → `InstanceKey::sliding/fixed(scope_key, bucket)` |
 | join 执行 | `executor/context.rs::execute_joins`（pub(super)）+ `match_exec.rs` with-joins 富化 | **懒执行**：match/close 命中时才算（`execute_match_with_joins`），事件进窗口前不做 join |
-| 窗口查找 | `match_engine/types.rs` `WindowLookup` trait（snapshot / join_lookup / with_timestamps） | `advance_at_with_masks` 已接收 `windows: Option<&dyn WindowLookup>`——**运行时传真 lookup**，oracle 传 `None` |
+| 窗口查找 | `crates/wf-cep/src/cep/types.rs` `WindowLookup` trait（snapshot / join_lookup / with_timestamps） | `advance_at_with_masks` 已接收 `windows: Option<&dyn WindowLookup>`——**运行时传真 lookup**，oracle 传 `None` |
 | oracle（wfgen） | `crates/wfgen/src/oracle/mod.rs` `run_oracle_events_opts` | 逐规则 SM 独立推进；**无窗口状态、无 WindowLookup** → join 一律不评估（q21 已知差异即源于此） |
 
 ## 3. 语法与编译（wf-lang）
@@ -95,7 +95,7 @@ pub struct JoinKeyPlan {
 
 ### 4.1 执行点
 
-`advance_at_with_diagnostics`（`match_engine/mod.rs` L300+）在 `extract_key` **之前**：
+`advance_at_with_diagnostics`（`crates/wf-cep/src/cep/advance.rs`）在 `extract_key` **之前**：
 
 ```
 if let Some(kjp) = &self.plan.key_join {
@@ -230,11 +230,11 @@ oracle 有窗口状态后，q21（anti join）真实评估：oracle=引擎=0（a
 
 | 断言 | 代码证据 |
 |---|---|
-| 运行时 advance 传真 WindowLookup | `rule_task.rs:964` `advance_at_with_masks(alias, &row_event, event_nanos, Some(&lookup), ...)`——每次 advance 都传 |
+| 运行时 advance 传真 WindowLookup | `engine_task/rule_task/rule_task_rows.rs` `advance_at_with_masks(alias, &row_event, event_nanos, Some(&lookup), ...)`——每次 advance 都传 |
 | join 查找 O(1) 索引路径 | `window_lookup.rs:163-175` `RegistryLookup::join_lookup`：窗口维护的 join 索引直接返回 `Arc<Event>`，无 seq 水印时走索引而非扫描 |
 | 键校验位置 = K1 | `checker/rules/keys.rs:28-39`：未限定键须存在于**所有非 join 事件源**，且**已显式跳过 join 窗口**（`scope.join_windows`）——这就是要改的精确位置 |
 | join 窗口在 checker scope 中可见 | `checker/rules/scope_build.rs:61` `scope.join_windows.push(target)` |
-| `advance_at_with_masks` 已带 `windows` 参数 | `match_engine/mod.rs` 签名 |
+| `advance_at_with_masks` 已带 `windows` 参数 | `crates/wf-cep/src/cep/advance.rs`（`advance_at_with_masks` 签名） |
 | oracle 无窗口状态（join 一律不评估） | `wfgen/oracle/mod.rs` `windows` 恒传 None |
 
 ### 9.2 遗漏与修正（已并入实施）

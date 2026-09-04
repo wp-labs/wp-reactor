@@ -17,7 +17,7 @@ SIGKILL 兜底砍掉；此时 TCP listener 已关闭但进程仍满负荷（644%
 2. **卡点 A（rule task）**：`engine_task/mod.rs` 的 `run_push_loop` 用
    `tokio::select!{ biased; }`，原先 `rx.recv()` 排在 `cancel.cancelled()`
    之前——push channel 被 ingest burst 灌满时，cancel 分支被饿死；
-   `process_batch`（`engine_task/rule_task.rs`）对 batch 内每个 event 做同步
+   `process_batch`（`engine_task/rule_task/rule_task_run.rs`）对 batch 内每个 event 做同步
    `machine.advance_at_with`，一个 batch 内不可中断。
 3. **卡点 B（大头：sink consumer）**：`alert_task.rs` 原有的
    `run_sink_consumer` **没有 cancel token**，退出只依赖 channel 关闭
@@ -36,7 +36,7 @@ process 内部的 await 不可中断 → 预算失效）。改为 warp-parse 模
    `GROUP_JOIN_TIMEOUT = 3s`，每个 handle 用剩余时间 join；超时
    `handle.abort()` + 记录 aborted 数。整个 group 一个上界，避免逐 handle
    累积。退出时打 `task group {name} shutdown complete: tasks=.. aborted=..`。
-2. `lifecycle/alert_task.rs` `run_sink_consumer`：加 `cancel:
+2. `wf-runtime/src/alert_task.rs` `run_sink_consumer`：加 `cancel:
    CancellationToken`；cancel 后带 `SINK_DRAIN_BUDGET = 1s` 排空 channel，
    超时 drop 剩余 batch + `sink.stop()`。抽 `dispatch_batch` helper 共享
    正常/关闭路径。

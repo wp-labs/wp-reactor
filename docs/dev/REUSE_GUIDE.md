@@ -123,7 +123,7 @@ enum ColumnData<T> { Const(T), Rows(Vec<T>) }  // at(row): Const→唯一值, Ro
 - **预算阶梯**（三层）：内存 `max_memory` → 磁盘 `max_disk` → 拒收兜底（不丢已建桶）
 - **铁律**：内存+磁盘预算之和必须 ≥ 状态总量, 否则拒收丢键（`[clean]` 不报, 需对拍 EMIT）
 - **键改名兼容**：`max_spill_bytes → max_disk`、`spill → disk_provider` 保留旧键为别名（解析接受 + lint 迁移 Warning）
-- 实现：`stats_exec.rs`（记账/检查）、`spawn.rs`（注入）、`wf-lang`（解析）;
+- 实现：`match_engine/executor/stats_exec/`（记账/检查）、`spawn.rs`（注入）、`wf-lang`（解析）;
   设计 `docs/design/stats-state-spill-redb.md` §19/§20
 
 ### 3.7 键改名兼容别名（配置/API 演进）
@@ -220,12 +220,12 @@ bench 的 `RSS_peak` 单次不可信（运行间波动），对比用 `MEMORY=1 
 | 机制 | 成熟度 | 位置 | 能力 | 验证/局限 |
 |---|---|---|---|---|
 | **常量列折叠 `ColumnData<T>`** | ★5 | `alert/column_batch.rs` | 全列同值折叠单值，读时 O(1) 展开 | q13 30M/100M 双达标 + q1 无退化；⚠ 仅 4 计划常量列可折叠（emit_time 跨批变化、summary/record 路径 per-row，R1 修正） |
-| **SmolStr 内联 + `StrSink` trait** | ★5 | `match_engine/key.rs`、`column_batch.rs` | ≤22B 短字符串零堆分配；String/SmolStrBuilder 统一渲染 | 多处使用；字节一致守护测试 |
+| **SmolStr 内联 + `StrSink` trait** | ★5 | `wf-cep/src/cep/key.rs`、`column_batch.rs` | ≤22B 短字符串零堆分配；String/SmolStrBuilder 统一渲染 | 多处使用；字节一致守护测试 |
 | 批式 commit（`commit_each_rows_batch`） | ★4 | `column_batch.rs` | 列式批量装载（bulk extend + 块级 fill） | q1 路径；q13b 用逐行（fcb4630 取舍，见 §3.5 教训） |
 | f64 快车道（`stage_yield_cell_f64`） | ★4 | `column_batch.rs` + `each_exec.rs` | yield 与 entity 同列数字 → 直写免 Value/coerce | q1/q13；EPS +40% 实证 |
 | `EntityCol` 列直读 | ★4 | `each_exec.rs` | Int64/TsNanos/Utf8/Generic 三态直读 | q13a/q13b |
 | 零拷贝 move 进列（`EachRowCells` owned） | ★4 | `column_batch.rs` | owned 值 move 进列，免二次拷贝 | fcb4630 核心；moved 批式已证分配总量不变则内存不变 |
-| **列式中间窗 staging**（`push_record_columnar`） | ★4 | `rule_task.rs` `PipeBatchStager` | col_sources 预计算 + SmolStr 内联 meta，免 `record_window_fields` 的 clone+HashSet+Arc::from 每行分配 | q4a 4.4×；deferred emit/行式 on-each 中间窗统一受益；push_record 退化为测试对拍用 |
+| **列式中间窗 staging**（`push_record_columnar`） | ★4 | `engine_task/rule_task/stager.rs`（`PipeBatchStager`） | col_sources 预计算 + SmolStr 内联 meta，免 `record_window_fields` 的 clone+HashSet+Arc::from 每行分配 | q4a 4.4×；deferred emit/行式 on-each 中间窗统一受益；push_record 退化为测试对拍用 |
 | **中间窗轻量 build**（`build_each_alert_pipe`） | ★4 | `each_exec.rs` | 跳过 wfx_id 哈希/fired_at ISO8601/machine_id（中间窗消费者按列读不需要）；yield 引用 `__wfu_*` meta 时回退全量 | q4a；复用 q13a `each_yield_meta_light` 空槽不可观测性；收益小（build 已薄）但机制通用 |
 
 ### B. Join / 正确性
@@ -233,10 +233,10 @@ bench 的 `RSS_peak` 单次不可信（运行间波动），对比用 `MEMORY=1 
 | 机制 | 成熟度 | 位置 | 能力 | 验证/局限 |
 |---|---|---|---|---|
 | **批级预查（key 分组去重）** | ★5 | `each_exec.rs` `key_rows` | 每唯一 key 一次 lookup，hot key 共享 | q13 卡死修复关键；集成对拍 |
-| **广播按订阅类型裁剪**（`round_robin_only`） | ★5 | `window/fanout.rs` | 无 pull 订阅 → 只广播不物化 events | q13 30M 达标；变异测试（写反即失败） |
-| **D4 保留 pin** | ★5 | `rule_task.rs` `publish_retention_floor` | 挂起实例保留 pin 闭环到时间驱逐 | deferred 正确性根治（q4/q9） |
-| **运行期评估 gate** | ★5 | `rule_task.rs` `scan_deferred` | 评估前沿 = 目标窗 append 位 | q4a 100M 欠发根治 |
-| **健全前沿 gate**（跨源提交乱序） | ★5 | `rule_task.rs` | 乱序提交防护 + lo_min 历史缓存修复 | 30M 三连根治（正确性/多发/内存） |
+| **广播按订阅类型裁剪**（`round_robin_only`） | ★5 | `window/fanout/dispatch.rs` | 无 pull 订阅 → 只广播不物化 events | q13 30M 达标；变异测试（写反即失败） |
+| **D4 保留 pin** | ★5 | `engine_task/rule_task/mod.rs`（`publish_retention_floor`） | 挂起实例保留 pin 闭环到时间驱逐 | deferred 正确性根治（q4/q9） |
+| **运行期评估 gate** | ★5 | `engine_task/rule_task/rule_task_scan.rs`（`scan_deferred`） | 评估前沿 = 目标窗 append 位 | q4a 100M 欠发根治 |
+| **健全前沿 gate**（跨源提交乱序） | ★5 | `engine_task/rule_task/` | 乱序提交防护 + lo_min 历史缓存修复 | 30M 三连根治（正确性/多发/内存） |
 | **条件复核冗余跳过**（`cond_recheck_redundant`） | ★4 | `deferred_exec.rs` | asof 契约保证候选 key 匹配 → 单条件规则跳过 `row_matches_conds`（~17ns/候选） | q4a/q9；⚠ 依赖 asof 契约，测试 lookup 必须同步按契约过滤 |
 | **enrich 裸名注入**（`enrich_join_row_bare`） | ★4 | `context.rs` | `eval_field_value` 对 Qualified 读裸名键 → qualified 键死数据，只注入裸名（or_insert 不覆盖）；省 457ns/实例（3.1×） | q4a 主墙（评估 56%）；eager 路径保留全量（契约测试锁定） |
 | provider 预物化（`join_rows_lookup`） | ★3 | `window/provider/mod.rs` | 静态表 Arc<Event> 一次构建 | 收益有限（批级预查已压 lookup 频率） |
@@ -262,17 +262,17 @@ bench 的 `RSS_peak` 单次不可信（运行间波动），对比用 `MEMORY=1 
 | 机制 | 成熟度 | 位置 | 能力 | 验证/局限 |
 |---|---|---|---|---|
 | **等价对拍测试**（列式 vs 行式字节一致） | ★5 | 各 `tests/*` | 两条路径逐字段对拍 | 本专项核心守护（每次列式化改动都靠它） |
-| **变异测试**（关键判定写反即失败） | ★5 | `fanout.rs` 等 | 防"看似正确实则失效" | round_robin_only 等 |
+| **变异测试**（关键判定写反即失败） | ★5 | `window/fanout/` 等 | 防"看似正确实则失效" | round_robin_only 等 |
 | ack floor 门控驱逐 | ★5 | `evictor.rs` | 未读/未广播不驱逐（宁可超 cap） | 驱逐正确性 + D4 pin 闭环 |
-| 完成信号 + 生产/消费双分片（M-13） | ★4 | `rule_task.rs` | max_acked 追平语义、分片分组完成 | q13 分片根治 |
+| 完成信号 + 生产/消费双分片（M-13） | ★4 | `engine_task/rule_task/rule_task_run.rs` | max_acked 追平语义、分片分组完成 | q13 分片根治 |
 | `completion_gap` 分组完成判定 | ★4 | `window/router.rs` | min/max 分片口径（keyed vs round-robin） | 慢分片尾部不截断 |
 
 ### E. 配置 / 资源预算
 
 | 机制 | 成熟度 | 位置 | 能力 | 验证/局限 |
 |---|---|---|---|---|
-| **规则级共享预算**（`max_memory`/`max_disk` 共享计数） | ★4 | `stats_exec.rs` + `spawn.rs` + `wf-lang` | 用户配规则总量, 分片共享一个 `Arc<AtomicU64>` 占用计数（建桶/驱逐/close 记账, 检查走共享读值, 未共享退化本地） | q18 30M/100M 实测（EMIT 对拍 29,370,378 ✓, RSS 35-40→24GB）; 守护测试 `mem_shared_counter_rule_budget`/`spill_shared_counter_rule_budget`; ⚠ 仅 stats 规则（CEP/join 无 SpillStore） |
+| **规则级共享预算**（`max_memory`/`max_disk` 共享计数） | ★4 | `match_engine/executor/stats_exec/` + `spawn.rs` + `wf-lang` | 用户配规则总量, 分片共享一个 `Arc<AtomicU64>` 占用计数（建桶/驱逐/close 记账, 检查走共享读值, 未共享退化本地） | q18 30M/100M 实测（EMIT 对拍 29,370,378 ✓, RSS 35-40→24GB）; 守护测试 `mem_shared_counter_rule_budget`/`spill_shared_counter_rule_budget`; ⚠ 仅 stats 规则（CEP/join 无 SpillStore） |
 | **键改名兼容别名** | ★4 | `wf-lang/src/checker/rules/limits.rs` | 旧键保留 + lint 迁移 Warning, 新名优先 | `max_spill_bytes→max_disk`、`spill→disk_provider`; 测试: 新键解析/旧键编译生效/迁移警告 |
-| **spill 状态外溢**（redb 三层预算阶梯, 键 `disk_provider`） | ★4 | `stats_exec.rs` + `spill.rs` | 内存→磁盘→拒收; 窗口级文件 + 流式 close 分批读回 + 异步写 worker（每分片单写者）; store 惰性创建（零驱逐窗口零开销） | q18 100M 正确性达标; 守护测试: 全链路对拍（count/sum/last/distinct/top/流式 close/多窗口）+ 序列化往返全变体 + RowFields 去重 + 惰性创建 |
+| **spill 状态外溢**（redb 三层预算阶梯, 键 `disk_provider`） | ★4 | `match_engine/executor/stats_exec/` + `spill.rs` | 内存→磁盘→拒收; 窗口级文件 + 流式 close 分批读回 + 异步写 worker（每分片单写者）; store 惰性创建（零驱逐窗口零开销） | q18 100M 正确性达标; 守护测试: 全链路对拍（count/sum/last/distinct/top/流式 close/多窗口）+ 序列化往返全变体 + RowFields 去重 + 惰性创建 |
 
 ---

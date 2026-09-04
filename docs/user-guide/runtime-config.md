@@ -40,7 +40,7 @@ stream_tag = "syslog"
 data_format = "arrow_ipc"                  # 标准 Arrow IPC file
 
 [runtime]
-executor_parallelism = 2
+rule_shards = 1          # 规则并行分片（旧 executor_parallelism 键已移除）
 rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules   = "rules/*.wfl"
@@ -198,7 +198,7 @@ data_format = "arrow_ipc"
 
 ```toml
 [runtime]
-executor_parallelism = 2
+rule_shards = 1          # 规则并行分片（旧 executor_parallelism 键已移除）
 rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules   = "rules/*.wfl"
@@ -206,6 +206,7 @@ rules   = "rules/*.wfl"
 
 说明：
 
+- `rule_shards`：规则并行分片数（`1` = 不分片；配置别名 `rule_parallelism`；旧 `executor_parallelism` 键已移除）
 - `schemas` / `rules` 支持 glob
 - 可使用 `schemas/**/*.wfs` 递归扫描
 

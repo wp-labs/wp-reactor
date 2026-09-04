@@ -210,9 +210,10 @@ wp-labs/
     ├── crates/
     │   ├── wf-lang/           # WFL/WFS 语言编译器（纯同步，零运行时依赖）
     │   ├── wf-config/         # 配置解析（.toml + 项目工具共享函数）
-    │   ├── wf-core/           # 核心引擎（Window + CEP + Alert）
-    │   ├── wf-runtime/        # 异步运行时（Receiver + RuleTask + Lifecycle）
-    │   └── wf-engine/         # `wfusion` CLI 核心逻辑库
+    │   ├── wf-cep/            # CEP 同步执行核（cep 状态机 + eval/Value/Event + 纯叶；2026-09 P4 自 wf-engine 迁出）
+    │   ├── wf-data/           # 共享时间/数据小工具（供 wf-runtime 消费）
+    │   ├── wf-engine/         # 引擎执行内核（match_engine 规则层 + executor/columnar/window/alert/sink；原 wf-core 并入）
+    │   └── wf-runtime/        # 异步运行时（Receiver + RuleTask + Lifecycle + Metrics + CLI）
     ├── examples/              # 配置与规则示例
     │   ├── wfusion.toml
     │   ├── schemas/
@@ -246,18 +247,25 @@ wp-labs/
 ### 3.2 Crate 依赖关系
 
 ```
-wf-lang  (纯同步，无运行时依赖)
-  ↑
-wf-config  (依赖 wf-lang + wp-connector-api，配置解析 + sink 路由配置)
-  ↑
-wf-core  (依赖 wf-config + wf-lang + wp-connector-api，核心引擎逻辑 + sink 调度)
-  ↑
-wf-runtime  (依赖 wf-core + wp-arrow + wp-connector-api，异步运行时 + sink 工厂)
-  ↑
-wf-engine  (依赖 wf-config + wf-runtime，供 `wfusion` 二进制复用的 CLI 库)
+wf-lang（纯同步，零运行时依赖；WFL/WFS 编译器）
+  ↓                    ↓
+wf-config           wf-cep
+（wf-lang +          （wf-lang + arrow 纯数据面；
+ wp-connector-api，   CEP 同步执行核，2026-09 P4
+ 配置解析 + sink       自 wf-engine 整迁；依赖墙禁
+ 路由配置）            tokio/async/IO）
+  └─────────┬──────────┘
+            ↓
+      wf-engine（wf-config + wf-cep + wf-lang + wp-connector-api/wp-model-core，
+                 引擎执行内核：match_engine 规则层 + window/alert/sink/pipe）
+            ↓
+      wf-runtime（wf-engine + wf-config + wf-data + wf-lang + wp-arrow/wp-connector-api，
+                  异步运行时 + 生命周期 + CLI 命令面）
 
-wfl  (依赖 wf-config + wf-lang + tree-sitter，开发者工具)
-wfgen  (依赖 wf-core + wf-lang，测试数据生成)
+wf-data（无 workspace 依赖——共享时间/数据小工具，供 wf-runtime 消费）
+
+`wfl`（开发者工具）与 `wfgen`（测试数据生成）等二进制位于相邻 `warp-fusion`
+workspace，依赖本 workspace 的 wf-* crate，不在 wp-reactor 六 crate 内。
 ```
 
 ### 3.3 wf-lang（WFL 编译器）
@@ -287,33 +295,39 @@ wf-lang/
     └── parse_utils.rs         # 解析工具函数
 ```
 
-### 3.4 wf-core（核心引擎）
+### 3.4 wf-cep + wf-engine（核心引擎，承接原 wf-core 职责）
 
-Window 缓冲、CEP 状态机、规则执行、告警输出、sink 调度。同步与异步混合 API。
+核心引擎逻辑分属两个 crate：`wf-cep` 承载 CEP 同步执行核（无 async/IO，依赖墙禁 tokio、允许
+arrow 纯数据面；2026-09 P4 自 wf-engine 整迁），`wf-engine` 承载引擎执行内核（match_engine
+规则执行层 + window/alert/sink/pipe）。engine 经 shim 从 wf-cep 重导出 cep 公开面，公开路径不变。
 
 ```
-wf-core/
+wf-cep/
 └── src/
-    ├── lib.rs
-    ├── window/
-    │   ├── mod.rs
-    │   ├── buffer.rs          # Window: 带 watermark 的时间窗口缓冲 + cursor-based 读取
-    │   ├── registry.rs        # WindowRegistry: 窗口注册 + stream→window 订阅表
-    │   ├── router.rs          # Router: watermark-aware 路由 + Notify 通知
-    │   └── evictor.rs         # Evictor: 时间淘汰 + 内存淘汰
-    ├── rule/
-    │   ├── mod.rs
-    │   ├── match_engine.rs    # CepStateMachine: scope-key 状态机 + 表达式求值
-    │   ├── executor.rs        # RuleExecutor: score/entity 求值 → AlertRecord
-    │   └── event_bridge.rs    # batch_to_events: RecordBatch → Vec<Event>
-    ├── alert/
-    │   ├── mod.rs
-    │   └── types.rs           # AlertRecord（alert_id, score, entity, fired_at, yield_target...）
-    ├── sink/
-    │   ├── mod.rs
-    │   ├── dispatch.rs        # SinkDispatcher: yield-target 路由引擎（connector 模式）
-    │   └── runtime.rs         # SinkRuntime: 封装 wp-connector-api SinkHandle
-    └── error.rs               # CoreError（基于 orion-error 结构化错误）
+    ├── cep/                   # CepStateMachine: scope-key 状态机 + 逐事件求值
+    │   ├── mod.rs             # hub（结构面/构造/共享簿记 + re-export）
+    │   ├── advance.rs / window.rs / expiry.rs   # 推进入口族 / 单窗推进 / 到期收口
+    │   ├── close.rs conv.rs join_then_key.rs key.rs limits.rs seq.rs state.rs step.rs types.rs
+    │   ├── eval/              # 逐事件解释求值器（cmp / funcs）
+    │   └── tests/             # cep 语义测试（coverage_* / derived_key / first_match_time）
+    ├── value.rs rows.rs row_views.rs value_extract.rs masks.rs   # Value/行字段/列式行视图/掩码
+    ├── regex_cache.rs cidr_cache.rs time.rs error.rs external.rs   # 纯叶（P4 v0.1 迁入）
+    └── lib.rs
+
+wf-engine/
+└── src/
+    ├── lib.rs                 # 对外契约：顶层模块 + shim 重导出（error/time/external 自 wf-cep）
+    ├── match_engine/          # 规则执行层（本 crate 主体）
+    │   ├── mod.rs             # 门面：cep/executor/columnar/… 公开面
+    │   ├── executor/          # RuleExecutor + execution_path + stats_exec/ + eval/
+    │   ├── columnar*.rs       # 列式编译/求值核（columnar_compile / columnar_eval）
+    │   ├── event_bridge*.rs   # batch_to_events: RecordBatch ↔ Event（含列式视图）
+    │   ├── spill*.rs / async_persist.rs / contract.rs
+    │   └── tests/             # 引擎层语义/集成测试（l2/l3/executor/…）
+    ├── window/                # Window actor/buffer/evictor/fanout/router/progress
+    ├── alert/                 # AlertRecord / AlertColumnBuilder
+    ├── pipe/                  # 窗口流水线注册
+    └── sink/                  # SinkDispatcher / SinkRuntime（connector 模式）
 ```
 
 ### 3.5 wf-runtime（异步运行时）
@@ -331,18 +345,20 @@ wf-runtime/
     │   ├── spawn.rs           # 任务组创建: alert/evictor/rules/receiver
     │   ├── signal.rs          # wait_for_signal: SIGINT + SIGTERM
     │   └── types.rs           # TaskGroup, RunRule, BootstrapData
-    ├── receiver.rs            # Receiver: TCP 监听 + Arrow IPC 解码 + 路由
-    ├── engine_task/           # RuleTask: per-rule pull-based 规则执行循环
+    ├── receiver/              # Receiver: TCP 监听 + 帧解码（arrow/ndjson/csv）+ 路由
     │   ├── mod.rs
-    │   ├── rule_task.rs       # run_rule_task: Notify + cursor 驱动的事件处理
+    │   └── tests.rs           # 主题分片：receiver_tests_file_replay / arrow_coerce / route_dispatch
+    ├── engine_task/           # 规则任务：per-rule pull-based 执行（rule_task + stats_task 族）
+    │   ├── mod.rs
+    │   ├── rule_task/         # run_rule_task: Notify + cursor 驱动（rule_task_run / rows / scan / emit / stager / debug）
+    │   ├── stats_task.rs      # stats 规则执行任务
     │   ├── task_types.rs      # RuleTaskConfig, WindowSource
     │   └── window_lookup.rs   # 窗口查找辅助
     ├── alert_task.rs          # run_alert_dispatcher（connector sink 路由）
     ├── evictor_task.rs        # run_evictor: 定时淘汰
+    ├── metrics/               # 指标采集（mod.rs hub + counters/records/alloc_stats/server 子模块）
     ├── sink_build.rs          # SinkFactoryRegistry + build_sink_dispatcher
-    ├── sink_factory/          # Sink 工厂实现
-    │   ├── mod.rs
-    │   └── file.rs            # FileSinkFactory: 异步文件写入（tokio BufWriter）
+    ├── cli/                   # wfusion CLI 命令面（二进制位于相邻 warp-fusion workspace）
     ├── schema_bridge.rs       # WindowSchema + WindowConfig → WindowDef 转换
     └── error.rs               # RuntimeError（基于 orion-error）
 ```
@@ -1169,7 +1185,7 @@ sinks = "sinks"
 listen = "tcp://127.0.0.1:9800"                   # 监听地址
 
 [runtime]
-executor_parallelism = 2                       # 规则执行并行度
+executor_parallelism = 2                       # 规则执行并行度（旧键；现行 = rule_shards 分片）
 rule_exec_timeout = "30s"                      # 单条规则执行超时
 schemas = "schemas/*.wfs"                      # Window Schema 文件 glob 模式
 rules   = "rules/*.wfl"                        # WFL 规则文件 glob 模式
@@ -1346,62 +1362,51 @@ serde_json = "1.0"               # ParamMap (JSON 值) 序列化
 wildmatch = "2"                  # yield-target 通配符匹配
 ```
 
-### 7.4 wf-core
+### 7.4 wf-cep（CEP 同步执行核）
+
+```toml
+[dependencies]
+wf-lang = { path = "../wf-lang" }
+arrow.workspace = true          # 纯 arrow 数据面（依赖墙：禁 tokio/async/网络/持久化 IO）
+orion-error.workspace = true
+regex.workspace = true          # regex_cache / cidr_cache / eval funcs 族
+```
+
+> 原 `wf-core`（核心引擎）2026-06 并入 wf-engine；2026-09 P4 再把 CEP 同步执行核
+> 迁出为 wf-cep（结构见 §3.4），engine 经 shim 重导出保持公开路径不变。
+
+### 7.5 wf-engine（引擎执行内核）
 
 ```toml
 [dependencies]
 wf-config = { path = "../wf-config" }
 wf-lang = { path = "../wf-lang" }
-wp-connector-api.workspace = true  # SinkHandle, SinkSpec (用于 SinkRuntime)
-arrow = { version = "54", default-features = false, features = ["ipc"] }
-serde.workspace = true
-serde_json = "1.0"
-async-trait = "0.1"
-tokio = { version = "1", features = ["sync"] }  # Notify, RwLock, Mutex
-log = "0.4"
-orion-error.workspace = true
-derive_more.workspace = true
-thiserror.workspace = true
-regex = "1"
+wf-cep = { path = "../wf-cep" }
+wp-connector-api.workspace = true  # SinkHandle, SinkSpec
+wp-model-core.workspace = true
+arrow.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 ```
 
-### 7.5 wf-runtime
+### 7.6 wf-runtime（异步运行时）
 
 ```toml
 [dependencies]
-wf-core = { path = "../wf-core" }
+wf-engine = { path = "../wf-engine" }
 wf-config = { path = "../wf-config" }
+wf-data = { path = "../wf-data" }
 wf-lang = { path = "../wf-lang" }
 wp-connector-api.workspace = true  # SinkFactory, SinkBuildCtx, SinkHandle
-wp-arrow = "0.2"                 # Arrow IPC 编解码
-wp-model-core = "0.8"            # DataRecord（FileSinkFactory 需要 AsyncRecordSink）
-arrow = { version = "54", default-features = false, features = ["ipc"] }
+wp-arrow = "0.3"                 # Arrow IPC 编解码
+wp-model-core.workspace = true   # DataRecord（sink 需要 AsyncRecordSink）
+arrow.workspace = true
 tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt-multi-thread", "signal", "time", "fs"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-serde_json = "1.0"
-log = "0.4"
-async-trait = "0.1"
-tracing.workspace = true
-tracing-subscriber.workspace = true
-tracing-appender.workspace = true
-orion-error.workspace = true
-derive_more.workspace = true
-thiserror.workspace = true
 ```
 
-### 7.6 wf-engine（二进制 `wfusion`）
-
-```toml
-[dependencies]
-wf-config = { path = "../wf-config" }
-wf-runtime = { path = "../wf-runtime" }
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
-tracing.workspace = true
-orion-error.workspace = true
-```
-
-实际 `wfusion` 二进制位于 `warp-fusion/src/main.rs`，这里只保留 CLI/启动逻辑实现。
+> 注：wf-engine 现为纯引擎库（非二进制）；`wfusion` CLI 命令面位于
+> `wf-runtime/src/cli`，实际二进制在相邻 `warp-fusion` workspace。
 
 ### 7.7 wfl（二进制 `wfl`）
 
@@ -1433,6 +1438,9 @@ arrow = { version = "54", default-features = false, features = ["ipc"] }
 
 该 crate 位于 `warp-fusion/crates/wfgen`。
 
+> 注：上例为早期依赖样例（`wf-core` 已不存在）；wfgen 现属相邻 `warp-fusion` 仓库，
+> 其依赖以该仓库现状为准（wp-reactor 侧六 crate 见 §3/§7.4-7.6）。
+
 
 ## 8. wp-motor 侧改动
 
@@ -1442,7 +1450,7 @@ wp-motor 需要新增一个 Arrow IPC Sink，将解析后的 DataRecord 通过 T
 
 ```toml
 # wp-motor/Cargo.toml
-wf-arrow = { path = "../wf-arrow" }
+wp-arrow = { path = "../wp-arrow" }
 ```
 
 ### 8.2 Sink 实现
@@ -1529,6 +1537,10 @@ retry_max_interval = "30s"                        # 最大重试间隔
 | **P9** | 正确性门禁: test + shuffle + scenario verify | 计划中 |
 | **P10** | 可靠性分级: at_least_once / exactly_once | 计划中 |
 | **P11** | 分布式 V2+: 多节点部署 | 计划中 |
+
+> 里程碑中的 crate 归属为交付当时的命名（早期划分）：wf-core 已于 2026-06 并入 wf-engine，
+> CEP 同步执行核 2026-09 迁入 wf-cep；wfgen/wfl 二进制现位于相邻 warp-fusion 仓库。
+> 现行六 crate（wf-lang / wf-config / wf-cep / wf-data / wf-engine / wf-runtime）划分见 §3。
 
 ### 9.2 执行计划
 

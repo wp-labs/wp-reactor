@@ -313,7 +313,7 @@ file = "logs/wf-engine.log"
 
 [logging.modules]
 "wf_runtime::receiver" = "debug"
-"wf_core::rule::match_engine" = "trace"
+"wf_runtime::engine_task::rule_task" = "trace"   # 规则驱动 + CEP 状态机（wf_cep）
 ```
 
 ### 6.2 关键日志事件

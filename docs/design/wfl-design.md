@@ -822,7 +822,7 @@ pub struct MatchPlan {
 - Close 路径 asof join 使用 `Instance.last_event_nanos`（实例最后处理事件时间），确保不会”前看”到实例生命周期之外的右表版本。
 
 ### 9.3 并发控制
-- 全局 `Semaphore(executor_parallelism)`。
+- 全局 `Semaphore(executor_parallelism)`（注：键已移除——2026-08 后规则并发 = `rule_shards` 分片，每分片独立 rule task 通道，无全局信号量）。
 - join/yield 包裹超时。
 - 规则执行与 IO 解耦（避免阻塞主分发循环）。
 

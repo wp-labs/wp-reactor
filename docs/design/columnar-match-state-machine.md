@@ -34,7 +34,7 @@
 
 `archive/columnar-execution-progress.md` L165：懒物化的 `broadcast_batch_only` 初版**排除 sharded
 窗口**；Q2 是 `match<auction:10m>` → `Subscription::Sharded`。**改造前** `message_parse`
-的 sharded 分支（`fanout.rs`）**硬性要求 `events=Some`**（`debug_assert!`），
+的 sharded 分支（`window/fanout/`）**硬性要求 `events=Some`**（`debug_assert!`），
 导致 sharded match 在 parse 阶段全量 `batch_to_events` 物化每行 HashMap → Q2 ~6.2-7.2M（progress M2a 双峰基线）。
 本文设计「sharded 也走 `events=None` + 列式分片」，免物化；现已进一步演进为
 **parse 侧预分片（方案A）+ typed ScopeKey 分片键**（见 §实现状态）。
@@ -84,7 +84,7 @@ shard 拥有的 batch 行）。随 `ParsedRoute` 进入 actor commit 路径，�
 `broadcast_batch_only`。仅 sharded 且 defer 的窗口有值；unsharded / 行式窗口为 `None`。
 
 **（b）单 shard 推送 —— `RulePush.shard_rows: Option<Arc<Vec<u32>>>`**
-（`crates/wf-engine/src/window/fanout.rs` L48 `RulePush`）：actor 把 (a) 的整批 partition
+（`crates/wf-engine/src/window/fanout/mod.rs` `RulePush`）：actor 把 (a) 的整批 partition
 按 shard 拆开，每个 shard 拿到**自己的那一份子集**放进 `RulePush.shard_rows`。语义：
 `events=None && batch=Some && shard_rows=Some` → **sharded 列式子集**，规则任务只对本子集
 做 `ColumnarEvent` / 懒物化。unsharded / 行式推送为 `None`。
@@ -102,7 +102,7 @@ pub struct RulePush {
 }
 ```
 
-### 2.2 列式分片函数（`fanout.rs`）
+### 2.2 列式分片函数（`window/fanout/`）
 
 列式子集不再走 `Value`/`f64` 往返，而是用 **typed `ScopeKey`** 直读 Arrow 原生值，
 与行式 `sharded_sends`（同样走 `ScopeKey`：`scope_key_from_values(extract_key_simple(...))`）
@@ -159,7 +159,7 @@ fn partition_rows_by_key(batch, keys: &[FieldRef], shard_count) -> Option<Vec<Ve
 > 唯一的既有分歧是 `>2^53` 的 Int64 键：行式 `from_value` 会经 `f64` 丢精度，列式
 > `ScopeKey::Int` 保持 i64——这是**行式路径自身**的语义，非列式引入，对拍见 §8。
 
-## 3. `fanout.rs`：sharded 分支支持 `events=None`
+## 3. `window/fanout/`：sharded 分支支持 `events=None`
 
 `broadcast_inner` 的 `Subscription::Sharded` 分支从「要求 events」改为「二者择一」。
 **主路径复用 parse 侧预分片**：`broadcast_batch_only` 把 `ParsedWindow.shard_rows`
@@ -253,10 +253,10 @@ if win.defer_materialization() {
 > `precompute_shard_rows` 对**每个** defer 窗口都会调用一次（含 unsharded），但无 sharded
 > 订阅时返回 `None`，开销仅一次 fanout table 读锁查询，可忽略。
 
-## 5. `rule_task.rs`：sharded 收到 `events=None` 时的懒物化
+## 5. `engine_task/rule_task/`：sharded 收到 `events=None` 时的懒物化
 
 `process_batch` 的 match 路径当前只在 `events.is_none() && batch.is_some() && machine.is_some()`
-时走懒物化（L456 `defer_materialize`）。注意 sharded 排除**不在 rule task**（原稿「对
+时走懒物化（`defer_materialize`）。注意 sharded 排除**不在 rule task**（原稿「对
 `has_sharded_subscribers` 有另判」有误——该判断全库只有 route_parse 一处使用）；§4 放行后
 sharded push 以 `events=None` 到达，需两处改动：
 
@@ -400,12 +400,17 @@ let row_domain: Vec<usize> = match shard_rows {
 
 ### 代码改动（P2 全部管道，与 §6 设计一致）
 
+> 注：本表为 P2 落地（2026-08）时的改动记录，文件路径已按 2026-09 P4 目录化后的现行布局标注
+> （`window/fanout.rs` → `window/fanout/`，`rule_task.rs` → `engine_task/rule_task/`）。
+> typed ScopeKey 直读函数（`column_scalar` / `scope_key_from_column` / `scope_key_columnar` /
+> `scope_key_shard_index`）现位于 `wf-cep/src/cep/key.rs`（`window/fanout/scope_key.rs` 为 re-export shim）。
+
 | 文件 | 改动 |
 |---|---|
-| `wf-engine/src/window/fanout.rs` | `RulePush.shard_rows`（本 shard 子集）；新增 `column_scalar` / `scope_key_from_column` / `scope_key_columnar`（typed ScopeKey 直读原生值，替代初版 `extract_key_columnar`+FNV）/ `partition_rows_by_key`（typed ScopeKey fallback）/ `precompute_shard_rows`（parse 侧预分片）；`broadcast_inner` Sharded 分支「二者择一」（events=Some 行式 `sharded_sends` 分片 / events=None 复用预分片，长度不符才 `partition_rows_by_key` 防御性重分片；各 shard 共享 `batch_arc`） |
+| `wf-engine/src/window/fanout/` | `RulePush.shard_rows`（本 shard 子集）；新增 `column_scalar` / `scope_key_from_column` / `scope_key_columnar`（typed ScopeKey 直读原生值，替代初版 `extract_key_columnar`+FNV）/ `partition_rows_by_key`（typed ScopeKey fallback）/ `precompute_shard_rows`（parse 侧预分片）；`broadcast_inner` Sharded 分支「二者择一」（events=Some 行式 `sharded_sends` 分片 / events=None 复用预分片，长度不符才 `partition_rows_by_key` 防御性重分片；各 shard 共享 `batch_arc`） |
 | `wf-engine/src/window/router.rs` | `route_parse`：删 `&& !has_sharded_subscribers` 合取项（sharded 也能 defer，未新增 `columnar_match_safe`）；对 defer 窗口调用 `precompute_shard_rows` 并把整批 per-shard 行索引子集装入 `ParsedWindow.shard_rows`（`has_sharded_subscribers` 已随删除） |
 | `wf-engine/src/match_engine/mod.rs` | `pub(crate)` re-export `field_ref_name`、`scope_key_shard_index` 等 |
-| `wf-runtime/src/engine_task/rule_task.rs` | `process_batch` 加 `shard_rows: Option<&[u32]>` 形参；`row_domain` 按 shard 子集遍历（行域相对 `DeferredRows` + 绝对行恢复），defer 块 + 主循环一致 |
+| `wf-runtime/src/engine_task/rule_task/rule_task_run.rs` | `process_batch` 加 `shard_rows: Option<&[u32]>` 形参；`row_domain` 按 shard 子集遍历（行域相对 `DeferredRows` + 绝对行恢复），defer 块 + 主循环一致 |
 | `wf-runtime/src/engine_task/tests.rs` | 全部 `RulePush` 构造补 `shard_rows`（None 或本 shard 子集）；新增 `push_sharded_only_processes_shard_rows_subset` 等 |
 
 ### 对拍（wf-engine 全绿）

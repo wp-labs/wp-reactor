@@ -16,7 +16,7 @@ wp-reactor 的错误分三类处理：
 
 | Crate | 错误边界 |
 |---|---|
-| `wf-engine` | 定义 `CoreReason` 和 `CoreResult<T>`（`src/error.rs`） |
+| `wf-cep` | 定义 `CoreReason` 和 `CoreResult<T>`（`src/error.rs`，2026-09 P4 随同步执行核收编） |
 | `wf-runtime` | 定义 `RuntimeReason` 和 `RuntimeResult<T>`，task 边界使用 `RuntimeResult`（`src/error.rs`） |
 | `wf-runtime` | CLI 边界用 `EngineReason` / `EngineResult`，直接渲染 `DiagnosticReport`（`src/cli/error.rs`） |
 | `wf-config` | 定义 `ConfigReason` 和 `ConfigResult<T>`，配置加载、校验、sink 配置边界结构化（`src/error.rs`）；变量展开用 `VarsReason`（`src/vars/error.rs`） |
@@ -26,7 +26,7 @@ wp-reactor 的错误分三类处理：
 
 领域 reason 使用 `#[derive(OrionError)]`，业务变体必须有稳定 `identity`。动态信息不放在 enum payload 里，而是放到 `StructError` 的 detail、position、context 或 source。
 
-`wf-engine`：
+`wf-cep`（原 wf-engine 域，P4 收编）：
 
 ```rust
 #[derive(Debug, Clone, PartialEq, OrionError)]

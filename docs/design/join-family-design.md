@@ -98,7 +98,7 @@ measure     := 'maxrow' '(' field ')' ['tie' '(' field 'asc'|'desc' ')']
 - **`reduce` + `as label`**：归约结果为一行，`label.field` 引用（Q9 `winner.bidder`）。
   ⚠ review R2：`as label` 不是裸名——reduce 整行以**裸键 object value** 注入 eval context
   （`ctx.fields["winner"] = Value::Object{...}`），`label.field` 编译为 `FieldRef::Path(["label","field"])`。
-  `field_ref_name` 会丢限定词（`key.rs:338-349`），裸名在多行冲突时取错（Q9 的 dateTime/extra 重名）——不能依赖。
+  `field_ref_name` 会丢限定词（`crates/wf-cep/src/cep/key.rs`），裸名在多行冲突时取错（Q9 的 dateTime/extra 重名）——不能依赖。
 - **`emit at <expr>`**：deferred 标记 + 触发点（review R1）。expr 为驱动行字段/表达式（如 `a.expires`）；
   无 `emit at` 即 eager。校验 `emit_at ≥ within 上界`。
 - **`within` 开闭记号**复用 stats tier 的 `<` 前缀：
@@ -361,7 +361,7 @@ P2（回看 interval eager 执行：时间谓词 + 存在/首/最新）已落地
   - **deferred 跳过**：`join.emit_at.is_some()` 的 join 在 eager 路径跳过（P3 rule_task
     deferred 分支处理，设计 §2.2 互斥）。
 - **`bucket_end(time, interval_seconds)` 内建**：`= time_bucket(t) + interval`（Q8 上开桶形态），
-  引擎两套 eval 路径（`match_engine/eval/funcs.rs` 与 `executor/eval/builtins.rs`）都实现。
+  引擎两套 eval 路径（`crates/wf-cep/src/cep/eval/funcs.rs` 与 `crates/wf-engine/src/match_engine/executor/eval/builtins.rs`）都实现。
 - **富化提取**：`enrich_join_row`（限定名 `window.field` + 裸名），interval 与既有 mode 共用。
 
 ### 12.2 测试
@@ -428,7 +428,7 @@ P3（deferred 触发 + reduce 执行）已落地。`cargo test -p wf-engine -p w
     （右窗 ts，设计 §9 风险 2）；`as label` 整行 object 注入（`ctx.fields[label]`）；
   - 空集不输出（Q9 无 bid 的 auction 恰不输出）；纯存在（Q8）取区间内最早行。
   - 输出复用 `build_each_alert_with`（origin/fired_at 参数化，`each_exec.rs`）。
-- **runtime `rule_task.rs`**：
+- **runtime `engine_task/rule_task/mod.rs`**：
   - `DeferredRuntime` 挂起队列（每驱动行一实例）+ 事件时间 watermark；
   - each 分支挂起（不即时输出）；批次尾 `scan_deferred` 到期扫描；
   - `scan_timeouts` 事件时间到期（**不叠加墙钟**——replay 对拍依赖事件时间序）；

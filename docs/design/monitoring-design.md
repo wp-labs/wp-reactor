@@ -80,7 +80,7 @@ params.topic = "wf_metrics"
 
 ## 现状
 
-内置了一套 hand-rolled 指标系统（`wf-runtime/src/metrics.rs`，1103 行），已覆盖 40+ 指标：
+内置了一套 hand-rolled 指标系统（`wf-runtime/src/metrics/`——hub `mod.rs` + `counters.rs`（RuntimeMetrics impl）/ `records.rs`（MetricsSnapshot::to_records）子模块；目录化前为单文件 `metrics.rs`，1103 行），已覆盖 40+ 指标：
 
 ### 已有指标
 
@@ -362,7 +362,7 @@ endpoint = "http://vm:8428/api/v1/write"
 保留 `run_metrics_task()` 的 tokio interval 循环，改动输出目标：
 
 ```rust
-// 改造前（metrics.rs）
+// 改造前（metrics.rs 单文件——重构前位置；现 metrics/ 目录模块）
 async fn run_metrics_task(...) {
     let mut interval = tokio::time::interval(report_interval);
     loop {
@@ -385,7 +385,7 @@ async fn run_metrics_task(...) {
 4. **新增** `MonSend` channel（`mpsc::Sender<Vec<MetricsRecord>>`）→ 连接 metrics_task → monitor sink
 5. **新增** `sinks/infra.d/monitor.toml` → monitor sink group，复用 `SinkDispatcher` → backend 管线
 6. **改造** `run_metrics_task()` → 输出从 log/Prometheus 改为 `mon_send.send()`
-7. **移除** 手写 Prometheus TCP server（`metrics.rs` 中的 `serve_prometheus()` 和 `render_prometheus()`, ~150 行） + 日志表格渲染（~50 行）
+7. **移除** 手写 Prometheus TCP server（重构前 `metrics.rs` 单文件中的 `serve_prometheus()` / `render_prometheus()`，~150 行） + 日志表格渲染（~50 行）
 
 ---
 
@@ -397,8 +397,8 @@ async fn run_metrics_task(...) {
 |------|------|--------|
 | snapshot() + to_data_records() | drain AtomicU64 → DataRecord | 0.5d |
 | MonSend channel + monitor sink group | 指标进入 sink 管线 | 1d |
-| 通道背压 gauge | `metrics.rs` + `alert_task.rs` | 0.5d |
-| 端到端延迟 histogram | `metrics.rs` + `rule_task.rs` | 0.5d |
+| 通道背压 gauge | `metrics/`（counters.rs）+ `alert_task.rs` | 0.5d |
+| 端到端延迟 histogram | `metrics/`（counters.rs）+ `engine_task/rule_task/` | 0.5d |
 
 ### P1（重要）
 

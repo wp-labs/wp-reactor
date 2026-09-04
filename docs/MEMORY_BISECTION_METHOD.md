@@ -139,7 +139,7 @@ yield）→ 常量列折叠省 8-11GB 分配总量 → 30M/100M RSS 双达标（
 
 | API | 位置 | 用途 |
 |---|---|---|
-| `RuleFanout::round_robin_only` / `queued_items` | `wf-engine/src/window/fanout.rs` | 订阅类型判断 / 通道排队量（含分片求和） |
+| `RuleFanout::round_robin_only` / `queued_items` | `wf-engine/src/window/fanout/dispatch.rs` | 订阅类型判断 / 通道排队量（含分片求和） |
 | `Router::mailbox_inflight` | `wf-engine/src/window/router.rs` | mailbox 已用/容量字节 |
 | `Window::allocated_usage` / `allocated_bytes(batch)` | `wf-engine/src/window/buffer/mod.rs` | 真实占用会计（驱逐/mailbox 预算仍用 content_bytes，勿混） |
 | `MemoryProbe::exclusive` / `peak_growth` | `wf-runtime/src/memory_probe.rs` | 测试内量化分配峰值（N vs 3N 断言）；⚠ 全局计数器，独占执行（测试名过滤） |
@@ -148,10 +148,10 @@ yield）→ 常量列折叠省 8-11GB 分配总量 → 30M/100M RSS 双达标（
 
 | 模式 | 落点 | 适用场景（实测收益） |
 |---|---|---|
-| `Vec<Option<T>>` → Arrow builder | `PipeCol`（`rule_task.rs`） | 列装载：16B/值 → 8B+nullbitmap，字符串列 per-row 分配归零 |
+| `Vec<Option<T>>` → Arrow builder | `PipeCol`（`engine_task/rule_task/stager.rs`） | 列装载：16B/值 → 8B+nullbitmap，字符串列 per-row 分配归零 |
 | eval→stage 流式融合 | `PipeRowSink` trait（`each_exec.rs`）+ `PipeStagerSink` | 先物化整批中间结构 → 逐行 sink + 复用 scratch（811→195 B/行） |
 | `Vec<String>` → `Vec<SmolStr>` | `AlertColumnBuilder`（`column_batch.rs`） | 短字符串列（≤22B 内联零堆分配）；fired_at 24B 超限保持 String |
-| `StrSink` trait | `match_engine/key.rs` | String + SmolStrBuilder 统一渲染（2^53 边界由守护测试钉死） |
+| `StrSink` trait | `wf-cep/src/cep/key.rs` | String + SmolStrBuilder 统一渲染（2^53 边界由守护测试钉死） |
 | 中转 Vec → 直连 `commit_each_row` | `each_exec.rs` | 消灭“累积整批 + 二次拷贝”（每行 3 String clone + staged cell clone） |
 | `EntityCol` 列直读 | `each_exec.rs` | 免 `Value`/`SmolStr` 中转直读 Int64/Utf8 列（Int64/Utf8/Generic 三态） |
 

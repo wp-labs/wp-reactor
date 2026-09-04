@@ -2,7 +2,7 @@
 
 > **状态：Implemented（语义冻结——正确性验证的基准）**
 >
-> 2026-08-16 · **代码**：`wf-engine/src/match_engine/cep/mod.rs`
+> 2026-08-16 · **代码**：`crates/wf-cep/src/cep/mod.rs`
 > （`push_expiry_candidate` / `scan_expired_at` / `advance_at_with_diagnostics`）
 > · 验证工具：`wf-examples/performance/nexmark_pk/scripts/verify_ground_truth.py`
 > （确定性模拟器）+ `q5_diff_v2.py`（逐 alert 对拍）
@@ -79,7 +79,7 @@ nexmark 30M 正确性验证（2026-08-16）以本文语义为基准：
 
 ## 5. scan_timeouts：墙钟推进（非确定性来源）
 
-**代码**：`wf-runtime/src/engine_task/rule_task.rs`
+**代码**：`wf-runtime/src/engine_task/rule_task/rule_task_scan.rs`
 
 周期 tick 用 `watermark + 墙钟 elapsed` 推进过期——引擎空闲期用墙钟满足窗口
 TTL 的设计。这是**输出非确定性的唯一已知来源**（30M 量级 0.0036%），确定性

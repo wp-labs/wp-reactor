@@ -65,7 +65,7 @@ commit 路径、metrics 并发读 atomic；改造成本（驱逐搬进 actor + i
 
 ### 2.2 方案：WindowProgress ack floor
 
-**代码**：`wf-engine/src/window/progress.rs`、`fanout.rs`、`evictor.rs`
+**代码**：`wf-engine/src/window/progress.rs`、`fanout/`、`evictor.rs`
 
 核心不变量：**batch 可驱逐 ⇔ 事件时间过期 && 所有消费者已 ack seq+1**
 

@@ -5,7 +5,7 @@
 > 2026-08-27 · 优先级：高（q18 100M 状态 18.6G 是语义必然，
 > 唯一的根治路径是让状态落盘，内存只保留活跃子集）
 > 实现：`crates/wf-engine/src/match_engine/spill.rs`（存储层）+
-> `stats_exec.rs`（StatsWindowState 接入：clock 驱逐/读回/close 合并）
+> `crates/wf-engine/src/match_engine/executor/stats_exec/state.rs`（StatsWindowState 接入：clock 驱逐/读回/close 合并）
 > 验证：§18 —— q18 100M spill EMIT 2937 万零丢弃、RSS 20.6GB 有界（vs 35-40GB）
 > 关联：`notes/q18-stats-key-state-memory.md`（q18 归因 + 键数线性增长根源 §10.4）、
 > `MEMORY_ISSUES_100M.md` M-18
@@ -472,7 +472,7 @@ rule q18_last_bid_stats {
 **兼容**：旧键 `max_spill_bytes` 保留为别名（解析接受 + lint 迁移 Warning）,
 新配置一律用 `max_disk`。
 
-**记账口径**（`stats_exec.rs` `StatsWindowState`）：
+**记账口径**（`crates/wf-engine/src/match_engine/executor/stats_exec/state.rs` `StatsWindowState`）：
 
 ```
 驱逐成功（evict_to_spill）   → fetch_add(allowance × 链长)   // 落盘占用
@@ -511,7 +511,7 @@ close 并入/流式 drain        → fetch_sub(并入键数 × allowance) // 窗
 注入）。旧语义 2GB/片 × 10 = 20GB 违背用户直觉——用户配 2GB 就是整个规则最多
 驻留 2GB 状态。
 
-**记账口径**（`stats_exec.rs` `StatsWindowState`）：与 spill 对称——
+**记账口径**（`crates/wf-engine/src/match_engine/executor/stats_exec/state.rs` `StatsWindowState`）：与 spill 对称——
 
 ```
 新建桶（account_new_bucket）   → mem_add(allowance)

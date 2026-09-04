@@ -561,7 +561,7 @@ pub enum Expr {
 |-------|------|------|
 | wf-engine | `src/external.rs` | `ExternalCallHandler` trait + 全局 `dispatch_external_call` + `eval_external` 共享 helper |
 | wf-engine | `src/match_engine/executor/eval.rs` | `"external"` eval 分支（`on each` / derive / score 路径） |
-| wf-engine | `src/match_engine/cep/eval.rs` | `"external"` eval 分支（match / close / `on event` 路径） |
+| wf-cep | `src/cep/eval/funcs.rs` | `"external"` eval 分支（match / close / `on event` 路径） |
 | wf-runtime | `src/external/mod.rs` | 模块入口 |
 | wf-runtime | `src/external/runtime.rs` | `ExternalRuntime`（薄转发层 + 错误处理） |
 | wf-runtime | `src/external/redis_backend.rs` | `RedisBackend` → `wp_knowledge::facade` |

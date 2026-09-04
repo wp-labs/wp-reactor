@@ -378,8 +378,8 @@ loop {
 | # | 位置 | 触发条件 | 量级 | 状态/对应缺口 |
 |---|---|---|---|---|
 | 1 | `router.rs` route_parse L361-380 | 窗口 `defer_materialization=false`（有规则走行式）且非分片 | 全批 `batch_to_events[_filtered]` | **剩余面**：gap 4-8 的 match 侧 + 行式 stats 窗口（qradar 全 defer → 不触发） |
-| 2 | `rule_task.rs` L1249 eager 兜底 | `ExecutionPath::EagerRows`（非 deferred / 非 columnar each / 非 deferred-pending） | 全批 | **剩余面**：gap 4-8 的 each 侧 + debug 模式（2026-09-02 已收窄：deferred join 免 eager） |
-| 3 | `rule_task.rs` L4610 `PipeBatchStager::take_events` | pipe flush 且目标有 Single/Sharded（**row-path 中间窗消费者**）订阅 | 每批一次 | **条件物化**：纯列式消费者（q4b stats 从窗口读、无事件订阅）→ `take_batch` 不物化；row-path 消费者存在时才物化 |
+| 2 | `engine_task/rule_task/rule_task_run.rs` eager 兜底（原单文件 `rule_task.rs` L1249，拆分后去行号） | `ExecutionPath::EagerRows`（非 deferred / 非 columnar each / 非 deferred-pending） | 全批 | **剩余面**：gap 4-8 的 each 侧 + debug 模式（2026-09-02 已收窄：deferred join 免 eager） |
+| 3 | `engine_task/rule_task/stager.rs` `PipeBatchStager::take_events`（原单文件 `rule_task.rs` L4610） | pipe flush 且目标有 Single/Sharded（**row-path 中间窗消费者**）订阅 | 每批一次 | **条件物化**：纯列式消费者（q4b stats 从窗口读、无事件订阅）→ `take_batch` 不物化；row-path 消费者存在时才物化 |
 | 4 | `stats_task.rs` L411 | stats 列式段 `process_batch_rows` 返回 false（where 非列式 / distinct 不支持等）→ 行式回退 | 行域内行 | **剩余面**：stats 行式回退（主路径 q15-q19 已列式，回退是 rare） |
 | 5 | 窗口 log `OnceLock`（buffer/mod.rs L844） | route_parse 预置 events 的窗口；hot-reload 新订阅者 `events_since()` | 惰性 | hot-reload 兜底，生产 pull 已不用 |
 

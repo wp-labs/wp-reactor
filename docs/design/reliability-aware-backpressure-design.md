@@ -193,7 +193,7 @@ lossy = false            # 告警类：慢后端背压
 |---|---|
 | 配置解析 | WFL 规则 + sink TOML 增加 `lossy` 字段（默认 `false`） |
 | `window/progress.rs` | slot 带 `lossy` 标记；`min_acked` 只统计非可丢 slot |
-| `window/fanout.rs` / `rule_task.rs` | 规则注册 slot 时传入 `lossy` |
+| `window/fanout/` / `engine_task/rule_task/` | 规则注册 slot 时传入 `lossy` |
 | `window/eviction.rs` | `evict_expired` 的 floor 改走 `min_acked_among_non_lossy` |
 | `window/actor.rs` | 背压从「全局 20GB」改为「per-window `max_window_bytes`」 |
 | `sink/runtime.rs` + `sink/dispatch.rs` | 按 `lossy` 决定 drop/await；修串行 dispatch |
