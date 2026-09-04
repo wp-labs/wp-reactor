@@ -176,64 +176,10 @@ impl<'a> ColumnarBatch<'a> {
     }
 }
 
-/// Batch-level columnar **branch-guard** masks for the three guard sites the
-/// state machine evaluates per event:
-///
-/// - `event` — `match_plan.event_steps` (keyed `(event_step_idx, branch_idx)`);
-/// - `close` — `match_plan.close_steps` accumulation guard (keyed
-///   `(close_step_idx, branch_idx)`);
-/// - `neg` — `match_plan.seq` negation steps (keyed `(neg_idx, 0)`, the same
-///   negation-only ordering `SeqRuntime::build` produces).
-#[derive(Default, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.ColumnarBatch")]
-pub struct GuardMasks {
-    event: EngineHashMap<(usize, usize), BooleanArray>,
-    close: EngineHashMap<(usize, usize), BooleanArray>,
-    neg: EngineHashMap<(usize, usize), BooleanArray>,
-}
-
-impl GuardMasks {
-    pub fn insert_event(&mut self, step: usize, branch: usize, mask: BooleanArray) {
-        self.event.insert((step, branch), mask);
-    }
-
-    pub fn insert_close(&mut self, step: usize, branch: usize, mask: BooleanArray) {
-        self.close.insert((step, branch), mask);
-    }
-
-    pub fn insert_neg(&mut self, neg: usize, branch: usize, mask: BooleanArray) {
-        self.neg.insert((neg, branch), mask);
-    }
-
-    /// Two-valued lookup (null → false) for "must be true" guards (event steps).
-    /// `None` = no columnar mask for this `(step, branch)`.
-    pub fn event_value(&self, step: usize, branch: usize, row: usize) -> Option<bool> {
-        self.event.get(&(step, branch)).map(|m| m.value(row))
-    }
-
-    /// Three-valued lookup for permissive guards (close steps): `Some(Some(b))`
-    /// = explicit bool, `Some(None)` = null / missing field (permissive), `None`
-    /// = no columnar mask for this `(step, branch)`.
-    pub fn close_value(&self, step: usize, branch: usize, row: usize) -> Option<Option<bool>> {
-        self.close.get(&(step, branch)).map(|m| {
-            if m.is_null(row) {
-                None
-            } else {
-                Some(m.value(row))
-            }
-        })
-    }
-
-    /// Two-valued lookup (null → false) for negation guards. `None` = no
-    /// columnar mask for this `(neg, branch)`.
-    pub fn neg_value(&self, neg: usize, branch: usize, row: usize) -> Option<bool> {
-        self.neg.get(&(neg, branch)).map(|m| m.value(row))
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.event.is_empty() && self.close.is_empty() && self.neg.is_empty()
-    }
-}
+/// Batch-level columnar **branch-guard** masks（2026-09-04 P4-B0 下沉
+/// `wf_cep::masks`，本层 re-export 保 `crate::match_engine::columnar::GuardMasks`
+/// 路径与可见级；consumers 见 `wf_cep::masks`）。
+pub use wf_cep::masks::GuardMasks;
 
 /// Collect the hit row indices of a boolean mask into an ascending `Vec<u32>`
 /// (the `Mask → Indices` step in `columnar-execution-design.md` §3.1).
