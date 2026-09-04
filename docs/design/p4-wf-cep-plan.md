@@ -61,7 +61,7 @@ builder helpers（供 engine 剩测/bench 使用；避免重复实现）。
 | S1 | 建 wf-cep skeleton；cep 生产+cep/tests 整迁；`mod cep`→依赖重导出；GuardMasks/join_then_key 处置；testkit（eval + helpers） | workspace check + wf-cep 测试 + 引擎剩测全绿 |
 | S2 | 语义套件按 §4 归位（先出最终清单） | 全量测试 + llvm-cov 覆盖对比 |
 | S3 | CI 依赖墙校验（wf-cep 无 arrow/tokio）；unreachable_pub 门禁自动覆盖新 crate；bench q1/q5/q13 对照 | CI 绿 + 性能数字对照 |
-| S4 | CHANGELOG/版本（2.1.0 候选）→ tag → warp-fusion 升依赖验证 | 跨仓库绿 |
+| S4 | CHANGELOG/版本（2.0.18 候选——patch 判据：公开 API 与行为不变，同 2.0.16/17 惯例；wf-cep 对外正式化或首次行为变化时再评估 minor）→ tag → warp-fusion 升依赖验证 | 跨仓库绿 |
 
 ## 6. 风险与收益
 
@@ -175,7 +175,7 @@ builder helpers（供 engine 剩测/bench 使用；避免重复实现）。
 | S1 | cep/types.rs 切分方案 + cep 11.8k + event_bridge 1.5k 整迁 + testkit（engine 剩测对 cep pub(crate) 访问点收敛） | wf-cep 编译 + engine 剩测全绿 |
 | S2 | 测试归位最终清单（l2/l3/accu/seq/close/core_coverage 对 executor/columnar import 扫描后定，P4 §4「移前必查」） | 全量测试 + llvm-cov 覆盖对比 |
 | S3 | CI 墙校验（已有）+ bench q1/q5/q13 对照 | CI 绿 + 性能数字对照 |
-| S4 | CHANGELOG 2.1.0 候选 → tag → warp-fusion 升依赖跨仓验证 | 跨仓库绿 |
+| S4 | CHANGELOG 2.0.18 候选（patch）→ tag → warp-fusion 升依赖跨仓验证 | 跨仓库绿 |
 
 - 工作量重估：S1 主体 1-2 天（沿用 2026-09-03 判定）；S2 0.5-1 天（以最终清单为准）。
 - **S1 边界确认已完成（2026-09-04，见 `p4-wf-cep-s1-boundary.md`）**：阻塞点收敛为 B1-B4 四个
@@ -216,4 +216,4 @@ builder helpers（供 engine 剩测/bench 使用；避免重复实现）。
 - **测试分布（守恒）**：wf-cep 341（cep 140 + sem_tests 201）/ wf-engine 1002+73 /
   wf-runtime 606+15 / wf-lang 1051；clippy×2 = 0、fmt = 0。语义层独立测试
   `cargo test -p wf-cep` = 341 passed 0.01s——「语义改动不触发 engine 编译」兑现。
-- **剩余**：B3 收尾（CHANGELOG 2.1.0 → tag → warp-fusion 升依赖跨仓验证 + CI 墙确认）。
+- **剩余**：B3 收尾（CHANGELOG 2.0.18 候选 → tag → warp-fusion 升依赖跨仓验证 + CI 墙确认）。
