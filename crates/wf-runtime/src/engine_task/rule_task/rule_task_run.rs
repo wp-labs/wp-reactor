@@ -187,6 +187,7 @@ impl RuleTask {
             emit_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
             append_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
             last_reported_instances: AtomicI64::new(0),
+            last_reported_memory: AtomicI64::new(0),
             pending_alerts: std::sync::Mutex::new(PendingAlertColumns::default()),
             pipe_state: std::sync::Mutex::new(PipeState::Uninit),
             each_direct,
@@ -369,7 +370,7 @@ impl RuleTask {
                 slot.fetch_max(ack, std::sync::atomic::Ordering::Release);
             }
         }
-        self.update_rule_instances_metric();
+        self.update_rule_limit_metrics();
     }
 
     /// 批级时间列 max（raw i64，可向量化）：gate 只需「批 max 事件时间」用于与
@@ -1022,12 +1023,12 @@ impl RuleTask {
         self.flush_pipes().await;
     }
 
-    /// Update the periodic per-rule instance-count gauge.
+    /// Update the periodic per-rule limit gauges（实例数 + 估算内存）。
     ///
-    /// P2b: the gauge is the sum across a rule's shards, so each shard reports
-    /// the delta since its last report. On drain (flush/EOS) the count drops to
-    /// zero and the final delta reconciles the shard's contribution to zero.
-    pub(super) fn update_rule_instances_metric(&self) {
+    /// P2b: 每个 gauge 是规则全部分片的和，所以每 shard 报自上次以来的 delta。
+    /// 在 drain（flush/EOS）时计数/内存归零，最后一次 delta 把本 shard 的贡献
+    /// 对冲回零。
+    pub(super) fn update_rule_limit_metrics(&self) {
         if let Some(metrics) = &self.metrics {
             let rule_name = self.executor.plan().name.as_str();
             let cur = self
@@ -1039,6 +1040,16 @@ impl RuleTask {
             let delta = cur - last;
             if delta != 0 {
                 metrics.adjust_rule_instances(rule_name, delta);
+            }
+            let cur_mem = self
+                .machine
+                .as_ref()
+                .map(|machine| machine.rule_memory_bytes() as i64)
+                .unwrap_or(0);
+            let last_mem = self.last_reported_memory.swap(cur_mem, Ordering::Relaxed);
+            let mem_delta = cur_mem - last_mem;
+            if mem_delta != 0 {
+                metrics.adjust_rule_memory_bytes(rule_name, mem_delta);
             }
         }
     }
@@ -1120,6 +1131,6 @@ impl RuleTask {
         while let Ok(push) = rx.try_recv() {
             self.process_push(push).await;
         }
-        self.update_rule_instances_metric();
+        self.update_rule_limit_metrics();
     }
 }

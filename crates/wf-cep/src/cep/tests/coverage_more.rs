@@ -610,3 +610,46 @@ fn close_output_field_defaults_via_state_machine_roundtrip() {
     assert_eq!(out.close_step_data.len(), 1);
     assert_eq!(out.scope_key, vec![str_val("10.0.0.1")]);
 }
+
+// ===========================================================================
+// rule_memory_bytes（2026-09-04 导出：limits.max_memory 会计值可观测）
+// ===========================================================================
+
+#[test]
+fn rule_memory_bytes_tracks_only_when_max_memory_configured() {
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("req", count_ge(1.0))])],
+    );
+    // 未配 max_memory → 不记账（0）——避免无谓逐事件开销（tracks_memory_bytes 门）。
+    let mut no_limit = CepStateMachine::with_limits(
+        "r".into(),
+        plan.clone(),
+        None,
+        Some(throttle_limits(100, ExceedAction::Throttle)),
+    );
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    no_limit.advance_at("req", &e, 0);
+    assert_eq!(no_limit.instance_count(), 1);
+    assert_eq!(no_limit.rule_memory_bytes(), 0);
+
+    // 配了 max_memory → 实例准入按 base 记账 > 0；未分片 = 本地估算。
+    let limits = LimitsPlan {
+        max_memory_bytes: Some(1 << 20),
+        max_instances: None,
+        max_throttle: None,
+        on_exceed: ExceedAction::Throttle,
+        disk_provider: None,
+        max_disk_bytes: None,
+    };
+    let mut sm = CepStateMachine::with_limits("r".into(), plan, None, Some(limits));
+    sm.advance_at("req", &e, 0);
+    assert_eq!(sm.instance_count(), 1);
+    let mem = sm.rule_memory_bytes();
+    assert!(mem > 0, "准入实例后应记账 > 0");
+    assert_eq!(mem, sm.estimated_memory_bytes_for_test());
+
+    // close 收口释放实例 → 会计随移除归零。
+    sm.close(&[str_val("10.0.0.1")], CloseReason::Timeout);
+    assert_eq!(sm.rule_memory_bytes(), 0);
+}

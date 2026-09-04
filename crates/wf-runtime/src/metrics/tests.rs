@@ -387,6 +387,29 @@ fn rule_instances_gauge_sums_deltas_across_shards() {
     assert_eq!(m.snapshot().rule_instances["r1"], 0);
 }
 
+#[test]
+fn rule_memory_bytes_gauge_sums_deltas_and_is_exported() {
+    let m = RuntimeMetrics::new(&["r1".to_string()], &[], &[], BTreeMap::new());
+    // 内存可增可减：两 shard 增量 3.5M + 1.5M → 5M；回落 −3M → 2M；收口归零。
+    m.adjust_rule_memory_bytes("r1", 3_500_000);
+    m.adjust_rule_memory_bytes("r1", 1_500_000);
+    assert_eq!(m.snapshot().rule_memory_bytes["r1"], 5_000_000);
+    m.adjust_rule_memory_bytes("r1", -3_000_000);
+    assert_eq!(m.snapshot().rule_memory_bytes["r1"], 2_000_000);
+    m.adjust_rule_memory_bytes("r1", -2_000_000);
+    assert_eq!(m.snapshot().rule_memory_bytes["r1"], 0);
+    // 负值钳 0（gauge 恒非负，同实例计数）。
+    m.adjust_rule_memory_bytes("r1", -5);
+    assert_eq!(m.snapshot().rule_memory_bytes["r1"], 0);
+    // 导出记录：stage=rule name=memory_bytes label=r1（metrics.ndjson 可消费）。
+    let recs = m.snapshot().to_records();
+    assert!(recs.iter().any(|r| {
+        r.fields.iter().any(|(k, v)| k == "stage" && v == "rule")
+            && r.fields.iter().any(|(k, v)| k == "name" && v == "memory_bytes")
+            && r.fields.iter().any(|(k, v)| k == "label" && v == "r1")
+    }));
+}
+
 /// `window.allocated_bytes` / `mailbox_inflight_bytes` 指标必须被导出（2026-08-25
 /// 在途量分账）。
 ///

@@ -484,6 +484,9 @@ pub(super) struct RuleTask {
     /// across a rule's shards, so each shard reports the delta since its last
     /// report (P2b).
     last_reported_instances: AtomicI64,
+    /// Last value reported to the `rule_memory_bytes` gauge（同 delta 语义：
+    /// 内存可增可减 + recalibrate 校正，收口时最后一次上报对冲归零）。
+    last_reported_memory: AtomicI64,
     /// Batched alert delivery: per-yield-target columnar builders flushed to
     /// the sink writers when the batch fills / at EOS. The record→columns
     /// append runs on this thread by design — see [`Self::emit`].

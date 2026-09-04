@@ -308,6 +308,20 @@ impl CepStateMachine {
         self.instances.len()
     }
 
+    /// Estimated live-instance memory across all shards of this rule (the
+    /// `limits.max_memory` accounting value). Sharded rules report the shared
+    /// cross-shard total; unsharded rules the local estimate.
+    ///
+    /// Exported by the runtime as `rule.memory_bytes` so `max_memory` can be
+    /// calibrated from measurement instead of guesswork. Only maintained when
+    /// the rule configures `max_memory`（先设宽上限跑真实负载读峰值，再收紧）。
+    pub fn rule_memory_bytes(&self) -> usize {
+        self.shared
+            .as_ref()
+            .map(|s| s.memory_bytes())
+            .unwrap_or(self.estimated_memory_bytes)
+    }
+
     /// Borrow the underlying plan.
     pub fn plan(&self) -> &MatchPlan {
         &self.plan

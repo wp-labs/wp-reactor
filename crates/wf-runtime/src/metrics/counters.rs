@@ -156,6 +156,7 @@ impl RuntimeMetrics {
             rule_events_total: make_rule_map(),
             rule_matches_total: make_rule_map(),
             rule_instances: make_rule_map_i64(),
+            rule_memory_bytes: make_rule_map_i64(),
             rule_cursor_gap_total: gap_map,
             rule_stats_over_limit_total: make_rule_map(),
             alert_emitted_total: make_rule_map(),
@@ -335,6 +336,14 @@ impl RuntimeMetrics {
     /// (shards=1) yields the same numeric value as the old overwriting store.
     pub fn adjust_rule_instances(&self, rule: &str, delta: i64) {
         if let Some(v) = self.rule_instances.get(rule) {
+            v.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    /// Adjust the `rule_memory_bytes` gauge by a signed delta（同实例计数：
+    /// 每 shard 报 current−last，内存可增可减、recalibrate 会校正，故也走 delta）。
+    pub fn adjust_rule_memory_bytes(&self, rule: &str, delta: i64) {
+        if let Some(v) = self.rule_memory_bytes.get(rule) {
             v.fetch_add(delta, Ordering::Relaxed);
         }
     }
@@ -565,6 +574,7 @@ impl RuntimeMetrics {
             rule_events: self.drain_map(&self.rule_events_total),
             rule_matches: self.drain_map(&self.rule_matches_total),
             rule_instances: self.read_gauge_map(&self.rule_instances),
+            rule_memory_bytes: self.read_gauge_map(&self.rule_memory_bytes),
             rule_cursor_gaps: self.drain_gap_map(&self.rule_cursor_gap_total),
             rule_stats_over_limit: self.drain_map(&self.rule_stats_over_limit_total),
             alert_emitted: self.drain_map(&self.alert_emitted_total),

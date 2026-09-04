@@ -8,7 +8,7 @@
 //! - `stage_pipe_record` 目标缺失 → Dead 终态; `flush_pipes` 空转。
 //! - `scan_timeouts` / `flush` 的 conv-sink 路由分支（含 barrier 批次投递）。
 //! - `pull_and_advance` 整批 round-robin 门控跳过分支。
-//! - `dump_profiling` 节流 / 日志; `update_rule_instances_metric` delta 上报。
+//! - `dump_profiling` 节流 / 日志; `update_rule_limit_metrics` delta 上报。
 //! - `process_batch` 未知窗口早退 / 仅 events 输入路径; `Drop` 释放进度槽。
 use std::sync::Arc;
 
@@ -299,7 +299,7 @@ fn new_sets_each_direct_and_deferred_flags() {
 }
 
 // ---------------------------------------------------------------------------
-// dump_profiling / update_rule_instances_metric
+// dump_profiling / update_rule_limit_metrics
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -318,19 +318,19 @@ fn dump_profiling_throttles_and_logs() {
 }
 
 #[test]
-fn update_rule_instances_metric_reports_delta() {
+fn update_rule_limit_metrics_reports_delta() {
     let m = metrics();
     let task = make_task(Spec {
         metrics: Some(m.clone()),
         ..Spec::default()
     });
     // 无 machine → cur 0; last 0 → delta 0。
-    task.update_rule_instances_metric();
+    task.update_rule_limit_metrics();
 
     // 强制 last=5 → delta -5（调整路径）。
     task.last_reported_instances
         .store(5, std::sync::atomic::Ordering::Relaxed);
-    task.update_rule_instances_metric();
+    task.update_rule_limit_metrics();
     assert_eq!(
         task.last_reported_instances
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -348,7 +348,7 @@ fn update_rule_instances_metric_reports_delta() {
         metrics: Some(metrics()),
         ..Spec::default()
     });
-    task.update_rule_instances_metric();
+    task.update_rule_limit_metrics();
 }
 
 // ---------------------------------------------------------------------------

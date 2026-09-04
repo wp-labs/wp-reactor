@@ -566,7 +566,7 @@ impl RuleTask {
         }
         if let Some(metrics) = &self.metrics {
             metrics.observe_rule_scan_timeout(&rule_name, started.elapsed());
-            self.update_rule_instances_metric();
+            self.update_rule_limit_metrics();
         }
         // Timeout closes may have staged intermediate rows — deliver them.
         self.flush_pipes().await;
@@ -821,7 +821,7 @@ impl RuleTask {
         }
         if let Some(metrics) = &self.metrics {
             metrics.observe_rule_flush(&rule_name, started.elapsed());
-            self.update_rule_instances_metric();
+            self.update_rule_limit_metrics();
         }
         // Drain the batched alert delivery after close emissions.
         self.flush_alerts().await;
