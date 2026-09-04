@@ -72,6 +72,8 @@ window endpoint_events {
 - `pattern ... { ... }`
 - `rule ... { ... }`
 - `test ... for ... { ... }`
+- `yield preset ...`（输出模板声明，通常集中放 `_global.wfl`，见下文「yield preset」）
+- 顶层 `list` 绑定（`name = ( ... )` 括号列表，须在规则之前声明，见下文「顶层列表」）
 
 最常见的规则结构：
 
@@ -193,7 +195,7 @@ match<sip:5m> {
 - 支持滑动窗口、固定窗口、会话窗口、HOP 滑动窗口
 - key 支持点字段和下标字段，例如 `match<e["detail.sha256"]:5m>`
 - key 支持**多层嵌套路径**（root 必须是结构化 object/array 字段），例如 `match<s.extensions_obj.obj.id:1d:fixed>`——按路径叶值分组，等价于把该叶先提取为顶层字段再用其分组；嵌套路径可含数组索引段（`s.roles_obj.related[0].uid`）
-- key 可引用**`let` 派生字段**（issue #83）：事件先按 `let` 定义求值再参与分组，要求 `let` 定义为纯字段/嵌套路径形态、派生值类型为标量（digit/chars/bool/time/ip/hex，float/object/array 除外）
+- key 可引用**`let` 派生字段**（issue #83）：事件先按 `let` 定义求值再参与分组；`let` 定义可以是任意可推断为标量 key 类型的表达式（字段/嵌套路径、函数与字面量派生如 `concat`/`coalesce`/`case` 均可，issue #80），float/object/array 除外，窗口/状态依赖函数除外
 - 多步是顺序关系，前一步命中后才进入后一步
 
 派生 / 嵌套 key 示例：
@@ -218,7 +220,7 @@ match<s.extensions_obj.obj.id:1d:fixed> {
 
 - 直接写嵌套路径与先用 `let` 取别名再作 key **聚合结果一致**（编译为同一分组表达式）；`let` 名与事件源字段同名时，`let` 绑定优先（与表达式解析一致）
 - 嵌套/派生 key 缺失、为空、或路径中途是数组/对象（漏写叶段）→ 与普通 key 缺失行为一致：该事件不进入任何实例
-- v1 边界：派生/嵌套 key 仅支持单事件源规则；`let` 定义暂不接受函数/字面量派生作 key；与 `rule_shards > 1` 分片、`conv`、pipeline stage 组合暂不支持
+- v1 边界：派生/嵌套 key 仅支持单事件源规则；不支持作为 `conv`、pipeline stage（seq/any 等形态）的 key；多 shard 分片下按派生值落片，同派生值跨批稳定落同一片（分片键语义与普通 key 一致）
 
 固定窗口示例：
 
@@ -893,7 +895,7 @@ rule q12_bidder_10s_window_count {
     stats<10s:fixed> group by (b.bidder) {
         b | count as bid_count;
         b | avg(b.price) as avg_price;
-        b | distinct(b.bidder) as uniq_bidders;
+        b | distinct_count(b.bidder) as uniq_bidders;
         b | last(b.url) as last_url;          // 最近合格行的整行字段（Q18）
         b | top(10, b.price) as top_prices;   // per-key top-N（Q19）
     }
@@ -907,9 +909,9 @@ rule q12_bidder_10s_window_count {
 
 说明：
 
-- 窗口规格 `stats<dur:mode>`：`fixed(dur)`（epoch 对齐固定桶）或 `session(gap)`；时长支持 `d` 后缀（如 `1d:fixed` = UTC 日历天桶）。
+- 窗口规格 `stats<dur:mode>`：`fixed(dur)`（epoch 对齐固定桶）或 `session(gap)`。注意：`session` 目前仅语法/计划层支持，运行时 `stats_task` 尚未收口 session 窗口推进（P2/P3），生产勿用；`fixed` 时长支持 `d` 后缀（如 `1d:fixed` = UTC 日历天桶）。
 - `group by (keys)`：复合键分组；空键 = 全局单实例。
-- 度量聚合：`count` / `sum(f)` / `avg(f)`（(sum,count) 归并） / `min(f)` / `max(f)` / `distinct(f)` / `last(f)`（保留最近行字段） / `top(N, f)`（per-key top-N）。
+- 度量聚合：`count` / `sum(f)` / `avg(f)`（(sum,count) 归并） / `min(f)` / `max(f)` / `distinct_count(f)` / `last(f)`（保留最近行字段） / `top(N, f)`（per-key top-N）。
 - `as <label>` 命名度量；yield 用 `stat.value(final(label))` 读取数值、`b.*` 读分组键/字段（last/top 行字段经 field_values 注入）。
 - 每 (键 × 桶) 收口一行；无 `on each`/`match`/`score`，不参与 conv。
 - 典型用途：NEXMark Q12/Q15-19 形态（按用户/分类/卖家/日历天的计数、去重、Top-N、末条）。
@@ -964,15 +966,15 @@ fmt("{} failed {} times from {}", fail.username, count(fail), fail.sip)
 
 当前代码里已接入并有 checker 支持的常见函数包括：
 
-- 字符串：`contains`、`regex_match`、`startswith`、`endswith`、`lower`、`upper`、`len`、`concat`、`join`、`join_by`
-- 数值：`round`、`abs`、`ceil`、`floor`、`sqrt`、`pow`、`log`、`exp`、`clamp`
+- 字符串：`contains`、`regex_match`、`startswith`、`endswith`、`startswith_any`、`endswith_any`、`lower`、`upper`、`len`、`substr`、`indexof`、`count_char`、`trim`、`ltrim`、`rtrim`、`replace`、`replace_plain`、`concat`、`join`、`join_by`
+- 数值：`round`、`abs`、`ceil`、`floor`、`sqrt`、`pow`、`log`、`exp`、`clamp`、`sign`、`trunc`、`is_finite`
 - 空值 / 空白处理：`coalesce`、`isnull`、`isnotnull`、`is_blank`、`null_if_blank`、`default_if_blank`
 - 结构化对象：`merge`
-- 时间：`time_diff`、`time_bucket`
+- 时间：`time_diff`、`time_bucket`、`bucket_end`
 - 网络：`cidr_match(ip, subnet)`（IP 是否落在子网内，subnet 为 `"addr/prefix"`，兼容 IPv4/IPv6，Sigma `|cidr` 等效）
 - 当前引擎时间：`now`、`now_s`、`now_ms`、`now_us`、`now_ns`；时间值转换：`time_to_s`、`time_to_ms`
 - 哈希 / 编码：`md5`、`sha1`、`sha1_n`、`sha256`、`hex`、`stable_id`
-- 窗口集合：`collect_set`、`collect_list`、`first`、`last`
+- 窗口集合：`collect_set`、`collect_list`、`first`、`last`、`stddev`、`percentile`
 - 画像 / 回看：`baseline`
 - 方法调用：`window.has(...)`
 
@@ -1069,10 +1071,11 @@ yield security_alerts (
 
 | 函数 | 返回类型 | 说明 |
 |------|----------|------|
-| `strftime(timestamp, format)` | `chars` | 按 chrono 格式字符串格式化 UTC 时间；timestamp 可为秒/毫秒/微秒/纳秒 epoch 数值 |
+| `strftime(timestamp)` / `strftime(timestamp, format)` | `chars` | 按 chrono 格式字符串格式化 UTC 时间；timestamp 可为秒/毫秒/微秒/纳秒 epoch 数值；省略 format 时用默认 `%Y-%m-%d %H:%M:%S%.3f` |
 | `strptime(text, format)` | `time` | 按格式解析时间，返回 epoch milliseconds |
 | `time_diff(t1, t2)` | `float` | 返回两个时间的秒级差值绝对值 |
 | `time_bucket(t, interval_seconds)` | `time` | 将时间向下取整到指定秒级窗口，返回 epoch milliseconds |
+| `bucket_end(t, interval_seconds)` | `time` | 返回 `time_bucket` 所属窗口的终点（下界 + interval） |
 
 示例：
 
@@ -1159,6 +1162,8 @@ yield security_alerts (
 | `collect_list(alias.field)` | `array/T` | 收集当前 rule instance 内 alias 事件集合最近最多 1024 个字段值，保留出现顺序 |
 | `first(alias.field)` | `T` | 返回当前 rule instance 内 alias 最近字段样本中的首个字段值 |
 | `last(alias.field)` | `T` | 返回当前 rule instance 内 alias 最近字段样本中的末个字段值 |
+| `stddev(alias.field)` | `float` | 当前 rule instance 内 alias 最近字段样本的标准差（样本 <2 时返回 0） |
+| `percentile(alias.field, p)` | `float` | 样本百分位；`p` 必须是 0-100 数字字面量（越界编译拒绝） |
 
 `collect_set(alias.field)` 和 `stat.count(window_event(alias))` 基于同一个 alias 事件集合。常见 evidence 输出写法：
 
@@ -1179,7 +1184,7 @@ yield security_alerts (
 )
 ```
 
-如果某条事件缺少 `event_id`，它仍计入 `event_count`，但不会进入 `evidences`。alias 字段集合保留最近最多 1024 个字段值；`collect_set` / `collect_list` / `first` / `last` 均基于这组最近样本。大窗口或重复 `event_id` 场景下，`evidences` 数组长度可能小于 `event_count`。
+如果某条事件缺少 `event_id`，它仍计入 `event_count`，但不会进入 `evidences`。alias 字段集合保留最近最多 1024 个字段值；`collect_set` / `collect_list` / `first` / `last` / `stddev` / `percentile` 均基于这组最近样本。大窗口或重复 `event_id` 场景下，`evidences` 数组长度可能小于 `event_count`。
 
 ## 规则测试
 
@@ -1201,7 +1206,6 @@ test <测试名> for <规则名> {
     }
     options {
         close_trigger = timeout;
-        eval_mode = strict;
         permutation = shuffle;
         runs = 8;
     }
