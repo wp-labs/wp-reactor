@@ -17,6 +17,9 @@
 //! （CI 校验依赖树，见 .github/workflows/ci.yml wf-cep dependency wall）。
 //! 后续 P4 扩展（cep 状态机 / event_bridge 视图 / eval）以此为落点。
 
+#[cfg(test)]
+mod sem_tests;
+
 pub mod cep;
 pub mod cidr_cache;
 pub mod error;

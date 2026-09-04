@@ -1,20 +1,28 @@
-#![allow(dead_code)] // P4-B2：join harness 供 execute/joins 消费的面；随迁语义子集使用的面已去
+#![allow(dead_code)]
+// join harness（row/snapshot_join/asof_join/anti_join）随 execute/joins 留 engine，此处仅语义子集消费
 //! L2 feature tests: limits, key_map, window.has(), baseline(), joins.
 
-mod execute;
-mod joins;
+mod baseline;
+mod expr;
+mod fixed;
+mod guards;
+mod keymap;
+mod limits;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use wf_lang::ast::{Bound, BoundVal, CloseMode, Expr, FieldRef, JoinMode, WithinSpec};
-use wf_lang::plan::{JoinCondPlan, JoinPlan};
-
-use crate::match_engine::cep::{
-    CepStateMachine, EngineHashMap, Event, MatchedContext, StepData, Value, WindowLookup,
+use wf_lang::ast::{CloseMode, Expr, FieldRef, JoinMode};
+use wf_lang::plan::{
+    ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, RateSpec, WindowSpec,
 };
-use crate::match_engine::{JoinRow, RuleExecutor};
+
+use crate::cep::{
+    CepStateMachine, CloseReason, EngineHashMap, Event, SharedLimits, StepResult, Value,
+    WindowLookup,
+};
+use crate::row_views::JoinRow;
 
 use super::helpers::*;
 

@@ -1,4 +1,4 @@
-#![allow(dead_code)] // P4-B2：语义测试随迁 wf-cep 后 engine 侧面收窄，保留完整副本便于对 diff/复用
+#![allow(dead_code)] // P4-B2 双份副本：与 engine tests/helpers.rs 同源，子集消费方用不到的面保持完整便于 diff
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use wf_lang::plan::{
     WindowSpec, YieldPlan,
 };
 
-use crate::match_engine::cep::{Event, Value};
+use crate::cep::{Event, Value};
 
 pub fn event(fields: Vec<(&str, Value)>) -> Event {
     Event {

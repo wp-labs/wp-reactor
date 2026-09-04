@@ -6,9 +6,7 @@
 //! - `*_bench.rs`：热路径基准（`#[ignore]` 或 bench 专用，不进常规单测）；
 //! - CEP 状态机内部细节测试在同级 `cep/tests/`。
 
-mod accu;
 mod advance_count_bench;
-mod any_l2;
 mod close_bench;
 mod columnar_bench;
 mod columnar_close_seq;
@@ -26,20 +24,14 @@ mod guard_bench;
 mod helpers;
 mod hop_bench;
 mod interval_bench;
-mod join_key;
 mod match_bench;
 mod nexmark_hotpath_bench;
 mod perf;
 mod q13b_join_bench;
 mod scope_key_bench;
-mod seq_l2;
 mod spill_write_bench;
 mod stats_soa_bench;
 
-mod cep_core;
-mod close;
 mod executor;
 mod l2;
-mod l3;
 mod regression;
-mod seq_order;

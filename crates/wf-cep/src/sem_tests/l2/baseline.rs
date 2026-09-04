@@ -65,7 +65,7 @@ fn baseline_accumulates_state_in_guard() {
 /// baseline() should return 0.0 on the first event (no history yet).
 #[test]
 fn baseline_returns_zero_on_first_event() {
-    use crate::match_engine::cep::eval_expr;
+    use crate::cep::eval_expr;
 
     let expr = Expr::FuncCall {
         qualifier: None,

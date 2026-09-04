@@ -170,7 +170,7 @@ fn compound_expr_and_window_has_no_match() {
 /// context through the BinOp evaluation.
 #[test]
 fn compound_expr_baseline_in_comparison() {
-    use crate::match_engine::EngineHashMap as Map;
+    use crate::cep::EngineHashMap as Map;
     use wf_lang::ast::BinOp;
 
     // Expression: baseline(x, 300) > 2.0
@@ -188,7 +188,7 @@ fn compound_expr_baseline_in_comparison() {
     };
 
     // Use eval_expr_ext directly with a baselines store to verify context flows
-    use crate::match_engine::cep::eval_expr_ext;
+    use crate::cep::eval_expr_ext;
     let mut baselines = Map::default();
 
     // Feed varying values to build baseline with nonzero stddev.

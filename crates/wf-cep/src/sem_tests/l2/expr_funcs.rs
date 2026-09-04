@@ -9,7 +9,7 @@ use super::*;
 
 #[test]
 fn blank_functions_work() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let mut fields = EngineHashMap::default();
     fields.insert("empty".into(), Value::Str(String::new().into()));
@@ -127,7 +127,7 @@ fn blank_functions_work() {
 
 #[test]
 fn merge_shallow_merges_objects_in_l2_eval() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let mut base = EngineHashMap::default();
     base.insert("severity".into(), Value::Number(3.0));
@@ -167,7 +167,7 @@ fn merge_shallow_merges_objects_in_l2_eval() {
 
 #[test]
 fn merge_fails_when_object_literal_value_is_missing_in_l2_eval() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let event = Event {
         fields: EngineHashMap::default(),
@@ -194,7 +194,7 @@ fn merge_fails_when_object_literal_value_is_missing_in_l2_eval() {
 
 #[test]
 fn merge_treats_missing_field_arg_as_empty_object_in_l2_eval() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let event = Event {
         fields: EngineHashMap::default(),
@@ -220,7 +220,7 @@ fn merge_treats_missing_field_arg_as_empty_object_in_l2_eval() {
 
 #[test]
 fn hash_and_id_functions_work() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let mut fields = EngineHashMap::default();
     fields.insert("msg".into(), Value::Str("hello".into()));
@@ -451,7 +451,7 @@ fn hash_and_id_functions_work() {
 
 #[test]
 fn stable_id_uses_unambiguous_segments() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let event = Event {
         fields: EngineHashMap::default(),
@@ -491,7 +491,7 @@ fn stable_id_uses_unambiguous_segments() {
 
 #[test]
 fn strptime_parses_date() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -509,7 +509,7 @@ fn strptime_parses_date() {
 
 #[test]
 fn strptime_returns_epoch_milliseconds() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -534,7 +534,7 @@ fn strptime_returns_epoch_milliseconds() {
 
 #[test]
 fn replace_regex_substitution() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -553,7 +553,7 @@ fn replace_regex_substitution() {
 
 #[test]
 fn startswith_and_endswith_work() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let starts = Expr::FuncCall {
         qualifier: None,
@@ -580,7 +580,7 @@ fn startswith_and_endswith_work() {
 
 #[test]
 fn substr_supports_one_based_and_negative_start() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let mut fields = EngineHashMap::default();
     fields.insert("msg".into(), Value::Str("abcdef".into()));
@@ -613,7 +613,7 @@ fn substr_supports_one_based_and_negative_start() {
 
 #[test]
 fn trim_removes_surrounding_whitespace() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -628,7 +628,7 @@ fn trim_removes_surrounding_whitespace() {
 
 #[test]
 fn mvcount_array_returns_length() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -650,7 +650,7 @@ fn mvcount_array_returns_length() {
 
 #[test]
 fn mvjoin_array_with_separator() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -675,7 +675,7 @@ fn mvjoin_array_with_separator() {
 
 #[test]
 fn mvindex_single_and_range() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let mut fields = EngineHashMap::default();
     fields.insert(
@@ -719,7 +719,7 @@ fn mvindex_single_and_range() {
 
 #[test]
 fn mvappend_flattens_arrays_and_scalars() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let mut fields = EngineHashMap::default();
     fields.insert(
@@ -757,7 +757,7 @@ fn mvappend_flattens_arrays_and_scalars() {
 
 #[test]
 fn split_text_to_array() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -783,7 +783,7 @@ fn split_text_to_array() {
 
 #[test]
 fn mvdedup_removes_duplicates_keep_order() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -822,8 +822,8 @@ fn mvdedup_removes_duplicates_keep_order() {
 fn external_func_call_dispatches_to_handler() {
     use std::sync::Arc;
 
+    use crate::cep::eval_expr;
     use crate::external::{ExternalCallHandler, set_external_handler};
-    use crate::match_engine::cep::eval_expr;
 
     struct PwdHandler;
     impl ExternalCallHandler for PwdHandler {

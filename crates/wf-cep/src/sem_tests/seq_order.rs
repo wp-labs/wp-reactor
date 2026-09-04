@@ -1,7 +1,7 @@
 //! Verify the existing `on event` engine's ordering semantics:
 //! does step i+1 only evaluate after step i completes?
 
-use crate::match_engine::cep::{CepStateMachine, StepResult};
+use crate::cep::{CepStateMachine, StepResult};
 
 use super::helpers::*;
 

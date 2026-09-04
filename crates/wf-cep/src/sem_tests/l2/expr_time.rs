@@ -13,7 +13,7 @@ use super::*;
 
 #[test]
 fn time_diff_returns_seconds() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -34,7 +34,7 @@ fn time_diff_returns_seconds() {
 
 #[test]
 fn time_diff_absolute_value() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -59,7 +59,7 @@ fn time_diff_absolute_value() {
 
 #[test]
 fn time_bucket_floors_to_interval() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -79,7 +79,7 @@ fn time_bucket_floors_to_interval() {
 
 #[test]
 fn time_bucket_exact_boundary() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -104,7 +104,7 @@ fn time_bucket_exact_boundary() {
 /// `bucket_end(t, 60s)` = 桶末 = `time_bucket(t) + interval`。
 #[test]
 fn bucket_end_returns_bucket_upper_edge() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -127,7 +127,7 @@ fn bucket_end_returns_bucket_upper_edge() {
 /// 恰在桶边界：t = 1_700_000_040_000（60s 桶界）→ 桶末 = 1_700_000_100_000（移入下桶）。
 #[test]
 fn bucket_end_at_exact_boundary_moves_to_next_bucket() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -148,7 +148,7 @@ fn bucket_end_at_exact_boundary_moves_to_next_bucket() {
 
 #[test]
 fn time_bucket_rejects_non_positive_or_non_finite_interval() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let event = Event {
         fields: EngineHashMap::default(),
@@ -169,7 +169,7 @@ fn time_bucket_rejects_non_positive_or_non_finite_interval() {
 
 #[test]
 fn math_functions_work() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let mut fields = EngineHashMap::default();
     fields.insert("n".into(), Value::Number(-12.345));
@@ -403,7 +403,7 @@ fn math_functions_work() {
 
 #[test]
 fn now_functions_work() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let event = Event {
         fields: EngineHashMap::default(),
@@ -474,7 +474,7 @@ fn now_functions_work() {
 
 #[test]
 fn now_functions_share_timestamp_within_expression() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let event = Event {
         fields: EngineHashMap::default(),

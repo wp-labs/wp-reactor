@@ -4,7 +4,7 @@ use std::time::Duration;
 use wf_lang::ast::MatchMode;
 use wf_lang::plan::{ExceedAction, LimitsPlan, MatchPlan, RateSpec};
 
-use crate::match_engine::cep::{CepStateMachine, StepResult};
+use crate::cep::{CepStateMachine, StepResult};
 
 use super::helpers::*;
 

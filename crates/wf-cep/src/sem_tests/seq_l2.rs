@@ -6,7 +6,7 @@ use wf_lang::ast::MatchMode;
 use wf_lang::plan::WindowSpec;
 use wf_lang::plan::{MatchPlan, SeqPlan, SeqSkipPlan, SeqStepPlan};
 
-use crate::match_engine::cep::{CepStateMachine, StepResult};
+use crate::cep::{CepStateMachine, StepResult};
 
 use super::helpers::*;
 

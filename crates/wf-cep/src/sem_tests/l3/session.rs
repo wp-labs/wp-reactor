@@ -44,7 +44,7 @@ fn session_plan(gap_secs: u64) -> wf_lang::plan::MatchPlan {
 #[test]
 fn session_gap_uses_last_event_time_for_expiry() {
     let mut sm = CepStateMachine::new("r_session".to_string(), session_plan(10), None);
-    let e = crate::match_engine::tests::helpers::event(vec![("k", Value::Str("a".into()))]);
+    let e = crate::sem_tests::helpers::event(vec![("k", Value::Str("a".into()))]);
 
     let _ = sm.advance_at("e", &e, secs(0));
     let _ = sm.advance_at("e", &e, secs(9));
@@ -63,8 +63,8 @@ fn session_gap_uses_last_event_time_for_expiry() {
 fn session_scan_expired_sorted_by_last_event_time() {
     let mut sm = CepStateMachine::new("r_session_sort".to_string(), session_plan(10), None);
 
-    let a = crate::match_engine::tests::helpers::event(vec![("k", Value::Str("a".into()))]);
-    let b = crate::match_engine::tests::helpers::event(vec![("k", Value::Str("b".into()))]);
+    let a = crate::sem_tests::helpers::event(vec![("k", Value::Str("a".into()))]);
+    let b = crate::sem_tests::helpers::event(vec![("k", Value::Str("b".into()))]);
 
     let _ = sm.advance_at("e", &a, secs(0));
     let _ = sm.advance_at("e", &b, secs(0));

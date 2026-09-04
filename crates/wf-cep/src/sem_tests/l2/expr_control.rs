@@ -11,7 +11,7 @@ use super::*;
 
 #[test]
 fn not_negates_bool_literal() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let event = Event {
         fields: EngineHashMap::default(),
@@ -28,7 +28,7 @@ fn not_negates_bool_literal() {
 
 #[test]
 fn not_negates_comparison() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::Not(Box::new(Expr::BinOp {
         op: BinOp::Eq,
@@ -47,7 +47,7 @@ fn not_negates_comparison() {
 
 #[test]
 fn not_de_morgan_equivalence() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     // `not (a || b)` ≡ `(not a) && (not b)`。
     let a = Expr::Field(FieldRef::Simple("a".into()));
@@ -77,7 +77,7 @@ fn not_de_morgan_equivalence() {
 
 #[test]
 fn not_non_bool_is_none() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     // `not 5`（数值）→ None：与 Neg 非数值 → None 一致，不做隐式非零判真。
     let event = Event {
@@ -95,7 +95,7 @@ fn not_non_bool_is_none() {
 
 #[test]
 fn if_then_else_true_branch() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::IfThenElse {
         cond: Box::new(Expr::Bool(true)),
@@ -111,7 +111,7 @@ fn if_then_else_true_branch() {
 
 #[test]
 fn if_then_else_false_branch() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::IfThenElse {
         cond: Box::new(Expr::Bool(false)),
@@ -127,7 +127,7 @@ fn if_then_else_false_branch() {
 
 #[test]
 fn if_then_else_nested() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     // if true then (if false then 1 else 2) else 3
     let expr = Expr::IfThenElse {
@@ -148,7 +148,7 @@ fn if_then_else_nested() {
 
 #[test]
 fn if_then_else_with_field_condition() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     // if action == "failed" then 80 else 40
     let expr = Expr::IfThenElse {
@@ -178,7 +178,7 @@ fn if_then_else_with_field_condition() {
 
 #[test]
 fn regex_match_matches() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -196,7 +196,7 @@ fn regex_match_matches() {
 
 #[test]
 fn regex_match_no_match() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -218,7 +218,7 @@ fn regex_match_no_match() {
 
 #[test]
 fn cidr_match_guard_hit() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -236,7 +236,7 @@ fn cidr_match_guard_hit() {
 
 #[test]
 fn cidr_match_guard_miss_and_error() {
-    use crate::match_engine::cep::{Event, eval_expr};
+    use crate::cep::{Event, eval_expr};
 
     let base = |sip: &str| {
         let mut fields = EngineHashMap::default();

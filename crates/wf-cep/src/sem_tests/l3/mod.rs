@@ -9,7 +9,7 @@ use std::time::Duration;
 use wf_lang::ast::{BinOp, CloseMode, Expr, FieldRef};
 use wf_lang::plan::{ConvChainPlan, ConvOpPlan, ConvPlan, ExprPlan, SortKeyPlan};
 
-use crate::match_engine::cep::{
+use crate::cep::{
     CepStateMachine, CloseOutput, CloseReason, EngineHashMap, StepData, StepResult, Value,
 };
 
