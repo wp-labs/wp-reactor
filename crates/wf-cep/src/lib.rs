@@ -11,7 +11,7 @@
 pub mod cidr_cache;
 pub mod error;
 pub mod external;
-pub mod rows;
 pub mod regex_cache;
+pub mod rows;
 pub mod time;
 pub mod value;

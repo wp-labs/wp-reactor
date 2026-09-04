@@ -63,7 +63,7 @@ pub(crate) enum AlertBatch {
 }
 
 impl AlertBatch {
-pub(crate) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             AlertBatch::Rows(rows) => rows.len(),
             AlertBatch::Columns(cols) => cols.len(),
@@ -72,7 +72,7 @@ pub(crate) fn len(&self) -> usize {
 
     #[allow(dead_code)]
     #[allow(dead_code)]
-pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
@@ -136,7 +136,7 @@ impl SinkFanout {
     ///
     /// Each entry is `(sink_ptr, channels)` where `channels` are that sink's
     /// `parallel` writers — the emit path round-robins across them.
-pub(crate) fn resolve(&self, window_name: &str) -> ResolvedChannels {
+    pub(crate) fn resolve(&self, window_name: &str) -> ResolvedChannels {
         if let Some(groups) = self
             .cache
             .read()
@@ -167,7 +167,7 @@ pub(crate) fn resolve(&self, window_name: &str) -> ResolvedChannels {
     }
 
     /// Next round-robin writer index for a sink's parallel channels.
-pub(crate) fn next_index(&self, sink_ptr: usize, writer_count: usize) -> usize {
+    pub(crate) fn next_index(&self, sink_ptr: usize, writer_count: usize) -> usize {
         if writer_count <= 1 {
             return 0;
         }
@@ -184,7 +184,7 @@ pub(crate) fn next_index(&self, sink_ptr: usize, writer_count: usize) -> usize {
     }
 
     /// Warn once-per-target when a yield_target has no sink at all.
-pub(crate) fn warn_if_no_sink(&self, window_name: &str) {
+    pub(crate) fn warn_if_no_sink(&self, window_name: &str) {
         let mut warned = self.warned_no_sink.lock().expect("warned lock poisoned");
         if warned.insert(window_name.to_string()) {
             wf_warn!(

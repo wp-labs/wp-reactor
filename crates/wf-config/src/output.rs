@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_OUTPUT_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
 
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(
+    ::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default,
+)]
 #[serde(rename_all = "snake_case")]
 #[moju(kind = "state", domain = "Config", module = "Config.ConfigIo")]
 pub enum OutputTimeZone {

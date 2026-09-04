@@ -38,7 +38,7 @@ pub(crate) enum StatLabelStage {
 }
 
 impl<'a> Scope<'a> {
-pub(crate) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Scope {
             aliases: HashMap::new(),
             let_types: HashMap::new(),
@@ -51,7 +51,7 @@ pub(crate) fn new() -> Self {
     /// Resolve a FieldRef to a ValType using this scope.
     /// Returns Ok(Some(t)) for scalar fields, Ok(None) for set-level alias references,
     /// and Err(message) for invalid references.
-pub(crate) fn resolve_field_ref(&self, fref: &FieldRef) -> Result<Option<ValType>, String> {
+    pub(crate) fn resolve_field_ref(&self, fref: &FieldRef) -> Result<Option<ValType>, String> {
         match fref {
             FieldRef::Simple(name) => self.resolve_simple(name),
             FieldRef::Qualified(alias, field) => {
@@ -128,14 +128,14 @@ pub(crate) fn resolve_field_ref(&self, fref: &FieldRef) -> Result<Option<ValType
     }
 
     /// Check whether a field exists in a specific alias's window.
-pub(crate) fn alias_has_field(&self, alias: &str, field: &str) -> bool {
+    pub(crate) fn alias_has_field(&self, alias: &str, field: &str) -> bool {
         self.aliases
             .get(alias)
             .is_some_and(|s| s.fields.iter().any(|f| f.name == field))
     }
 
     /// Get the field type for a field that exists in a specific alias.
-pub(crate) fn get_field_type_for_alias(&self, alias: &str, field: &str) -> Option<ValType> {
+    pub(crate) fn get_field_type_for_alias(&self, alias: &str, field: &str) -> Option<ValType> {
         self.aliases.get(alias).and_then(|s| {
             s.fields
                 .iter()

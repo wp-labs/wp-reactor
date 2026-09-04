@@ -69,7 +69,11 @@ const DEFAULT_RELOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Result of an [`Reactor::apply_reload`] attempt.
 #[derive(::moju_derive::MoJu, Debug)]
-#[moju(kind = "state", domain = "Runtime", module = "Runtime.ReactorLifecycle")]
+#[moju(
+    kind = "state",
+    domain = "Runtime",
+    module = "Runtime.ReactorLifecycle"
+)]
 pub enum ReloadOutcome {
     /// Reload was applied: old rule tasks were swapped for a freshly compiled
     /// generation sharing the existing windows/router/sinks.
@@ -92,7 +96,11 @@ pub const RESTART_EXIT_CODE: i32 = 75;
 
 /// Outcome of [`Reactor::run`], indicating why the control loop exited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Runtime", module = "Runtime.ReactorLifecycle")]
+#[moju(
+    kind = "state",
+    domain = "Runtime",
+    module = "Runtime.ReactorLifecycle"
+)]
 pub enum RunOutcome {
     /// Normal shutdown (SIGINT / SIGTERM / all handles dropped).
     Normal,
@@ -108,7 +116,11 @@ pub enum RunOutcome {
 /// `RuntimeResult` error (e.g. a config compile failure), so the caller can
 /// distinguish *blocked* reloads (`Ok(Blocked)`) from *failed* reloads (`Err`).
 #[derive(Debug, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Runtime", module = "Runtime.ReactorLifecycle")]
+#[moju(
+    kind = "state",
+    domain = "Runtime",
+    module = "Runtime.ReactorLifecycle"
+)]
 pub enum ReloadRequest {
     /// Reload the rule set from the given (raw + effective) config.
     Reload {
@@ -132,7 +144,11 @@ pub enum ReloadRequest {
 /// Also exposes the root [`CancellationToken`] (for the existing `status`
 /// route's `accepting` field) without letting the holder cancel the engine.
 #[derive(Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.ReactorLifecycle")]
+#[moju(
+    kind = "struct",
+    domain = "Runtime",
+    module = "Runtime.ReactorLifecycle"
+)]
 pub struct RuntimeControlHandle {
     tx: mpsc::Sender<ReloadRequest>,
     cancel: CancellationToken,
@@ -227,7 +243,11 @@ impl RuntimeControlHandle {
 /// the shared `Arc<Router>`/registry, so swapping rule tasks does not lose
 /// in-flight window data.
 #[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.ReactorLifecycle")]
+#[moju(
+    kind = "struct",
+    domain = "Runtime",
+    module = "Runtime.ReactorLifecycle"
+)]
 pub struct Reactor {
     pub(crate) cancel: CancellationToken,
     /// Dedicated token for rule tasks only. A child of `cancel`, so a root

@@ -20,7 +20,11 @@ use wf_engine::match_engine::Value;
 use super::redis_backend::RedisBackend;
 
 #[derive(Default, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.ExternalRuntime")]
+#[moju(
+    kind = "struct",
+    domain = "Runtime",
+    module = "Runtime.ExternalRuntime"
+)]
 pub struct ExternalRuntime {
     redis: RedisBackend,
 }

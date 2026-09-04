@@ -20,7 +20,9 @@ use crate::vars::{ConfigVarContext, expand_value};
 use crate::window::{WindowConfig, WindowDefaults, WindowOverride};
 use toml::Value as TomlValue;
 
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(
+    ::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default,
+)]
 #[serde(rename_all = "snake_case")]
 #[moju(kind = "state", domain = "Config", module = "Config.FusionConfig")]
 pub enum FusionMode {

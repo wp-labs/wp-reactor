@@ -4,7 +4,6 @@
 
 use super::ParsedRuleFile;
 
-
 pub(super) fn format_rule_check_error(
     error: &wf_lang::CheckError,
     parsed: &ParsedRuleFile,
@@ -204,7 +203,10 @@ pub(super) fn yield_preset_source_end(
         .unwrap_or(lines.len())
 }
 
-pub(super) fn find_yield_preset_decl_location(source: &str, preset_name: &str) -> Option<(usize, usize)> {
+pub(super) fn find_yield_preset_decl_location(
+    source: &str,
+    preset_name: &str,
+) -> Option<(usize, usize)> {
     find_nth_yield_preset_decl_location(source, preset_name, 1)
 }
 
@@ -373,7 +375,11 @@ pub(super) fn find_token_column(line: &str, token: &str) -> Option<usize> {
     find_named_token_column(line, token, false)
 }
 
-pub(super) fn find_named_token_column(line: &str, token: &str, require_assignment: bool) -> Option<usize> {
+pub(super) fn find_named_token_column(
+    line: &str,
+    token: &str,
+    require_assignment: bool,
+) -> Option<usize> {
     let mut search_from = 0;
     while let Some(relative_idx) = line[search_from..].find(token) {
         let idx = search_from + relative_idx;

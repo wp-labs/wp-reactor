@@ -30,16 +30,16 @@ fn is_scalar_stringable_type(t: &ValType) -> bool {
                 | BaseType::Time
                 | BaseType::Ip
                 | BaseType::Hex
-       ) | ValType::Bool
+        ) | ValType::Bool
             | ValType::Numeric
-   )
+    )
 }
 
 fn is_array_like(t: &ValType) -> bool {
     matches!(
         t,
         ValType::Array(_) | ValType::ArrayAny | ValType::EmptyArray
-   )
+    )
 }
 
 fn check_join_values(
@@ -54,7 +54,10 @@ fn check_join_values(
         if let Some(t) = infer_type(arg, scope)
             && !is_scalar_stringable_type(&t)
         {
-            errors.push(rule_error(rule_name, format!("{}() argument {} must be scalar, got {:?}", name, i + 1, t)));
+            errors.push(rule_error(
+                rule_name,
+                format!("{}() argument {} must be scalar, got {:?}", name, i + 1, t),
+            ));
         }
     }
 }
@@ -101,30 +104,132 @@ pub(crate) fn check_func_call(
         && matches!(
             name,
             "collect_set" | "collect_list" | "first" | "last" | "stddev" | "percentile"
-       )
+        )
     {
-        errors.push(rule_error(rule_name, format!("{}() is not allowed in guard expressions; use it in score/entity/yield instead", name)));
+        errors.push(rule_error(
+            rule_name,
+            format!(
+                "{}() is not allowed in guard expressions; use it in score/entity/yield instead",
+                name
+            ),
+        ));
         return;
     }
 
     // 内建函数按类别分派（2026-09-03 拆件）：分派集合与各 check_*_func 内
     // match 由同一类别表生成；新增内建函数须加入对应类别并保持集合同步。
-    if matches!(name, "count" | "sum" | "avg" | "min" | "max" | "collect_set" | "collect_list" | "first" | "last" | "stddev" | "percentile") {
+    if matches!(
+        name,
+        "count"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "collect_set"
+            | "collect_list"
+            | "first"
+            | "last"
+            | "stddev"
+            | "percentile"
+    ) {
         check_agg_func(&ctx, name, args, errors);
-    } else if matches!(name, "abs" | "ceil" | "floor" | "round" | "sqrt" | "exp" | "sign" | "trunc" | "is_finite" | "pow" | "log" | "clamp") {
+    } else if matches!(
+        name,
+        "abs"
+            | "ceil"
+            | "floor"
+            | "round"
+            | "sqrt"
+            | "exp"
+            | "sign"
+            | "trunc"
+            | "is_finite"
+            | "pow"
+            | "log"
+            | "clamp"
+    ) {
         check_numeric_func(&ctx, name, args, errors);
-    } else if matches!(name, "time_diff" | "time_bucket" | "bucket_end" | "now" | "now_s" | "now_ms" | "now_us" | "now_ns" | "time_to_s" | "time_to_ms" | "strftime" | "strptime") {
+    } else if matches!(
+        name,
+        "time_diff"
+            | "time_bucket"
+            | "bucket_end"
+            | "now"
+            | "now_s"
+            | "now_ms"
+            | "now_us"
+            | "now_ns"
+            | "time_to_s"
+            | "time_to_ms"
+            | "strftime"
+            | "strptime"
+    ) {
         check_time_func(&ctx, name, args, errors);
-    } else if matches!(name, "regex_match" | "cidr_match" | "count_char" | "contains" | "startswith" | "endswith" | "startswith_any" | "endswith_any" | "md5" | "sha1" | "sha256" | "hex" | "sha1_n" | "stable_id" | "join" | "join_by" | "substr" | "replace" | "replace_plain" | "trim" | "ltrim" | "rtrim" | "concat" | "indexof" | "lower" | "upper" | "len") {
+    } else if matches!(
+        name,
+        "regex_match"
+            | "cidr_match"
+            | "count_char"
+            | "contains"
+            | "startswith"
+            | "endswith"
+            | "startswith_any"
+            | "endswith_any"
+            | "md5"
+            | "sha1"
+            | "sha256"
+            | "hex"
+            | "sha1_n"
+            | "stable_id"
+            | "join"
+            | "join_by"
+            | "substr"
+            | "replace"
+            | "replace_plain"
+            | "trim"
+            | "ltrim"
+            | "rtrim"
+            | "concat"
+            | "indexof"
+            | "lower"
+            | "upper"
+            | "len"
+    ) {
         check_str_func(&ctx, name, args, errors);
-    } else if matches!(name, "mvcount" | "mvjoin" | "split" | "mvdedup" | "mvsort" | "mvreverse" | "mvindex" | "mvappend") {
+    } else if matches!(
+        name,
+        "mvcount"
+            | "mvjoin"
+            | "split"
+            | "mvdedup"
+            | "mvsort"
+            | "mvreverse"
+            | "mvindex"
+            | "mvappend"
+    ) {
         check_mv_func(&ctx, name, args, errors);
-    } else if matches!(name, "has" | "baseline" | "coalesce" | "merge" | "isnull" | "isnotnull" | "is_blank" | "null_if_blank" | "default_if_blank") {
+    } else if matches!(
+        name,
+        "has"
+            | "baseline"
+            | "coalesce"
+            | "merge"
+            | "isnull"
+            | "isnotnull"
+            | "is_blank"
+            | "null_if_blank"
+            | "default_if_blank"
+    ) {
         check_misc_func(&ctx, name, args, errors);
     }
 }
 /// agg 类内建函数检查（2026-09-03 自 check_func_call 拆出；arm 原样搬移）。
-fn check_agg_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+fn check_agg_func(
+    ctx: &FuncCheckCtx<'_, '_>,
+    name: &str,
+    args: &[Expr],
+    errors: &mut Vec<CheckError>,
+) {
     let scope = ctx.scope;
     let rule_name = ctx.rule_name;
     match name {
@@ -134,22 +239,32 @@ fn check_agg_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors:
             // to count (they would silently omit at runtime).
             if let Some(Expr::Field(
                 FieldRef::Qualified(..) | FieldRef::Bracketed(..) | FieldRef::Path { .. },
-           )) = args.first()
+            )) = args.first()
             {
-                errors.push(rule_error(rule_name, "count() expects a set-level argument (alias), not a field projection".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "count() expects a set-level argument (alias), not a field projection"
+                        .to_string(),
+                ));
             }
         }
         "sum" | "avg" => {
             // Nested paths are not aggregateable as flat columns → reject them
             // (consistent with first/last/collect_*, which also reject Path).
             if matches!(args.first(), Some(Expr::Field(FieldRef::Path { .. }))) {
-                errors.push(rule_error(rule_name, format!("{}() argument must be a column projection (alias.field)", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!(
+                        "{}() argument must be a column projection (alias.field)",
+                        name
+                    ),
+                ));
             }
             if let Some(Expr::Field(FieldRef::Simple(alias_name))) = args.first()
                 && matches!(
                     scope.resolve_field_ref(&FieldRef::Simple(alias_name.clone())),
                     Ok(None)
-               )
+                )
             {
                 errors.push(rule_error(rule_name, format!("{}() requires a field projection like alias.field; set-level alias `{}` is not allowed", name, alias_name)));
             }
@@ -158,19 +273,28 @@ fn check_agg_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors:
                 && let Some(t) = infer_type(arg, scope)
                 && !is_numeric(&t)
             {
-                errors.push(rule_error(rule_name, format!("{}() requires a numeric field, got {:?}", name, t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() requires a numeric field, got {:?}", name, t),
+                ));
             }
         }
         "min" | "max" => {
             // Nested paths are not aggregateable as flat columns → reject them.
             if matches!(args.first(), Some(Expr::Field(FieldRef::Path { .. }))) {
-                errors.push(rule_error(rule_name, format!("{}() argument must be a column projection (alias.field)", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!(
+                        "{}() argument must be a column projection (alias.field)",
+                        name
+                    ),
+                ));
             }
             if let Some(Expr::Field(FieldRef::Simple(alias_name))) = args.first()
                 && matches!(
                     scope.resolve_field_ref(&FieldRef::Simple(alias_name.clone())),
                     Ok(None)
-               )
+                )
             {
                 errors.push(rule_error(rule_name, format!("{}() requires a field projection like alias.field; set-level alias `{}` is not allowed", name, alias_name)));
             }
@@ -179,73 +303,115 @@ fn check_agg_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors:
                 && let Some(t) = infer_type(arg, scope)
                 && !is_orderable(&t)
             {
-                errors.push(rule_error(rule_name, format!("{}() requires an orderable field, got {:?}", name, t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() requires an orderable field, got {:?}", name, t),
+                ));
             }
         }
         "collect_set" | "collect_list" => {
             // T22: argument must be Column projection (alias.field)
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument: alias.field", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() requires exactly 1 argument: alias.field", name),
+                ));
             } else if !matches!(
                 args[0],
                 Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
-           ) {
-                errors.push(rule_error(rule_name, format!("{}() argument must be a column projection (alias.field)", name)));
+            ) {
+                errors.push(rule_error(
+                    rule_name,
+                    format!(
+                        "{}() argument must be a column projection (alias.field)",
+                        name
+                    ),
+                ));
             }
         }
         "first" | "last" => {
             // T23: argument must be Column projection (alias.field)
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument: alias.field", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() requires exactly 1 argument: alias.field", name),
+                ));
             } else if !matches!(
                 args[0],
                 Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
-           ) {
-                errors.push(rule_error(rule_name, format!("{}() argument must be a column projection (alias.field)", name)));
+            ) {
+                errors.push(rule_error(
+                    rule_name,
+                    format!(
+                        "{}() argument must be a column projection (alias.field)",
+                        name
+                    ),
+                ));
             }
         }
         // L3 Statistical functions (M28.3)
         "stddev" => {
             // T24: field must be digit or float
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, "stddev() requires exactly 1 argument: alias.field".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "stddev() requires exactly 1 argument: alias.field".to_string(),
+                ));
             } else if let Some(arg) = args.first() {
                 if let Some(t) = infer_type(arg, scope)
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("stddev() requires a numeric field, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("stddev() requires a numeric field, got {:?}", t),
+                    ));
                 }
                 // Also check it's a column projection
                 if !matches!(
                     args[0],
                     Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
-               ) {
-                    errors.push(rule_error(rule_name, "stddev() argument must be a column projection (alias.field)".to_string()));
+                ) {
+                    errors.push(rule_error(
+                        rule_name,
+                        "stddev() argument must be a column projection (alias.field)".to_string(),
+                    ));
                 }
             }
         }
         "percentile" => {
             // T25: percentile(field, p) where field is numeric, p is 0-100
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "percentile() requires exactly 2 arguments: (field, p)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "percentile() requires exactly 2 arguments: (field, p)".to_string(),
+                ));
             } else {
                 // First arg must be numeric column
                 if let Some(t) = infer_type(&args[0], scope)
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("percentile() field must be numeric, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("percentile() field must be numeric, got {:?}", t),
+                    ));
                 }
                 if !matches!(
                     args[0],
                     Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
-               ) {
-                    errors.push(rule_error(rule_name, "percentile() field must be a column projection (alias.field)".to_string()));
+                ) {
+                    errors.push(rule_error(
+                        rule_name,
+                        "percentile() field must be a column projection (alias.field)".to_string(),
+                    ));
                 }
                 // Second arg must be digit literal 0-100
                 match &args[1] {
                     Expr::Number(p) if *p >= 0.0 && *p <= 100.0 => {} // OK
                     _ => {
-                        errors.push(rule_error(rule_name, "percentile() p must be a number literal 0-100".to_string()));
+                        errors.push(rule_error(
+                            rule_name,
+                            "percentile() p must be a number literal 0-100".to_string(),
+                        ));
                     }
                 }
             }
@@ -255,80 +421,124 @@ fn check_agg_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors:
 }
 
 /// numeric 类内建函数检查（2026-09-03 自 check_func_call 拆出；arm 原样搬移）。
-fn check_numeric_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+fn check_numeric_func(
+    ctx: &FuncCheckCtx<'_, '_>,
+    name: &str,
+    args: &[Expr],
+    errors: &mut Vec<CheckError>,
+) {
     let scope = ctx.scope;
     let rule_name = ctx.rule_name;
     match name {
         "abs" | "ceil" | "floor" => {
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 numeric argument", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() requires exactly 1 numeric argument", name),
+                ));
             } else if let Some(t) = infer_type(&args[0], scope)
                 && !is_numeric(&t)
             {
-                errors.push(rule_error(rule_name, format!("{}() argument must be numeric, got {:?}", name, t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() argument must be numeric, got {:?}", name, t),
+                ));
             }
         }
         "round" => {
             if args.len() != 1 && args.len() != 2 {
-                errors.push(rule_error(rule_name, "round() requires 1 or 2 arguments: (value, [precision])".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "round() requires 1 or 2 arguments: (value, [precision])".to_string(),
+                ));
             } else {
                 if let Some(t) = infer_type(&args[0], scope)
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("round() first argument must be numeric, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("round() first argument must be numeric, got {:?}", t),
+                    ));
                 }
                 if args.len() == 2
                     && let Some(t) = infer_type(&args[1], scope)
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("round() second argument must be numeric, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("round() second argument must be numeric, got {:?}", t),
+                    ));
                 }
             }
         }
         "sqrt" | "exp" | "sign" | "trunc" | "is_finite" => {
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 numeric argument", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() requires exactly 1 numeric argument", name),
+                ));
             } else if let Some(t) = infer_type(&args[0], scope)
                 && !is_numeric(&t)
             {
-                errors.push(rule_error(rule_name, format!("{}() argument must be numeric, got {:?}", name, t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() argument must be numeric, got {:?}", name, t),
+                ));
             }
         }
         "pow" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "pow() requires exactly 2 numeric arguments: (x, y)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "pow() requires exactly 2 numeric arguments: (x, y)".to_string(),
+                ));
             } else {
                 for (i, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
                         && !is_numeric(&t)
                     {
-                        errors.push(rule_error(rule_name, format!("pow() argument {} must be numeric, got {:?}", i + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!("pow() argument {} must be numeric, got {:?}", i + 1, t),
+                        ));
                     }
                 }
             }
         }
         "log" => {
             if args.len() != 1 && args.len() != 2 {
-                errors.push(rule_error(rule_name, "log() requires 1 or 2 numeric arguments: (x, [base])".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "log() requires 1 or 2 numeric arguments: (x, [base])".to_string(),
+                ));
             } else {
                 for (i, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
                         && !is_numeric(&t)
                     {
-                        errors.push(rule_error(rule_name, format!("log() argument {} must be numeric, got {:?}", i + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!("log() argument {} must be numeric, got {:?}", i + 1, t),
+                        ));
                     }
                 }
             }
         }
         "clamp" => {
             if args.len() != 3 {
-                errors.push(rule_error(rule_name, "clamp() requires exactly 3 numeric arguments: (x, min, max)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "clamp() requires exactly 3 numeric arguments: (x, min, max)".to_string(),
+                ));
             } else {
                 for (i, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
                         && !is_numeric(&t)
                     {
-                        errors.push(rule_error(rule_name, format!("clamp() argument {} must be numeric, got {:?}", i + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!("clamp() argument {} must be numeric, got {:?}", i + 1, t),
+                        ));
                     }
                 }
             }
@@ -338,85 +548,145 @@ fn check_numeric_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], err
 }
 
 /// time 类内建函数检查（2026-09-03 自 check_func_call 拆出；arm 原样搬移）。
-fn check_time_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+fn check_time_func(
+    ctx: &FuncCheckCtx<'_, '_>,
+    name: &str,
+    args: &[Expr],
+    errors: &mut Vec<CheckError>,
+) {
     let scope = ctx.scope;
     let rule_name = ctx.rule_name;
     match name {
         "time_diff" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "time_diff() requires exactly 2 arguments: (t1, t2)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "time_diff() requires exactly 2 arguments: (t1, t2)".to_string(),
+                ));
             } else {
                 for (i, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
                         && !compatible(&t, &ValType::Base(BaseType::Time))
                         && !is_numeric(&t)
                     {
-                        errors.push(rule_error(rule_name, format!("time_diff() argument {} must be time or numeric, got {:?}", i + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!(
+                                "time_diff() argument {} must be time or numeric, got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        ));
                     }
                 }
             }
         }
         "time_bucket" | "bucket_end" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 2 arguments: (time, interval_seconds)", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!(
+                        "{}() requires exactly 2 arguments: (time, interval_seconds)",
+                        name
+                    ),
+                ));
             } else {
                 // First argument must be time or numeric
                 if let Some(t) = infer_type(&args[0], scope)
                     && !compatible(&t, &ValType::Base(BaseType::Time))
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("{}() first argument must be time or numeric, got {:?}", name, t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!(
+                            "{}() first argument must be time or numeric, got {:?}",
+                            name, t
+                        ),
+                    ));
                 }
                 // Second argument must be numeric (duration in seconds)
                 if let Some(t) = infer_type(&args[1], scope)
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("{}() second argument must be numeric (interval seconds), got {:?}", name, t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!(
+                            "{}() second argument must be numeric (interval seconds), got {:?}",
+                            name, t
+                        ),
+                    ));
                 }
             }
         }
         "now" | "now_s" | "now_ms" | "now_us" | "now_ns" if !args.is_empty() => {
-            errors.push(rule_error(rule_name, format!("{}() requires no arguments", name)));
+            errors.push(rule_error(
+                rule_name,
+                format!("{}() requires no arguments", name),
+            ));
         }
         "now" | "now_s" | "now_ms" | "now_us" | "now_ns" => {}
         "time_to_s" | "time_to_ms" => {
             // time 值 → 秒/毫秒 epoch（issue #69）：接受 time 或数值参数，返回 digit。
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument: (time)", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() requires exactly 1 argument: (time)", name),
+                ));
             } else if let Some(t) = infer_type(&args[0], scope)
                 && !compatible(&t, &ValType::Base(BaseType::Time))
                 && !is_numeric(&t)
             {
-                errors.push(rule_error(rule_name, format!("{}() argument must be time or numeric, got {:?}", name, t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() argument must be time or numeric, got {:?}", name, t),
+                ));
             }
         }
         "strftime" => {
             if args.len() != 1 && args.len() != 2 {
-                errors.push(rule_error(rule_name, "strftime() requires 1 or 2 arguments: (time[, format])".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "strftime() requires 1 or 2 arguments: (time[, format])".to_string(),
+                ));
             } else {
                 if let Some(t) = infer_type(&args[0], scope)
                     && !compatible(&t, &ValType::Base(BaseType::Time))
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("strftime() first argument must be time or numeric, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!(
+                            "strftime() first argument must be time or numeric, got {:?}",
+                            t
+                        ),
+                    ));
                 }
                 if args.len() == 2
                     && let Some(t) = infer_type(&args[1], scope)
                     && !compatible(&t, &ValType::Base(BaseType::Chars))
                 {
-                    errors.push(rule_error(rule_name, format!("strftime() second argument must be chars, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("strftime() second argument must be chars, got {:?}", t),
+                    ));
                 }
             }
         }
         "strptime" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "strptime() requires exactly 2 arguments: (text, format)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "strptime() requires exactly 2 arguments: (text, format)".to_string(),
+                ));
             } else {
                 for (i, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
                         && !compatible(&t, &ValType::Base(BaseType::Chars))
                     {
-                        errors.push(rule_error(rule_name, format!("strptime() argument {} must be chars, got {:?}", i + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!("strptime() argument {} must be chars, got {:?}", i + 1, t),
+                        ));
                     }
                 }
             }
@@ -426,17 +696,34 @@ fn check_time_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors
 }
 
 /// str 类内建函数检查（2026-09-03 自 check_func_call 拆出；arm 原样搬移）。
-fn check_str_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+fn check_str_func(
+    ctx: &FuncCheckCtx<'_, '_>,
+    name: &str,
+    args: &[Expr],
+    errors: &mut Vec<CheckError>,
+) {
     let scope = ctx.scope;
     let rule_name = ctx.rule_name;
 
     // 字符串族再分派（2026-09-03）：pattern/hash 族抽 check_pattern_func /
     // check_hash_func；文本核心 arm 留在下方 match。
-    if matches!(name, "regex_match" | "cidr_match" | "contains" | "startswith" | "endswith" | "startswith_any" | "endswith_any") {
+    if matches!(
+        name,
+        "regex_match"
+            | "cidr_match"
+            | "contains"
+            | "startswith"
+            | "endswith"
+            | "startswith_any"
+            | "endswith_any"
+    ) {
         check_pattern_func(ctx, name, args, errors);
         return;
     }
-    if matches!(name, "md5" | "sha1" | "sha256" | "hex" | "sha1_n" | "stable_id") {
+    if matches!(
+        name,
+        "md5" | "sha1" | "sha256" | "hex" | "sha1_n" | "stable_id"
+    ) {
         check_hash_func(ctx, name, args, errors);
         return;
     }
@@ -444,61 +731,92 @@ fn check_str_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors:
         "count_char" => {
             // count_char(text, ch)：统计 ch 在 text 中的出现次数（Flink q14 UDF 同款）。
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "count_char() requires exactly 2 arguments: (text, char)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "count_char() requires exactly 2 arguments: (text, char)".to_string(),
+                ));
             } else {
                 for (i, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
                         && !compatible(&t, &ValType::Base(BaseType::Chars))
                     {
-                        errors.push(rule_error(rule_name, format!("count_char() argument {} must be chars, got {:?}", i + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!("count_char() argument {} must be chars, got {:?}", i + 1, t),
+                        ));
                     }
                 }
             }
         }
         "join" => {
             if args.is_empty() {
-                errors.push(rule_error(rule_name, "join() requires at least 1 argument".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "join() requires at least 1 argument".to_string(),
+                ));
             } else {
                 check_join_values("join", args, 0, scope, rule_name, errors);
             }
         }
         "join_by" => {
             if args.len() < 2 {
-                errors.push(rule_error(rule_name, "join_by() requires at least 2 arguments: (separator, value, ...)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "join_by() requires at least 2 arguments: (separator, value, ...)".to_string(),
+                ));
             } else {
                 if let Some(t) = infer_type(&args[0], scope)
                     && !compatible(&t, &ValType::Base(BaseType::Chars))
                 {
-                    errors.push(rule_error(rule_name, format!("join_by() separator must be chars, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("join_by() separator must be chars, got {:?}", t),
+                    ));
                 }
                 check_join_values("join_by", args, 1, scope, rule_name, errors);
             }
         }
         "substr" => {
             if args.len() != 2 && args.len() != 3 {
-                errors.push(rule_error(rule_name, "substr() requires 2 or 3 arguments: (text, start, [length])".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "substr() requires 2 or 3 arguments: (text, start, [length])".to_string(),
+                ));
             } else {
                 if let Some(t) = infer_type(&args[0], scope)
                     && !compatible(&t, &ValType::Base(BaseType::Chars))
                 {
-                    errors.push(rule_error(rule_name, format!("substr() first argument must be chars, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("substr() first argument must be chars, got {:?}", t),
+                    ));
                 }
                 if let Some(t) = infer_type(&args[1], scope)
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("substr() second argument must be numeric, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("substr() second argument must be numeric, got {:?}", t),
+                    ));
                 }
                 if args.len() == 3
                     && let Some(t) = infer_type(&args[2], scope)
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("substr() third argument must be numeric, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("substr() third argument must be numeric, got {:?}", t),
+                    ));
                 }
             }
         }
         "replace" => {
             if args.len() != 3 {
-                errors.push(rule_error(rule_name, "replace() requires exactly 3 arguments: (text, pattern, replacement)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "replace() requires exactly 3 arguments: (text, pattern, replacement)"
+                        .to_string(),
+                ));
             } else {
                 // text + replacement must be chars
                 for (i, arg) in [0usize, 2usize].iter().copied().enumerate() {
@@ -506,86 +824,139 @@ fn check_str_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors:
                         && !compatible(&t, &ValType::Base(BaseType::Chars))
                     {
                         let pos = if i == 0 { 1 } else { 3 };
-                        errors.push(rule_error(rule_name, format!("replace() argument {} must be chars, got {:?}", pos, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!("replace() argument {} must be chars, got {:?}", pos, t),
+                        ));
                     }
                 }
                 // pattern should be a valid regex string literal
                 match &args[1] {
                     Expr::StringLit(pat) => {
                         if regex_syntax::Parser::new().parse(pat).is_err() {
-                            errors.push(rule_error(rule_name, format!("replace() pattern \"{}\" is not valid regex", pat)));
+                            errors.push(rule_error(
+                                rule_name,
+                                format!("replace() pattern \"{}\" is not valid regex", pat),
+                            ));
                         }
                     }
                     _ => {
-                        errors.push(rule_error(rule_name,  "replace() second argument must be a string literal regex pattern".to_string()));
+                        errors.push(rule_error(
+                            rule_name,
+                            "replace() second argument must be a string literal regex pattern"
+                                .to_string(),
+                        ));
                     }
                 }
             }
         }
         "replace_plain" => {
             if args.len() != 3 {
-                errors.push(rule_error(rule_name, "replace_plain() requires exactly 3 arguments: (text, from, to)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "replace_plain() requires exactly 3 arguments: (text, from, to)".to_string(),
+                ));
             } else {
                 for (i, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
                         && !compatible(&t, &ValType::Base(BaseType::Chars))
                     {
-                        errors.push(rule_error(rule_name, format!("replace_plain() argument {} must be chars, got {:?}", i + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!(
+                                "replace_plain() argument {} must be chars, got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        ));
                     }
                 }
             }
         }
         "trim" => {
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, "trim() requires exactly 1 argument".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "trim() requires exactly 1 argument".to_string(),
+                ));
             } else if let Some(t) = infer_type(&args[0], scope)
                 && !compatible(&t, &ValType::Base(BaseType::Chars))
             {
-                errors.push(rule_error(rule_name, format!("trim() argument must be chars, got {:?}", t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("trim() argument must be chars, got {:?}", t),
+                ));
             }
         }
         "ltrim" | "rtrim" => {
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() requires exactly 1 argument", name),
+                ));
             } else if let Some(t) = infer_type(&args[0], scope)
                 && !compatible(&t, &ValType::Base(BaseType::Chars))
             {
-                errors.push(rule_error(rule_name, format!("{}() argument must be chars, got {:?}", name, t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() argument must be chars, got {:?}", name, t),
+                ));
             }
         }
         "concat" if args.is_empty() => {
-            errors.push(rule_error(rule_name, "concat() requires at least 1 argument".to_string()));
+            errors.push(rule_error(
+                rule_name,
+                "concat() requires at least 1 argument".to_string(),
+            ));
         }
         "concat" => {}
         "indexof" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "indexof() requires exactly 2 arguments: (text, needle)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "indexof() requires exactly 2 arguments: (text, needle)".to_string(),
+                ));
             } else {
                 for (i, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
                         && !compatible(&t, &ValType::Base(BaseType::Chars))
                     {
-                        errors.push(rule_error(rule_name, format!("indexof() argument {} must be chars, got {:?}", i + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!("indexof() argument {} must be chars, got {:?}", i + 1, t),
+                        ));
                     }
                 }
             }
         }
         "lower" | "upper" => {
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() requires exactly 1 argument", name),
+                ));
             } else if let Some(t) = infer_type(&args[0], scope)
                 && !compatible(&t, &ValType::Base(BaseType::Chars))
             {
-                errors.push(rule_error(rule_name, format!("{}() argument must be chars, got {:?}", name, t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() argument must be chars, got {:?}", name, t),
+                ));
             }
         }
         "len" => {
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, "len() requires exactly 1 argument".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "len() requires exactly 1 argument".to_string(),
+                ));
             } else if let Some(t) = infer_type(&args[0], scope)
                 && !compatible(&t, &ValType::Base(BaseType::Chars))
             {
-                errors.push(rule_error(rule_name, format!("len() argument must be chars, got {:?}", t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("len() argument must be chars, got {:?}", t),
+                ));
             }
         }
         // L3 Collection functions (M28.2)
@@ -594,43 +965,70 @@ fn check_str_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors:
 }
 
 /// pattern 类内建函数检查（2026-09-03 自 check_str_func 拆出；arm 原样搬移）。
-fn check_pattern_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+fn check_pattern_func(
+    ctx: &FuncCheckCtx<'_, '_>,
+    name: &str,
+    args: &[Expr],
+    errors: &mut Vec<CheckError>,
+) {
     let scope = ctx.scope;
     let rule_name = ctx.rule_name;
     match name {
         "regex_match" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "regex_match() requires exactly 2 arguments: (field, pattern)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "regex_match() requires exactly 2 arguments: (field, pattern)".to_string(),
+                ));
             } else {
                 // First argument should be Chars
                 if let Some(t) = infer_type(&args[0], scope)
                     && !compatible(&t, &ValType::Base(BaseType::Chars))
                 {
-                    errors.push(rule_error(rule_name, format!("regex_match() first argument must be chars, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("regex_match() first argument must be chars, got {:?}", t),
+                    ));
                 }
                 // Second argument should be a string literal (compile-time regex check)
                 match &args[1] {
                     Expr::StringLit(pat) => {
                         if regex_syntax::Parser::new().parse(pat).is_err() {
-                            errors.push(rule_error(rule_name, format!("regex_match() pattern \"{}\" is not valid regex", pat)));
+                            errors.push(rule_error(
+                                rule_name,
+                                format!("regex_match() pattern \"{}\" is not valid regex", pat),
+                            ));
                         }
                     }
                     _ => {
-                        errors.push(rule_error(rule_name,  "regex_match() second argument must be a string literal pattern".to_string()));
+                        errors.push(rule_error(
+                            rule_name,
+                            "regex_match() second argument must be a string literal pattern"
+                                .to_string(),
+                        ));
                     }
                 }
             }
         }
         "cidr_match" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "cidr_match() requires exactly 2 arguments: (ip, subnet)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "cidr_match() requires exactly 2 arguments: (ip, subnet)".to_string(),
+                ));
             } else {
                 // First argument: IP 字段（Ip）或字符串（Chars）都可。
                 if let Some(t) = infer_type(&args[0], scope)
                     && !compatible(&t, &ValType::Base(BaseType::Chars))
                     && !matches!(t, ValType::Base(BaseType::Ip))
                 {
-                    errors.push(rule_error(rule_name, format!("cidr_match() first argument must be an IP or string field, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!(
+                            "cidr_match() first argument must be an IP or string field, got {:?}",
+                            t
+                        ),
+                    ));
                 }
                 // Second argument: 字符串字面量，编译期校验 CIDR 合法性。
                 match &args[1] {
@@ -640,46 +1038,74 @@ fn check_pattern_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], err
                         }
                     }
                     _ => {
-                        errors.push(rule_error(rule_name, "cidr_match() second argument must be a string literal CIDR".to_string()));
+                        errors.push(rule_error(
+                            rule_name,
+                            "cidr_match() second argument must be a string literal CIDR"
+                                .to_string(),
+                        ));
                     }
                 }
             }
         }
         "contains" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "contains() requires exactly 2 arguments: (haystack, needle)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "contains() requires exactly 2 arguments: (haystack, needle)".to_string(),
+                ));
             } else {
                 for (i, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
                         && !compatible(&t, &ValType::Base(BaseType::Chars))
                     {
-                        errors.push(rule_error(rule_name, format!("contains() argument {} must be chars, got {:?}", i + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!("contains() argument {} must be chars, got {:?}", i + 1, t),
+                        ));
                     }
                 }
             }
         }
         "startswith" | "endswith" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 2 arguments: (text, prefix_or_suffix)", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!(
+                        "{}() requires exactly 2 arguments: (text, prefix_or_suffix)",
+                        name
+                    ),
+                ));
             } else {
                 for (i, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
                         && !compatible(&t, &ValType::Base(BaseType::Chars))
                     {
-                        errors.push(rule_error(rule_name, format!("{}() argument {} must be chars, got {:?}", name, i + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!("{}() argument {} must be chars, got {:?}", name, i + 1, t),
+                        ));
                     }
                 }
             }
         }
         "startswith_any" | "endswith_any" => {
             if args.len() < 2 {
-                errors.push(rule_error(rule_name, format!("{}() requires at least 2 arguments: (text, prefix_or_suffix, ...)", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!(
+                        "{}() requires at least 2 arguments: (text, prefix_or_suffix, ...)",
+                        name
+                    ),
+                ));
             } else {
                 for (i, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
                         && !compatible(&t, &ValType::Base(BaseType::Chars))
                     {
-                        errors.push(rule_error(rule_name, format!("{}() argument {} must be chars, got {:?}", name, i + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!("{}() argument {} must be chars, got {:?}", name, i + 1, t),
+                        ));
                     }
                 }
             }
@@ -689,55 +1115,87 @@ fn check_pattern_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], err
 }
 
 /// hash 类内建函数检查（2026-09-03 自 check_str_func 拆出；arm 原样搬移）。
-fn check_hash_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+fn check_hash_func(
+    ctx: &FuncCheckCtx<'_, '_>,
+    name: &str,
+    args: &[Expr],
+    errors: &mut Vec<CheckError>,
+) {
     let scope = ctx.scope;
     let rule_name = ctx.rule_name;
     match name {
         "md5" | "sha1" | "sha256" | "hex" => {
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() requires exactly 1 argument", name),
+                ));
             } else if let Some(t) = infer_type(&args[0], scope)
                 && !compatible(&t, &ValType::Base(BaseType::Chars))
             {
-                errors.push(rule_error(rule_name, format!("{}() argument must be chars, got {:?}", name, t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() argument must be chars, got {:?}", name, t),
+                ));
             }
         }
         "sha1_n" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "sha1_n() requires exactly 2 arguments: (text, length)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "sha1_n() requires exactly 2 arguments: (text, length)".to_string(),
+                ));
             } else {
                 if let Some(t) = infer_type(&args[0], scope)
                     && !compatible(&t, &ValType::Base(BaseType::Chars))
                 {
-                    errors.push(rule_error(rule_name, format!("sha1_n() first argument must be chars, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("sha1_n() first argument must be chars, got {:?}", t),
+                    ));
                 }
                 if let Some(t) = infer_type(&args[1], scope)
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("sha1_n() second argument must be numeric, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("sha1_n() second argument must be numeric, got {:?}", t),
+                    ));
                 }
                 match &args[1] {
                     Expr::Number(n)
                         if n.is_finite() && n.fract() == 0.0 && *n >= 1.0 && *n <= 40.0 => {}
-                    Expr::Number(_) => errors.push(rule_error(rule_name, "sha1_n() length must be an integer from 1 to 40".to_string())),
+                    Expr::Number(_) => errors.push(rule_error(
+                        rule_name,
+                        "sha1_n() length must be an integer from 1 to 40".to_string(),
+                    )),
                     _ => {}
                 }
             }
         }
         "stable_id" => {
             if args.len() < 2 {
-                errors.push(rule_error(rule_name, "stable_id() requires at least 2 arguments: (prefix, value, ...)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "stable_id() requires at least 2 arguments: (prefix, value, ...)".to_string(),
+                ));
             } else {
                 if let Some(t) = infer_type(&args[0], scope)
                     && !compatible(&t, &ValType::Base(BaseType::Chars))
                 {
-                    errors.push(rule_error(rule_name, format!("stable_id() prefix must be chars, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("stable_id() prefix must be chars, got {:?}", t),
+                    ));
                 }
                 for (i, arg) in args.iter().enumerate().skip(1) {
                     if let Some(t) = infer_type(arg, scope)
                         && !is_scalar_stringable_type(&t)
                     {
-                        errors.push(rule_error(rule_name, format!("stable_id() argument {} must be scalar, got {:?}", i + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!("stable_id() argument {} must be scalar, got {:?}", i + 1, t),
+                        ));
                     }
                 }
             }
@@ -747,76 +1205,142 @@ fn check_hash_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors
 }
 
 /// mv 类内建函数检查（2026-09-03 自 check_func_call 拆出；arm 原样搬移）。
-fn check_mv_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+fn check_mv_func(
+    ctx: &FuncCheckCtx<'_, '_>,
+    name: &str,
+    args: &[Expr],
+    errors: &mut Vec<CheckError>,
+) {
     let scope = ctx.scope;
     let rule_name = ctx.rule_name;
     match name {
         "mvcount" => {
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, "mvcount() requires exactly 1 argument".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "mvcount() requires exactly 1 argument".to_string(),
+                ));
             } else if let Some(t) = infer_type(&args[0], scope)
                 && !is_array_like(&t)
             {
-                errors.push(rule_error(rule_name, format!("mvcount() argument must be an array expression, got {:?}", t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!(
+                        "mvcount() argument must be an array expression, got {:?}",
+                        t
+                    ),
+                ));
             }
         }
         "mvjoin" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "mvjoin() requires exactly 2 arguments: (array_expr, separator)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "mvjoin() requires exactly 2 arguments: (array_expr, separator)".to_string(),
+                ));
             } else {
                 if let Some(t) = infer_type(&args[0], scope)
                     && !is_array_like(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("mvjoin() first argument must be an array expression, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!(
+                            "mvjoin() first argument must be an array expression, got {:?}",
+                            t
+                        ),
+                    ));
                 }
                 if let Some(t) = infer_type(&args[1], scope)
                     && !compatible(&t, &ValType::Base(BaseType::Chars))
                 {
-                    errors.push(rule_error(rule_name, format!("mvjoin() second argument must be chars separator, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!(
+                            "mvjoin() second argument must be chars separator, got {:?}",
+                            t
+                        ),
+                    ));
                 }
             }
         }
         "split" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "split() requires exactly 2 arguments: (text, separator)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "split() requires exactly 2 arguments: (text, separator)".to_string(),
+                ));
             } else {
                 if let Some(t) = infer_type(&args[0], scope)
                     && !compatible(&t, &ValType::Base(BaseType::Chars))
                 {
-                    errors.push(rule_error(rule_name, format!("split() first argument must be chars, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("split() first argument must be chars, got {:?}", t),
+                    ));
                 }
                 if let Some(t) = infer_type(&args[1], scope)
                     && !compatible(&t, &ValType::Base(BaseType::Chars))
                 {
-                    errors.push(rule_error(rule_name, format!("split() second argument must be chars, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("split() second argument must be chars, got {:?}", t),
+                    ));
                 }
             }
         }
         "mvdedup" => {
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, "mvdedup() requires exactly 1 argument".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "mvdedup() requires exactly 1 argument".to_string(),
+                ));
             } else if let Some(t) = infer_type(&args[0], scope)
                 && !is_array_like(&t)
             {
-                errors.push(rule_error(rule_name, format!("mvdedup() argument must be an array expression, got {:?}", t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!(
+                        "mvdedup() argument must be an array expression, got {:?}",
+                        t
+                    ),
+                ));
             }
         }
         "mvsort" | "mvreverse" => {
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() requires exactly 1 argument", name),
+                ));
             } else if let Some(t) = infer_type(&args[0], scope)
                 && !is_array_like(&t)
             {
-                errors.push(rule_error(rule_name, format!("{}() argument must be an array expression, got {:?}", name, t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!(
+                        "{}() argument must be an array expression, got {:?}",
+                        name, t
+                    ),
+                ));
             }
         }
         "mvindex" => {
             if args.len() != 2 && args.len() != 3 {
-                errors.push(rule_error(rule_name,  "mvindex() requires 2 or 3 arguments: (array_expr, index, [end_index])".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "mvindex() requires 2 or 3 arguments: (array_expr, index, [end_index])"
+                        .to_string(),
+                ));
             } else {
                 if let Some(t) = infer_type(&args[0], scope) {
                     if !is_array_like(&t) {
-                        errors.push(rule_error(rule_name, format!("mvindex() first argument must be an array expression, got {:?}", t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!(
+                                "mvindex() first argument must be an array expression, got {:?}",
+                                t
+                            ),
+                        ));
                     } else if args.len() == 2
                         && matches!(t, ValType::ArrayAny | ValType::EmptyArray)
                     {
@@ -826,19 +1350,34 @@ fn check_mv_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: 
                 if let Some(t) = infer_type(&args[1], scope)
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("mvindex() second argument must be numeric index, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!(
+                            "mvindex() second argument must be numeric index, got {:?}",
+                            t
+                        ),
+                    ));
                 }
                 if args.len() == 3
                     && let Some(t) = infer_type(&args[2], scope)
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("mvindex() third argument must be numeric index, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!(
+                            "mvindex() third argument must be numeric index, got {:?}",
+                            t
+                        ),
+                    ));
                 }
             }
         }
         "mvappend" => {
             if args.is_empty() {
-                errors.push(rule_error(rule_name, "mvappend() requires at least 1 argument".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "mvappend() requires at least 1 argument".to_string(),
+                ));
             } else {
                 let mut element_type: Option<ValType> = None;
                 for (idx, arg) in args.iter().enumerate() {
@@ -861,7 +1400,15 @@ fn check_mv_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: 
                         {
                             element_type = Some(unified);
                         } else {
-                            errors.push(rule_error(rule_name, format!("mvappend() argument {} type {:?} is not compatible with {:?}", idx + 1, arg_element_type, existing)));
+                            errors.push(rule_error(
+                                rule_name,
+                                format!(
+                                    "mvappend() argument {} type {:?} is not compatible with {:?}",
+                                    idx + 1,
+                                    arg_element_type,
+                                    existing
+                                ),
+                            ));
                         }
                     } else {
                         element_type = Some(arg_element_type);
@@ -874,7 +1421,12 @@ fn check_mv_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: 
 }
 
 /// misc 类内建函数检查（2026-09-03 自 check_func_call 拆出；arm 原样搬移）。
-fn check_misc_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors: &mut Vec<CheckError>) {
+fn check_misc_func(
+    ctx: &FuncCheckCtx<'_, '_>,
+    name: &str,
+    args: &[Expr],
+    errors: &mut Vec<CheckError>,
+) {
     let scope = ctx.scope;
     let rule_name = ctx.rule_name;
     let allow_mixed_coalesce = ctx.allow_mixed_coalesce;
@@ -882,29 +1434,44 @@ fn check_misc_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors
         "has" => {
             // T11-T13: window.has() checks
             if args.is_empty() || args.len() > 2 {
-                errors.push(rule_error(rule_name, "has() expects 1 or 2 arguments".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "has() expects 1 or 2 arguments".to_string(),
+                ));
             }
             // T12: second argument must be a string literal
             if args.len() == 2 && !matches!(args[1], Expr::StringLit(_)) {
-                errors.push(rule_error(rule_name, "has() second argument must be a string literal (field name)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "has() second argument must be a string literal (field name)".to_string(),
+                ));
             }
         }
         "baseline" => {
             // T26: baseline(expr, dur) or baseline(expr, dur, method)
             if args.len() != 2 && args.len() != 3 {
-                errors.push(rule_error(rule_name, "baseline() requires 2 or 3 arguments: (expr, duration, [method])".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "baseline() requires 2 or 3 arguments: (expr, duration, [method])".to_string(),
+                ));
             } else {
                 // First argument must be numeric
                 if let Some(t) = infer_type(&args[0], scope)
                     && !is_numeric(&t)
                 {
-                    errors.push(rule_error(rule_name, format!("baseline() first argument must be numeric, got {:?}", t)));
+                    errors.push(rule_error(
+                        rule_name,
+                        format!("baseline() first argument must be numeric, got {:?}", t),
+                    ));
                 }
                 // Second argument must be a positive number (duration in seconds)
                 match &args[1] {
                     Expr::Number(n) if *n > 0.0 => {} // OK
                     _ => {
-                        errors.push(rule_error(rule_name, "baseline() second argument must be a positive duration".to_string()));
+                        errors.push(rule_error(
+                            rule_name,
+                            "baseline() second argument must be a positive duration".to_string(),
+                        ));
                     }
                 }
                 // Third argument (if present) must be a string literal: "mean", "ewma", or "median"
@@ -925,7 +1492,10 @@ fn check_misc_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors
         }
         "coalesce" => {
             if args.is_empty() {
-                errors.push(rule_error(rule_name, "coalesce() requires at least 1 argument".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "coalesce() requires at least 1 argument".to_string(),
+                ));
             } else if !allow_mixed_coalesce {
                 let mut first_type: Option<ValType> = None;
                 for (idx, arg) in args.iter().enumerate() {
@@ -936,7 +1506,15 @@ fn check_misc_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors
                         if !(compatible(existing, &inferred)
                             || is_numeric(existing) && is_numeric(&inferred))
                         {
-                            errors.push(rule_error(rule_name, format!("coalesce() argument {} type {:?} is not compatible with {:?}", idx + 1, inferred, existing)));
+                            errors.push(rule_error(
+                                rule_name,
+                                format!(
+                                    "coalesce() argument {} type {:?} is not compatible with {:?}",
+                                    idx + 1,
+                                    inferred,
+                                    existing
+                                ),
+                            ));
                         }
                     } else {
                         first_type = Some(inferred);
@@ -946,39 +1524,64 @@ fn check_misc_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors
         }
         "merge" => {
             if args.is_empty() {
-                errors.push(rule_error(rule_name, "merge() requires at least 1 argument".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "merge() requires at least 1 argument".to_string(),
+                ));
             } else {
                 for (idx, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
                         && !compatible(&ValType::Object, &t)
                     {
-                        errors.push(rule_error(rule_name, format!("merge() argument {} must be object, got {:?}", idx + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!("merge() argument {} must be object, got {:?}", idx + 1, t),
+                        ));
                     }
                 }
             }
         }
         "isnull" | "isnotnull" if args.len() != 1 => {
-            errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument", name)));
+            errors.push(rule_error(
+                rule_name,
+                format!("{}() requires exactly 1 argument", name),
+            ));
         }
         "isnull" | "isnotnull" => {}
         "is_blank" | "null_if_blank" => {
             if args.len() != 1 {
-                errors.push(rule_error(rule_name, format!("{}() requires exactly 1 argument", name)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() requires exactly 1 argument", name),
+                ));
             } else if let Some(t) = infer_type(&args[0], scope)
                 && !compatible(&t, &ValType::Base(BaseType::Chars))
             {
-                errors.push(rule_error(rule_name, format!("{}() argument must be chars, got {:?}", name, t)));
+                errors.push(rule_error(
+                    rule_name,
+                    format!("{}() argument must be chars, got {:?}", name, t),
+                ));
             }
         }
         "default_if_blank" => {
             if args.len() != 2 {
-                errors.push(rule_error(rule_name, "default_if_blank() requires exactly 2 arguments: (text, default)".to_string()));
+                errors.push(rule_error(
+                    rule_name,
+                    "default_if_blank() requires exactly 2 arguments: (text, default)".to_string(),
+                ));
             } else {
                 for (i, arg) in args.iter().enumerate() {
                     if let Some(t) = infer_type(arg, scope)
                         && !compatible(&t, &ValType::Base(BaseType::Chars))
                     {
-                        errors.push(rule_error(rule_name, format!("default_if_blank() argument {} must be chars, got {:?}", i + 1, t)));
+                        errors.push(rule_error(
+                            rule_name,
+                            format!(
+                                "default_if_blank() argument {} must be chars, got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        ));
                     }
                 }
             }
@@ -987,12 +1590,11 @@ fn check_misc_func(ctx: &FuncCheckCtx<'_, '_>, name: &str, args: &[Expr], errors
     }
 }
 
-
 fn is_stat_selector_name(name: &str) -> bool {
     matches!(
         name,
         "window_event" | "match_event" | "match_distinct" | "trigger" | "final"
-   )
+    )
 }
 
 fn check_stat_func(
@@ -1003,7 +1605,10 @@ fn check_stat_func(
     errors: &mut Vec<CheckError>,
 ) {
     if args.len() != 1 {
-        errors.push(rule_error(rule_name, format!("stat.{name}() requires exactly 1 stat selector argument")));
+        errors.push(rule_error(
+            rule_name,
+            format!("stat.{name}() requires exactly 1 stat selector argument"),
+        ));
         return;
     }
 
@@ -1071,7 +1676,12 @@ fn check_stat_func(
         && let Some(info) = scope.stat_labels.get(symbol)
         && !matches!(info.measure, Measure::Count)
     {
-        errors.push(rule_error(rule_name, format!("stat.count(match_event({symbol})) requires step label `{symbol}` to use count")));
+        errors.push(rule_error(
+            rule_name,
+            format!(
+                "stat.count(match_event({symbol})) requires step label `{symbol}` to use count"
+            ),
+        ));
     }
 }
 
@@ -1086,22 +1696,37 @@ fn parse_stat_selector<'a>(
         args,
     } = expr
     else {
-        errors.push(rule_error(rule_name,  "stat functions require a selector such as window_event(alias) or trigger(label)".to_string()));
+        errors.push(rule_error(
+            rule_name,
+            "stat functions require a selector such as window_event(alias) or trigger(label)"
+                .to_string(),
+        ));
         return None;
     };
 
     if !is_stat_selector_name(name) {
-        errors.push(rule_error(rule_name, format!("unknown stat selector `{name}(...)`")));
+        errors.push(rule_error(
+            rule_name,
+            format!("unknown stat selector `{name}(...)`"),
+        ));
         return None;
     }
 
     if args.len() != 1 {
-        errors.push(rule_error(rule_name, format!("stat selector `{name}(...)` requires exactly 1 symbol argument")));
+        errors.push(rule_error(
+            rule_name,
+            format!("stat selector `{name}(...)` requires exactly 1 symbol argument"),
+        ));
         return None;
     }
 
     let Expr::Field(FieldRef::Simple(symbol)) = &args[0] else {
-        errors.push(rule_error(rule_name, format!("stat selector `{name}(...)` requires a static symbol argument, without quotes")));
+        errors.push(rule_error(
+            rule_name,
+            format!(
+                "stat selector `{name}(...)` requires a static symbol argument, without quotes"
+            ),
+        ));
         return None;
     };
 
@@ -1118,7 +1743,13 @@ fn check_label_stage(
 ) {
     match scope.stat_labels.get(label) {
         Some(info) if info.stage == expected_stage => {}
-        Some(_) => errors.push(rule_error(rule_name, format!("{context} requires step label `{label}` to come from {}", stat_label_stage_name(expected_stage)))),
+        Some(_) => errors.push(rule_error(
+            rule_name,
+            format!(
+                "{context} requires step label `{label}` to come from {}",
+                stat_label_stage_name(expected_stage)
+            ),
+        )),
         None => errors.push(unknown_label_error(rule_name, label, context)),
     }
 }

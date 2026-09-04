@@ -25,7 +25,11 @@ const PIPE_EVENT_TIME_FIELD: &str = "__wf_pipe_ts";
 const RULE_PRELUDE_FILE: &str = "_global.wfl";
 
 #[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.ReactorLifecycle")]
+#[moju(
+    kind = "struct",
+    domain = "Runtime",
+    module = "Runtime.ReactorLifecycle"
+)]
 struct ParsedRuleFile {
     path: PathBuf,
     source: String,
@@ -163,35 +167,16 @@ mod diag;
 // 使用 → #[allow(unused_imports)]（StatsBucket / accumulate_* 先例）。
 #[allow(unused_imports)]
 use diag::{
-    format_rule_check_error,
-    format_prelude_yield_preset_error,
-    backtick_tokens,
-    extract_backtick_token_after,
-    find_prelude_yield_preset_arg_location,
-    find_referenced_prelude_yield_preset_token_location,
-    find_prelude_yield_preset_token_location,
+    backtick_tokens, extract_backtick_token_after, find_named_arg_column, find_named_token_column,
+    find_nth_yield_preset_decl_location, find_prelude_yield_preset_arg_location,
+    find_prelude_yield_preset_token_location, find_referenced_prelude_yield_preset_token_location,
+    find_token_column, find_yield_preset_decl_location, format_prelude_yield_preset_error,
+    format_rule_check_error, is_ident_byte, is_ident_char, is_ident_start_byte, keyword_at,
+    line_declares_yield_preset, line_starts_yield_preset_decl, parse_yield_preset_decl_at,
+    skip_line_comment, skip_quoted_string, skip_ws_and_line_comments, source_line_column,
+    source_line_snippet, yield_preset_decl_locations, yield_preset_decl_rest,
     yield_preset_source_end,
-    find_yield_preset_decl_location,
-    find_nth_yield_preset_decl_location,
-    line_declares_yield_preset,
-    line_starts_yield_preset_decl,
-    yield_preset_decl_rest,
-    yield_preset_decl_locations,
-    parse_yield_preset_decl_at,
-    keyword_at,
-    skip_ws_and_line_comments,
-    skip_quoted_string,
-    skip_line_comment,
-    source_line_column,
-    is_ident_start_byte,
-    is_ident_byte,
-    find_named_arg_column,
-    find_token_column,
-    find_named_token_column,
-    is_ident_char,
-    source_line_snippet,
 };
-
 
 fn rule_prelude_path(glob_pattern: &str, base_dir: &Path) -> PathBuf {
     rule_glob_root(glob_pattern, base_dir).join(RULE_PRELUDE_FILE)
@@ -765,7 +750,6 @@ fn measure_output_name(measure: Measure) -> &'static str {
         _ => "measure",
     }
 }
-
 
 #[cfg(test)]
 #[path = "compile_tests.rs"]

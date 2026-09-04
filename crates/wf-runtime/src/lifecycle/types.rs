@@ -50,7 +50,11 @@ const ABORT_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 /// This ensures upstream producers exit before downstream consumers,
 /// and consumers can drain all in-flight work before the reactor stops.
 #[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.ReactorLifecycle")]
+#[moju(
+    kind = "struct",
+    domain = "Runtime",
+    module = "Runtime.ReactorLifecycle"
+)]
 pub(crate) struct TaskGroup {
     pub(super) name: &'static str,
     handles: Vec<JoinHandle<RuntimeResult<()>>>,
@@ -244,7 +248,11 @@ mod tests {
 
 #[allow(clippy::large_enum_variant)] // Match carries the compiled MatchPlan; boxing it would churn the hot path
 #[derive(::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Runtime", module = "Runtime.ReactorLifecycle")]
+#[moju(
+    kind = "state",
+    domain = "Runtime",
+    module = "Runtime.ReactorLifecycle"
+)]
 pub(crate) enum RunRuleKind {
     Match {
         match_plan: MatchPlan,
@@ -264,7 +272,11 @@ pub(crate) enum RunRuleKind {
 /// Pairs a rule execution kind with its [`RuleExecutor`] and precomputed
 /// routing from stream names to CEP aliases.
 #[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.ReactorLifecycle")]
+#[moju(
+    kind = "struct",
+    domain = "Runtime",
+    module = "Runtime.ReactorLifecycle"
+)]
 pub(crate) struct RunRule {
     pub kind: RunRuleKind,
     pub executor: RuleExecutor,
@@ -279,7 +291,11 @@ pub(crate) struct RunRule {
 
 /// Compiled artifacts from the config-loading phase, ready for task spawning.
 #[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.ReactorLifecycle")]
+#[moju(
+    kind = "struct",
+    domain = "Runtime",
+    module = "Runtime.ReactorLifecycle"
+)]
 pub(crate) struct BootstrapData {
     pub rules: Vec<RunRule>,
     pub router: std::sync::Arc<wf_engine::window::Router>,

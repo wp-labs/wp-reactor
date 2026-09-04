@@ -35,7 +35,7 @@ pub(crate) struct IngestLimiter {
 }
 
 impl IngestLimiter {
-pub(crate) fn new(rate_per_sec: usize) -> Arc<Self> {
+    pub(crate) fn new(rate_per_sec: usize) -> Arc<Self> {
         Arc::new(Self {
             rate_per_sec: rate_per_sec as f64,
             tokens: Mutex::new(rate_per_sec as f64),
@@ -46,7 +46,7 @@ pub(crate) fn new(rate_per_sec: usize) -> Arc<Self> {
     /// Consume `events` tokens, sleeping as needed to keep the long-run rate ≤
     /// `rate_per_sec`. Guards are scoped to a block so no `MutexGuard` crosses
     /// the `.await` (std guards are not `Send`).
-pub(crate) async fn acquire(&self, events: usize) {
+    pub(crate) async fn acquire(&self, events: usize) {
         let n = events.max(1) as f64;
         let wait = {
             let mut tokens = self.tokens.lock().unwrap();
