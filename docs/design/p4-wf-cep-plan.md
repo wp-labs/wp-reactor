@@ -1,6 +1,6 @@
 # P4 规划：抽取纯语义 crate `wf-cep`
 
-> 状态：方案评审稿（2026-09-03）· 决策 D1 定名 `wf-cep` · 未开工
+> 状态：方案评审稿（2026-09-03）· 决策 D1 定名 `wf-cep` · v0.1/v0.2 已交付（片 1-3）· 片 4-6 立项决定见文末（2026-09-04 v0.3）
 > 背景：结构性待办 P4——把不依赖 tokio/arrow 的纯语义逻辑从 `wf-engine`(118k)
 > 单 crate 中抽出，立编译器强制依赖墙，缩短语义测试迭代，为差分/性质测试铺路。
 
@@ -130,3 +130,51 @@ builder helpers（供 engine 剩测/bench 使用；避免重复实现）。
 - **片 4-6（搁置，需独立排期）**：cep types 切分 + event_bridge/key/eval 下沉
   同步执行核；若未来要「语义层独立秒测」，前提是**列式行表示抽象化设计**
   （泛型/擦除 ColumnarEvent 句柄），应单独立项评审后再动。
+
+---
+
+## 立项决定（2026-09-04，v0.3）：片 4-6 以「直接搬迁」立项（X），列式抽象化（Y）降级
+
+- **立项 X**：片 4-6 同步执行核**直接搬迁** wf-cep——cep 11.8k（2026-09-04 实测
+  11,829 含 eval/tests）+ event_bridge 族 1.5k（含 views/tests）+ types.rs 541 行切分；
+  **接受 arrow 数据面**（决策 A 墙内），不引入列式行表示抽象。
+- **降级 Y**：列式行表示抽象化（泛型/擦除 ColumnarEvent 句柄）**不做**；仅当出现
+  第二行表示消费方，或 P0-3 差分/proptest 大规模铺开后 arrow 编译成实际瓶颈时
+  重新立项（届时在 X 地基上接口面已清晰，评估成本大幅下降）。
+
+### 立项论据（2026-09-04 评审：迭代/性能 + 可维护/可读两维度）
+
+1. **边界锁死**：30+ 刀文件级拆分后 cep/event_bridge/columnar 边界已现成（cep 目录
+   即新 crate 骨架），但全是 `pub(crate)` 纸面边界——同一 crate 内靠纪律不靠编译
+   器，必回潮；crate 墙（孤儿规则 + 依赖方向 + 可见性）是唯一能兑现那 30 刀投入
+   的方式。
+2. **测试信号纯化**：语义测试（l2/l3/accu/seq/close/core_coverage，数百个）现与
+   columnar/executor/spill 混居 wf-engine 116.7k 行单体，且 cep 自带测试被迫
+   `tokio::test`、受 async 偶发 flaky 污染回归信号（async_persist 案例）；X 后
+   `cargo test -p wf-cep` = 纯语义信号，定位面砍半。
+3. **叶子化**：wf-cep 只依赖 wf-lang，内部改动不触碰 engine；语义迭代/proptest
+   落点独立。实测增量 `-p wf-engine --lib` 1334 测试 2.35s 非瓶颈（不构成 Y 的
+   「秒测」理由）；wf-runtime 30s 固定 sleep 集成测试为真瓶颈，两案均不影响。
+4. **代价对比**：X 的代价 = 一次定型的 shim 胶水面（片 6 门面收缩可控）；Y 的代价 =
+   概念税（「双表示」复杂度搬家而非消除）+ 跨 crate trait 永久接口负债 + 快路径
+   类型体操，单一消费方下属 YAGNI。
+
+### 立项条款（交付标准，防长期债）
+
+- **条款 1（shim 最小化）**：片 6 收尾门面收缩，`match_engine::{…}` 改从 wf-cep
+  重导出，engine shim/转发面压到最小、不留长期转发债（crate 级一次定型，对齐坑
+  #12/#24 的 re-export 三约束经验）。
+- **条款 2（类型归属自然度 = S1 评审门）**：cep/types.rs 541 行切分若出现
+  Event/FieldSource 等类型被迫留 engine 的不自然归属（孤儿/双向 impl 咬合），说明
+  墙的画法不对——回头重审边界（含局部 Y 抽象），不留「类型放错层」的长期别扭布局。
+
+### 排期（沿用决策 A 切片节奏，每片绿闸推进）
+
+| 步 | 内容 | 门禁 |
+|---|---|---|
+| S1 | cep/types.rs 切分方案 + cep 11.8k + event_bridge 1.5k 整迁 + testkit（engine 剩测对 cep pub(crate) 访问点收敛） | wf-cep 编译 + engine 剩测全绿 |
+| S2 | 测试归位最终清单（l2/l3/accu/seq/close/core_coverage 对 executor/columnar import 扫描后定，P4 §4「移前必查」） | 全量测试 + llvm-cov 覆盖对比 |
+| S3 | CI 墙校验（已有）+ bench q1/q5/q13 对照 | CI 绿 + 性能数字对照 |
+| S4 | CHANGELOG 2.1.0 候选 → tag → warp-fusion 升依赖跨仓验证 | 跨仓库绿 |
+
+- 工作量重估：S1 主体 1-2 天（沿用 2026-09-03 判定）；S2 0.5-1 天（以最终清单为准）。
