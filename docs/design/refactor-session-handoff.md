@@ -1,11 +1,11 @@
-# 结构性重构：任务进展交接（2026-09-04 v6 快照 — 17 个超大型文件全部拆分完成）
+# 结构性重构：任务进展交接（2026-09-04 v7 快照 — 全仓 >1500 行文件拆分完成）
 
 > 本文件记录 wp-reactor/warp-fusion 结构性重构进行中状态，供新 session 直接续接。
 > 配套方案文档：`docs/design/p4-wf-cep-plan.md`；发布条目：`CHANGELOG.md [2.0.17]`。
 
-## 0. 仓库与分支状态（2026-09-04，17 刀拆分已提交、未 push）
+## 0. 仓库与分支状态（2026-09-04，13 刀拆分已提交、未 push）
 
-- **wp-reactor @ main = `1858c51`**，**领先 origin/main 17 笔未 push**（`572b725` … `1858c51`，见 §3.6/§6）。origin/main = `d9d3c2f`（v5 快照，已推）。工作树干净（本文档提交后）。
+- **wp-reactor @ main = `31b741f`**，**领先 origin/main 13 笔未 push**（`e4c6c3e` … `31b741f`，见 §3.7/§6）。origin/main = `e3fba4c`（v6 快照，已推）。工作树干净（本文档提交后）。
 - **tags `v2.0.16` + `v2.0.17` 均已推 origin**。工作树干净（moju 产物已提交）。
 - **warp-fusion @ alpha**：仍为**本地 path 依赖**（`@gxl:block(local_reactor)`，git tag 块注释停 v2.0.15）；工作树 `M Cargo.toml` + `M Cargo.lock` **未提交**（会破坏他人构建）。**下一步：切 `tag = "v2.0.17"` 并定本地块去留**（需用户决策）。
 - wf-skills 已同步。
@@ -80,14 +80,32 @@
 | `engine_task/deferred_integration_tests.rs` 3023 | 655 | deferred_q9 563 / q8 673 / q13 462 / q13_sharded 565 / wfl 170（31 测试） |
 | `engine_task/rule_task_bench.rs` 2366 | 233 | bench_pipe 583 / join 525 / alloc 923 / row_loop 135 |
 
+## 3.7 已完成：全仓 >1500 行文件拆分（2026-09-04，测试 6 + 生产 7，13 刀；提交 `e4c6c3e`…`31b741f`）
+
+> 门禁同 §3.6（每刀 + 每波 consolidated；origin/main 已在 e3fba4c，本批 13 笔未 push）。拆分后全仓最大文件 = `lifecycle/spawn.rs` 1489（此前已判定无再拆候选）。
+
+**生产拆件（7，含 4 个 hub/dir-module）**：
+
+| 文件 | 收口 | 子模块 |
+|---|---|---|
+| `event_bridge.rs` 1509（pub mod） | 368 | event_bridge_views.rs 539（ColumnarEvent/JoinRow/TriggerEvent 列式视图面）+ event_bridge_tests.rs 647（内联测试外移）；23 pub 项逐条核对 0 遗失 |
+| `metrics/mod.rs` 1510（pub mod） | 553 | counters.rs 678（impl RuntimeMetrics 全量下沉）+ records.rs 311（impl MetricsSnapshot::to_records）；只搬 impl 不移动项声明 → 零 re-export 新增 |
+| `alert/column_batch.rs` 1581 | 294 | column_batch_stage.rs 463 + column_batch_commit.rs 264（impl AlertColumnBuilder 按方法边界切两块）+ column_batch_tests.rs 604；struct 全留父面，零 pub 项移入 |
+| `match_engine/spill.rs` 1588（pub mod） | 41 | spill_store.rs 173（trait+Mem）+ spill_redb.rs 383 + spill_serde.rs 580（手写字节编解码）+ spill_tests.rs 459；模块名 redb→redb_store 避 extern crate 同名遮蔽（E0659/E0425）；14 pub 项全保留 |
+| `executor/mod.rs` 1613（hub） | 251 | plan_analysis.rs 508（构造期静态分析族）+ rule_exec.rs 901（impl RuleExecutor 整块下沉 + 尾部原语簇）；声明/re-export 区原位保留；YieldKind/OutputStatic/ReduceLabelReads 交叉密集留 hub |
+| `cep/mod.rs` 1986（目录 hub） | 576 | advance.rs 290（advance 入口家族）+ window.rs 790（advance_window 单方法 ~740 行整块）+ expiry.rs 393（close/scan_expired）；6 私有方法提 pub(super)，零 pub 提级；match_engine/mod.rs 零改动 |
+| `compiler/mod.rs` 1680（wf-lang） | 85 | rules.rs 610 + match_build.rs 234 + bind_tracking.rs 365 + clause_build.rs 444；测试消费项 `#[cfg(test)] pub(crate) use` 门控（lib 无生产消费） |
+
+**测试拆件（6，原样搬移）**：`l2/expr.rs` 1612→18（expr_control/time/funcs 3 模块 41 测试）· `columnar_tests.rs` 1622→90（guard 950 / output 605，32 测试）· `receiver/tests.rs` 1697→252（file_replay 632 / arrow_coerce 425 / route_dispatch 422）· `stats_spill_test.rs` 1714→171（mem 682 / shared 475 / redb 368，27 测试）· `close_bench.rs` 1729→304（q15_cep 338 / stats_hotpath 797 / stats_merge 333）· `direct_tests.rs` 1831→99（join 826 / row 439 / columnar 504，19 测试）。
+
 ## 4. 待办积压（按优先级）
 
 1. **#1 H 尾 — machine 行内 emit 相位（~90 行）**：close/match emit 块仍内联在 `process_batch_machine_rows`（含 `&self` async `stage_or_emit_record` + `lookup`）。拆法 A = 每行 &mut self 方法 → 逐行 async future（热点不取）；拆法 B = 按 ALERT_BATCH_SIZE 批外收口 emit 节奏（需改 emit 时序 + 对拍）。当前评估：维持现状，勿为拆而拆。
-2. **可选拆件候选**（剩余）：全仓 >2000L 大文件已清（见 §3.6）。余量级候选：`columnar_tests.rs` 1622（原 mod tests 整体外移，子主题 guard ~1019 vs output ~604 可再切，需分置共享 helper）；`coverage_r4_close_each.rs`/`close_deferred.rs` 等 1300-1400L 新文件（仓库先例 ~1190 上界，不拆亦可）。columnar.rs/each_exec.rs 已**文件级**拆分完成——P4 片4-6 语义下沉仍待立项对表（现文件边界更清晰，是更好的对表基础）。
+2. **可选拆件候选**（剩余）：**全仓已无 >1500L 文件**（§3.6+§3.7 共 30 刀）。量级候选：`lifecycle/spawn.rs` 1489（receiver/metrics 两组已拆，剩余 alert/evictor/rule 任务组互相借用深，前判无再拆候选，如需可重评估）；`config_loader/fusion_tests.rs` 1476、`diagnostics.rs` 1445（wf-lang，样板集中）、`window/buffer/mod.rs` 1442、`window_lookup.rs` 1439、`cep/tests/coverage_r4.rs` 1411、`eval/builtins.rs` 1382（这些均在仓库既有先例上界 ~1400 附近，属「可拆可不拆」，未立项前不动）。columnar.rs/each_exec.rs/cep/mod.rs/event_bridge.rs 已**文件级**拆分——P4 片4-6 语义下沉仍待立项对表（现模块边界 = advance/window/expiry/views 等，是更好的对表基础）。
 3. **P4 片4-6**（cep/event_bridge/key/eval 同步执行核下沉 wf-cep）：搁置；前置 = 「列式行表示抽象化」设计立项（孤儿规则 + TriggerEvent 持 Arc<RecordBatch> 不可约层）。
 4. **warp-fusion 收尾**：切 `tag = "v2.0.17"` + 本地 path 块去留 + 重锁后 `cargo test --workspace` 复验。
 5. **fmt 存量漂移清理**（另会话）：固定 rustfmt 版本或一次性全仓格式化单独立提交，避免与 CI 打架。
-6. **push wp-reactor**：main 领先 origin 17 笔（572b725…1858c51，见 §3.6/§6）。
+6. **push wp-reactor**：main 领先 origin 13 笔（e4c6c3e…31b741f，见 §3.7/§6）。
 
 ## 5. 关键坑（再会话必读，含本会话新增）
 
@@ -122,6 +140,8 @@
 29. **大测试文件主题分片模板**（本会话 13 刀验证）：刀文件内 `#[path = "<name>.rs"] mod <name>;` 声明子模块（不改 parent mod.rs → 同 crate 多刀可并行不冲突）；新文件 = `//! 中文主题` + `use super::*;`（父私有项/use 绑定 glob 继承，零 use 清单）+ 原样切片（section banner 连续切，测试名/断言/属性零改动）；独占 helper 随搬防 dead_code，共享 harness/import 留父；搬后清父文件失用 import；子模块内 `super::` 因层级下沉失效处改 `crate::` 绝对路径（#15，deferred/eval/tests 三刀各踩）。搬移内容用「HEAD 重建比对/逐字节 diff + fn 名集合守恒」自检；lib 测试数守恒（1051/1334/606）为最终断言。
 30. **生产模块拆件可见性三形态**（fanout/each_exec/columnar/rule_task 四刀验证）：① 私有 mod（each_exec/fanout）：被消费项移子模块后父文件对等 re-export（源 ≥ re-export 级，E0364-safe）；struct 留父面 + impl 下沉（私有字段对 sibling 测试可见性只向下流，零提级最干净——fanout RuleFanout/columnar ColumnarBatch 先例）；② pub mod（columnar）：原 pub 项子模块内保持 pub + 父 `pub use` re-export，路径与可见级逐条对账（脚本 0 遗失）；③ impl 块按方法边界整块切（不破 impl），方法间只经 `&self`/模块级 helper 的组可拆；`&mut` 字段贯穿或超大单方法（~500 行）宁可不拆；私有方法移子模块提 `pub(super)`（有效域 = 父模块子树，含 sibling 测试直调面），入口方法提 `pub(crate)` + mod.rs 顶层 `#[allow(unused_imports)] use` re-bind（rule_task_run 先例）。
 31. **并行 agent 拆件协作**：多刀并发同树（各刀 in-file 声明 → 父文件零冲突）可行，但 cargo 锁串行化构建、且并行中间态会让工作树**短暂编译失败**（agent 误判外部会话/互相等待）——收尾后必须 consolidated 复跑三 crate 测试 + clippy×2 为准；agent 勿并发 commit（共享 index 竞态会互相吞文件）——由主控统一 add/commit 每刀。
+32. **hub/mod.rs 拆件法**（executor/cep/compiler/metrics 四 hub 验证）：root 保留「声明/re-export 区 + struct + 共享簿记」，impl 按方法组**整块下沉**子文件（`use super::*` 引类型，struct 留 root 则私有字段零提级——metrics counters/cep advance-window-expiry/executor rule_exec 先例）；超大单方法（advance_window ~740 行）与交叉密集类型组（YieldKind/OutputStatic/ReduceLabelReads 被 6+ sibling super:: 引用）宁留 hub；被测试消费的项用 `#[cfg(test)] pub(crate) use` 门控（lib 无生产消费点防 unused import，compiler bind_tracking 先例）。
+33. **子模块命名避 extern crate 同名**：`mod redb;` 会在父模块遮蔽 extern prelude（E0659/E0425）——改名 redb_store；同理会撞 crate 名的子模块命名前先想 extern prelude。
 
 ## 6. 自 v2.0.16 起提交清单
 
@@ -140,3 +160,8 @@ v6 前 17 刀（2026-09-04 超大型文件拆分，未 push，见 §3.6）：
 `572b725` test(wf-lang): checker/tests/coverage_extra.rs 分片 4 · `1b84507` test(wf-engine): executor/coverage_r4.rs 分片 3 · `b26d899` test(wf-engine): yield_tests.rs 分片 4 · `826beae` test(wf-engine): window/buffer/tests.rs 分片 4 · `49dee17` test(wf-runtime): stats_task_tests.rs 分片 3 · `4e7a566` test(wf-engine): executor/coverage_extra.rs 分片 8 · `bbbfde5` test(wf-engine): stats_exec_test.rs 分片 5 · `daf203a` test(wf-engine): eval/tests.rs 分片 6 · `6c8e517` test(wf-engine): core_coverage.rs 分片 4 · `cceaeb6` test(wf-runtime): deferred_integration_tests.rs 分片 5 · `f55b665` test(wf-engine): nexmark_hotpath_bench.rs 分片 3 · `f9cec9a` test(wf-runtime): engine_task/tests.rs 分片 7 · `9c91059` test(wf-runtime): rule_task_bench.rs 分片 4 · `b276cae` refactor(wf-engine): window/fanout 拆分 · `f4e27b2` refactor(wf-engine): columnar.rs 拆分 · `bfef438` refactor(wf-engine): each_exec.rs 拆分 · `1858c51` refactor(wf-runtime): rule_task/mod.rs 拆分
 
 （v6 快照本文档提交后）
+
+v7 前 13 刀（2026-09-04 >1500L 文件拆分，未 push，见 §3.7）：
+`e4c6c3e` test(wf-lang→wf-engine): l2/expr.rs 分片 3 · `a8b56a4` test(wf-engine): columnar_tests.rs 分片 2 · `4507dd2` test(wf-runtime): receiver/tests.rs 分片 3 · `3c41537` test(wf-engine): stats_spill_test.rs 分片 3 · `ca9dc88` test(wf-engine): close_bench.rs 分片 3 · `69d5e74` test(wf-engine): direct_tests.rs 分片 3 · `86f3abb` refactor(wf-engine): event_bridge.rs 拆分 · `da0b8c4` refactor(wf-engine): spill.rs 拆分 · `5a7d9ff` refactor(wf-engine): alert/column_batch.rs 拆分 · `c25a620` refactor(wf-runtime): metrics/mod.rs 拆分 · `a8aa49f` refactor(wf-engine): executor/mod.rs 拆分 · `5a87a63` refactor(wf-engine): cep/mod.rs 拆分 · `31b741f` refactor(wf-lang): compiler/mod.rs 拆分
+
+（v7 快照本文档提交后）
