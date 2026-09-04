@@ -1,11 +1,11 @@
-# 结构性重构：任务进展交接（2026-09-04 v7 快照 — 全仓 >1500 行文件拆分完成）
+# 结构性重构：任务进展交接（2026-09-04 v8 快照 — >1500 行文件拆分 + fmt 存量漂移清理完成）
 
 > 本文件记录 wp-reactor/warp-fusion 结构性重构进行中状态，供新 session 直接续接。
 > 配套方案文档：`docs/design/p4-wf-cep-plan.md`；发布条目：`CHANGELOG.md [2.0.17]`。
 
-## 0. 仓库与分支状态（2026-09-04，13 刀拆分已提交、未 push）
+## 0. 仓库与分支状态（2026-09-04，>1500L 拆分 13 刀 + fmt 清理 2 笔已提交、未 push）
 
-- **wp-reactor @ main = `31b741f`**，**领先 origin/main 13 笔未 push**（`e4c6c3e` … `31b741f`，见 §3.7/§6）。origin/main = `e3fba4c`（v6 快照，已推）。工作树干净（本文档提交后）。
+- **wp-reactor @ main = `565f12c`**，**领先 origin/main 16 笔未 push**（`e4c6c3e` … `565f12c`，见 §3.7/§3.8/§6）。origin/main = `e3fba4c`（v6 快照，已推）。工作树干净（本文档提交后）。
 - **tags `v2.0.16` + `v2.0.17` 均已推 origin**。工作树干净（moju 产物已提交）。
 - **warp-fusion @ alpha**：仍为**本地 path 依赖**（`@gxl:block(local_reactor)`，git tag 块注释停 v2.0.15）；工作树 `M Cargo.toml` + `M Cargo.lock` **未提交**（会破坏他人构建）。**下一步：切 `tag = "v2.0.17"` 并定本地块去留**（需用户决策）。
 - wf-skills 已同步。
@@ -19,7 +19,7 @@
 | clippy 2 | `cargo clippy --lib --workspace --all-features -- -D warnings -W unreachable_pub` | 0（StatsBucket 修复后） |
 | wf-cep 依赖墙 | `cargo tree -p wf-cep \| grep tokio` | 无（允许 arrow 数据面） |
 | 跨仓 | warp-fusion（本地 path 依赖）`cargo test --workspace` | 364 全绿（含 oracle 对拍 e2e） |
-| fmt | `cargo fmt --all -- --check` | **全仓红 = 存量 rustfmt 版本漂移**（30+ 文件，无一本会话改动文件）；勿整仓 fmt，只 fmt 改动文件 |
+| fmt | `cargo fmt --all -- --check` | **0**（`2411024` 全仓收敛 18 文件后；CI fmt job 固定 toolchain 1.98，`565f12c`，见 §3.8） |
 
 ## 2. 已完成：#1 rule_task 拆件（S1 ✅ S2 ✅ S3 4 刀 ✅ H 主行循环拆分 ✅）
 
@@ -98,13 +98,22 @@
 
 **测试拆件（6，原样搬移）**：`l2/expr.rs` 1612→18（expr_control/time/funcs 3 模块 41 测试）· `columnar_tests.rs` 1622→90（guard 950 / output 605，32 测试）· `receiver/tests.rs` 1697→252（file_replay 632 / arrow_coerce 425 / route_dispatch 422）· `stats_spill_test.rs` 1714→171（mem 682 / shared 475 / redb 368，27 测试）· `close_bench.rs` 1729→304（q15_cep 338 / stats_hotpath 797 / stats_merge 333）· `direct_tests.rs` 1831→99（join 826 / row 439 / columnar 504，19 测试）。
 
+## 3.8 已完成：fmt 存量漂移清理（2026-09-04，`2411024` + `565f12c`）
+
+> §4.2 任务 #5 结项。漂移根源 = CI fmt job 浮动 `stable`：每次 stable 升级都可能改 rustfmt 规则，长期「只 fmt 改动文件」政策下积出全仓存量漂移。利用重构暂停 + 树干净窗口整仓收敛，纯格式化零语义变化。
+
+- `2411024` chore：`cargo fmt --all` 一次收敛 **18 文件 3765+/3078-**（wf-runtime 12：perf_diag 族/compile 族/lifecycle 多文件/external×2/alert_task；wf-lang 2：check_funcs.rs 951 行 diff = 重构前 144 hunk 历史漂移 + 本刀混入一次清掉、scope.rs；wf-engine fanout/tests.rs 2398 行、wf-config 2、wf-cep lib.rs 1）。
+- `565f12c` ci：fmt job 改 `dtolnay/rust-toolchain@master` + `toolchain: 1.98`（= 本仓格式化产出所用 rustfmt 1.9.0，与本地 1.97.1 的 rustfmt 同为 1.9.0、同规则）+ 前置 `rustfmt --version` 打印便于排障；test/clippy job 仍随 matrix stable/beta。
+- 门禁复验（与基线完全守恒）：`cargo fmt --all -- --check` = 0；wf-lang 1051 / wf-engine 1334+73（首跑 1 笔 async_persist flaky，单独复跑绿，类坑 #10）/ wf-runtime 606+15；clippy all-targets + clippy2 unreachable_pub 均 0。
+- 说明：warp-fusion 跨仓未动；本地与 CI rustfmt 同 1.9.0 理论无残余差异，若 CI 仍红先看 `rustfmt --version` 输出核对。
+
 ## 4. 待办积压（按优先级）
 
 1. **#1 H 尾 — machine 行内 emit 相位（~90 行）**：close/match emit 块仍内联在 `process_batch_machine_rows`（含 `&self` async `stage_or_emit_record` + `lookup`）。拆法 A = 每行 &mut self 方法 → 逐行 async future（热点不取）；拆法 B = 按 ALERT_BATCH_SIZE 批外收口 emit 节奏（需改 emit 时序 + 对拍）。当前评估：维持现状，勿为拆而拆。
 2. **可选拆件候选**（剩余）：**全仓已无 >1500L 文件**（§3.6+§3.7 共 30 刀）。量级候选：`lifecycle/spawn.rs` 1489（receiver/metrics 两组已拆，剩余 alert/evictor/rule 任务组互相借用深，前判无再拆候选，如需可重评估）；`config_loader/fusion_tests.rs` 1476、`diagnostics.rs` 1445（wf-lang，样板集中）、`window/buffer/mod.rs` 1442、`window_lookup.rs` 1439、`cep/tests/coverage_r4.rs` 1411、`eval/builtins.rs` 1382（这些均在仓库既有先例上界 ~1400 附近，属「可拆可不拆」，未立项前不动）。columnar.rs/each_exec.rs/cep/mod.rs/event_bridge.rs 已**文件级**拆分——P4 片4-6 语义下沉仍待立项对表（现模块边界 = advance/window/expiry/views 等，是更好的对表基础）。
 3. **P4 片4-6**（cep/event_bridge/key/eval 同步执行核下沉 wf-cep）：搁置；前置 = 「列式行表示抽象化」设计立项（孤儿规则 + TriggerEvent 持 Arc<RecordBatch> 不可约层）。
 4. **warp-fusion 收尾**：切 `tag = "v2.0.17"` + 本地 path 块去留 + 重锁后 `cargo test --workspace` 复验。
-5. **fmt 存量漂移清理**（另会话）：固定 rustfmt 版本或一次性全仓格式化单独立提交，避免与 CI 打架。
+5. **fmt 存量漂移清理**：✅ 已完成（`2411024` 全仓收敛 + `565f12c` CI 固定 1.98，见 §3.8）。
 6. **push wp-reactor**：main 领先 origin 13 笔（e4c6c3e…31b741f，见 §3.7/§6）。
 
 ## 5. 关键坑（再会话必读，含本会话新增）
@@ -117,7 +126,7 @@
 6. 背景 `(cmd &)` 残留 fd/进程：用完 pkill；macOS 无 `timeout`。
 7. 迁移脚本误匹配史：排除 struct/enum/impl/`->`/`::` 前缀上下文（MatchPlan::default 递归挂死案例）。
 8. wp-reactor 的 Cargo.lock 被 gitignore（不提交）。
-9. **本地 rustfmt 与 CI 版本漂移**：勿整仓 `cargo fmt --all`，只 fmt 改动文件（`rustfmt --edition 2024 <files>`）。
+9. **fmt 策略（2026-09-04 更新）**：漂移源 = CI fmt job 浮动 stable（升级即改 rustfmt 规则）。已根治：全仓 `cargo fmt --all` 一次性收敛（`2411024`，18 文件 3765+/3078-，纯格式化）+ CI fmt job 固定 toolchain 1.98（rustfmt 1.9.0，`565f12c`）。日常仍只 fmt 改动文件即可；确需整仓 fmt 须树干净 + 单独提交。
 10. wf-engine 偶发 flaky（columnar_bind_*）复跑即绿，勿当回归。
 11. **&mut self 方法与活借用冲突**：大方法内常有自字段借用贯穿（aliases 等），外抽 helper 须 `&self`，或「先取 idx（不可变借用即止）再按 idx 可变索引」形态（builder_for 三稿才过借用检查）。
 12. **root re-export 三约束**：`pub(crate) use` 链需源项 ≥ pub(crate)；pub 声明在私有模块 + 链顶止 pub(crate) 触发 `-W unreachable_pub`；lib 无生产消费的链报 unused import → 组合解：`pub(crate) use` + `#[allow(unused_imports)]`（StatsBucket / accumulate_* 先例）。
@@ -165,3 +174,8 @@ v7 前 13 刀（2026-09-04 >1500L 文件拆分，未 push，见 §3.7）：
 `e4c6c3e` test(wf-lang→wf-engine): l2/expr.rs 分片 3 · `a8b56a4` test(wf-engine): columnar_tests.rs 分片 2 · `4507dd2` test(wf-runtime): receiver/tests.rs 分片 3 · `3c41537` test(wf-engine): stats_spill_test.rs 分片 3 · `ca9dc88` test(wf-engine): close_bench.rs 分片 3 · `69d5e74` test(wf-engine): direct_tests.rs 分片 3 · `86f3abb` refactor(wf-engine): event_bridge.rs 拆分 · `da0b8c4` refactor(wf-engine): spill.rs 拆分 · `5a7d9ff` refactor(wf-engine): alert/column_batch.rs 拆分 · `c25a620` refactor(wf-runtime): metrics/mod.rs 拆分 · `a8aa49f` refactor(wf-engine): executor/mod.rs 拆分 · `5a87a63` refactor(wf-engine): cep/mod.rs 拆分 · `31b741f` refactor(wf-lang): compiler/mod.rs 拆分
 
 （v7 快照本文档提交后）
+
+v8（fmt 存量漂移清理 2 笔，未 push，见 §3.8）：
+`2411024` chore: rustfmt 全仓格式化收敛（18 文件 3765+/3078-，纯格式化零语义）· `565f12c` ci: fmt job 固定 toolchain 1.98（rustfmt 1.9.0）+ 打印版本
+
+（v8 快照本文档提交后）
