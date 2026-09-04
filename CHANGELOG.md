@@ -2,6 +2,23 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [2.0.18] -- latest
+
+### Changed
+
+- **P4 落地：`wf-cep` 收编引擎同步执行核（公开 API 与行为不变）**：
+  - 依赖墙闭环：`GuardMasks` → `wf_cep::masks`；Arrow 列 → `Value` 值提取核心（`extract_field_value` 族 + wfl structured-JSON 判定）→ `wf_cep::value_extract`；CEP 状态机与逐事件解释求值器（cep 16 生产文件 + cep/tests）→ `wf_cep::cep`；列式行视图（ColumnarEvent/JoinRow/TriggerEvent/FieldIndex/批级 join 行 + 列式 scope-key 直读）→ `wf_cep::row_views`；
+  - `wf-engine` 公开路径零变化（`match_engine::{cep, columnar, event_bridge}` shim 重导出，99 个引用文件零改动）；Event/FieldSource/载具同 crate，孤儿规则约束消解；cep → wf-config 反向耦合以 `DEFAULT_OUTPUT_TIME_FORMAT` 上移 `wf-lang` 根消除；
+  - 语义测试归位：341 项随迁 wf-cep（cep/tests 140 + sem_tests 201：accu/any_l2/close/seq_l2/seq_order/cep_core/join_key/l2 子集/l3 整组/eval_coverage 纯段），`cargo test -p wf-cep` 独立秒测（0.01s）——语义改动不再触发 wf-engine 编译；helpers/join-harness 双侧副本保 engine 剩测。
+- **工程内务（公开 API 与行为不变）**：
+  - `wf-runtime`：`rule_task` `process_batch` 行循环 H-1..H-5 拆分（~1085 → 503 行：machine/on-each 双路循环独立、advance/scan-close 相位提同步自由函数）+ 行循环级 release 基准（`row_loop_*`，无 sleep 直驱 process_batch）；`lifecycle/spawn.rs` receiver/source 组与 metrics 任务组拆出 `spawn_receiver.rs`/`spawn_metrics.rs`；`lifecycle/compile.rs` 测试外移 + 规则检查诊断组拆出 `compile_diag.rs`；`perf_diag.rs` 大测试外移；
+  - `wf-lang`：`check_func_call` 错误样板收口（145 处统一 `rule_error`）并按内建函数类别切片 6 helper（agg/numeric/time/str/mv/misc），`check_str_func` 再分 pattern/hash 族；
+  - 全仓 >1500 行 / 超大型文件拆分收尾（~30 刀）：生产 11（fanout/columnar/each_exec/rule_task/event_bridge/spill/column_batch/metrics/executor/cep/compiler hub 收口 + `#[path]` sibling 子模块）+ 测试 19 主题分片（coverage/bench/集成套件原样搬移，测试名与断言零改动）；
+  - rustfmt 存量漂移整仓收敛（18 文件 3765+/3078-，纯格式化零语义）；CI fmt job 固定 toolchain 1.98（rustfmt 1.9.0）+ 前置版本打印，杜绝 stable 升级导致 fmt 规则漂移刷红。
+- **文档**：refactor 会话交接快照 v2–v8 入库；`p4-wf-cep-plan` 决策链（v0.1–v0.5：纯叶 → 停片 3 → 片 4-6 直接搬迁立项 → S1 边界确认 → B0-B2 执行记录）与 S1 边界确认报告。
+
+- **验证**：`wf-cep` 341 / `wf-engine` 1002（+73 ignored）/ `wf-runtime` 606（+15）/ `wf-lang` 1051 全绿；双 clippy（all-targets + lib `unreachable_pub`）与 fmt 0；`wf-cep` 依赖墙保持（无 tokio / async / IO）。跨仓 warp-fusion 升依赖验证见发布流程。
+
 ## [2.0.17] -- latest
 
 ### Changed
