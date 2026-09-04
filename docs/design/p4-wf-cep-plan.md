@@ -198,3 +198,22 @@ builder helpers（供 engine 剩测/bench 使用；避免重复实现）。
   extract_scope_key_from_row（cep/key.rs，B1 才迁）。→ **B0-3 三载具下沉并入 B1**（cep
   同步核整迁时与 FieldSource/types.rs 同批搬，孤儿自然消解）；B0 剩余可选小刀 =
   scope_key_from_column 归位（依赖 ScopeKey，同样等 B1）。
+
+---
+
+## 执行记录（2026-09-04，v0.5）：B1（cep 整迁）+ B2（测试归位）已绿闸
+
+- `940a405` **B1**：cep 同步执行核 16 生产文件 + cep/tests 140 测试整迁 wf_cep::cep；
+  B0-3 载具并入（ColumnarEvent/JoinRow/TriggerEvent/FieldIndex + scope_key 族 →
+  wf_cep::row_views）；engine 全 shim 保路径（99 引用文件零改动）；孤儿消解；
+  cep→wf_config 反向耦合以常量上移 wf_lang 根解决（DEFAULT_OUTPUT_TIME_FORMAT）。
+- `11a76bb` **B2**：语义套件归位 wf_cep::sem_tests——G2 顶层（accu/any_l2/close/seq_l2/
+  seq_order/cep_core）+ join_key + l2 语义子集（baseline/expr 族/fixed/guards/keymap/limits）
+  + l3 整组 + eval_coverage 纯 eval 段，共 **201 测试随迁**（wf-cep 测试 140→341）；
+  helpers/l2-harness 双份（engine 侧保完整副本 + allow(dead_code)）；eval_coverage 拆分
+  （RuleExecutor/L3 yield 段留 engine）；core_coverage 整组/regression/executor/bench/
+  columnar/event_bridge 测试留 engine（S1 判定）。
+- **测试分布（守恒）**：wf-cep 341（cep 140 + sem_tests 201）/ wf-engine 1002+73 /
+  wf-runtime 606+15 / wf-lang 1051；clippy×2 = 0、fmt = 0。语义层独立测试
+  `cargo test -p wf-cep` = 341 passed 0.01s——「语义改动不触发 engine 编译」兑现。
+- **剩余**：B3 收尾（CHANGELOG 2.1.0 → tag → warp-fusion 升依赖跨仓验证 + CI 墙确认）。
