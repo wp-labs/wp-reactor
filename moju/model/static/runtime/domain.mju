@@ -9,13 +9,6 @@
 // CliEntry — CLI entry point
 // =============================================================
 
-actor Admin {
-  can RunCommand
-  can ShutdownSignal
-  can ConfigChange
-  can IncomingData
-}
-
 struct Cli {
   command: Commands
 }
@@ -72,23 +65,6 @@ state EngineReason {
 // ReactorLifecycle — reactor bootstrap, rule compilation, task
 // group spawning, graceful shutdown, and signal handling
 // =============================================================
-
-command RunCommand {
-  config_path: String
-  work_dir: String
-}
-
-command ShutdownSignal {
-  reason: String
-}
-
-command ConfigChange {
-  new_config: String
-}
-
-command IncomingData {
-  source: String
-}
 
 struct Reactor {
   cancel: String

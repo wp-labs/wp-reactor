@@ -1,14 +1,7 @@
 // ---------------------------------------------------------------------------
 // engine domain — module architecture
-// Crate: wf-engine
+// Code: crates/wf-engine + crates/wf-cep（P4 同步执行核拆分；同 domain.mju 头部说明）
 // ---------------------------------------------------------------------------
-
-module EventIngress {
-  layer Interface
-  owns DataSender, IncomingBatch, MemoryPressure, NewEvents
-
-  responsible_for "Accept external data events, memory-pressure signals, and new-event pushes from the runtime and route them into the CEP engine"
-}
 
 module ColumnarBatch {
   layer DataFusion
@@ -40,7 +33,7 @@ module RuleFanout {
 
 module MatchEngine {
   layer DataFusion
-  owns CepStateMachine, InstanceKey, ScopeKey, Instance, StepState, BranchState, StepData, StepResult, StepProgress, StepOutcome, MatchedContext, CloseOutput, CloseReason, BindData, RollingStats, AliasState, SeqRuntime, SharedLimits, WindowLookup, AsofLookup, JoinKey, FieldSource, Event, Value, ValueKey, CoreReason
+  owns CepStateMachine, InstanceKey, ScopeKey, Instance, StepState, BranchState, StepData, StepResult, StepProgress, StepOutcome, MatchedContext, CloseOutput, CloseReason, BindData, RollingStats, AliasState, SeqRuntime, SharedLimits, AsofLookup, JoinKey, Event, Value, ValueKey, CoreReason
 
   responsible_for "NFA-style state machine for sequential event pattern matching with close-mode lifecycle, field sources, window/asof lookups, and core error reasons"
 }
@@ -54,7 +47,7 @@ module StatsEngine {
 
 module SpillStore {
   layer DataFusion
-  owns SpillStore, RedbSpillStore, MemSpillStore, NoopSpillStore, SpillError, Reader, Writer, RedbBatchWriter, AsyncPersister, BatchWriter, PersistError
+  owns RedbSpillStore, MemSpillStore, NoopSpillStore, SpillError, Reader, Writer, RedbBatchWriter, AsyncPersister, PersistError
 
   responsible_for "State-overflow spill-to-disk storage backends (redb/mem/noop), batched writers, and asynchronous persistence with error handling"
 }
@@ -80,13 +73,6 @@ module PipeExecution {
   responsible_for "Pipe (window-like source) definition and registry for piped rule inputs"
 }
 
-module ExternalCall {
-  layer DataFusion
-  owns ExternalCallHandler
-
-  responsible_for "External service call handler backing the external() WFL function"
-}
-
 module RuleExecution {
   layer DataFusion
   owns RuleExecutor
@@ -95,8 +81,6 @@ module RuleExecution {
 }
 
 dependency_rule EngineDeps {
-  EventIngress -> WindowManager
-  EventIngress -> MatchEngine
   WindowManager -> RuleFanout
   WindowManager -> WindowEviction
   RuleFanout -> MatchEngine
@@ -110,6 +94,5 @@ dependency_rule EngineDeps {
   RuleExecution -> StatsEngine
   RuleExecution -> AlertOutput
   RuleExecution -> SpillStore
-  RuleExecution -> ExternalCall
   PipeExecution -> RuleExecution
 }

@@ -2,6 +2,15 @@
 // WP-Reactor layered architecture
 // Defines the four canonical layers and their permitted dependency directions.
 // ---------------------------------------------------------------------------
+//
+// Workspace crate 映射（moju 域 → Rust crate）：
+//   Lang    → crates/wf-lang
+//   Config  → crates/wf-config
+//   Engine  → crates/wf-engine + crates/wf-cep（P4 同步执行核拆分，engine shim 重导出）
+//   Runtime → crates/wf-runtime
+//   crates/wf-data（纯函数工具，无 struct/enum）未建模；
+//   CLI 二进制在相邻 workspace ../warp-fusion，未在本模型建模。
+// ---------------------------------------------------------------------------
 
 layer Interface
 layer Application
@@ -52,7 +61,4 @@ dependency_rule CrossDomainDeps {
 
   // Alert dispatch forwards records to the sink dispatcher
   Runtime.AlertDispatch -> Engine.SinkDispatch
-
-  // External runtime adapters bridge external calls
-  Runtime.ExternalRuntime -> Engine.ExternalCall
 }

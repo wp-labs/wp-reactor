@@ -59,7 +59,7 @@ module LangTest {
 
 module LangScenario {
   layer DataFusion
-  owns WfgFile, ScenarioDecl, TimeClause, SyntaxScenario, ScenarioAttr, AttrValue, TrafficBlock, SyntaxStreamDecl, RateExpr, WaveShape, TimelineSegment, SyntaxInjectionBlock, SyntaxInjectCase, InjectCaseMode, SeqBlock, ScenarioSeqStep, FieldPredicate, ExpectBlock, ExpectCheck, ExpectMetric, CompareOp, ExpectValue, Rate, RateUnit, StreamBlock, FieldOverride, GenExpr, GenArg, InjectBlock, InjectLine, InjectUseStep, InjectMode, FaultsBlock, FaultType, FaultLine, OracleBlock, ParamAssign, ParamValue
+  owns WfgFile, ScenarioDecl, TimeClause, SyntaxScenario, ScenarioAttr, AttrValue, TrafficBlock, SyntaxStreamDecl, RateExpr, WaveShape, TimelineSegment, SyntaxInjectionBlock, SyntaxInjectCase, InjectCaseMode, SeqBlock, FieldPredicate, ExpectBlock, ExpectCheck, ExpectMetric, CompareOp, ExpectValue, Rate, RateUnit, StreamBlock, FieldOverride, GenExpr, GenArg, InjectBlock, InjectLine, InjectUseStep, InjectMode, FaultsBlock, FaultType, FaultLine, OracleBlock, ParamAssign, ParamValue
   responsible_for "WFG scenario grammar — traffic generation, injections, faults, and oracle expectations"
 }
 
@@ -71,7 +71,7 @@ module LangChecker {
 
 module LangCompile {
   layer DataFusion
-  owns CompileRequest, RulePlan, BindPlan, MatchPlan, KeyMapPlan, JoinKeyPlan, WindowSpec, StepPlan, BranchPlan, AggPlan, EachPlan, PatternOriginPlan, LetPlan, SeqPlan, SeqStepPlan, SeqSkipPlan, StatsPlan, StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, SpillMode, JoinPlan, JoinCondPlan, LimitsPlan, ExceedAction, RateSpec, EntityPlan, ScorePlan, YieldPlan, ConvPlan, ConvChainPlan, ConvOpPlan, SortKeyPlan, ExprPlan, ConvWindowPlan, YieldField
+  owns RulePlan, BindPlan, MatchPlan, KeyMapPlan, JoinKeyPlan, WindowSpec, StepPlan, BranchPlan, AggPlan, EachPlan, PatternOriginPlan, LetPlan, SeqPlan, SeqStepPlan, SeqSkipPlan, StatsPlan, StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, SpillMode, JoinPlan, JoinCondPlan, LimitsPlan, ExceedAction, RateSpec, EntityPlan, ScorePlan, YieldPlan, ConvPlan, ConvChainPlan, ConvOpPlan, SortKeyPlan, ConvWindowPlan, YieldField
   responsible_for "WFL compilation — compile WFL rules into executable match, join, stats, limits, entity, score, yield, and conv plans"
 }
 

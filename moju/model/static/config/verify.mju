@@ -13,4 +13,3 @@ verify LoadConfigResolves for flow LoadConfig {
     FusionConfig.sinks == "fusion.toml"
   }
 }
-

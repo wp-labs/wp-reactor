@@ -2,37 +2,7 @@
 // runtime domain — flows
 // Crate: wf-runtime
 // ---------------------------------------------------------------------------
-
-// ReactorStart：从配置引导引擎 —— 加载 schema、编译规则、spawn 任务组、进入服务循环
-// 概念步骤：LoadAndCompile → SpawnTasks → Serve
-flow ReactorStart {
-  trigger RunCommand
-  creates Reactor
-
-  step<stop> Serve {
-    create Reactor {
-      base_dir = RunCommand.work_dir
-    }
-  }
-}
-
-// DataIngest：Receiver 绑定数据源，将外部数据路由进引擎
-// 概念步骤：Bind → Route
-flow DataIngest {
-  trigger IncomingData
-
-  step<stop> Route {
-  }
-}
-
-// HotReload：编译新规则，准备原子任务切换，实现零停机更新
-// 概念步骤：Prepare → Apply
-flow HotReload {
-  trigger ConfigChange
-  creates PreparedRuleReload
-
-  step<stop> Apply {
-    create PreparedRuleReload {
-    }
-  }
-}
+// （无代码背书的 CLI/管理消息 Admin / RunCommand / ShutdownSignal / ConfigChange /
+//  IncomingData 已随模型瘦身删除，ReactorStart / DataIngest / HotReload 概念流一并
+//  移除 —— reactor 生命周期与热重载以 ReactorLifecycle / HotReload 模块的代码类型为准，
+//  启动/接入/更新的外部触发在 CLI（warp-fusion）侧，不在本模型内建模。）

@@ -4,7 +4,8 @@
 // ---------------------------------------------------------------------------
 
 // LoadConfig：fusion 配置加载管道 —— 读 TOML → 展开变量 → 校验 → 解析为 FusionConfig
-// 概念步骤：Expand → Validate → Resolve
+// 触发命令 ConfigLoadRequest 由外部 CLI 构造（warp-fusion 侧），本模型仅保留
+// 概念流以维持验证用例；其余 CLI 级消息已随模型瘦身移除。
 flow LoadConfig {
   trigger ConfigLoadRequest
   creates FusionConfig
@@ -12,18 +13,6 @@ flow LoadConfig {
   step<stop> Resolve {
     create FusionConfig {
       sinks = ConfigLoadRequest.path
-    }
-  }
-}
-
-// DetectConfigChange：对比新旧配置，分类变更并产出热重载计划
-// 概念步骤：Classify → Plan
-flow DetectConfigChange {
-  trigger ConfigLoadRequest
-  creates FusionReloadPlan
-
-  step<stop> Plan {
-    create FusionReloadPlan {
     }
   }
 }

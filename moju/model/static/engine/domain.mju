@@ -1,29 +1,12 @@
 // ---------------------------------------------------------------------------
-// engine domain — streaming CEP / match engine (crates/wf-engine)
+// engine domain — streaming CEP / match engine
+// Code: crates/wf-engine + crates/wf-cep（P4 拆分：同步执行核 —— value/rows/
+// masks/value_extract/cep/row_views/cidr_cache 等叶模块下沉 wf-cep，wf-engine
+// 经 shim 重导出，公开路径不变；本域模块与类型按逻辑归属建模，跨两个 crate）
 // Static model: columnar batch processing, NFA-style matching, stats SoA
 // accumulation, spill-to-disk, window actor management, alert output, and
 // sink dispatch.
 // ---------------------------------------------------------------------------
-
-// =============================================================
-// EventIngress — external data event entry points
-// =============================================================
-
-actor DataSender {
-  can IncomingBatch
-}
-
-command IncomingBatch {
-  stream_name: String
-}
-
-command MemoryPressure {
-  window_name: String
-}
-
-command NewEvents {
-  events: List<Event>
-}
 
 // =============================================================
 // ColumnarBatch — columnar batch representation and evaluation
@@ -502,14 +485,6 @@ struct SharedLimits {
   failed: Bool
 }
 
-// Rust trait contract — external window access for has() and join
-struct WindowLookup {
-}
-
-// Rust trait contract — per-row named-field source for the state machine
-struct FieldSource {
-}
-
 state AsofLookup {
   Hit
   Miss
@@ -711,10 +686,6 @@ state NumericKind {
 // SpillStore — spill-to-disk storage backends
 // =============================================================
 
-// Rust trait contract — state overflow spill storage (put_batch/take/drain)
-struct SpillStore {
-}
-
 struct RedbSpillStore {
   db: String?
   path: String
@@ -760,10 +731,6 @@ struct AsyncPersister {
   queued_bytes: Int
   idle: String
   workers: List<String>
-}
-
-// Rust trait contract — batch write backend for async persist
-struct BatchWriter {
 }
 
 state PersistError {
@@ -898,14 +865,6 @@ struct Pipe {
 
 struct PipeRegistry {
   pipes: Map<String,Pipe>
-}
-
-// =============================================================
-// ExternalCall — external service call handler
-// =============================================================
-
-// Rust trait contract — external() service call dispatcher
-struct ExternalCallHandler {
 }
 
 // =============================================================

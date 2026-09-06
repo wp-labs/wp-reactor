@@ -668,12 +668,6 @@ state InjectCaseMode {
 
 struct SeqBlock {
   entity: String
-  steps: List<ScenarioSeqStep>
-}
-
-state ScenarioSeqStep {
-  Use
-  Not
 }
 
 struct FieldPredicate {
@@ -869,11 +863,6 @@ state JoinKeySource {
 // LangCompile — WFL compilation plans (compiled AST -> runtime)
 // =============================================================
 
-command CompileRequest {
-  source: String
-  schema_paths: List<String>
-}
-
 struct RulePlan {
   name: String
   binds: List<BindPlan>
@@ -882,7 +871,7 @@ struct RulePlan {
   each_plan: EachPlan?
   stats_plan: StatsPlan?
   joins: List<JoinPlan>
-  where: ExprPlan?
+  where: Expr?
   entity_plan: EntityPlan
   yield_plan: YieldPlan
   score_plan: ScorePlan
@@ -895,7 +884,7 @@ struct RulePlan {
 struct BindPlan {
   alias: String
   window: String
-  filter: ExprPlan?
+  filter: Expr?
 }
 
 struct MatchPlan {
@@ -946,7 +935,7 @@ struct BranchPlan {
   label: String?
   source: String
   field: FieldSelector?
-  guard: ExprPlan?
+  guard: Expr?
   agg: AggPlan
 }
 
@@ -954,12 +943,12 @@ struct AggPlan {
   transforms: List<Transform>
   measure: Measure
   cmp: CmpOp
-  threshold: ExprPlan
+  threshold: Expr
 }
 
 struct EachPlan {
   alias: String
-  filter: ExprPlan?
+  filter: Expr?
 }
 
 struct PatternOriginPlan {
@@ -969,7 +958,7 @@ struct PatternOriginPlan {
 
 struct LetPlan {
   name: String
-  expr: ExprPlan
+  expr: Expr
 }
 
 struct SeqPlan {
@@ -991,7 +980,7 @@ struct SeqStepPlan {
 
 struct StatsPlan {
   window_spec: WindowSpec
-  keys: List<ExprPlan>
+  keys: List<Expr>
   output_shape: StatsOutputShapePlan
   measures: List<StatsMeasurePlan>
   tracked_bind_fields: Map<String,List<String>>
@@ -1005,7 +994,7 @@ state StatsOutputShapePlan {
 struct StatsMeasurePlan {
   label: String
   source_alias: String
-  where_expr: ExprPlan?
+  where_expr: Expr?
   agg: StatsAggPlan
   field: FieldRef?
   arg: Int?
@@ -1032,7 +1021,7 @@ struct JoinPlan {
   conds: List<JoinCondPlan>
   within: WithinSpec?
   reduce: ReduceClause?
-  emit_at: ExprPlan?
+  emit_at: Expr?
 }
 
 struct JoinCondPlan {
@@ -1062,11 +1051,11 @@ struct RateSpec {
 
 struct EntityPlan {
   entity_type: String
-  entity_id_expr: ExprPlan
+  entity_id_expr: Expr
 }
 
 struct ScorePlan {
-  expr: ExprPlan
+  expr: Expr
 }
 
 struct YieldPlan {
@@ -1077,7 +1066,7 @@ struct YieldPlan {
 
 struct YieldField {
   name: String
-  value: ExprPlan
+  value: Expr
 }
 
 struct ConvPlan {
@@ -1103,15 +1092,8 @@ struct ConvWindowPlan {
 }
 
 struct SortKeyPlan {
-  expr: ExprPlan
+  expr: Expr
   descending: Bool
-}
-
-state ExprPlan {
-  Const
-  Field
-  Binary
-  FuncCall
 }
 
 // =============================================================

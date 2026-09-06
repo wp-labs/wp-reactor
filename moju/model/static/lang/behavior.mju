@@ -2,29 +2,6 @@
 // lang domain — flows
 // Crate: wf-lang
 // ---------------------------------------------------------------------------
-
-// CompileRule：WFL 规则编译管道 —— 解析 → 语义检查 → 编译为可执行 plan
-// 概念步骤：Parse → Check → Compile
-flow CompileRule {
-  trigger CompileRequest
-  creates RulePlan
-
-  step<stop> Compile {
-    create RulePlan {
-      name = CompileRequest.source
-    }
-  }
-}
-
-// ExplainRule：编译并产出规则解释（供 explain 命令展示）
-// 概念步骤：Compile → Render
-flow ExplainRule {
-  trigger CompileRequest
-  creates RuleExplanation
-
-  step<stop> Render {
-    create RuleExplanation {
-      name = CompileRequest.source
-    }
-  }
-}
+// （无代码背书的 CLI 级编译/解释入口消息 CompileRequest 已随模型瘦身删除，
+//  相应 CompileRule / ExplainRule 概念流一并移除 —— 编译管道以 LangCompile
+//  模块的 plan 结构为准，编译入口由外部 CLI 直接调用代码 API，不在模型内建模。）

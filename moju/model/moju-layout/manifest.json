@@ -2,6 +2,11 @@
   "schema_version": 1,
   "diagrams": {
     "flow_swimlane_v4:Runtime.DataIngest": "diagrams/diagram-flow_5Fswimlane_5Fv4_3ARuntime.DataIngest.json",
+    "runtime:Global::layer_diagram_v2": "diagrams/diagram-runtime_3AGlobal_3A_3Alayer_5Fdiagram_5Fv2.json",
+    "structure_graph_v2::module::Config.ConfigChange": "diagrams/diagram-structure_5Fgraph_5Fv2_3A_3Amodule_3A_3AConfig.ConfigChange.json",
+    "structure_graph_v2::module::Config.SinkConfig": "diagrams/diagram-structure_5Fgraph_5Fv2_3A_3Amodule_3A_3AConfig.SinkConfig.json",
+    "structure_graph_v2::module::Engine.MatchEngine": "diagrams/diagram-structure_5Fgraph_5Fv2_3A_3Amodule_3A_3AEngine.MatchEngine.json",
+    "structure_graph_v2::module::Engine.StatsEngine": "diagrams/diagram-structure_5Fgraph_5Fv2_3A_3Amodule_3A_3AEngine.StatsEngine.json",
     "structure_graph_v2::module::Lang.LangChecker": "diagrams/diagram-structure_5Fgraph_5Fv2_3A_3Amodule_3A_3ALang.LangChecker.json",
     "structure_graph_v2::module::Lang.LangClauses": "diagrams/diagram-structure_5Fgraph_5Fv2_3A_3Amodule_3A_3ALang.LangClauses.json",
     "structure_graph_v2::module::Lang.LangCompile": "diagrams/diagram-structure_5Fgraph_5Fv2_3A_3Amodule_3A_3ALang.LangCompile.json",

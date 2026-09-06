@@ -1,37 +1,6 @@
 // ---------------------------------------------------------------------------
 // Reactor subsystem use cases
 // ---------------------------------------------------------------------------
-
-usecase RunReactor {
-  meta {
-    label zh "启动 Reactor 引擎"
-    label en "Run Reactor Engine"
-  }
-
-  actor Runtime.Admin
-  trigger Runtime.RunCommand
-  outcome Runtime.Reactor
-  flow Runtime.ReactorStart
-}
-
-usecase IngestData {
-  meta {
-    label zh "接入外部数据流"
-    label en "Ingest External Data Stream"
-  }
-
-  trigger Runtime.IncomingData
-  outcome Engine.OutputRecord
-  flow Runtime.DataIngest
-}
-
-usecase HotReloadRules {
-  meta {
-    label zh "热更新规则"
-    label en "Hot Reload Rules"
-  }
-
-  trigger Runtime.ConfigChange
-  outcome Runtime.PreparedRuleReload
-  flow Runtime.HotReload
-}
+// （原 RunReactor / IngestData / HotReloadRules 用例基于已删除的 CLI 级
+//  actor/消息（Admin / RunCommand / IncomingData / ConfigChange）建模；
+//  随模型瘦身移除。运行时子系统用例待 CLI 工程单独建模后补充。）

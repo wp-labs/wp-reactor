@@ -1,0 +1,28 @@
+{
+  "pan": {
+    "x": 0.0,
+    "y": 0.0
+  },
+  "nodes": {
+    "state:Config.FusionReloadDisposition": {
+      "x": 852.8047,
+      "y": 424.59766
+    },
+    "struct:Config.ClassifiedFusionConfigChange": {
+      "x": 569.4258,
+      "y": 480.15234
+    },
+    "struct:Config.FusionReloadPlan": {
+      "x": 165.10938,
+      "y": 374.54688
+    },
+    "state:Config.FusionChangeKind": {
+      "x": 852.8047,
+      "y": 614.85156
+    }
+  },
+  "sizes": {},
+  "scales": {},
+  "fills": {},
+  "options": {}
+}

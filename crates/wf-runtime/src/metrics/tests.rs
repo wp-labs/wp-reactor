@@ -405,7 +405,9 @@ fn rule_memory_bytes_gauge_sums_deltas_and_is_exported() {
     let recs = m.snapshot().to_records();
     assert!(recs.iter().any(|r| {
         r.fields.iter().any(|(k, v)| k == "stage" && v == "rule")
-            && r.fields.iter().any(|(k, v)| k == "name" && v == "memory_bytes")
+            && r.fields
+                .iter()
+                .any(|(k, v)| k == "name" && v == "memory_bytes")
             && r.fields.iter().any(|(k, v)| k == "label" && v == "r1")
     }));
 }
