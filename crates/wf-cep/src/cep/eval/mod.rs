@@ -15,6 +15,10 @@ use super::types::{EngineHashMap, FieldSource, RollingStats, Value, WindowLookup
 pub mod cmp; // engine columnar_eval 跨 crate 消费
 
 mod funcs;
+mod funcs_misc;
+mod funcs_num;
+mod funcs_str;
+mod funcs_time;
 
 use cmp::{coerce_to_f64, compare_values};
 use funcs::eval_func_call;

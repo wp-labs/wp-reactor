@@ -90,25 +90,30 @@ pub fn try_eval_expr_to_f64(expr: &Expr) -> Option<f64> {
         Expr::BinOp { op, left, right } => {
             let l = try_eval_expr_to_f64(left)?;
             let r = try_eval_expr_to_f64(right)?;
-            match op {
-                BinOp::Add => Some(l + r),
-                BinOp::Sub => Some(l - r),
-                BinOp::Mul => Some(l * r),
-                BinOp::Div => {
-                    if r == 0.0 {
-                        None
-                    } else {
-                        Some(l / r)
-                    }
-                }
-                BinOp::Mod => {
-                    if r == 0.0 {
-                        None
-                    } else {
-                        Some(l % r)
-                    }
-                }
-                _ => None,
+            fold_f64_binop(op, l, r)
+        }
+        _ => None,
+    }
+}
+
+/// 常量折叠的 f64 算术（除/模零 → None; 非算术算子 → None）。
+fn fold_f64_binop(op: &BinOp, l: f64, r: f64) -> Option<f64> {
+    match op {
+        BinOp::Add => Some(l + r),
+        BinOp::Sub => Some(l - r),
+        BinOp::Mul => Some(l * r),
+        BinOp::Div => {
+            if r == 0.0 {
+                None
+            } else {
+                Some(l / r)
+            }
+        }
+        BinOp::Mod => {
+            if r == 0.0 {
+                None
+            } else {
+                Some(l % r)
             }
         }
         _ => None,
@@ -440,5 +445,22 @@ mod tests {
         // 容器类型不参与
         let mut h = Sha256::new();
         assert!(update_stable_id_hash(&mut h, &Value::Array(vec![num(1.0)])).is_none());
+    }
+    #[test]
+    fn const_fold_zero_guards_and_non_arithmetic_ops() {
+        // 除/模零（含 -0.0）→ None; 非算术算子 → None（fold_f64_binop 提取回归）
+        assert_eq!(try_eval_expr_to_f64(&bin(BinOp::Div, en(1.0), en(-0.0))), None);
+        assert_eq!(try_eval_expr_to_f64(&bin(BinOp::Mod, en(7.0), en(-0.0))), None);
+        assert_eq!(
+            try_eval_expr_to_f64(&bin(BinOp::Sub, en(5.0), en(2.0))),
+            Some(3.0)
+        );
+        assert_eq!(try_eval_expr_to_f64(&bin(BinOp::Eq, en(1.0), en(1.0))), None);
+        // 未知名路径: 与既有的字面折叠一致
+        assert_eq!(
+            try_eval_expr_to_f64(&Expr::Bool(true)),
+            None,
+            "Bool 字面量非数值"
+        );
     }
 }
