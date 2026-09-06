@@ -49,128 +49,304 @@ pub(super) fn materialize_system_vars(
     expr: &wf_lang::ast::Expr,
     score: YieldMeta,
 ) -> Option<wf_lang::ast::Expr> {
-    use wf_lang::ast::{Expr, SystemVar};
-
+    use wf_lang::ast::Expr;
     match expr {
-        Expr::Number(n) => Some(Expr::Number(*n)),
-        Expr::StringLit(s) => Some(Expr::StringLit(s.clone())),
-        Expr::Bool(b) => Some(Expr::Bool(*b)),
-        Expr::SystemVar(SystemVar::Score) => Some(Expr::Number(score.score?)),
-        Expr::SystemVar(SystemVar::EventFirstTime) => {
-            Some(utils::time_nanos_to_expr(score.event_first_time_nanos?))
+        Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) | Expr::Field(_) => {
+            materialize_simple_leaf(expr)
         }
-        Expr::SystemVar(SystemVar::EventLastTime) => {
-            Some(utils::time_nanos_to_expr(score.event_last_time_nanos?))
-        }
-        Expr::SystemVar(SystemVar::EvidenceStartTime) => {
-            Some(utils::time_nanos_to_expr(score.evidence_first_time_nanos?))
-        }
-        Expr::SystemVar(SystemVar::EvidenceEndTime) => {
-            Some(utils::time_nanos_to_expr(score.evidence_last_time_nanos?))
-        }
-        Expr::SystemVar(SystemVar::WindowStartTime) => {
-            Some(utils::time_nanos_to_expr(score.window_start_time_nanos?))
-        }
-        Expr::SystemVar(SystemVar::WindowEndTime) => {
-            Some(utils::time_nanos_to_expr(score.window_end_time_nanos?))
-        }
-        Expr::SystemVar(SystemVar::EmitTime) => {
-            Some(utils::time_nanos_to_expr(score.emit_time_nanos?))
-        }
-        Expr::SystemVar(SystemVar::FirstMatchTime) => {
-            Some(utils::time_nanos_to_expr(score.first_match_time_nanos?))
-        }
-        Expr::WfuMeta(field) => match score.resolve_wfu_meta(*field)? {
-            Value::Number(n) => Some(Expr::Number(n)),
-            Value::Str(s) => Some(Expr::StringLit(s.to_string())),
-            Value::Bool(b) => Some(Expr::Bool(b)),
-            _ => None,
-        },
-        Expr::Field(fr) => Some(Expr::Field(fr.clone())),
-        Expr::BinOp { op, left, right } => Some(Expr::BinOp {
-            op: *op,
-            left: Box::new(materialize_system_vars(left, score)?),
-            right: Box::new(materialize_system_vars(right, score)?),
-        }),
-        Expr::Neg(inner) => Some(Expr::Neg(Box::new(materialize_system_vars(inner, score)?))),
-        Expr::Not(inner) => Some(Expr::Not(Box::new(materialize_system_vars(inner, score)?))),
+        Expr::SystemVar(sv) => materialize_system_var(sv, score),
+        Expr::WfuMeta(field) => materialize_wfu_meta(*field, score),
+        Expr::BinOp { op, left, right } => materialize_binop(*op, left, right, score),
+        Expr::Neg(inner) => map_materialize_boxed(inner, score, Expr::Neg),
+        Expr::Not(inner) => map_materialize_boxed(inner, score, Expr::Not),
         Expr::FuncCall {
             qualifier,
             name,
             args,
-        } => Some(Expr::FuncCall {
-            qualifier: qualifier.clone(),
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|arg| materialize_system_vars(arg, score))
-                .collect::<Option<Vec<_>>>()?,
-        }),
-        Expr::Object(items) => Some(Expr::Object(
-            items
-                .iter()
-                .map(|item| {
-                    Some(wf_lang::ast::ObjectItem {
-                        targets: item.targets.clone(),
-                        type_hint: item.type_hint.clone(),
-                        value: materialize_system_vars(&item.value, score)?,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?,
-        )),
-        Expr::Array(items) => Some(Expr::Array(
-            items
-                .iter()
-                .map(|item| materialize_system_vars(item, score))
-                .collect::<Option<Vec<_>>>()?,
-        )),
+        } => materialize_func_call(qualifier, name, args, score),
+        Expr::Object(items) => materialize_object(items, score),
+        Expr::Array(items) => materialize_array(items, score),
         Expr::InList {
             expr,
             list,
             negated,
-        } => Some(Expr::InList {
-            expr: Box::new(materialize_system_vars(expr, score)?),
-            list: list
-                .iter()
-                .map(|item| materialize_system_vars(item, score))
-                .collect::<Option<Vec<_>>>()?,
-            negated: *negated,
-        }),
+        } => materialize_in_list(expr, list, *negated, score),
         Expr::IfThenElse {
             cond,
             then_expr,
             else_expr,
-        } => Some(Expr::IfThenElse {
-            cond: Box::new(materialize_system_vars(cond, score)?),
-            then_expr: Box::new(materialize_system_vars(then_expr, score)?),
-            else_expr: Box::new(materialize_system_vars(else_expr, score)?),
-        }),
+        } => materialize_if_then_else(cond, then_expr, else_expr, score),
         Expr::Match {
             expr,
             arms,
             default,
-        } => Some(Expr::Match {
-            expr: Box::new(materialize_system_vars(expr, score)?),
-            arms: arms
-                .iter()
-                .map(|arm| {
-                    Some(wf_lang::ast::MatchArm {
-                        patterns: arm
-                            .patterns
-                            .iter()
-                            .map(|p| materialize_system_vars(p, score))
-                            .collect::<Option<Vec<_>>>()?,
-                        value: materialize_system_vars(&arm.value, score)?,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?,
-            default: default
-                .as_ref()
-                .and_then(|d| materialize_system_vars(d, score))
-                .map(Box::new),
-        }),
+        } => materialize_match(expr, arms, default, score),
         _ => None,
     }
+}
+
+/// 无需递归的叶子/透传节点。
+fn materialize_simple_leaf(expr: &wf_lang::ast::Expr) -> Option<wf_lang::ast::Expr> {
+    use wf_lang::ast::Expr;
+    match expr {
+        Expr::Number(n) => Some(Expr::Number(*n)),
+        Expr::StringLit(s) => Some(Expr::StringLit(s.clone())),
+        Expr::Bool(b) => Some(Expr::Bool(*b)),
+        Expr::Field(fr) => Some(Expr::Field(fr.clone())),
+        _ => None,
+    }
+}
+
+/// 系统变量 → 字面量表达式。
+fn materialize_system_var(
+    sv: &wf_lang::ast::SystemVar,
+    score: YieldMeta,
+) -> Option<wf_lang::ast::Expr> {
+    use wf_lang::ast::{Expr, SystemVar};
+    match *sv {
+        SystemVar::Score => Some(Expr::Number(score.score?)),
+        SystemVar::EventFirstTime => Some(utils::time_nanos_to_expr(score.event_first_time_nanos?)),
+        SystemVar::EventLastTime => Some(utils::time_nanos_to_expr(score.event_last_time_nanos?)),
+        SystemVar::EvidenceStartTime => {
+            Some(utils::time_nanos_to_expr(score.evidence_first_time_nanos?))
+        }
+        SystemVar::EvidenceEndTime => {
+            Some(utils::time_nanos_to_expr(score.evidence_last_time_nanos?))
+        }
+        SystemVar::WindowStartTime => {
+            Some(utils::time_nanos_to_expr(score.window_start_time_nanos?))
+        }
+        SystemVar::WindowEndTime => Some(utils::time_nanos_to_expr(score.window_end_time_nanos?)),
+        SystemVar::EmitTime => Some(utils::time_nanos_to_expr(score.emit_time_nanos?)),
+        SystemVar::FirstMatchTime => Some(utils::time_nanos_to_expr(score.first_match_time_nanos?)),
+        _ => None,
+    }
+}
+
+/// wfu 元字段 → 对应字面量表达式（容器值不支持 → None）。
+fn materialize_wfu_meta(
+    field: wf_lang::wfu_meta::WfuMetaField,
+    score: YieldMeta,
+) -> Option<wf_lang::ast::Expr> {
+    use wf_lang::ast::Expr;
+    match score.resolve_wfu_meta(field)? {
+        Value::Number(n) => Some(Expr::Number(n)),
+        Value::Str(s) => Some(Expr::StringLit(s.to_string())),
+        Value::Bool(b) => Some(Expr::Bool(b)),
+        _ => None,
+    }
+}
+
+/// 单个子节点的递归包装（Neg / Not）。
+fn map_materialize_boxed(
+    inner: &wf_lang::ast::Expr,
+    score: YieldMeta,
+    wrap: fn(Box<wf_lang::ast::Expr>) -> wf_lang::ast::Expr,
+) -> Option<wf_lang::ast::Expr> {
+    Some(wrap(Box::new(materialize_system_vars(inner, score)?)))
+}
+
+fn materialize_binop(
+    op: wf_lang::ast::BinOp,
+    left: &wf_lang::ast::Expr,
+    right: &wf_lang::ast::Expr,
+    score: YieldMeta,
+) -> Option<wf_lang::ast::Expr> {
+    use wf_lang::ast::Expr;
+    Some(Expr::BinOp {
+        op,
+        left: Box::new(materialize_system_vars(left, score)?),
+        right: Box::new(materialize_system_vars(right, score)?),
+    })
+}
+
+fn materialize_func_call(
+    qualifier: &Option<String>,
+    name: &str,
+    args: &[wf_lang::ast::Expr],
+    score: YieldMeta,
+) -> Option<wf_lang::ast::Expr> {
+    use wf_lang::ast::Expr;
+    Some(Expr::FuncCall {
+        qualifier: qualifier.clone(),
+        name: name.to_string(),
+        args: args
+            .iter()
+            .map(|arg| materialize_system_vars(arg, score))
+            .collect::<Option<Vec<_>>>()?,
+    })
+}
+
+fn materialize_object(
+    items: &[wf_lang::ast::ObjectItem],
+    score: YieldMeta,
+) -> Option<wf_lang::ast::Expr> {
+    use wf_lang::ast::Expr;
+    Some(Expr::Object(
+        items
+            .iter()
+            .map(|item| {
+                Some(wf_lang::ast::ObjectItem {
+                    targets: item.targets.clone(),
+                    type_hint: item.type_hint.clone(),
+                    value: materialize_system_vars(&item.value, score)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?,
+    ))
+}
+
+fn materialize_array(items: &[wf_lang::ast::Expr], score: YieldMeta) -> Option<wf_lang::ast::Expr> {
+    use wf_lang::ast::Expr;
+    Some(Expr::Array(
+        items
+            .iter()
+            .map(|item| materialize_system_vars(item, score))
+            .collect::<Option<Vec<_>>>()?,
+    ))
+}
+
+fn materialize_in_list(
+    expr: &wf_lang::ast::Expr,
+    list: &[wf_lang::ast::Expr],
+    negated: bool,
+    score: YieldMeta,
+) -> Option<wf_lang::ast::Expr> {
+    use wf_lang::ast::Expr;
+    Some(Expr::InList {
+        expr: Box::new(materialize_system_vars(expr, score)?),
+        list: list
+            .iter()
+            .map(|item| materialize_system_vars(item, score))
+            .collect::<Option<Vec<_>>>()?,
+        negated,
+    })
+}
+
+fn materialize_if_then_else(
+    cond: &wf_lang::ast::Expr,
+    then_expr: &wf_lang::ast::Expr,
+    else_expr: &wf_lang::ast::Expr,
+    score: YieldMeta,
+) -> Option<wf_lang::ast::Expr> {
+    use wf_lang::ast::Expr;
+    Some(Expr::IfThenElse {
+        cond: Box::new(materialize_system_vars(cond, score)?),
+        then_expr: Box::new(materialize_system_vars(then_expr, score)?),
+        else_expr: Box::new(materialize_system_vars(else_expr, score)?),
+    })
+}
+
+fn materialize_match(
+    expr: &wf_lang::ast::Expr,
+    arms: &[wf_lang::ast::MatchArm],
+    default: &Option<Box<wf_lang::ast::Expr>>,
+    score: YieldMeta,
+) -> Option<wf_lang::ast::Expr> {
+    use wf_lang::ast::Expr;
+    Some(Expr::Match {
+        expr: Box::new(materialize_system_vars(expr, score)?),
+        arms: arms
+            .iter()
+            .map(|arm| {
+                Some(wf_lang::ast::MatchArm {
+                    patterns: arm
+                        .patterns
+                        .iter()
+                        .map(|p| materialize_system_vars(p, score))
+                        .collect::<Option<Vec<_>>>()?,
+                    value: materialize_system_vars(&arm.value, score)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?,
+        default: default
+            .as_ref()
+            .and_then(|d| materialize_system_vars(d, score))
+            .map(Box::new),
+    })
+}
+
+#[path = "builtins_handlers.rs"]
+mod handlers;
+
+type BuiltinHandler = fn(&str, &[wf_lang::ast::Expr], &dyn FieldSource, YieldMeta) -> Option<Value>;
+
+fn builtin_handler(name: &str) -> Option<BuiltinHandler> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static HANDLERS: OnceLock<HashMap<&'static str, BuiltinHandler>> = OnceLock::new();
+    let map = HANDLERS.get_or_init(|| {
+        let mut map: HashMap<&'static str, BuiltinHandler> = HashMap::new();
+        map.insert("contains", handlers::builtin_contains);
+        map.insert("startswith", handlers::builtin_startswith);
+        map.insert("endswith", handlers::builtin_endswith);
+        map.insert("merge", handlers::builtin_merge);
+        map.insert("substr", handlers::builtin_substr);
+        map.insert("replace", handlers::builtin_replace);
+        map.insert("trim", handlers::builtin_trim);
+        map.insert("lower", handlers::builtin_lower);
+        map.insert("upper", handlers::builtin_upper);
+        map.insert("len", handlers::builtin_len);
+        map.insert("mvcount", handlers::builtin_mvcount);
+        map.insert("mvjoin", handlers::builtin_mvjoin);
+        map.insert("mvindex", handlers::builtin_mvindex);
+        map.insert("mvappend", handlers::builtin_mvappend);
+        map.insert("split", handlers::builtin_split);
+        map.insert("mvdedup", handlers::builtin_mvdedup);
+        map.insert("abs", handlers::builtin_abs);
+        map.insert("round", handlers::builtin_round);
+        map.insert("ceil", handlers::builtin_ceil);
+        map.insert("floor", handlers::builtin_floor);
+        map.insert("sqrt", handlers::builtin_sqrt);
+        map.insert("pow", handlers::builtin_pow);
+        map.insert("log", handlers::builtin_log);
+        map.insert("exp", handlers::builtin_exp);
+        map.insert("clamp", handlers::builtin_clamp);
+        map.insert("sign", handlers::builtin_sign);
+        map.insert("trunc", handlers::builtin_trunc);
+        map.insert("is_finite", handlers::builtin_is_finite);
+        map.insert("ltrim", handlers::builtin_ltrim);
+        map.insert("rtrim", handlers::builtin_rtrim);
+        map.insert("fmt", handlers::builtin_fmt);
+        map.insert("concat", handlers::builtin_concat);
+        map.insert("join", handlers::builtin_join);
+        map.insert("join_by", handlers::builtin_join_by);
+        map.insert("indexof", handlers::builtin_indexof);
+        map.insert("replace_plain", handlers::builtin_replace_plain);
+        map.insert("startswith_any", handlers::builtin_startswith_any);
+        map.insert("endswith_any", handlers::builtin_endswith_any);
+        map.insert("coalesce", handlers::builtin_coalesce);
+        map.insert("isnull", handlers::builtin_isnull);
+        map.insert("isnotnull", handlers::builtin_isnotnull);
+        map.insert("is_blank", handlers::builtin_is_blank);
+        map.insert("null_if_blank", handlers::builtin_null_if_blank);
+        map.insert("default_if_blank", handlers::builtin_default_if_blank);
+        map.insert("md5", handlers::builtin_md5);
+        map.insert("sha1", handlers::builtin_sha1);
+        map.insert("sha1_n", handlers::builtin_sha1_n);
+        map.insert("sha256", handlers::builtin_sha256);
+        map.insert("hex", handlers::builtin_hex);
+        map.insert("stable_id", handlers::builtin_stable_id);
+        map.insert("mvsort", handlers::builtin_mvsort);
+        map.insert("mvreverse", handlers::builtin_mvreverse);
+        map.insert("now", handlers::builtin_now);
+        map.insert("now_ms", handlers::builtin_now);
+        map.insert("now_s", handlers::builtin_now_s);
+        map.insert("now_us", handlers::builtin_now_us);
+        map.insert("now_ns", handlers::builtin_now_ns);
+        map.insert("time_to_s", handlers::builtin_time_to_s);
+        map.insert("time_to_ms", handlers::builtin_time_to_s);
+        map.insert("strftime", handlers::builtin_strftime);
+        map.insert("strptime", handlers::builtin_strptime);
+        map.insert("regex_match", handlers::builtin_regex_match);
+        map.insert("cidr_match", handlers::builtin_cidr_match);
+        map.insert("time_diff", handlers::builtin_time_diff);
+        map.insert("time_bucket", handlers::builtin_time_bucket);
+        map.insert("bucket_end", handlers::builtin_bucket_end);
+        map.insert("external", handlers::builtin_external);
+        map
+    });
+    map.get(name).copied()
 }
 
 pub(super) fn eval_builtin_func_with_l3(
@@ -179,902 +355,8 @@ pub(super) fn eval_builtin_func_with_l3(
     ctx: &dyn FieldSource,
     score: YieldMeta,
 ) -> Option<Value> {
-    match name {
-        "contains" => {
-            if args.len() != 2 {
-                return None;
-            }
-            let haystack = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let needle = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            Some(Value::Bool(haystack.contains(needle.as_str())))
-        }
-        "startswith" => {
-            if args.len() != 2 {
-                return None;
-            }
-            let text = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let prefix = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            Some(Value::Bool(text.starts_with(prefix.as_str())))
-        }
-        "endswith" => {
-            if args.len() != 2 {
-                return None;
-            }
-            let text = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let suffix = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            Some(Value::Bool(text.ends_with(suffix.as_str())))
-        }
-        "merge" => {
-            if args.is_empty() {
-                return None;
-            }
-            let mut merged = EngineHashMap::default();
-            for arg in args {
-                match eval_merge_arg(arg, ctx, score) {
-                    Some(Value::Object(fields)) => merged.extend(fields),
-                    None if matches!(arg, wf_lang::ast::Expr::Field(_)) => {}
-                    None => return None,
-                    Some(_) => return None,
-                }
-            }
-            Some(Value::Object(merged))
-        }
-        "substr" => {
-            if args.len() != 2 && args.len() != 3 {
-                return None;
-            }
-            let text = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let start = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Number(n) => n.trunc() as i64,
-                _ => return None,
-            };
-            let chars: Vec<char> = text.chars().collect();
-            let len = chars.len() as i64;
-            let mut start_idx = if start > 0 {
-                start - 1
-            } else if start < 0 {
-                len + start
-            } else {
-                0
-            };
-            if start_idx < 0 {
-                start_idx = 0;
-            }
-            if start_idx >= len {
-                return Some(Value::Str(String::new().into()));
-            }
-            let mut end_idx = len;
-            if args.len() == 3 {
-                let length = match eval_expr_with_l3(&args[2], ctx, score)? {
-                    Value::Number(n) => n.trunc() as i64,
-                    _ => return None,
-                };
-                if length <= 0 {
-                    return Some(Value::Str(String::new().into()));
-                }
-                end_idx = (start_idx + length).min(len);
-            }
-            let sub = chars[start_idx as usize..end_idx as usize]
-                .iter()
-                .collect::<String>();
-            Some(Value::Str(sub.into()))
-        }
-        "replace" => {
-            if args.len() != 3 {
-                return None;
-            }
-            let text = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let pattern = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let replacement = match eval_expr_with_l3(&args[2], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let re = regex::Regex::new(&pattern).ok()?;
-            Some(Value::Str(
-                re.replace_all(text.as_str(), replacement.as_str())
-                    .into_owned()
-                    .into(),
-            ))
-        }
-        "trim" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => Some(Value::Str(s.trim().to_string().into())),
-                _ => None,
-            }
-        }
-        "lower" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => Some(Value::Str(s.to_lowercase().into())),
-                _ => None,
-            }
-        }
-        "upper" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => Some(Value::Str(s.to_uppercase().into())),
-                _ => None,
-            }
-        }
-        "len" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => Some(Value::Number(s.len() as f64)),
-                _ => None,
-            }
-        }
-        "mvcount" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Array(arr) => Some(Value::Number(arr.len() as f64)),
-                _ => None,
-            }
-        }
-        "mvjoin" => {
-            if args.len() != 2 {
-                return None;
-            }
-            let arr = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Array(arr) => arr,
-                _ => return None,
-            };
-            let sep = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let joined = arr
-                .into_iter()
-                .map(|v| value_to_string(&v))
-                .collect::<Vec<_>>()
-                .join(&sep);
-            Some(Value::Str(joined.into()))
-        }
-        "mvindex" => {
-            if args.len() != 2 && args.len() != 3 {
-                return None;
-            }
-            let arr = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Array(arr) => arr,
-                _ => return None,
-            };
-            if args.len() == 2 {
-                let idx = match eval_expr_with_l3(&args[1], ctx, score)? {
-                    Value::Number(n) => utils::normalize_index(n.trunc() as i64, arr.len()),
-                    _ => return None,
-                }?;
-                return arr.get(idx).cloned();
-            }
-            if arr.is_empty() {
-                return Some(Value::Array(Vec::new()));
-            }
-            let start = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Number(n) => n.trunc() as i64,
-                _ => return None,
-            };
-            let end = match eval_expr_with_l3(&args[2], ctx, score)? {
-                Value::Number(n) => n.trunc() as i64,
-                _ => return None,
-            };
-            let len = arr.len() as i64;
-            let mut start_idx = if start < 0 { len + start } else { start };
-            let mut end_idx = if end < 0 { len + end } else { end };
-            if end_idx < 0 || start_idx >= len {
-                return Some(Value::Array(Vec::new()));
-            }
-            if start_idx < 0 {
-                start_idx = 0;
-            }
-            if end_idx >= len {
-                end_idx = len - 1;
-            }
-            if start_idx > end_idx {
-                return Some(Value::Array(Vec::new()));
-            }
-            Some(Value::Array(
-                arr[start_idx as usize..=end_idx as usize].to_vec(),
-            ))
-        }
-        "mvappend" => {
-            if args.is_empty() {
-                return None;
-            }
-            let mut out: Vec<Value> = Vec::new();
-            for arg in args {
-                match eval_expr_with_l3(arg, ctx, score)? {
-                    Value::Array(values) => out.extend(values),
-                    value => out.push(value),
-                }
-            }
-            Some(Value::Array(out))
-        }
-        "split" => {
-            if args.len() != 2 {
-                return None;
-            }
-            let text = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let sep = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let parts = if sep.is_empty() {
-                text.chars()
-                    .map(|c| Value::Str(c.to_string().into()))
-                    .collect()
-            } else {
-                text.split(sep.as_str())
-                    .map(|s| Value::Str(s.to_string().into()))
-                    .collect()
-            };
-            Some(Value::Array(parts))
-        }
-        "mvdedup" => {
-            if args.len() != 1 {
-                return None;
-            }
-            let arr = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Array(arr) => arr,
-                _ => return None,
-            };
-            let mut deduped: Vec<Value> = Vec::new();
-            for v in arr {
-                if !deduped.iter().any(|existing| values_equal(existing, &v)) {
-                    deduped.push(v);
-                }
-            }
-            Some(Value::Array(deduped))
-        }
-        "abs" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => Some(Value::Number(n.abs())),
-                _ => None,
-            }
-        }
-        "round" => {
-            if args.len() != 1 && args.len() != 2 {
-                return None;
-            }
-            let value = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => n,
-                _ => return None,
-            };
-            let precision = if args.len() == 2 {
-                match eval_expr_with_l3(&args[1], ctx, score)? {
-                    Value::Number(n) => utils::f64_to_i64_trunc(n)?,
-                    _ => return None,
-                }
-            } else {
-                0
-            };
-            let rounded = utils::round_with_precision(value, precision)?;
-            Some(Value::Number(rounded))
-        }
-        "ceil" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => Some(Value::Number(n.ceil())),
-                _ => None,
-            }
-        }
-        "floor" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => Some(Value::Number(n.floor())),
-                _ => None,
-            }
-        }
-        "sqrt" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) if n >= 0.0 => Some(Value::Number(n.sqrt())),
-                _ => None,
-            }
-        }
-        "pow" => {
-            if args.len() != 2 {
-                return None;
-            }
-            let x = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => n,
-                _ => return None,
-            };
-            let y = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Number(n) => n,
-                _ => return None,
-            };
-            let out = x.powf(y);
-            if out.is_finite() {
-                Some(Value::Number(out))
-            } else {
-                None
-            }
-        }
-        "log" => {
-            if args.len() != 1 && args.len() != 2 {
-                return None;
-            }
-            let x = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => n,
-                _ => return None,
-            };
-            if x <= 0.0 {
-                return None;
-            }
-            let out = if args.len() == 2 {
-                let base = match eval_expr_with_l3(&args[1], ctx, score)? {
-                    Value::Number(n) => n,
-                    _ => return None,
-                };
-                if base <= 0.0 || (base - 1.0).abs() < f64::EPSILON {
-                    return None;
-                }
-                x.log(base)
-            } else {
-                x.ln()
-            };
-            if out.is_finite() {
-                Some(Value::Number(out))
-            } else {
-                None
-            }
-        }
-        "exp" => {
-            if args.len() != 1 {
-                return None;
-            }
-            let x = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => n,
-                _ => return None,
-            };
-            let out = x.exp();
-            if out.is_finite() {
-                Some(Value::Number(out))
-            } else {
-                None
-            }
-        }
-        "clamp" => {
-            if args.len() != 3 {
-                return None;
-            }
-            let x = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => n,
-                _ => return None,
-            };
-            let min = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Number(n) => n,
-                _ => return None,
-            };
-            let max = match eval_expr_with_l3(&args[2], ctx, score)? {
-                Value::Number(n) => n,
-                _ => return None,
-            };
-            if min > max {
-                return None;
-            }
-            Some(Value::Number(x.clamp(min, max)))
-        }
-        "sign" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) if n.is_finite() => Some(Value::Number(n.signum())),
-                _ => None,
-            }
-        }
-        "trunc" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => Some(Value::Number(n.trunc())),
-                _ => None,
-            }
-        }
-        "is_finite" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => Some(Value::Bool(n.is_finite())),
-                _ => None,
-            }
-        }
-        "ltrim" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => Some(Value::Str(s.trim_start().to_string().into())),
-                _ => None,
-            }
-        }
-        "rtrim" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => Some(Value::Str(s.trim_end().to_string().into())),
-                _ => None,
-            }
-        }
-        "fmt" => {
-            if args.is_empty() {
-                return None;
-            }
-            let template = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let values = args[1..]
-                .iter()
-                .map(|arg| eval_expr_with_l3(arg, ctx, score))
-                .collect::<Option<Vec<_>>>()?;
-            Some(Value::Str(
-                utils::apply_fmt_template(template.as_str(), &values)?.into(),
-            ))
-        }
-        "concat" => {
-            if args.is_empty() {
-                return None;
-            }
-            let mut out = String::new();
-            for arg in args {
-                let value = eval_expr_with_l3(arg, ctx, score)?;
-                out.push_str(&value_to_string(&value));
-            }
-            Some(Value::Str(out.into()))
-        }
-        "join" => {
-            if args.is_empty() {
-                return None;
-            }
-            let mut out = String::new();
-            for arg in args {
-                out.push_str(&eval_join_arg_with_l3(arg, ctx, score)?);
-            }
-            Some(Value::Str(out.into()))
-        }
-        "join_by" => {
-            if args.len() < 2 {
-                return None;
-            }
-            let sep = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let mut parts = Vec::with_capacity(args.len() - 1);
-            for arg in &args[1..] {
-                parts.push(eval_join_arg_with_l3(arg, ctx, score)?);
-            }
-            Some(Value::Str(parts.join(&sep).into()))
-        }
-        "indexof" => {
-            if args.len() != 2 {
-                return None;
-            }
-            let text = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let needle = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let idx = text.find(needle.as_str()).map(|x| x as f64).unwrap_or(-1.0);
-            Some(Value::Number(idx))
-        }
-        "replace_plain" => {
-            if args.len() != 3 {
-                return None;
-            }
-            let text = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let from = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let to = match eval_expr_with_l3(&args[2], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            Some(Value::Str(text.replace(from.as_str(), to.as_str()).into()))
-        }
-        "startswith_any" => {
-            if args.len() < 2 {
-                return None;
-            }
-            let text = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            for arg in &args[1..] {
-                let prefix = match eval_expr_with_l3(arg, ctx, score)? {
-                    Value::Str(s) => s,
-                    _ => return None,
-                };
-                if text.starts_with(prefix.as_str()) {
-                    return Some(Value::Bool(true));
-                }
-            }
-            Some(Value::Bool(false))
-        }
-        "endswith_any" => {
-            if args.len() < 2 {
-                return None;
-            }
-            let text = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            for arg in &args[1..] {
-                let suffix = match eval_expr_with_l3(arg, ctx, score)? {
-                    Value::Str(s) => s,
-                    _ => return None,
-                };
-                if text.ends_with(suffix.as_str()) {
-                    return Some(Value::Bool(true));
-                }
-            }
-            Some(Value::Bool(false))
-        }
-        "coalesce" => {
-            if args.is_empty() {
-                return None;
-            }
-            for arg in args {
-                if let Some(v) = eval_expr_with_l3(arg, ctx, score) {
-                    if matches!(&v, Value::Str(s) if utils::is_blank_str(s)) {
-                        continue;
-                    }
-                    return Some(v);
-                }
-            }
-            None
-        }
-        "isnull" => {
-            if args.len() != 1 {
-                return None;
-            }
-            Some(Value::Bool(
-                eval_expr_with_l3(&args[0], ctx, score).is_none(),
-            ))
-        }
-        "isnotnull" => {
-            if args.len() != 1 {
-                return None;
-            }
-            Some(Value::Bool(
-                eval_expr_with_l3(&args[0], ctx, score).is_some(),
-            ))
-        }
-        "is_blank" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score) {
-                Some(Value::Str(s)) => Some(Value::Bool(utils::is_blank_str(&s))),
-                None => Some(Value::Bool(true)),
-                Some(_) => None,
-            }
-        }
-        "null_if_blank" => {
-            if args.len() != 1 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) if utils::is_blank_str(&s) => None,
-                Value::Str(s) => Some(Value::Str(s)),
-                _ => None,
-            }
-        }
-        "default_if_blank" => {
-            if args.len() != 2 {
-                return None;
-            }
-            match eval_expr_with_l3(&args[0], ctx, score) {
-                Some(Value::Str(s)) if !utils::is_blank_str(&s) => Some(Value::Str(s)),
-                Some(Value::Str(_)) | None => match eval_expr_with_l3(&args[1], ctx, score)? {
-                    Value::Str(s) => Some(Value::Str(s)),
-                    _ => None,
-                },
-                Some(_) => None,
-            }
-        }
-        "md5" => {
-            let text = utils::eval_single_string_arg_with_l3(args, ctx, score)?;
-            Some(Value::Str(
-                hex::encode(<Md5 as Md5Digest>::digest(text.as_bytes())).into(),
-            ))
-        }
-        "sha1" => {
-            let text = utils::eval_single_string_arg_with_l3(args, ctx, score)?;
-            Some(Value::Str(
-                hex::encode(<Sha1 as Sha1Digest>::digest(text.as_bytes())).into(),
-            ))
-        }
-        "sha1_n" => {
-            if args.len() != 2 {
-                return None;
-            }
-            let text = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let len = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Number(n) if n.is_finite() && n.fract() == 0.0 => n as usize,
-                _ => return None,
-            };
-            if !(1..=40).contains(&len) {
-                return None;
-            }
-            let digest = hex::encode(<Sha1 as Sha1Digest>::digest(text.as_bytes()));
-            Some(Value::Str(digest[..len].to_string().into()))
-        }
-        "sha256" => {
-            let text = utils::eval_single_string_arg_with_l3(args, ctx, score)?;
-            Some(Value::Str(
-                hex::encode(Sha256::digest(text.as_bytes())).into(),
-            ))
-        }
-        "hex" => {
-            let text = utils::eval_single_string_arg_with_l3(args, ctx, score)?;
-            Some(Value::Str(hex::encode(text.as_bytes()).into()))
-        }
-        "stable_id" => {
-            if args.len() < 2 {
-                return None;
-            }
-            let prefix = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let mut hasher = Sha256::new();
-            for arg in &args[1..] {
-                let value = eval_expr_with_l3(arg, ctx, score)?;
-                utils::update_stable_id_hash(&mut hasher, &value)?;
-            }
-            let digest = hex::encode(hasher.finalize());
-            Some(Value::Str(format!("{}{}", prefix, &digest[..16]).into()))
-        }
-        "mvsort" => {
-            if args.len() != 1 {
-                return None;
-            }
-            let mut arr = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Array(arr) => arr,
-                _ => return None,
-            };
-            arr.sort_by(utils::compare_sortable_values);
-            Some(Value::Array(arr))
-        }
-        "mvreverse" => {
-            if args.len() != 1 {
-                return None;
-            }
-            let mut arr = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Array(arr) => arr,
-                _ => return None,
-            };
-            arr.reverse();
-            Some(Value::Array(arr))
-        }
-        "now" | "now_ms" => {
-            if !args.is_empty() {
-                return None;
-            }
-            Some(utils::time_nanos_to_value(utils::current_time_nanos()?))
-        }
-        "now_s" => {
-            if !args.is_empty() {
-                return None;
-            }
-            Some(Value::Number(
-                (utils::current_time_nanos()? / 1_000_000_000) as f64,
-            ))
-        }
-        "now_us" => {
-            if !args.is_empty() {
-                return None;
-            }
-            Some(Value::Number((utils::current_time_nanos()? / 1_000) as f64))
-        }
-        "now_ns" => {
-            if !args.is_empty() {
-                return None;
-            }
-            Some(Value::Number(utils::current_time_nanos()? as f64))
-        }
-        "time_to_s" | "time_to_ms" => {
-            // time 值（系统变量毫秒 / 输入字段纳秒 / 聚合保持原单位）统一按
-            // 数量级归一化到纳秒后转目标单位——两种来源都正确（issue #69）。
-            if args.len() != 1 {
-                return None;
-            }
-            let ts_nanos = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
-                _ => return None,
-            };
-            let divisor = if name == "time_to_s" {
-                1_000_000_000
-            } else {
-                1_000_000
-            };
-            Some(Value::Number((ts_nanos / divisor) as f64))
-        }
-        "strftime" => {
-            if args.len() != 1 && args.len() != 2 {
-                return None;
-            }
-            let ts_nanos = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
-                _ => return None,
-            };
-            let fmt = if let Some(fmt_expr) = args.get(1) {
-                match eval_expr_with_l3(fmt_expr, ctx, score)? {
-                    Value::Str(s) => s.to_string(),
-                    _ => return None,
-                }
-            } else {
-                score
-                    .time_format
-                    .unwrap_or(wf_config::DEFAULT_OUTPUT_TIME_FORMAT)
-                    .to_string()
-            };
-            let dt = utils::timestamp_nanos_to_utc(ts_nanos)?;
-            Some(Value::Str(dt.format(&fmt).to_string().into()))
-        }
-        "strptime" => {
-            if args.len() != 2 {
-                return None;
-            }
-            let text = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let fmt = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let ts_nanos = utils::parse_time_to_timestamp_nanos(&text, &fmt)?;
-            Some(utils::time_nanos_to_value(ts_nanos))
-        }
-        "regex_match" => {
-            if args.len() != 2 {
-                return None;
-            }
-            let hay = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let pat = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let re = crate::match_engine::regex_cache::cached_regex(&pat)?;
-            Some(Value::Bool(re.is_match(&hay)))
-        }
-        "cidr_match" => {
-            if args.len() != 2 {
-                return None;
-            }
-            let ip = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let cidr = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
-            };
-            let net = crate::match_engine::cidr_cache::cached_cidr(&cidr)?;
-            Some(Value::Bool(net.contains(&ip)))
-        }
-        "time_diff" => {
-            if args.len() != 2 {
-                return None;
-            }
-            let t1 = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
-                _ => return None,
-            };
-            let t2 = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
-                _ => return None,
-            };
-            Some(Value::Number((t1 - t2).abs() as f64 / 1_000_000_000.0))
-        }
-        "time_bucket" => {
-            if args.len() != 2 {
-                return None;
-            }
-            let t = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
-                _ => return None,
-            };
-            let interval = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Number(n) => n,
-                _ => return None,
-            };
-            let interval_nanos = positive_interval_seconds_to_nanos(interval)?;
-            let bucketed = t.div_euclid(interval_nanos) * interval_nanos;
-            Some(utils::time_nanos_to_value(bucketed))
-        }
-        "bucket_end" => {
-            // 桶末：`bucket_end(t, interval) = time_bucket(t, interval) + interval`
-            if args.len() != 2 {
-                return None;
-            }
-            let t = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
-                _ => return None,
-            };
-            let interval = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Number(n) => n,
-                _ => return None,
-            };
-            let interval_nanos = positive_interval_seconds_to_nanos(interval)?;
-            let bucketed = t.div_euclid(interval_nanos) * interval_nanos;
-            Some(utils::time_nanos_to_value(
-                bucketed.checked_add(interval_nanos)?,
-            ))
-        }
-        "external" => crate::external::eval_external(&args[0], &args[1..], |a| {
-            eval_expr_with_l3(a, ctx, score)
-        }),
-        _ => None,
-    }
+    let handler = builtin_handler(name)?;
+    handler(name, args, ctx, score)
 }
 
 fn eval_merge_arg(
@@ -1165,26 +447,13 @@ pub(super) fn eval_l3_func(
     if args.is_empty() {
         return None;
     }
-    let step_indices = step_data::resolve_step_indices(ctx, args.first());
-    let values = if let Some((alias, _)) = args.first().and_then(step_data::extract_bind_field_ref)
-        && step_data::get_bind_count(ctx, alias).is_some()
-    {
-        step_data::flatten_bind_series(ctx, args.first())
-    } else {
-        step_data::flatten_step_series(ctx, &step_indices, args.first())
-    };
+    let values = l3_series_values(ctx, args.first());
     match name {
         "collect_set" => {
             if args.len() != 1 {
                 return None;
             }
-            let mut out: Vec<Value> = Vec::new();
-            for v in values {
-                if !out.iter().any(|seen| values_equal(seen, &v)) {
-                    out.push(v);
-                }
-            }
-            Some(Value::Array(out))
+            Some(Value::Array(dedup_values(values)))
         }
         "collect_list" => {
             if args.len() != 1 {
@@ -1208,19 +477,7 @@ pub(super) fn eval_l3_func(
             if args.len() != 1 {
                 return None;
             }
-            let nums: Vec<f64> = values
-                .iter()
-                .filter_map(|v| match v {
-                    Value::Number(n) => Some(*n),
-                    _ => None,
-                })
-                .collect();
-            if nums.len() < 2 {
-                return Some(Value::Number(0.0));
-            }
-            let mean = nums.iter().sum::<f64>() / nums.len() as f64;
-            let variance = nums.iter().map(|n| (n - mean).powi(2)).sum::<f64>() / nums.len() as f64;
-            Some(Value::Number(variance.sqrt()))
+            Some(Value::Number(series_stddev(&values)))
         }
         "percentile" => {
             if args.len() != 2 {
@@ -1230,22 +487,67 @@ pub(super) fn eval_l3_func(
                 Value::Number(n) => n.clamp(0.0, 100.0) / 100.0,
                 _ => return None,
             };
-            let mut nums: Vec<f64> = values
-                .iter()
-                .filter_map(|v| match v {
-                    Value::Number(n) => Some(*n),
-                    _ => None,
-                })
-                .collect();
-            if nums.is_empty() {
-                return Some(Value::Number(0.0));
-            }
-            nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let idx = ((nums.len() - 1) as f64 * p).round() as usize;
-            Some(Value::Number(nums[idx.min(nums.len() - 1)]))
+            Some(percentile_value(&values, p))
         }
         _ => None,
     }
+}
+
+/// 解析 L3 系列值：bind 字段走 bind 序列，否则按 step 索引展开。
+fn l3_series_values(ctx: &dyn FieldSource, first: Option<&wf_lang::ast::Expr>) -> Vec<Value> {
+    let step_indices = step_data::resolve_step_indices(ctx, first);
+    if let Some((alias, _)) = first.and_then(step_data::extract_bind_field_ref)
+        && step_data::get_bind_count(ctx, alias).is_some()
+    {
+        step_data::flatten_bind_series(ctx, first)
+    } else {
+        step_data::flatten_step_series(ctx, &step_indices, first)
+    }
+}
+
+/// collect_set 去重（同原实现等值语义）。
+fn dedup_values(values: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for v in values {
+        if !out.iter().any(|seen| values_equal(seen, &v)) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// 样本标准差；不足 2 个数值 → 0.0（与原实现一致）。
+fn series_stddev(values: &[Value]) -> f64 {
+    let nums: Vec<f64> = values
+        .iter()
+        .filter_map(|v| match v {
+            Value::Number(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    if nums.len() < 2 {
+        return 0.0;
+    }
+    let mean = nums.iter().sum::<f64>() / nums.len() as f64;
+    let variance = nums.iter().map(|n| (n - mean).powi(2)).sum::<f64>() / nums.len() as f64;
+    variance.sqrt()
+}
+
+/// p 分位（最近秩取整）；空序列 → 0.0（与原实现一致）。
+fn percentile_value(values: &[Value], p: f64) -> Value {
+    let mut nums: Vec<f64> = values
+        .iter()
+        .filter_map(|v| match v {
+            Value::Number(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    if nums.is_empty() {
+        return Value::Number(0.0);
+    }
+    nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((nums.len() - 1) as f64 * p).round() as usize;
+    Value::Number(nums[idx.min(nums.len() - 1)])
 }
 
 pub(super) fn eval_aggregate_func(
@@ -1379,4 +681,61 @@ pub(super) fn numeric_values(values: &[Value]) -> Vec<f64> {
 
 pub(super) fn sum_numeric_values(values: &[Value]) -> f64 {
     numeric_values(values).iter().sum()
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    fn nums(values: &[f64]) -> Vec<Value> {
+        values.iter().map(|n| Value::Number(*n)).collect()
+    }
+
+    #[test]
+    fn series_stddev_matches_sample_formula() {
+        assert_eq!(series_stddev(&nums(&[])), 0.0);
+        assert_eq!(series_stddev(&nums(&[3.0])), 0.0); // 不足 2 个 → 0
+        let sd = series_stddev(&nums(&[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]));
+        assert!((sd - 2.0).abs() < 1e-9);
+        // 非数值成员被忽略
+        let mixed = vec![
+            Value::Number(2.0),
+            Value::Number(4.0),
+            Value::Str("x".into()),
+            Value::Number(4.0),
+        ];
+        let sd = series_stddev(&mixed);
+        assert!(sd >= 0.0);
+        assert_eq!(sd, series_stddev(&nums(&[2.0, 4.0, 4.0])));
+    }
+
+    #[test]
+    fn percentile_uses_nearest_rank_and_empty_guard() {
+        assert_eq!(percentile_value(&nums(&[]), 0.5), Value::Number(0.0));
+        assert_eq!(
+            percentile_value(&nums(&[1.0, 2.0, 3.0, 4.0]), 0.5),
+            Value::Number(3.0) // idx = round(3 * 0.5) = 2
+        );
+        assert_eq!(
+            percentile_value(&nums(&[10.0, 20.0, 30.0]), 0.0),
+            Value::Number(10.0)
+        );
+        assert_eq!(
+            percentile_value(&nums(&[10.0, 20.0, 30.0]), 1.0),
+            Value::Number(30.0)
+        );
+    }
+
+    #[test]
+    fn dedup_values_uses_value_equality() {
+        let out = dedup_values(vec![
+            Value::Number(1.0),
+            Value::Str("a".into()),
+            Value::Number(1.0),
+        ]);
+        assert_eq!(out.len(), 2);
+        // 近等数值按 epsilon 语义去重
+        let near = dedup_values(vec![Value::Number(1.0), Value::Number(1.0 + 1e-16)]);
+        assert_eq!(near.len(), 1);
+    }
 }

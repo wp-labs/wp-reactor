@@ -311,4 +311,42 @@ mod tests {
             ScopeKey::Float(_)
         )); // == 2^53: 不精确 → Float
     }
+
+    #[test]
+    fn comps_match_resolves_left_deep_ranges() {
+        // Empty ↔ 空区间
+        assert!(comps_match(&ScopeKey::Empty, &[], 0, 0));
+        assert!(!comps_match(&ScopeKey::Empty, &[k_int(1)], 0, 1));
+        // 单叶 ↔ 单元素区间
+        assert!(comps_match(&k_int(1), &[k_int(1)], 0, 1));
+        assert!(!comps_match(&k_int(1), &[k_int(2)], 0, 1));
+        // 左深 Pair: 右叶 = comps[end-1], 左子树匹配前缀
+        let pair = ScopeKey::Pair(Box::new(k_int(1)), Box::new(k_str("y")));
+        let comps = vec![k_int(1), k_str("y")];
+        assert!(comps_match(&pair, &comps, 0, 2));
+        // 区间只覆盖右叶时左子树失配
+        assert!(!comps_match(&pair, &comps, 1, 2));
+        // 空区间对非 Empty scope → false
+        assert!(!comps_match(&pair, &comps, 1, 1));
+    }
+
+    #[test]
+    fn scope_key_from_comps_builds_left_deep_tree() {
+        assert_eq!(scope_key_from_comps(&[]), ScopeKey::Empty);
+        assert_eq!(scope_key_from_comps(&[k_int(1)]), k_int(1));
+        let comps = vec![k_int(1), k_str("y"), k_float(0.5)];
+        let tree = scope_key_from_comps(&comps);
+        // 与 comps_match 互认: 整区间命中
+        assert!(comps_match(&tree, &comps, 0, 3));
+        // 与 scope_key_hash/comps_hash 同构
+        assert_eq!(scope_key_hash(&tree), comps_hash(&comps));
+    }
+
+    #[test]
+    fn value_number_projections() {
+        assert_eq!(value_to_i128(&Value::Number(7.0)), Some(7));
+        assert_eq!(value_to_i128(&Value::Str("x".into())), None);
+        assert_eq!(value_to_f64(&Value::Number(1.5)), Some(1.5));
+        assert_eq!(value_to_f64(&Value::Bool(true)), None);
+    }
 }

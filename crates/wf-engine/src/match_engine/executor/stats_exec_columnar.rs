@@ -839,3 +839,62 @@ fn stats_mask_cache_two_shards_match_single() {
         "两片共享缓存 + 分片行域归并 = 单实例全批"
     );
 }
+
+/// SoA 空键整批域归并（段 1d）分片对拍（2026-09-06 exec.rs 拆分回归）: 纯数值
+/// 计划（SoA 桶）按行号分两片 `process_batch_rows`（行域子集）+ `take_partial`/
+/// `merge_partial`, 与单实例全批逐值一致——锁定行域 + where mask（含被过滤的
+/// sum_r1）在 `accumulate_empty_bucket_numeric` 的 wi/rows/n 交互。
+#[test]
+fn stats_soa_empty_bucket_domain_split_matches_single() {
+    let plan = num_measures_plan();
+    let rows = vec![
+        row(&[
+            ("price", num(100.0)),
+            ("bidder", num(1.0)),
+            ("auction", num(1.0)),
+        ]),
+        row(&[
+            ("price", num(200.0)),
+            ("bidder", num(1.0)),
+            ("auction", num(2.0)),
+        ]),
+        // 3e6 ≥ 1e6: sum_r1 的 where（price<1e6）不过滤掉它——过滤的是行内值。
+        row(&[
+            ("price", num(3_000_000.0)),
+            ("bidder", num(2.0)),
+            ("auction", num(3.0)),
+        ]),
+        row(&[
+            ("price", num(400.0)),
+            ("bidder", num(2.0)),
+            ("auction", num(4.0)),
+        ]),
+        row(&[
+            ("price", num(5.0)),
+            ("bidder", num(3.0)),
+            ("auction", num(5.0)),
+        ]),
+    ];
+    let batch = rows_to_batch(&rows);
+    let mut single = StatsExecutor::new(plan.clone());
+    assert!(single.process_batch_rows(&batch, None), "数值度量应可列式化");
+    let expect = single.final_measure_values();
+    let mut a = StatsExecutor::new(plan.clone());
+    let mut b = StatsExecutor::new(plan);
+    assert!(a.process_batch_rows(&batch, Some(&[0u32, 2, 4])));
+    assert!(b.process_batch_rows(&batch, Some(&[1u32, 3])));
+    let (buckets, _) = b.take_partial();
+    a.merge_partial(buckets, 0);
+    assert_eq!(
+        a.final_measure_values(),
+        expect,
+        "SoA 分片归并必须与单实例逐值一致"
+    );
+    // 手算锚点: sum_all=3_000_705; avg_all=sum/5; min_all=5; max_all=3e6;
+    // sum_r1(price<1e6)=100+200+400+5=705。
+    assert_eq!(expect[0], 3_000_705.0, "sum_all");
+    assert_eq!(expect[1], 3_000_705.0 / 5.0, "avg_all");
+    assert_eq!(expect[2], 5.0, "min_all");
+    assert_eq!(expect[3], 3_000_000.0, "max_all");
+    assert_eq!(expect[4], 705.0, "sum_r1");
+}

@@ -90,9 +90,33 @@ impl ColumnExpr {
     /// the window's schema.
     pub(crate) fn eval_vec(&self, view: &ColumnarBatch<'_>, n: usize) -> CVec {
         match self {
+            // 列叶子与带 ColRef/常参的内核（ColRef → 本批列; 其余形态委托
+            // [`Self::eval_vec_kernel`]——两层分派把单函数圈复杂度压到阈值内,
+            // 各臂体逐字保持, 语义不变）。
             ColumnExpr::Lit(v) => lit_vec(v, n),
             ColumnExpr::Col(col) => view.col_vec(col, n),
             ColumnExpr::ListIndex { col, index } => view.list_index_vec(col, *index, n),
+            ColumnExpr::CidrMatch { col, net } => view.cidr_vec(col, net, n),
+            ColumnExpr::RegexMatch { col, re } => view.regex_vec(col, re, n),
+            ColumnExpr::StrFunc { op, hay, needle } => view.strfunc_vec(*op, hay, needle, n),
+            ColumnExpr::SplitIndex { col, sep, index } => view.split_index_vec(col, sep, *index, n),
+            other => other.eval_vec_kernel(view, n),
+        }
+    }
+
+    /// 一元/二元/参数组形态内核的分派（被 [`Self::eval_vec`] 的叶子层调用）。
+    fn eval_vec_kernel(&self, view: &ColumnarBatch<'_>, n: usize) -> CVec {
+        match self {
+            // 列叶子/带常参形态已由 eval_vec 直接分派——此处仅防呆（不可达）。
+            ColumnExpr::Lit(_)
+            | ColumnExpr::Col(_)
+            | ColumnExpr::ListIndex { .. }
+            | ColumnExpr::CidrMatch { .. }
+            | ColumnExpr::RegexMatch { .. }
+            | ColumnExpr::StrFunc { .. }
+            | ColumnExpr::SplitIndex { .. } => {
+                unreachable!("列叶子形态由 eval_vec 直接分派")
+            }
             ColumnExpr::Neg(inner) => neg_vec(inner.eval_vec(view, n)),
             ColumnExpr::Not(inner) => not_vec(inner.eval_vec(view, n)),
             ColumnExpr::And(left, right) => {
@@ -107,22 +131,14 @@ impl ColumnExpr {
             ColumnExpr::Arith { op, left, right } => {
                 arith_vec(*op, left.eval_vec(view, n), right.eval_vec(view, n))
             }
-            ColumnExpr::CidrMatch { col, net } => view.cidr_vec(col, net, n),
-            ColumnExpr::RegexMatch { col, re } => view.regex_vec(col, re, n),
-            ColumnExpr::StrFunc { op, hay, needle } => view.strfunc_vec(*op, hay, needle, n),
             ColumnExpr::Fmt { template, args } => {
-                let arg_vecs: Vec<CVec> = args.iter().map(|a| a.eval_vec(view, n)).collect();
-                fmt_vec(template, &arg_vecs, n)
+                fmt_vec(template, &eval_arg_vecs(args, view, n), n)
             }
             ColumnExpr::Strftime { ts, fmt } => strftime_vec(ts.eval_vec(view, n), fmt, n),
             ColumnExpr::CountChar { text, needle } => {
                 count_char_vec(text.eval_vec(view, n), needle.eval_vec(view, n), n)
             }
-            ColumnExpr::SplitIndex { col, sep, index } => view.split_index_vec(col, sep, *index, n),
-            ColumnExpr::Concat { args } => {
-                let arg_vecs: Vec<CVec> = args.iter().map(|a| a.eval_vec(view, n)).collect();
-                concat_vec(&arg_vecs, n)
-            }
+            ColumnExpr::Concat { args } => concat_vec(&eval_arg_vecs(args, view, n), n),
             ColumnExpr::InList {
                 expr,
                 list,
@@ -140,6 +156,11 @@ impl ColumnExpr {
             ),
         }
     }
+}
+
+/// 批量求值一组子表达式为列缓冲（Fmt / Concat 的 `args` 共用）。
+fn eval_arg_vecs(args: &[ColumnExpr], view: &ColumnarBatch<'_>, n: usize) -> Vec<CVec> {
+    args.iter().map(|a| a.eval_vec(view, n)).collect()
 }
 
 /// A literal constant column (one value repeated over `n` rows).
@@ -204,68 +225,29 @@ impl ColumnarBatch<'_> {
     /// Materialize a [`ColRef`] leaf into a typed column in a single pass. A
     /// `Timestamp(Ns)` column reads as native `i64`; a `Null` column (missing
     /// field / unsupported type) reads as all-null, matching `ColRef` → `None`.
+    /// 各列类型的取值/空值映射收敛到下方 `*_col_vec` 自由函数（单臂无内联
+    /// match, 降低分派圈复杂度）。
     fn col_vec(&self, col: &ColRef, n: usize) -> CVec {
         match col.kind {
             ColKind::Null => CVec::Int(vec![None; n]),
-            ColKind::Int64 => match self.int64_array(col) {
-                Some(a) => CVec::Int(
-                    (0..n)
-                        .map(|r| (!a.is_null(r)).then(|| a.value(r)))
-                        .collect(),
-                ),
-                None => CVec::Int(vec![None; n]),
-            },
-            ColKind::TimestampNs => match self.ts_array(col) {
-                Some(a) => CVec::Int(
-                    (0..n)
-                        .map(|r| (!a.is_null(r)).then(|| a.value(r)))
-                        .collect(),
-                ),
-                None => CVec::Int(vec![None; n]),
-            },
-            ColKind::Float64 => match self.float64_array(col) {
-                Some(a) => CVec::Float(
-                    (0..n)
-                        .map(|r| (!a.is_null(r)).then(|| a.value(r)))
-                        .collect(),
-                ),
-                None => CVec::Float(vec![None; n]),
-            },
-            ColKind::Utf8 => match self.string_array(col) {
-                Some(a) => CVec::Str(
-                    (0..n)
-                        .map(|r| (!a.is_null(r)).then(|| a.value(r).into()))
-                        .collect(),
-                ),
-                None => CVec::Str(vec![None; n]),
-            },
-            ColKind::Bool => match self.bool_array(col) {
-                Some(a) => CVec::Bool(
-                    (0..n)
-                        .map(|r| (!a.is_null(r)).then(|| a.value(r)))
-                        .collect(),
-                ),
-                None => CVec::Bool(vec![None; n]),
-            },
+            ColKind::Int64 => int64_col_vec(self.int64_array(col), n),
+            ColKind::TimestampNs => ts_col_vec(self.ts_array(col), n),
+            ColKind::Float64 => float_col_vec(self.float64_array(col), n),
+            ColKind::Utf8 => str_col_vec(self.string_array(col), n),
+            ColKind::Bool => bool_col_vec(self.bool_array(col), n),
             // Array-shaped columns read bare are a non-null structured value per
             // row (`Value::Array`), never a scalar — compares false, reads null as
             // a boolean, and is not numeric (byte-identical to interpreted).
-            ColKind::JsonArray => match self.string_array(col) {
-                Some(a) => structured_col(n, |r| !a.is_null(r)),
-                None => structured_col(n, |_| false),
-            },
-            ColKind::List => match self.list_array(col) {
-                Some(a) => structured_col(n, |r| !a.is_null(r)),
-                None => structured_col(n, |_| false),
-            },
-            ColKind::LargeList => match self.large_list_array(col) {
-                Some(a) => structured_col(n, |r| !a.is_null(r)),
-                None => structured_col(n, |_| false),
-            },
-            ColKind::FixedSizeList => match self.fixed_size_list_array(col) {
-                Some(a) => structured_col(n, |r| !a.is_null(r)),
-                None => structured_col(n, |_| false),
-            },
+            ColKind::JsonArray => {
+                presence_col_vec(self.string_array(col).map(|a| a as &dyn Array), n)
+            }
+            ColKind::List => presence_col_vec(self.list_array(col).map(|a| a as &dyn Array), n),
+            ColKind::LargeList => {
+                presence_col_vec(self.large_list_array(col).map(|a| a as &dyn Array), n)
+            }
+            ColKind::FixedSizeList => {
+                presence_col_vec(self.fixed_size_list_array(col).map(|a| a as &dyn Array), n)
+            }
         }
     }
 
@@ -343,6 +325,76 @@ fn structured_col(n: usize, non_null: impl Fn(usize) -> bool) -> CVec {
             .map(|r| non_null(r).then_some(CScalar::Structured))
             .collect(),
     )
+}
+
+/// 原生 Int64 列物化（[`ColumnarBatch::col_vec`] 的 Int64/TimestampNs 共用形状）;
+/// 列缺失/形态不符 → 全 null（对齐 `ColKind::Null`）。
+fn int64_col_vec(a: Option<&Int64Array>, n: usize) -> CVec {
+    match a {
+        Some(a) => CVec::Int(
+            (0..n)
+                .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+                .collect(),
+        ),
+        None => CVec::Int(vec![None; n]),
+    }
+}
+
+/// Timestamp(Ns) 列以原生 i64 读取（物化为 Int 列）。
+fn ts_col_vec(a: Option<&TimestampNanosecondArray>, n: usize) -> CVec {
+    match a {
+        Some(a) => CVec::Int(
+            (0..n)
+                .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+                .collect(),
+        ),
+        None => CVec::Int(vec![None; n]),
+    }
+}
+
+/// 原生 Float64 列物化。
+fn float_col_vec(a: Option<&Float64Array>, n: usize) -> CVec {
+    match a {
+        Some(a) => CVec::Float(
+            (0..n)
+                .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+                .collect(),
+        ),
+        None => CVec::Float(vec![None; n]),
+    }
+}
+
+/// 原生 Utf8 列物化（值转 SmolStr）。
+fn str_col_vec(a: Option<&StringArray>, n: usize) -> CVec {
+    match a {
+        Some(a) => CVec::Str(
+            (0..n)
+                .map(|r| (!a.is_null(r)).then(|| a.value(r).into()))
+                .collect(),
+        ),
+        None => CVec::Str(vec![None; n]),
+    }
+}
+
+/// 原生 Bool 列物化。
+fn bool_col_vec(a: Option<&BooleanArray>, n: usize) -> CVec {
+    match a {
+        Some(a) => CVec::Bool(
+            (0..n)
+                .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+                .collect(),
+        ),
+        None => CVec::Bool(vec![None; n]),
+    }
+}
+
+/// 结构化列（JsonArray/List 族）裸读的「每行非 null 即 Structured」列;
+/// 列缺失/形态不符 → 全 null。
+fn presence_col_vec(a: Option<&dyn Array>, n: usize) -> CVec {
+    match a {
+        Some(a) => structured_col(n, |r| !a.is_null(r)),
+        None => structured_col(n, |_| false),
+    }
 }
 
 /// Vectorized `fmt(template, args...)` yield-cell evaluation: per row, all
@@ -614,66 +666,88 @@ fn not_vec(inner: CVec) -> CVec {
 impl ColumnarBatch<'_> {
     fn list_index_vec(&self, col: &ColRef, index: usize, n: usize) -> CVec {
         match col.kind {
-            ColKind::JsonArray => match self.string_array(col) {
-                Some(a) => CVec::Scalar(
-                    (0..n)
-                        .map(|r| {
-                            if a.is_null(r) {
-                                None
-                            } else {
-                                nth_json_array_scalar(a.value(r), index)
-                            }
-                        })
-                        .collect(),
-                ),
-                None => CVec::Scalar(vec![None; n]),
-            },
-            ColKind::List => match self.list_array(col) {
-                Some(a) => CVec::Scalar(
-                    (0..n)
-                        .map(|r| {
-                            if a.is_null(r) {
-                                None
-                            } else {
-                                list_slice_nth_scalar(a.value(r).as_ref(), index)
-                            }
-                        })
-                        .collect(),
-                ),
-                None => CVec::Scalar(vec![None; n]),
-            },
-            ColKind::LargeList => match self.large_list_array(col) {
-                Some(a) => CVec::Scalar(
-                    (0..n)
-                        .map(|r| {
-                            if a.is_null(r) {
-                                None
-                            } else {
-                                list_slice_nth_scalar(a.value(r).as_ref(), index)
-                            }
-                        })
-                        .collect(),
-                ),
-                None => CVec::Scalar(vec![None; n]),
-            },
-            ColKind::FixedSizeList => match self.fixed_size_list_array(col) {
-                Some(a) => CVec::Scalar(
-                    (0..n)
-                        .map(|r| {
-                            if a.is_null(r) {
-                                None
-                            } else {
-                                list_slice_nth_scalar(a.value(r).as_ref(), index)
-                            }
-                        })
-                        .collect(),
-                ),
-                None => CVec::Scalar(vec![None; n]),
-            },
+            ColKind::JsonArray => json_index_scalar_vec(self.string_array(col), index, n),
+            ColKind::List => list_index_scalar_vec(self.list_array(col), index, n),
+            ColKind::LargeList => large_list_index_scalar_vec(self.large_list_array(col), index, n),
+            ColKind::FixedSizeList => {
+                fixed_list_index_scalar_vec(self.fixed_size_list_array(col), index, n)
+            }
             // Non-array root column: the interpreted walk hits an index segment on
             // a non-array value → `None` for every row.
             _ => CVec::Scalar(vec![None; n]),
         }
+    }
+}
+
+/// JsonArray 列（Utf8 JSON 文本）第 `index` 个非 null 元素标量列; 缺失列 → 全 null。
+fn json_index_scalar_vec(a: Option<&StringArray>, index: usize, n: usize) -> CVec {
+    match a {
+        Some(a) => CVec::Scalar(
+            (0..n)
+                .map(|r| {
+                    if a.is_null(r) {
+                        None
+                    } else {
+                        nth_json_array_scalar(a.value(r), index)
+                    }
+                })
+                .collect(),
+        ),
+        None => CVec::Scalar(vec![None; n]),
+    }
+}
+
+/// List 列第 `index` 个非 null 元素标量列; 缺失列 → 全 null。
+fn list_index_scalar_vec(a: Option<&ListArray>, index: usize, n: usize) -> CVec {
+    match a {
+        Some(a) => CVec::Scalar(
+            (0..n)
+                .map(|r| {
+                    if a.is_null(r) {
+                        None
+                    } else {
+                        list_slice_nth_scalar(a.value(r).as_ref(), index)
+                    }
+                })
+                .collect(),
+        ),
+        None => CVec::Scalar(vec![None; n]),
+    }
+}
+
+/// LargeList 列第 `index` 个非 null 元素标量列; 缺失列 → 全 null。
+fn large_list_index_scalar_vec(a: Option<&LargeListArray>, index: usize, n: usize) -> CVec {
+    match a {
+        Some(a) => CVec::Scalar(
+            (0..n)
+                .map(|r| {
+                    if a.is_null(r) {
+                        None
+                    } else {
+                        list_slice_nth_scalar(a.value(r).as_ref(), index)
+                    }
+                })
+                .collect(),
+        ),
+        None => CVec::Scalar(vec![None; n]),
+    }
+}
+
+/// FixedSizeList 列第 `index` 个非 null 元素标量列; 缺失列 → 全 null。
+fn fixed_list_index_scalar_vec(a: Option<&FixedSizeListArray>, index: usize, n: usize) -> CVec {
+    match a {
+        Some(a) => CVec::Scalar(
+            (0..n)
+                .map(|r| {
+                    if a.is_null(r) {
+                        None
+                    } else {
+                        list_slice_nth_scalar(a.value(r).as_ref(), index)
+                    }
+                })
+                .collect(),
+        ),
+        None => CVec::Scalar(vec![None; n]),
     }
 }
 
@@ -891,23 +965,8 @@ fn logic_vec<const AND: bool>(left: CVec, right: CVec) -> CVec {
 fn compare_scalars(op: BinOp, lv: &CScalar, rv: &CScalar) -> bool {
     match (lv, rv) {
         (CScalar::Int(a), CScalar::Int(b)) => compare_int(op, *a, *b),
-        (CScalar::Str(a), CScalar::Str(b)) => {
-            let ord = a.cmp(b);
-            match op {
-                BinOp::Eq => ord.is_eq(),
-                BinOp::Ne => !ord.is_eq(),
-                BinOp::Lt => ord.is_lt(),
-                BinOp::Gt => ord.is_gt(),
-                BinOp::Le => ord.is_le(),
-                BinOp::Ge => ord.is_ge(),
-                _ => false,
-            }
-        }
-        (CScalar::Bool(a), CScalar::Bool(b)) => match op {
-            BinOp::Eq => a == b,
-            BinOp::Ne => a != b,
-            _ => false,
-        },
+        (CScalar::Str(a), CScalar::Str(b)) => compare_str(op, a, b),
+        (CScalar::Bool(a), CScalar::Bool(b)) => compare_bool(op, *a, *b),
         // A structured operand is a definite type mismatch → false (the
         // interpreted `compare_values` catch-all for non-scalar `Value`s).
         (CScalar::Structured, _) | (_, CScalar::Structured) => false,
@@ -916,6 +975,29 @@ fn compare_scalars(op: BinOp, lv: &CScalar, rv: &CScalar) -> bool {
             (Some(x), Some(y)) => compare_numeric(op, x, y),
             _ => false,
         },
+    }
+}
+
+/// Str 有序比较（`Eq/Ne/Lt/Gt/Le/Ge`; 非比较算子 → false）。
+fn compare_str(op: BinOp, a: &SmolStr, b: &SmolStr) -> bool {
+    let ord = a.cmp(b);
+    match op {
+        BinOp::Eq => ord.is_eq(),
+        BinOp::Ne => !ord.is_eq(),
+        BinOp::Lt => ord.is_lt(),
+        BinOp::Gt => ord.is_gt(),
+        BinOp::Le => ord.is_le(),
+        BinOp::Ge => ord.is_ge(),
+        _ => false,
+    }
+}
+
+/// Bool 相等比较（仅 `Eq/Ne`; 其余算子 → false）。
+fn compare_bool(op: BinOp, a: bool, b: bool) -> bool {
+    match op {
+        BinOp::Eq => a == b,
+        BinOp::Ne => a != b,
+        _ => false,
     }
 }
 
@@ -961,30 +1043,128 @@ fn arithmetic(op: BinOp, lv: &CScalar, rv: &CScalar) -> Option<CScalar> {
     if op == BinOp::Mod
         && let (CScalar::Int(a), CScalar::Int(b)) = (lv, rv)
     {
-        if *b == 0 {
-            return None;
-        }
-        return Some(CScalar::Int(a % b));
+        // i64 原生取模（更精确）; 除零 → null（与 f64 路径一致）。
+        return (*b != 0).then(|| CScalar::Int(a % b));
     }
     let ln = to_f64(lv)?;
     let rn = to_f64(rv)?;
-    let out = match op {
-        BinOp::Add => ln + rn,
-        BinOp::Sub => ln - rn,
-        BinOp::Mul => ln * rn,
-        BinOp::Div => {
-            if rn == 0.0 {
-                return None;
-            }
-            ln / rn
-        }
-        BinOp::Mod => {
-            if rn == 0.0 {
-                return None;
-            }
-            ln % rn
-        }
-        _ => return None,
-    };
-    Some(CScalar::Float(out))
+    arith_f64(op, ln, rn).map(CScalar::Float)
+}
+
+/// f64 算术（`+ - * / %`; 除/模零 → None; 非算术算子 → None）。
+fn arith_f64(op: BinOp, ln: f64, rn: f64) -> Option<f64> {
+    if rn == 0.0 && matches!(op, BinOp::Div | BinOp::Mod) {
+        return None;
+    }
+    match op {
+        BinOp::Add => Some(ln + rn),
+        BinOp::Sub => Some(ln - rn),
+        BinOp::Mul => Some(ln * rn),
+        BinOp::Div => Some(ln / rn),
+        BinOp::Mod => Some(ln % rn),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 数值内核（2026-09-06 拆分回归）: `%` 双 Int 原生取模（更精确）; 非 Mod 的
+    /// Int/Int 与任何含 Float 的组合走 f64; 除/模零与非数值/非算术算子 → None。
+    #[test]
+    fn arithmetic_int_mod_native_and_zero_guards() {
+        assert_eq!(
+            arithmetic(BinOp::Mod, &CScalar::Int(7), &CScalar::Int(3)),
+            Some(CScalar::Int(1))
+        );
+        assert_eq!(
+            arithmetic(BinOp::Mod, &CScalar::Int(-7), &CScalar::Int(3)),
+            Some(CScalar::Int(-1))
+        );
+        assert_eq!(
+            arithmetic(BinOp::Mod, &CScalar::Int(7), &CScalar::Int(0)),
+            None,
+            "int 除零 → null"
+        );
+        assert_eq!(
+            arithmetic(BinOp::Div, &CScalar::Float(1.0), &CScalar::Float(0.0)),
+            None,
+            "f64 除零 → null"
+        );
+        assert_eq!(
+            arithmetic(BinOp::Mod, &CScalar::Int(5), &CScalar::Float(0.0)),
+            None,
+            "混合路径模零 → null"
+        );
+        // 混合 Int/Float → f64; 非 Mod 的 Int/Int 同样 f64。
+        assert_eq!(
+            arithmetic(BinOp::Add, &CScalar::Int(2), &CScalar::Float(0.5)),
+            Some(CScalar::Float(2.5))
+        );
+        assert_eq!(
+            arithmetic(BinOp::Mul, &CScalar::Int(3), &CScalar::Int(4)),
+            Some(CScalar::Float(12.0))
+        );
+        // 比较算子不是算术 → None; 非数值操作数 → None。
+        assert_eq!(arithmetic(BinOp::Eq, &CScalar::Int(1), &CScalar::Int(1)), None);
+        assert_eq!(arithmetic(BinOp::Add, &CScalar::Str("a".into()), &CScalar::Int(1)), None);
+    }
+
+    /// 比较内核（2026-09-06 拆分回归）: Str 有序 / Bool 仅 Eq/Ne / Int 原生 /
+    /// Int↔Float epsilon 相等 / Structured 恒 false。
+    #[test]
+    fn compare_scalars_str_bool_numeric_and_structured() {
+        assert!(compare_scalars(
+            BinOp::Lt,
+            &CScalar::Str("a".into()),
+            &CScalar::Str("b".into())
+        ));
+        assert!(compare_scalars(
+            BinOp::Ge,
+            &CScalar::Str("b".into()),
+            &CScalar::Str("a".into())
+        ));
+        assert!(!compare_scalars(
+            BinOp::Lt,
+            &CScalar::Str("a".into()),
+            &CScalar::Str("a".into())
+        ));
+        assert!(compare_scalars(
+            BinOp::Eq,
+            &CScalar::Bool(true),
+            &CScalar::Bool(true)
+        ));
+        assert!(compare_scalars(
+            BinOp::Ne,
+            &CScalar::Bool(true),
+            &CScalar::Bool(false)
+        ));
+        assert!(!compare_scalars(
+            BinOp::Eq,
+            &CScalar::Bool(true),
+            &CScalar::Bool(false)
+        ));
+        assert!(
+            !compare_scalars(BinOp::Lt, &CScalar::Bool(false), &CScalar::Bool(true)),
+            "Bool 仅支持 Eq/Ne"
+        );
+        assert!(compare_scalars(BinOp::Lt, &CScalar::Int(1), &CScalar::Int(2)));
+        assert!(compare_scalars(
+            BinOp::Eq,
+            &CScalar::Int(1),
+            &CScalar::Float(1.0)
+        ));
+        // Structured 与任何值比较 → false。
+        assert!(!compare_scalars(
+            BinOp::Eq,
+            &CScalar::Structured,
+            &CScalar::Int(1)
+        ));
+        assert!(!compare_scalars(
+            BinOp::Ne,
+            &CScalar::Str("x".into()),
+            &CScalar::Structured
+        ));
+    }
 }

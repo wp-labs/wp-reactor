@@ -196,10 +196,10 @@ fn read_scope_key_depth(r: &mut Reader<'_>, depth: usize) -> Result<ScopeKey, Sp
 // ---------------------------------------------------------------------------
 
 /// StatsAccum 变体 tag。
-const TAG_NUMERIC: u8 = 0;
-const TAG_DISTINCT: u8 = 1;
-const TAG_LAST: u8 = 2;
-const TAG_TOP: u8 = 3;
+pub(crate) const TAG_NUMERIC: u8 = 0;
+pub(crate) const TAG_DISTINCT: u8 = 1;
+pub(crate) const TAG_LAST: u8 = 2;
+pub(crate) const TAG_TOP: u8 = 3;
 
 /// RowFields 序列化：按 layout 槽序写数组（layout 不序列化——读回时外部传入）。
 /// 写：numeric（f64×n）→ strings（bytes×n，SmolStr）→ others（tag+payload）→ null_mask。
@@ -318,66 +318,19 @@ pub fn serialize_accs(accs: &[StatsAccum]) -> Result<Vec<u8>, SpillError> {
         match acc {
             StatsAccum::Numeric(n) => {
                 w.u8(TAG_NUMERIC);
-                w.u64(n.count);
-                // sum/min/max 为 i128（可超 i64）——全宽写，读回无截断。
-                w.i128(n.sum);
-                match n.min {
-                    Some(m) => {
-                        w.u8(1);
-                        w.i128(m);
-                    }
-                    None => w.u8(0),
-                }
-                match n.max {
-                    Some(m) => {
-                        w.u8(1);
-                        w.i128(m);
-                    }
-                    None => w.u8(0),
-                }
+                write_numeric_acc(&mut w, n);
             }
             StatsAccum::Distinct(d) => {
                 w.u8(TAG_DISTINCT);
-                // ints 集合
-                let ints: Vec<i64> = d.ints().iter().copied().collect();
-                w.u64(ints.len() as u64);
-                for v in ints {
-                    w.i64(v);
-                }
-                // others 集合
-                let others: Vec<&DistinctKey> = d.others().iter().collect();
-                w.u64(others.len() as u64);
-                for k in others {
-                    write_distinct_key(&mut w, k);
-                }
+                write_distinct_acc(&mut w, d);
             }
             StatsAccum::Last(rf) => {
                 w.u8(TAG_LAST);
-                match rf {
-                    Some(rf) => {
-                        let ptr =
-                            std::ptr::NonNull::new(std::sync::Arc::as_ptr(rf) as *mut RowFields)
-                                .expect("Arc 指针非空");
-                        if let Some(idx) = written_rf.iter().position(|p| *p == ptr) {
-                            // 已写过 → 引用索引（复用读回时的同一 Arc）。
-                            w.u8(2);
-                            w.u64(idx as u64);
-                        } else {
-                            w.u8(1);
-                            write_row_fields(&mut w, rf)?;
-                            written_rf.push(ptr);
-                        }
-                    }
-                    None => w.u8(0),
-                }
+                write_last_acc(&mut w, rf, &mut written_rf)?;
             }
             StatsAccum::Top(entries) => {
                 w.u8(TAG_TOP);
-                w.u64(entries.len() as u64);
-                for e in entries {
-                    w.f64(e.key);
-                    write_row_fields(&mut w, &e.row)?;
-                }
+                write_top_acc(&mut w, entries)?;
             }
         }
     }
@@ -388,6 +341,80 @@ pub fn serialize_accs(accs: &[StatsAccum]) -> Result<Vec<u8>, SpillError> {
         )));
     }
     Ok(w.finish())
+}
+
+/// Numeric 累加器 payload 编码（tag 已由调用方写入）：count/sum/min/max——
+/// sum/min/max 为 i128（可超 i64）——全宽写，读回无截断。
+fn write_numeric_acc(w: &mut Writer, n: &NumericAccum) {
+    w.u64(n.count);
+    w.i128(n.sum);
+    match n.min {
+        Some(m) => {
+            w.u8(1);
+            w.i128(m);
+        }
+        None => w.u8(0),
+    }
+    match n.max {
+        Some(m) => {
+            w.u8(1);
+            w.i128(m);
+        }
+        None => w.u8(0),
+    }
+}
+
+/// Distinct 累加器 payload 编码：ints 集合 + others 集合（集合序非确定性——
+/// 读回重建集合, 序无关）。
+fn write_distinct_acc(w: &mut Writer, d: &DistinctSet) {
+    // ints 集合
+    let ints: Vec<i64> = d.ints().iter().copied().collect();
+    w.u64(ints.len() as u64);
+    for v in ints {
+        w.i64(v);
+    }
+    // others 集合
+    let others: Vec<&DistinctKey> = d.others().iter().collect();
+    w.u64(others.len() as u64);
+    for k in others {
+        write_distinct_key(w, k);
+    }
+}
+
+/// Last 行字段 payload 编码（指针表去重: 同桶多 last 共享同一 Arc → 重复引用只
+/// 写索引; 读回共享同一 Arc, 与内存语义一致）。`None` = 无行字段。
+fn write_last_acc(
+    w: &mut Writer,
+    rf: &Option<std::sync::Arc<RowFields>>,
+    written_rf: &mut Vec<std::ptr::NonNull<RowFields>>,
+) -> Result<(), SpillError> {
+    match rf {
+        Some(rf) => {
+            let ptr = std::ptr::NonNull::new(std::sync::Arc::as_ptr(rf) as *mut RowFields)
+                .expect("Arc 指针非空");
+            if let Some(idx) = written_rf.iter().position(|p| *p == ptr) {
+                // 已写过 → 引用索引（复用读回时的同一 Arc）。
+                w.u8(2);
+                w.u64(idx as u64);
+            } else {
+                w.u8(1);
+                write_row_fields(w, rf)?;
+                written_rf.push(ptr);
+            }
+        }
+        None => w.u8(0),
+    }
+    Ok(())
+}
+
+/// Top 条目数组 payload 编码（key + 行字段逐个写）。
+fn write_top_acc(w: &mut Writer, entries: &[TopEntry]) -> Result<(), SpillError> {
+    w.u64(entries.len() as u64);
+    for e in entries {
+        w.f64(e.key);
+        write_row_fields(w, &e.row)?;
+    }
+    Ok(())
 }
 
 /// 反序列化 accs 数组。`layout` = 当前 executor 的 RowFieldLayout（读回
@@ -406,82 +433,102 @@ pub fn deserialize_accs(
     let mut written_rf: Vec<std::sync::Arc<RowFields>> = Vec::new();
     for _ in 0..n {
         let acc = match r.u8()? {
-            TAG_NUMERIC => {
-                let count = r.u64()?;
-                let sum = r.i128()?;
-                let min = if r.u8()? == 1 { Some(r.i128()?) } else { None };
-                let max = if r.u8()? == 1 { Some(r.i128()?) } else { None };
-                StatsAccum::Numeric(Box::new(NumericAccum {
-                    count,
-                    sum,
-                    min,
-                    max,
-                }))
-            }
-            TAG_DISTINCT => {
-                let n_ints = r.u64()? as usize;
-                if n_ints > MAX_SERIALIZED_BYTES / 8 {
-                    return Err(SpillError::Corrupt("distinct ints 超上限".into()));
-                }
-                let mut ints = crate::match_engine::EngineHashSet::default();
-                for _ in 0..n_ints {
-                    ints.insert(r.i64()?);
-                }
-                let n_others = r.u64()? as usize;
-                if n_others > MAX_SERIALIZED_BYTES / 8 {
-                    return Err(SpillError::Corrupt("distinct others 超上限".into()));
-                }
-                let mut others = crate::match_engine::EngineHashSet::default();
-                for _ in 0..n_others {
-                    others.insert(read_distinct_key(&mut r)?);
-                }
-                StatsAccum::Distinct(Box::new(DistinctSet::from_parts(ints, others)))
-            }
-            TAG_LAST => {
-                let flag = r.u8()?;
-                let rf = match flag {
-                    0 => None,
-                    1 => {
-                        let rf = read_row_fields_with_layout(&mut r, layout)?;
-                        let arc = std::sync::Arc::new(rf);
-                        written_rf.push(std::sync::Arc::clone(&arc));
-                        Some(arc)
-                    }
-                    2 => {
-                        // 引用之前已读的 RowFields（共享同一 Arc, 与写侧去重对应）。
-                        let idx = r.u64()? as usize;
-                        if idx >= written_rf.len() {
-                            return Err(SpillError::Corrupt(format!(
-                                "RowFields 引用索引 {idx} 越界 ({} 已读)",
-                                written_rf.len()
-                            )));
-                        }
-                        Some(std::sync::Arc::clone(&written_rf[idx]))
-                    }
-                    other => {
-                        return Err(SpillError::Corrupt(format!("Last flag 未知 {other}")));
-                    }
-                };
-                StatsAccum::Last(rf)
-            }
-            TAG_TOP => {
-                let n = r.u64()? as usize;
-                if n > MAX_SERIALIZED_BYTES / 64 {
-                    return Err(SpillError::Corrupt("top 条目超上限".into()));
-                }
-                let mut entries = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let key = r.f64()?;
-                    let row = read_row_fields_with_layout(&mut r, layout)?;
-                    entries.push(TopEntry { key, row });
-                }
-                StatsAccum::Top(entries)
-            }
+            TAG_NUMERIC => read_numeric_acc(&mut r)?,
+            TAG_DISTINCT => read_distinct_acc(&mut r)?,
+            TAG_LAST => read_last_acc(&mut r, layout, &mut written_rf)?,
+            TAG_TOP => read_top_acc(&mut r, layout)?,
             other => return Err(SpillError::Corrupt(format!("StatsAccum 未知 tag {other}"))),
         };
         out.push(acc);
     }
     Ok(out)
+}
+
+/// Numeric 累加器 payload 解码（tag 已由调用方读取）。
+fn read_numeric_acc(r: &mut Reader<'_>) -> Result<StatsAccum, SpillError> {
+    let count = r.u64()?;
+    let sum = r.i128()?;
+    let min = if r.u8()? == 1 { Some(r.i128()?) } else { None };
+    let max = if r.u8()? == 1 { Some(r.i128()?) } else { None };
+    Ok(StatsAccum::Numeric(Box::new(NumericAccum {
+        count,
+        sum,
+        min,
+        max,
+    })))
+}
+
+/// Distinct 累加器 payload 解码（ints/others 集合; 数量带上限, 防损坏长度 OOM）。
+fn read_distinct_acc(r: &mut Reader<'_>) -> Result<StatsAccum, SpillError> {
+    let n_ints = r.u64()? as usize;
+    if n_ints > MAX_SERIALIZED_BYTES / 8 {
+        return Err(SpillError::Corrupt("distinct ints 超上限".into()));
+    }
+    let mut ints = crate::match_engine::EngineHashSet::default();
+    for _ in 0..n_ints {
+        ints.insert(r.i64()?);
+    }
+    let n_others = r.u64()? as usize;
+    if n_others > MAX_SERIALIZED_BYTES / 8 {
+        return Err(SpillError::Corrupt("distinct others 超上限".into()));
+    }
+    let mut others = crate::match_engine::EngineHashSet::default();
+    for _ in 0..n_others {
+        others.insert(read_distinct_key(r)?);
+    }
+    Ok(StatsAccum::Distinct(Box::new(DistinctSet::from_parts(
+        ints, others,
+    ))))
+}
+
+/// Last 累加器 payload 解码（flag 0=空 / 1=完整行字段（入表, 供后续引用）/
+/// 2=引用索引——越界 → Corrupt）。
+fn read_last_acc(
+    r: &mut Reader<'_>,
+    layout: &std::sync::Arc<crate::match_engine::executor::RowFieldLayout>,
+    written_rf: &mut Vec<std::sync::Arc<RowFields>>,
+) -> Result<StatsAccum, SpillError> {
+    let flag = r.u8()?;
+    let rf = match flag {
+        0 => None,
+        1 => {
+            let rf = read_row_fields_with_layout(r, layout)?;
+            let arc = std::sync::Arc::new(rf);
+            written_rf.push(std::sync::Arc::clone(&arc));
+            Some(arc)
+        }
+        2 => {
+            // 引用之前已读的 RowFields（共享同一 Arc, 与写侧去重对应）。
+            let idx = r.u64()? as usize;
+            if idx >= written_rf.len() {
+                return Err(SpillError::Corrupt(format!(
+                    "RowFields 引用索引 {idx} 越界 ({} 已读)",
+                    written_rf.len()
+                )));
+            }
+            Some(std::sync::Arc::clone(&written_rf[idx]))
+        }
+        other => return Err(SpillError::Corrupt(format!("Last flag 未知 {other}"))),
+    };
+    Ok(StatsAccum::Last(rf))
+}
+
+/// Top 累加器 payload 解码（条目数带上限, 防损坏长度 OOM）。
+fn read_top_acc(
+    r: &mut Reader<'_>,
+    layout: &std::sync::Arc<crate::match_engine::executor::RowFieldLayout>,
+) -> Result<StatsAccum, SpillError> {
+    let n = r.u64()? as usize;
+    if n > MAX_SERIALIZED_BYTES / 64 {
+        return Err(SpillError::Corrupt("top 条目超上限".into()));
+    }
+    let mut entries = Vec::with_capacity(n);
+    for _ in 0..n {
+        let key = r.f64()?;
+        let row = read_row_fields_with_layout(r, layout)?;
+        entries.push(TopEntry { key, row });
+    }
+    Ok(StatsAccum::Top(entries))
 }
 
 /// RowFields 反序列化（带 layout 版）。

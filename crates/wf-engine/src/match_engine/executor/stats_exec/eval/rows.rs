@@ -1,7 +1,6 @@
 //! rows — eval/ 子模块（从 eval.rs 拆分）。
 use super::*;
 
-
 pub(crate) fn field_name(fr: &FieldRef) -> &str {
     match fr {
         FieldRef::Simple(n) => n,
@@ -13,7 +12,6 @@ pub(crate) fn field_name(fr: &FieldRef) -> &str {
         _ => "",
     }
 }
-
 
 /// 度量字段在行字段列数组中的位置: 子集模式走构造期预计算; 无子集按
 /// `names` 名查（last/top 且字段在列内 → Some, 其余 None）。
@@ -33,7 +31,6 @@ pub(crate) fn measure_field_position(
         },
     }
 }
-
 
 /// last/top 行更新（Q18/Q19, 非归并状态）:
 /// - `last`: 最近合格行的行字段列数组替换（流有序 = 事件时间最新, 权威 Q18
@@ -75,7 +72,6 @@ pub(crate) fn apply_last_top(
     }
 }
 
-
 /// top-N 插入: key DESC 有序保留前 N; 同 key 新条目插在已有同 key 条目之后
 /// （先到者在前）。n=0 时清空（top(0, ...) 边界）。
 pub(crate) fn insert_top(entries: &mut Vec<TopEntry>, key: f64, row: RowFields, n: usize) {
@@ -98,7 +94,6 @@ pub(crate) fn insert_top(entries: &mut Vec<TopEntry>, key: f64, row: RowFields, 
     }
 }
 
-
 pub(crate) fn value_to_distinct_key(v: &Value) -> DistinctKey {
     match v {
         Value::Number(n) => DistinctKey::from_f64(*n),
@@ -107,7 +102,6 @@ pub(crate) fn value_to_distinct_key(v: &Value) -> DistinctKey {
         _ => DistinctKey::Str(format!("{:?}", v).into()),
     }
 }
-
 
 /// 行式 last/top 行字段提取（与列式 [`row_fields_from_batch`] 对齐, P5 紧凑化）:
 /// 按 `names` 列序返回 `Box<[Option<Value>]>`（缺失 = `None`）。`None` = 全列,
@@ -135,7 +129,6 @@ pub(crate) fn row_fields_from_row(
     std::sync::Arc::new(fields)
 }
 
-
 /// 从 batch 行提取字段列数组（last/top 列式路径用, P5 紧凑化）: 按 `cols`
 /// （每字段列索引, 每批预解析一次——免逐行 `schema.index_of`）提取, null/缺失 =
 /// `None`。`cols = None` 时全部 schema 列按字段名**排序**（与行式 None 同序——
@@ -151,17 +144,8 @@ pub(crate) fn row_fields_from_batch(
     match cols {
         Some(cols) => {
             for (i, ci) in cols.iter().enumerate() {
-                let v = match ci {
-                    Some(ci) => {
-                        let col = batch.column(*ci);
-                        if col.is_null(row) {
-                            None
-                        } else {
-                            extract_field_value(schema.field(*ci), col.as_ref(), row)
-                        }
-                    }
-                    None => None, // 字段缺失 → None
-                };
+                // 字段缺失 → None
+                let v = ci.and_then(|ci| batch_cell_value(batch, &schema, ci, row));
                 fields.set(i, v);
             }
         }
@@ -170,21 +154,27 @@ pub(crate) fn row_fields_from_batch(
             names.sort();
             for (i, name) in names.iter().enumerate() {
                 let col_idx = schema.index_of(name).expect("schema 字段必存在");
-                let col = batch.column(col_idx);
-                if col.is_null(row) {
-                    fields.set(i, None);
-                } else {
-                    fields.set(
-                        i,
-                        extract_field_value(schema.field(col_idx), col.as_ref(), row),
-                    );
-                }
+                fields.set(i, batch_cell_value(batch, &schema, col_idx, row));
             }
         }
     }
     std::sync::Arc::new(fields)
 }
 
+/// 从 batch 读单格字段值：null → `None`，否则按 schema 字段类型抽取。
+fn batch_cell_value(
+    batch: &RecordBatch,
+    schema: &arrow::datatypes::SchemaRef,
+    ci: usize,
+    row: usize,
+) -> Option<Value> {
+    let col = batch.column(ci);
+    if col.is_null(row) {
+        None
+    } else {
+        extract_field_value(schema.field(ci), col.as_ref(), row)
+    }
+}
 
 /// 从 batch 列读单行原生数值（Int64 原生 i64 → i128, 不走 f64——D8: ≥2^53 的
 /// Int64 经 `Value::Number(f64)` 会丢精度; Float64 按 `sum_masked` 同口径截断）。
@@ -203,7 +193,6 @@ pub(crate) fn column_i128_at(batch: &RecordBatch, ci: usize, row: usize) -> Opti
     None
 }
 
-
 /// 从 batch 列读单行原生数值（top 快速淘汰预检用; 列索引预解析, 零 index_of）。
 /// Int64 → as f64 / Float64 → 原值——与行字段提取后 `value_to_f64(Value::Number)`
 /// 同口径（event_bridge 契约: Int64 → Number(i as f64), Float64 → Number(f)）。
@@ -221,7 +210,6 @@ pub(crate) fn column_f64_at(batch: &RecordBatch, ci: usize, row: usize) -> Optio
     }
     None
 }
-
 
 /// 索引版 distinct 键读取（列索引批级预解析, 免每行 schema.index_of——q17 同款修复）。
 /// 与列式段 `insert_distinct_column` 同类型分派, 原生值构造（D7: 禁止
@@ -252,4 +240,57 @@ pub(crate) fn column_distinct_key_at(
         return Some(DistinctKey::from_i64(a.value(row)));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_name_extracts_simple_qualified_and_path_roots() {
+        assert_eq!(field_name(&FieldRef::Simple("k".into())), "k");
+        assert_eq!(
+            field_name(&FieldRef::Qualified("e".into(), "dip".into())),
+            "dip"
+        );
+        assert_eq!(
+            field_name(&FieldRef::Bracketed("e".into(), "ports".into())),
+            "ports"
+        );
+        assert_eq!(
+            field_name(&FieldRef::Path {
+                alias: "e".into(),
+                segments: vec![wf_lang::ast::PathSegment::Field("root".into())],
+            }),
+            "root"
+        );
+        // 非 Field 首段 / 未知形态 → ""
+        assert_eq!(
+            field_name(&FieldRef::Path {
+                alias: "e".into(),
+                segments: vec![wf_lang::ast::PathSegment::Index(0)],
+            }),
+            ""
+        );
+    }
+
+    #[test]
+    fn value_to_distinct_key_routes_by_kind() {
+        assert!(matches!(
+            value_to_distinct_key(&Value::Bool(true)),
+            DistinctKey::Int(1)
+        ));
+        assert!(matches!(
+            value_to_distinct_key(&Value::Bool(false)),
+            DistinctKey::Int(0)
+        ));
+        assert!(matches!(
+            value_to_distinct_key(&Value::Str("x".into())),
+            DistinctKey::Str(_)
+        ));
+        assert!(matches!(
+            value_to_distinct_key(&Value::Number(3.5)),
+            DistinctKey::Float(_) | DistinctKey::Int(_)
+        ));
+    }
 }

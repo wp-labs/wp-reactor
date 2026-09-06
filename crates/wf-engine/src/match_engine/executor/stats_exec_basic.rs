@@ -230,3 +230,72 @@ fn stats_where_filter_skips() {
     );
     assert_eq!(exec.final_measure_values()[0], 2.0);
 }
+
+/// 行式 SoA/Classic 桶等值（2026-09-06 exec.rs 拆分回归）: 同批行喂给纯数值
+/// 计划（SoA 桶）与「1 个 distinct + 同批数值度量」计划（Classic 桶）, 数值
+/// 度量值必须一致——锁定 `process_rows` 两分支（现为 row_acc
+/// `accumulate_row_map_soa`/`accumulate_row_map_classic`）的同语义契约, 以及
+/// 相同 where 表达式去重后共享同一 where_ok 位（q15 型多度量共享条件）。
+#[test]
+fn stats_row_soa_bucket_matches_classic_with_deduped_wheres() {
+    let mk =
+        |label: &str, agg: StatsAggPlan, field: Option<&str>, w: Option<Expr>| StatsMeasurePlan {
+            label: label.into(),
+            source_alias: "b".into(),
+            where_expr: w,
+            agg,
+            field: field.map(|f| FieldRef::Qualified("b".into(), f.into())),
+            arg: None,
+        };
+    // sum_lt/min_lt 共享同一 where（price<5000）→ 去重后 1 个唯一表达式;
+    // max_ge 用第二个唯一表达式——锁定 measure_where/where_ok 索引对齐。
+    let soa_plan = simple_plan(vec![
+        mk("n", StatsAggPlan::Count, None, None),
+        mk(
+            "sum_lt",
+            StatsAggPlan::Sum,
+            Some("price"),
+            Some(price_lt(5000.0)),
+        ),
+        mk(
+            "min_lt",
+            StatsAggPlan::Min,
+            Some("price"),
+            Some(price_lt(5000.0)),
+        ),
+        mk(
+            "max_ge",
+            StatsAggPlan::Max,
+            Some("price"),
+            Some(price_ge(5000.0)),
+        ),
+        mk("avg", StatsAggPlan::Avg, Some("price"), None),
+    ]);
+    let mut classic_measures = vec![distinct_measure("bids", "auction")]; // distinct → 强制 Classic 桶
+    classic_measures.extend(soa_plan.measures.clone());
+    let classic_plan = simple_plan(classic_measures);
+
+    let rows = vec![
+        row(&[("price", num(3000.0)), ("auction", num(11.0))]),
+        row(&[("price", num(8000.0)), ("auction", num(12.0))]),
+        row(&[("price", num(5000.0)), ("auction", num(13.0))]),
+    ];
+    let mut soa = StatsExecutor::new(soa_plan);
+    soa.process_rows(&rows, extract);
+    let sv = soa.final_measure_values();
+    let mut classic = StatsExecutor::new(classic_plan);
+    classic.process_rows(&rows, extract);
+    let cv = classic.final_measure_values();
+    assert_eq!(cv.len(), sv.len() + 1);
+    assert_eq!(cv[0], 3.0, "distinct auction 数 = 3");
+    for i in 0..sv.len() {
+        assert_eq!(sv[i], cv[i + 1], "measure[{i}] SoA vs Classic");
+    }
+    // 手算: n=3; sum_lt=3000（8000/5000 不过 price<5000）; min_lt=3000;
+    // max_ge=8000（5000 不过 >=5000 的 where——按值过滤, 非按行）; avg=16000/3。
+    assert_eq!(sv[0], 3.0, "count");
+    assert_eq!(sv[1], 3000.0, "sum_lt");
+    assert_eq!(sv[2], 3000.0, "min_lt");
+    assert_eq!(sv[3], 8000.0, "max_ge");
+    assert_eq!(sv[4], 16_000.0 / 3.0, "avg");
+}

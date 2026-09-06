@@ -29,7 +29,11 @@ pub use exec::StatsExecutor;
 // 单行/桶累加自由函数簇已迁入 row_acc.rs（exec.rs 过长拆分）——mod.rs 统一
 // re-export 保持对外路径不变（引擎 lib-tests / 分片统计消费）。
 #[allow(unused_imports)]
-pub(crate) use row_acc::{accumulate_bucket_row, accumulate_column_row, accumulate_soa};
+pub(crate) use row_acc::{
+    accumulate_bucket_row, accumulate_column_row, accumulate_empty_bucket_classic,
+    accumulate_empty_bucket_numeric, accumulate_empty_bucket_row_measures,
+    accumulate_row_map_classic, accumulate_row_map_soa, accumulate_soa,
+};
 
 mod row_acc;
 

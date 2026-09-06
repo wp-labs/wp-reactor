@@ -6,12 +6,16 @@
 //! [`accumulate_column_row`]（枚举/Box 循环）。`accumulate_soa` /
 //! `accumulate_column_row` 为 pub(crate)（SoA 对照 bench 消费）。
 
+use std::collections::HashMap;
+
 use arrow::array::BooleanArray;
 use arrow::record_batch::RecordBatch;
 use wf_cep::rows::{RowFieldLayout, RowFields};
 use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsPlan};
 
 use super::*;
+use crate::match_engine::Value;
+use crate::match_engine::cep::ScopeKey;
 
 /// 单行桶累加入口（按桶形态分派一次）: SoA → [`accumulate_soa`]; Classic →
 /// [`accumulate_column_row`]（枚举/Box 循环）。分派每行一次（非每度量）——
@@ -252,6 +256,336 @@ pub(crate) fn max_fold(cur: Option<i128>, v: i128) -> Option<i128> {
         Some(m) if m >= v => m,
         _ => v,
     })
+}
+
+// ---------------------------------------------------------------------------
+// 行式（HashMap 行）单行累加——`StatsExecutor::process_rows` 的桶内分支
+// （列式版 [`accumulate_soa`] / [`accumulate_column_row`] 的 map 行对应）。
+// 调用点持有 `&mut window` 桶借用, 自由函数免整 `self` 借用冲突。
+// ---------------------------------------------------------------------------
+
+/// 行式 SoA 桶单行累加（纯数值计划）: 通过 where 的度量 `counts[idx] += 1`
+/// （字段缺失/非数值仍计数——与行式语义一致, avg 的 count/sum 同步, D6）;
+/// 有字段且数值的行按聚合折叠（sum/avg 同槽, min/max 极值）。字段值经调用方
+/// `extract` 闭包读取（`process_rows` 的行读取协议）。
+pub(crate) fn accumulate_row_map_soa(
+    soa: &mut NumericSoA,
+    layout: &NumericSoALayout,
+    plan: &StatsPlan,
+    measure_where: &[Option<usize>],
+    where_ok: &[bool],
+    row: &HashMap<String, Value>,
+    extract: &impl Fn(&HashMap<String, Value>, &str) -> Option<Value>,
+) {
+    for (idx, measure) in plan.measures.iter().enumerate() {
+        if let Some(wi) = measure_where[idx]
+            && !where_ok[wi]
+        {
+            continue;
+        }
+        soa.counts[idx] += 1;
+        if let Some(field) = &measure.field
+            && let Some(val) = extract(row, field_name(field))
+            && let Some(n) = value_to_i128(&val)
+        {
+            match measure.agg {
+                StatsAggPlan::Sum | StatsAggPlan::Avg => {
+                    soa.sums[layout.sum_slot[idx].unwrap() as usize] += n;
+                }
+                StatsAggPlan::Min => {
+                    let s = layout.min_slot[idx].unwrap() as usize;
+                    let cur = &mut soa.mins[s];
+                    *cur = min_fold(*cur, n);
+                }
+                StatsAggPlan::Max => {
+                    let s = layout.max_slot[idx].unwrap() as usize;
+                    let cur = &mut soa.maxs[s];
+                    *cur = max_fold(*cur, n);
+                }
+                StatsAggPlan::Count => {}
+                _ => unreachable!("SoA 桶仅数值度量"),
+            }
+        }
+    }
+}
+
+/// 行式 Classic 桶单行累加（含 distinct/last/top 的计划）: count/sum/avg/
+/// min/max 计数 + 数值落账（复用 [`accumulate_numeric_value`]）; distinct 集
+/// 合插入; last/top 经 [`accumulate_last_top_row_map`]（行字段懒提取, 同桶多
+/// last/top 度量共享 1 份 Arc）。
+#[allow(clippy::too_many_arguments)] // 单行桶累加: 桶/计划/掩码索引/行字段 4 组参数
+pub(crate) fn accumulate_row_map_classic(
+    accs: &mut [StatsAccum],
+    plan: &StatsPlan,
+    measure_where: &[Option<usize>],
+    measure_field_idx: &[Option<usize>],
+    where_ok: &[bool],
+    row: &HashMap<String, Value>,
+    extract: &impl Fn(&HashMap<String, Value>, &str) -> Option<Value>,
+    row_names: Option<&[String]>,
+    row_layout: &std::sync::Arc<RowFieldLayout>,
+    row_cache: &mut Option<std::sync::Arc<RowFields>>,
+) {
+    for (idx, measure) in plan.measures.iter().enumerate() {
+        if let Some(wi) = measure_where[idx]
+            && !where_ok[wi]
+        {
+            continue;
+        }
+        let acc = &mut accs[idx];
+        match measure.agg {
+            StatsAggPlan::Count
+            | StatsAggPlan::Sum
+            | StatsAggPlan::Avg
+            | StatsAggPlan::Min
+            | StatsAggPlan::Max => {
+                let nacc = acc.numeric_mut();
+                nacc.count += 1;
+                // 度量字段值集中落账（复用列式路径同款折叠, 防分支复制漂移）。
+                if let Some(field) = &measure.field
+                    && let Some(val) = extract(row, field_name(field))
+                    && let Some(n) = value_to_i128(&val)
+                {
+                    accumulate_numeric_value(nacc, &measure.agg, n);
+                }
+            }
+            StatsAggPlan::DistinctCount => {
+                if let Some(field) = &measure.field
+                    && let Some(val) = extract(row, field_name(field))
+                {
+                    let key = value_to_distinct_key(&val);
+                    acc.distinct_mut().insert(key);
+                }
+            }
+            StatsAggPlan::Last | StatsAggPlan::Top => accumulate_last_top_row_map(
+                acc,
+                measure,
+                plan,
+                idx,
+                measure_field_idx,
+                row,
+                extract,
+                row_names,
+                row_layout,
+                row_cache,
+            ),
+        }
+    }
+}
+
+/// 行式 last/top 单行更新（map 路径; 语义与列式 [`accumulate_last_top_row`]
+/// 对齐）: top 快速淘汰预检（已满且 key 进不了前 N → 跳过, 免行字段 Arc 分配）;
+/// last/top 行字段按 `row_names` 列序懒提取一次, 多度量共享同一 Arc。
+/// `top(0)` 不保留条目; 字段缺失: last 仍保留整行（yield 读其它字段）, top 跳过。
+#[allow(clippy::too_many_arguments)] // 与 accumulate_row_map_classic 同签名族
+fn accumulate_last_top_row_map(
+    acc: &mut StatsAccum,
+    measure: &StatsMeasurePlan,
+    plan: &StatsPlan,
+    idx: usize,
+    measure_field_idx: &[Option<usize>],
+    row: &HashMap<String, Value>,
+    extract: &impl Fn(&HashMap<String, Value>, &str) -> Option<Value>,
+    row_names: Option<&[String]>,
+    row_layout: &std::sync::Arc<RowFieldLayout>,
+    row_cache: &mut Option<std::sync::Arc<RowFields>>,
+) {
+    let Some(field) = &measure.field else {
+        return;
+    };
+    let Some(val) = extract(row, field_name(field)) else {
+        // 字段缺失: last 仍保留整行（yield 读其它字段）; top 无键跳过。
+        if measure.agg == StatsAggPlan::Last {
+            let row =
+                row_cache.get_or_insert_with(|| row_fields_from_row(row, row_names, row_layout));
+            *acc.last_mut() = Some(std::sync::Arc::clone(row));
+        }
+        return;
+    };
+    if measure.agg == StatsAggPlan::Top {
+        // 快速淘汰预检（在构建行字段前）: top 已满且 key 进不了前 N → 跳过,
+        // 免每行 row_fields 提取 + Arc 分配。与列式路径同一口径（value_to_f64 同义）。
+        let n = measure.arg.unwrap_or(10) as usize;
+        if n == 0 {
+            return; // top(0): 不保留任何条目
+        }
+        if let Some(key) = value_to_f64(&val)
+            && let entries = acc.top()
+            && entries.len() == n
+            && key <= entries[n - 1].key
+        {
+            return;
+        }
+    }
+    // 行式路径: 按 row_names 列序提取（与列式 row_fields_from_batch 对齐; 同桶
+    // 多 last/top 度量 Arc 共享 1 份内存）。
+    let row = row_cache.get_or_insert_with(|| row_fields_from_row(row, row_names, row_layout));
+    let fidx = measure_field_position(plan, measure_field_idx, idx, row_names);
+    apply_last_top(acc, measure, row, fidx);
+}
+
+// ---------------------------------------------------------------------------
+// 空键整批域归并——`StatsExecutor::process_batch_rows_impl` 空键路径的
+// 段 1d（纯归并整列/整域累加）与段 2（distinct/last/top 行式段）。
+// ---------------------------------------------------------------------------
+
+/// 空键 SoA 桶整批域归并（段 1d; 行域驱动, 2026-08-24 分片裁剪）: 每度量行域
+/// 内满足 where 的计数一次算齐（avg 的 count 与 sum 同步——D6）; 有数值列时
+/// sum/min/max 整列域归并（SoA 无死状态）。
+#[allow(clippy::too_many_arguments)] // 域归并: 桶/布局/计划/掩码/行域 4 组参数
+pub(crate) fn accumulate_empty_bucket_numeric(
+    soa: &mut NumericSoA,
+    layout: &NumericSoALayout,
+    plan: &StatsPlan,
+    measure_where: &[Option<usize>],
+    batch: &RecordBatch,
+    masks: &[BooleanArray],
+    rows: Option<&[u32]>,
+    n: usize,
+) {
+    for (idx, measure) in plan.measures.iter().enumerate() {
+        let wi = measure_where[idx];
+        let rows_in = count_domain(rows, n, masks, wi);
+        match measure.agg {
+            StatsAggPlan::Count => {
+                soa.counts[idx] += rows_in;
+            }
+            StatsAggPlan::Sum | StatsAggPlan::Avg => {
+                soa.counts[idx] += rows_in;
+                if let Some(field) = &measure.field
+                    && let Some(col) = numeric_col(batch, field_name(field))
+                {
+                    let s = layout.sum_slot[idx].unwrap() as usize;
+                    soa.sums[s] += sum_domain(&col, rows, n, masks, wi);
+                }
+            }
+            StatsAggPlan::Min => {
+                soa.counts[idx] += rows_in;
+                if let Some(field) = &measure.field
+                    && let Some(col) = numeric_col(batch, field_name(field))
+                {
+                    let s = layout.min_slot[idx].unwrap() as usize;
+                    minmax_domain_one(&col, rows, n, masks, wi, true, &mut soa.mins[s]);
+                }
+            }
+            StatsAggPlan::Max => {
+                soa.counts[idx] += rows_in;
+                if let Some(field) = &measure.field
+                    && let Some(col) = numeric_col(batch, field_name(field))
+                {
+                    let s = layout.max_slot[idx].unwrap() as usize;
+                    minmax_domain_one(&col, rows, n, masks, wi, false, &mut soa.maxs[s]);
+                }
+            }
+            _ => unreachable!("SoA 桶仅数值度量"),
+        }
+    }
+}
+
+/// 空键 Classic 桶整批域归并（段 1d）: 数值度量计数 + sum/min/max 整列域归并;
+/// distinct/last/top 变体无 count（输出不读, 原字段为死状态——段 2 处理）。
+pub(crate) fn accumulate_empty_bucket_classic(
+    accs: &mut [StatsAccum],
+    plan: &StatsPlan,
+    measure_where: &[Option<usize>],
+    batch: &RecordBatch,
+    masks: &[BooleanArray],
+    rows: Option<&[u32]>,
+    n: usize,
+) {
+    for (idx, measure) in plan.measures.iter().enumerate() {
+        let wi = measure_where[idx];
+        let acc = &mut accs[idx];
+        let rows_in = count_domain(rows, n, masks, wi);
+        match measure.agg {
+            StatsAggPlan::Count => {
+                acc.numeric_mut().count += rows_in;
+            }
+            StatsAggPlan::Sum | StatsAggPlan::Avg => {
+                let nacc = acc.numeric_mut();
+                nacc.count += rows_in;
+                if let Some(field) = &measure.field
+                    && let Some(col) = numeric_col(batch, field_name(field))
+                {
+                    nacc.sum += sum_domain(&col, rows, n, masks, wi);
+                }
+            }
+            StatsAggPlan::Min | StatsAggPlan::Max => {
+                let nacc = acc.numeric_mut();
+                nacc.count += rows_in;
+                if let Some(field) = &measure.field
+                    && let Some(col) = numeric_col(batch, field_name(field))
+                {
+                    minmax_domain(&col, rows, n, masks, wi, &mut nacc.min, &mut nacc.max);
+                }
+            }
+            StatsAggPlan::DistinctCount => {
+                // 输出只用 distinct_set（无 count 字段——原 count 维护为死状态）
+            }
+            StatsAggPlan::Last | StatsAggPlan::Top => {
+                // P1 不实现（Q18/Q19 扩展, 段 2 处理）
+            }
+        }
+    }
+}
+
+/// 空键 distinct/last/top 行式段（段 2, 原生列值按行域 + where 过滤）: 逐度量
+/// 取 Empty 桶累加器后 distinct 域插入或 last/top 逐行更新（last/top 提取行字段
+/// 供 yield 注入）。返回 false = distinct 列类型不在支持集（调用方回退
+/// `process_rows`——前置已拦截, 防御性一致）。
+#[allow(clippy::too_many_arguments)] // 段 2 域归并: 窗口/计划/掩码/行域/行字段 5 组参数
+pub(crate) fn accumulate_empty_bucket_row_measures(
+    window: &mut StatsWindowState,
+    plan: &StatsPlan,
+    measure_where: &[Option<usize>],
+    measure_field_idx: &[Option<usize>],
+    batch: &RecordBatch,
+    masks: &[BooleanArray],
+    rows: Option<&[u32]>,
+    n: usize,
+    row_names: Option<&[String]>,
+    row_field_cols: Option<&[Option<usize>]>,
+    row_layout: &std::sync::Arc<RowFieldLayout>,
+) -> bool {
+    for (idx, measure) in plan.measures.iter().enumerate() {
+        if !matches!(
+            measure.agg,
+            StatsAggPlan::DistinctCount | StatsAggPlan::Last | StatsAggPlan::Top
+        ) {
+            continue;
+        }
+        let wi = measure_where[idx];
+        // distinct/last/top 计划恒 Classic（soa_layout 仅纯数值计划）——
+        // 解包取数组（形态不符 = 内部错误）。
+        let accs = match window
+            .bucket_mut(&ScopeKey::Empty, plan)
+            .expect("Empty 桶恒存在")
+        {
+            StatsBucketAccs::Classic(accs) => accs,
+            StatsBucketAccs::Numeric(_) => {
+                unreachable!("distinct/last/top 计划不走 SoA 桶")
+            }
+        };
+        let acc = &mut accs[idx];
+        if matches!(measure.agg, StatsAggPlan::DistinctCount) {
+            let Some(field) = &measure.field else {
+                continue;
+            };
+            let set = acc.distinct_mut();
+            if !insert_distinct_domain(batch, field_name(field), rows, n, masks, wi, set) {
+                return false;
+            }
+        } else {
+            // last/top: 逐行按行域 + where 更新（子集行字段提取; 空键 last 规则少用）
+            let passes = |r: usize| wi.is_none_or(|wi| masks[wi].value(r));
+            for r in domain_rows(rows, n).filter(|&r| passes(r)) {
+                let row = row_fields_from_batch(batch, r, row_field_cols, row_layout);
+                let fidx = measure_field_position(plan, measure_field_idx, idx, row_names);
+                apply_last_top(acc, measure, &row, fidx);
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]

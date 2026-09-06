@@ -41,19 +41,14 @@ pub(super) fn round_with_precision(value: f64, precision: i64) -> Option<f64> {
     if !value.is_finite() {
         return None;
     }
+    let p = i32::try_from(precision.unsigned_abs()).ok()?;
+    let factor = 10_f64.powi(p);
+    if !factor.is_finite() || factor == 0.0 {
+        return None;
+    }
     if precision >= 0 {
-        let p = i32::try_from(precision).ok()?;
-        let factor = 10_f64.powi(p);
-        if !factor.is_finite() || factor == 0.0 {
-            return None;
-        }
         Some((value * factor).round() / factor)
     } else {
-        let p = i32::try_from(-precision).ok()?;
-        let factor = 10_f64.powi(p);
-        if !factor.is_finite() || factor == 0.0 {
-            return None;
-        }
         Some((value / factor).round() * factor)
     }
 }
@@ -138,4 +133,85 @@ pub(super) fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Optio
     hasher.update(text.as_bytes());
     hasher.update(b";");
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    fn num(v: f64) -> Value {
+        Value::Number(v)
+    }
+
+    fn strv(v: &str) -> Value {
+        Value::Str(v.into())
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn round_with_precision_both_directions() {
+        assert!(close(round_with_precision(2.345, 2).unwrap(), 2.35));
+        assert!(close(round_with_precision(2.5, 0).unwrap(), 3.0));
+        assert!(close(round_with_precision(-2.5, 0).unwrap(), -3.0));
+        assert!(close(round_with_precision(1234.0, -2).unwrap(), 1200.0));
+        assert!(close(round_with_precision(1250.0, -2).unwrap(), 1300.0));
+        assert_eq!(round_with_precision(f64::NAN, 2), None);
+        assert_eq!(round_with_precision(1.0, 400), None); // 10^400 溢出 → None
+        assert_eq!(round_with_precision(1.0, i64::MIN), None); // unsigned_abs 不溢出、仍拒绝
+    }
+
+    #[test]
+    fn index_truncate_and_sortable_helpers() {
+        assert_eq!(normalize_index(-1, 5), Some(4));
+        assert_eq!(normalize_index(5, 5), None);
+        assert_eq!(normalize_index(-6, 5), None);
+        assert_eq!(f64_to_i64_trunc(2.9), Some(2));
+        assert_eq!(f64_to_i64_trunc(-2.9), Some(-2));
+        assert_eq!(f64_to_i64_trunc(f64::INFINITY), None);
+        assert_eq!(
+            compare_sortable_values(&num(1.0), &num(2.0)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_sortable_values(&strv("b"), &strv("a")),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_sortable_values(&num(1.0), &strv("b")),
+            Ordering::Less
+        ); // 混合 → 字符串序
+    }
+
+    #[test]
+    fn fmt_time_and_hash_helpers() {
+        assert_eq!(
+            apply_fmt_template("a={} b={}", &[num(1.0), strv("x")]),
+            Some("a=1 b=x".to_string())
+        );
+        assert_eq!(apply_fmt_template("{}", &[]), None);
+        assert!(is_blank_str("  "));
+        assert!(!is_blank_str("x"));
+        assert_eq!(time_nanos_to_value(1_000_000_000), num(1000.0)); // epoch_nanos_to_millis 折算
+        assert_eq!(
+            parse_time_to_timestamp_nanos("2023-11-14 22:13:20", "%Y-%m-%d %H:%M:%S"),
+            Some(1_700_000_000_000_000_000)
+        );
+        assert_eq!(
+            timestamp_nanos_to_utc(1_700_000_000_000_000_000).map(|dt| dt.timestamp()),
+            Some(1_700_000_000)
+        );
+        let hash_text = |v: &Value| {
+            let mut h = Sha256::new();
+            update_stable_id_hash(&mut h, v).unwrap();
+            h.finalize().to_vec()
+        };
+        assert_eq!(hash_text(&strv("ab")), hash_text(&strv("ab")));
+        assert_ne!(hash_text(&num(1.0)), hash_text(&strv("1"))); // 类型标签参与
+        let mut h = Sha256::new();
+        assert!(update_stable_id_hash(&mut h, &Value::Array(vec![num(1.0)])).is_none());
+    }
 }

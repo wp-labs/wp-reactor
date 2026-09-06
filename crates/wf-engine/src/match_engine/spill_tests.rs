@@ -3,7 +3,7 @@
 //! roundtrip 与损坏/深度/layout 失配拒绝、Noop/Mem/Redb store 行为、redb 文件
 //! 生命周期（删旧建新）与流式 drain。
 
-use super::serde::{TAG_EMPTY, TAG_INT, TAG_PAIR};
+use super::serde::{TAG_DISTINCT, TAG_EMPTY, TAG_INT, TAG_LAST, TAG_NUMERIC, TAG_PAIR, TAG_TOP};
 use super::*;
 use crate::match_engine::ScopeKey;
 use crate::match_engine::executor::{
@@ -456,4 +456,86 @@ fn redb_drain_up_to_streams_all() {
     keys.sort();
     assert_eq!(keys, vec![1000, 1001, 1002, 1003, 1004], "全部键恰好一次");
     s.cleanup();
+}
+
+/// 反序列化各变体损坏防护（2026-09-06 spill_serde 拆分回归）: 手工构造 accs
+/// 字节流, 逐变体触发解码路径的 Corrupt 分支（数量超上限 / 未知 tag / flag 未知 /
+/// 引用越界 / 长度超上限 / payload 截断）——锁定 `read_*_acc` 各 helper 的防护
+/// 边界（不得因损坏数据 OOM / 索引越界 panic / 静默丢键）。
+#[test]
+fn deserialize_accs_corrupt_guards_per_variant() {
+    let layout = sample_layout();
+    let expect_corrupt = |bytes: Vec<u8>| {
+        assert!(
+            matches!(
+                deserialize_accs(&bytes, &layout),
+                Err(SpillError::Corrupt(_))
+            ),
+            "期望 Corrupt, 实际未拒绝: {bytes:?}"
+        );
+    };
+    // accs 数量超上限（> 1024）
+    expect_corrupt(1025u64.to_le_bytes().to_vec());
+    // 未知 StatsAccum tag
+    let mut b = 1u64.to_le_bytes().to_vec();
+    b.push(99);
+    expect_corrupt(b);
+    // Numeric: min 存在但 i128 payload 截断
+    let mut b = 1u64.to_le_bytes().to_vec();
+    b.push(TAG_NUMERIC);
+    b.extend_from_slice(&3u64.to_le_bytes()); // count
+    b.extend_from_slice(&0i128.to_le_bytes()); // sum
+    b.push(1); // min 有值 → 后续 i128 缺失
+    expect_corrupt(b);
+    // Distinct: ints 数量超上限
+    let mut b = 1u64.to_le_bytes().to_vec();
+    b.push(TAG_DISTINCT);
+    b.extend_from_slice(&u64::MAX.to_le_bytes()); // n_ints 超上限
+    expect_corrupt(b);
+    // Last: 未知 flag
+    let mut b = 1u64.to_le_bytes().to_vec();
+    b.push(TAG_LAST);
+    b.push(9);
+    expect_corrupt(b);
+    // Last: 引用索引越界（尚未读入任何行字段）
+    let mut b = 1u64.to_le_bytes().to_vec();
+    b.push(TAG_LAST);
+    b.push(2); // flag=2 引用
+    b.extend_from_slice(&0u64.to_le_bytes()); // idx 0, 无已读行字段
+    expect_corrupt(b);
+    // Top: 条目数超上限
+    let mut b = 1u64.to_le_bytes().to_vec();
+    b.push(TAG_TOP);
+    b.extend_from_slice(&u64::MAX.to_le_bytes());
+    expect_corrupt(b);
+}
+
+/// 空值变体 roundtrip（2026-09-06 spill_serde 拆分回归）: Last(None) 的 flag 0、
+/// 空 Top / 空 Distinct / 空 Numeric 的 payload 全路径往返不丢信息。
+#[test]
+fn accs_empty_last_top_distinct_numeric_roundtrip() {
+    let layout = sample_layout();
+    let accs = vec![
+        StatsAccum::Last(None),
+        StatsAccum::Top(Vec::new()),
+        StatsAccum::Distinct(Box::default()),
+        StatsAccum::Numeric(Box::new(NumericAccum {
+            count: 0,
+            sum: 0,
+            min: None,
+            max: None,
+        })),
+    ];
+    let bytes = serialize_accs(&accs).expect("serialize");
+    let back = deserialize_accs(&bytes, &layout).expect("deserialize");
+    assert_eq!(back.len(), 4);
+    assert!(back[0].last().is_none(), "Last(None) flag 0 往返");
+    assert!(back[1].top().is_empty(), "空 Top 往返");
+    let StatsAccum::Distinct(d) = &back[2] else {
+        panic!("期望 Distinct 变体");
+    };
+    assert_eq!(d.len(), 0, "空 Distinct 往返");
+    assert_eq!(back[3].numeric().count, 0, "空 Numeric 往返");
+    assert_eq!(back[3].numeric().min, None);
+    assert_eq!(back[3].numeric().max, None);
 }
