@@ -45,23 +45,10 @@ fn input_row(input: &mut &str) -> ModalResult<InputStmt> {
     kw("row").parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal("(")).parse_next(input)?;
-    ws_skip.parse_next(input)?;
 
-    let alias = cut_err(ident)
-        .context(StrContext::Expected(StrContextValue::Description(
-            "event alias in row()",
-        )))
-        .parse_next(input)?
-        .to_string();
+    let alias = row_alias_comma(input)?;
 
     ws_skip.parse_next(input)?;
-    cut_err(literal(","))
-        .context(StrContext::Expected(StrContextValue::Description(
-            "',' after alias",
-        )))
-        .parse_next(input)?;
-    ws_skip.parse_next(input)?;
-
     let fields = row_fields(input)?;
 
     ws_skip.parse_next(input)?;
@@ -70,6 +57,24 @@ fn input_row(input: &mut &str) -> ModalResult<InputStmt> {
     cut_err(literal(";")).parse_next(input)?;
 
     Ok(InputStmt::Row { alias, fields })
+}
+
+/// `IDENT,` — `row(` 后的别名至逗号（括号已消费; 前后空白由调用方/本函数处理）。
+fn row_alias_comma(input: &mut &str) -> ModalResult<String> {
+    ws_skip.parse_next(input)?;
+    let alias = cut_err(ident)
+        .context(StrContext::Expected(StrContextValue::Description(
+            "event alias in row()",
+        )))
+        .parse_next(input)?
+        .to_string();
+    ws_skip.parse_next(input)?;
+    cut_err(literal(","))
+        .context(StrContext::Expected(StrContextValue::Description(
+            "',' after alias",
+        )))
+        .parse_next(input)?;
+    Ok(alias)
 }
 
 /// `field = expr { "," field = expr } [","]`——row() 内逗号分隔字段列表
@@ -109,6 +114,14 @@ fn field_assign(input: &mut &str) -> ModalResult<FieldAssign> {
 /// `tick(DURATION);`
 pub(super) fn input_tick(input: &mut &str) -> ModalResult<InputStmt> {
     kw("tick").parse_next(input)?;
+    let dur = tick_duration(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(literal(";")).parse_next(input)?;
+    Ok(InputStmt::Tick(dur))
+}
+
+/// `(DURATION)` — tick 的括号时长参数（`tick` 关键字已消费）。
+fn tick_duration(input: &mut &str) -> ModalResult<std::time::Duration> {
     ws_skip.parse_next(input)?;
     cut_err(literal("(")).parse_next(input)?;
     ws_skip.parse_next(input)?;
@@ -119,9 +132,7 @@ pub(super) fn input_tick(input: &mut &str) -> ModalResult<InputStmt> {
         .parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal(")")).parse_next(input)?;
-    ws_skip.parse_next(input)?;
-    cut_err(literal(";")).parse_next(input)?;
-    Ok(InputStmt::Tick(dur))
+    Ok(dur)
 }
 
 #[cfg(test)]

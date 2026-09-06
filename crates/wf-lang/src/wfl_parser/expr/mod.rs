@@ -287,22 +287,33 @@ fn system_var(input: &mut &str) -> ModalResult<Expr> {
             "system variable name",
         )))
         .parse_next(input)?;
-    match name {
-        "score" => Ok(Expr::SystemVar(SystemVar::Score)),
-        "event_first_time" => Ok(Expr::SystemVar(SystemVar::EventFirstTime)),
-        "event_last_time" => Ok(Expr::SystemVar(SystemVar::EventLastTime)),
-        "evidence_start_time" => Ok(Expr::SystemVar(SystemVar::EvidenceStartTime)),
-        "evidence_end_time" => Ok(Expr::SystemVar(SystemVar::EvidenceEndTime)),
-        "window_start_time" => Ok(Expr::SystemVar(SystemVar::WindowStartTime)),
-        "window_end_time" => Ok(Expr::SystemVar(SystemVar::WindowEndTime)),
-        "emit_time" => Ok(Expr::SystemVar(SystemVar::EmitTime)),
-        "first_match_time" => Ok(Expr::SystemVar(SystemVar::FirstMatchTime)),
-        _ => crate::wfu_meta::WfuMetaField::from_name(name)
-            .filter(|field| field.available_in_yield())
-            .map(Expr::WfuMeta)
-            .ok_or_else(|| winnow::error::ErrMode::Cut(winnow::error::ContextError::new())),
-    }
+    resolve_system_var(name)
 }
+
+/// `@score` 等系统变量名 → 表达式（未知名回退 wfu_meta 的 yield 可用元字段;
+/// 两者都不是 → Cut）。
+fn resolve_system_var(name: &str) -> ModalResult<Expr> {
+    if let Some(&(_, var)) = SYSTEM_VAR_NAMES.iter().find(|(n, _)| *n == name) {
+        return Ok(Expr::SystemVar(var));
+    }
+    crate::wfu_meta::WfuMetaField::from_name(name)
+        .filter(|field| field.available_in_yield())
+        .map(Expr::WfuMeta)
+        .ok_or_else(|| winnow::error::ErrMode::Cut(winnow::error::ContextError::new()))
+}
+
+/// 系统变量名表（解析期 `@name` → 枚举; 与解释/列式侧 `format_expr` 的名称对称）。
+const SYSTEM_VAR_NAMES: &[(&str, SystemVar)] = &[
+    ("score", SystemVar::Score),
+    ("event_first_time", SystemVar::EventFirstTime),
+    ("event_last_time", SystemVar::EventLastTime),
+    ("evidence_start_time", SystemVar::EvidenceStartTime),
+    ("evidence_end_time", SystemVar::EvidenceEndTime),
+    ("window_start_time", SystemVar::WindowStartTime),
+    ("window_end_time", SystemVar::WindowEndTime),
+    ("emit_time", SystemVar::EmitTime),
+    ("first_match_time", SystemVar::FirstMatchTime),
+];
 
 #[cfg(test)]
 mod tests {
@@ -430,6 +441,21 @@ mod tests {
             .expect("parse_atomic_expr should parse the field ref");
         assert_eq!(e, Expr::Field(FieldRef::Simple("x".into())));
         assert_eq!(s, ">= 3");
+    }
+
+    #[test]
+    fn system_var_resolution_table_and_unknown_rejected() {
+        assert_eq!(expr_of("@score"), Expr::SystemVar(SystemVar::Score));
+        assert_eq!(
+            expr_of("@window_end_time"),
+            Expr::SystemVar(SystemVar::WindowEndTime)
+        );
+        assert_eq!(
+            expr_of("@first_match_time"),
+            Expr::SystemVar(SystemVar::FirstMatchTime)
+        );
+        // 不在系统变量表、也无 wfu_meta yield 字段 → 解析错误
+        expr_err("@bogus_sysvar");
     }
 
     #[test]

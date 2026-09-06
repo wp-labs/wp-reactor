@@ -17,6 +17,19 @@ pub(super) fn if_expr(input: &mut &str) -> ModalResult<Expr> {
     kw("if").parse_next(input)?;
     ws_skip.parse_next(input)?;
     let cond = cut_err(parse_expr).parse_next(input)?;
+
+    let then_e = parse_if_then_branch(input)?;
+    let else_e = parse_if_else_branch(input)?;
+
+    Ok(Expr::IfThenElse {
+        cond: Box::new(cond),
+        then_expr: Box::new(then_e),
+        else_expr: Box::new(else_e),
+    })
+}
+
+/// `then <expr>`（if 条件已解析; `then` 关键字带 cut + 诊断上下文）。
+fn parse_if_then_branch(input: &mut &str) -> ModalResult<Expr> {
     ws_skip.parse_next(input)?;
     cut_err(kw("then"))
         .context(StrContext::Expected(StrContextValue::Description(
@@ -24,7 +37,11 @@ pub(super) fn if_expr(input: &mut &str) -> ModalResult<Expr> {
         )))
         .parse_next(input)?;
     ws_skip.parse_next(input)?;
-    let then_e = cut_err(or_expr).parse_next(input)?;
+    cut_err(or_expr).parse_next(input)
+}
+
+/// `else <expr>`（then 分支已解析; `else` 关键字带 cut + 诊断上下文）。
+fn parse_if_else_branch(input: &mut &str) -> ModalResult<Expr> {
     ws_skip.parse_next(input)?;
     cut_err(kw("else"))
         .context(StrContext::Expected(StrContextValue::Description(
@@ -32,12 +49,7 @@ pub(super) fn if_expr(input: &mut &str) -> ModalResult<Expr> {
         )))
         .parse_next(input)?;
     ws_skip.parse_next(input)?;
-    let else_e = cut_err(or_expr).parse_next(input)?;
-    Ok(Expr::IfThenElse {
-        cond: Box::new(cond),
-        then_expr: Box::new(then_e),
-        else_expr: Box::new(else_e),
-    })
+    cut_err(or_expr).parse_next(input)
 }
 
 /// case 模式匹配表达式（issue #79 Issue 2；2026-09-01 由 `match` 改名——
@@ -63,9 +75,27 @@ pub(super) fn case_expr(input: &mut &str) -> ModalResult<Expr> {
         )))
         .parse_next(input)?;
     ws_skip.parse_next(input)?;
+
+    let (arms, default) = parse_case_arms(input)?;
+
+    ws_skip.parse_next(input)?;
+    cut_err(literal("}"))
+        .context(StrContext::Expected(StrContextValue::Description(
+            "'}' closing case block",
+        )))
+        .parse_next(input)?;
+    Ok(Expr::Match {
+        expr: Box::new(subject),
+        arms,
+        default,
+    })
+}
+
+/// `pat1 | pat2 => …, …, _ => default` 分支列表（`{` 已消费）:
+/// 普通分支以 `,` 分隔（允许尾逗号）; `_` 默认分支必须最后（其后残留由 `}` 检查）。
+fn parse_case_arms(input: &mut &str) -> ModalResult<(Vec<MatchArm>, Option<Box<Expr>>)> {
     let mut arms = Vec::new();
     let mut default = None;
-    // `_` 默认分支（必须最后一个；其后残留内容由 `}` 检查报错）。
     loop {
         ws_skip.parse_next(input)?;
         if input.starts_with('}') {
@@ -82,17 +112,7 @@ pub(super) fn case_expr(input: &mut &str) -> ModalResult<Expr> {
         }
         break;
     }
-    ws_skip.parse_next(input)?;
-    cut_err(literal("}"))
-        .context(StrContext::Expected(StrContextValue::Description(
-            "'}' closing case block",
-        )))
-        .parse_next(input)?;
-    Ok(Expr::Match {
-        expr: Box::new(subject),
-        arms,
-        default,
-    })
+    Ok((arms, default))
 }
 
 /// 普通分支：`pat1 | pat2 => <expr>`（不含尾部逗号；逗号由 case_expr 循环消费）。

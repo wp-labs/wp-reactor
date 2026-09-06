@@ -16,6 +16,14 @@ pub(super) fn options_block(input: &mut &str) -> ModalResult<TestOptions> {
     ws_skip.parse_next(input)?;
     cut_err(literal("{")).parse_next(input)?;
 
+    let opts = parse_option_entries(input)?;
+
+    cut_err(literal("}")).parse_next(input)?;
+    Ok(opts)
+}
+
+/// `key = value; ...` 选项条目循环（`}` 收尾; 未知关键字 → Cut）。
+fn parse_option_entries(input: &mut &str) -> ModalResult<TestOptions> {
     let mut close_trigger = None;
     let mut eval_mode = None;
     let mut permutation = None;
@@ -44,8 +52,6 @@ pub(super) fn options_block(input: &mut &str) -> ModalResult<TestOptions> {
             }
         }
     }
-
-    cut_err(literal("}")).parse_next(input)?;
 
     Ok(TestOptions {
         close_trigger,

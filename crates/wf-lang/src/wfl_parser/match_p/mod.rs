@@ -8,6 +8,8 @@ use crate::parse_utils::{ident, kw, ws_skip};
 
 use super::expr;
 
+mod branch;
+mod seq;
 mod steps;
 mod window;
 
