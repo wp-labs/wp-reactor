@@ -1,0 +1,41 @@
+{
+  "project_root": "/Users/zuowenjian/devspace/rust/wfusion/wp-reactor/jumo/model",
+  "selected": {
+    "kind": "file",
+    "name": "crates/wf-cep/src/cep/eval/cmp.rs"
+  },
+  "diagnostics": [],
+  "related_files": [
+    {
+      "path": "/Users/zuowenjian/devspace/rust/wfusion/wp-reactor/jumo/model/jumo-layout/code-quality.json"
+    }
+  ],
+  "source_snippets": [],
+  "model_summary": "代码质量报告为采集快照，重构前须核对当前源码；下方度量为派发任务时的值，任务完成后须重算并比较。",
+  "active_domain": "",
+  "active_view": "Code Quality",
+  "quality": {
+    "target_kind": "file",
+    "target_name": "crates/wf-cep/src/cep/eval/cmp.rs",
+    "metrics": [
+      "代码行 389 行（拆分敏感）",
+      "文件复杂度密度 228.8/KLOC（5/10 档）（拆分敏感）",
+      "最大圈复杂度 13",
+      "最长函数 31 行",
+      "超圈复杂度函数 0 个",
+      "超长函数 0 个",
+      "行覆盖率 —",
+      "目标告警数 0 条"
+    ],
+    "offenders": [
+      "`crates/wf-cep/src/cep/eval/cmp.rs:86` `try_eval_expr_to_f64` 圈复杂度 13 · 长度 31 行",
+      "`crates/wf-cep/src/cep/eval/cmp.rs:24` `compare_strs` 圈复杂度 7 · 长度 12 行",
+      "`crates/wf-cep/src/cep/eval/cmp.rs:46` `compare_cmp` 圈复杂度 7 · 长度 11 行",
+      "`crates/wf-cep/src/cep/eval/cmp.rs:64` `from_binop` 圈复杂度 7 · 长度 11 行",
+      "`crates/wf-cep/src/cep/eval/cmp.rs:170` `round_with_precision` 圈复杂度 6 · 长度 15 行"
+    ],
+    "warnings": [],
+    "report_path": "/Users/zuowenjian/devspace/rust/wfusion/wp-reactor/jumo/model/jumo-layout/code-quality.json",
+    "rerun_command": "jumo-code code-quality /Users/zuowenjian/devspace/rust/wfusion/wp-reactor --out /Users/zuowenjian/devspace/rust/wfusion/wp-reactor/jumo/model/jumo-layout/code-quality.json"
+  }
+}

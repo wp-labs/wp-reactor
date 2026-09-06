@@ -1,0 +1,6 @@
+// ---------------------------------------------------------------------------
+// Reactor subsystem use cases
+// ---------------------------------------------------------------------------
+// （原 RunReactor / IngestData / HotReloadRules 用例基于已删除的 CLI 级
+//  actor/消息（Admin / RunCommand / IncomingData / ConfigChange）建模；
+//  随模型瘦身移除。运行时子系统用例待 CLI 工程单独建模后补充。）

@@ -1,0 +1,18 @@
+// ---------------------------------------------------------------------------
+// config domain — flows
+// Crate: wf-config
+// ---------------------------------------------------------------------------
+
+// LoadConfig：fusion 配置加载管道 —— 读 TOML → 展开变量 → 校验 → 解析为 FusionConfig
+// 触发命令 ConfigLoadRequest 由外部 CLI 构造（warp-fusion 侧），本模型仅保留
+// 概念流以维持验证用例；其余 CLI 级消息已随模型瘦身移除。
+flow LoadConfig {
+  trigger ConfigLoadRequest
+  creates FusionConfig
+
+  step<stop> Resolve {
+    create FusionConfig {
+      sinks = ConfigLoadRequest.path
+    }
+  }
+}

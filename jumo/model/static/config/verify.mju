@@ -1,0 +1,15 @@
+// ---------------------------------------------------------------------------
+// config domain — flow verification cases
+// ---------------------------------------------------------------------------
+
+verify LoadConfigResolves for flow LoadConfig {
+  given {
+    ConfigLoadRequest.path = "fusion.toml"
+  }
+
+  when ConfigLoadRequest
+
+  expect {
+    FusionConfig.sinks == "fusion.toml"
+  }
+}

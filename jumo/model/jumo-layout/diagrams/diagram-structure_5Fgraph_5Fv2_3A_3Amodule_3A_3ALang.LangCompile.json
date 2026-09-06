@@ -1,0 +1,70 @@
+{
+  "pan": {
+    "x": 0.0,
+    "y": -1721.8998
+  },
+  "nodes": {
+    "struct:Lang.EachPlan": {
+      "x": 757.2864,
+      "y": 1248.8284
+    },
+    "struct:Lang.BranchPlan": {
+      "x": 75.18337,
+      "y": 6172.4033
+    },
+    "struct:Lang.ConvPlan": {
+      "x": 638.64795,
+      "y": 534.5
+    },
+    "struct:Lang.RulePlan": {
+      "x": 114.19809,
+      "y": 2114.208
+    },
+    "struct:Lang.JoinPlan": {
+      "x": 730.3571,
+      "y": 1780.7589
+    },
+    "struct:Lang.LimitsPlan": {
+      "x": 623.1107,
+      "y": 2547.1123
+    },
+    "state:Lang.Measure": {
+      "x": 1032.1013,
+      "y": 6859.5923
+    },
+    "state:Lang.Transform": {
+      "x": 1032.1013,
+      "y": 6279.108
+    },
+    "struct:Lang.AggPlan": {
+      "x": 578.2605,
+      "y": 6493.6167
+    },
+    "struct:Lang.JoinCondPlan": {
+      "x": 1255.9231,
+      "y": 2031.1627
+    },
+    "state:Lang.CmpOp": {
+      "x": 1032.1013,
+      "y": 6684.4253
+    },
+    "struct:Lang.SortKeyPlan": {
+      "x": 2035.6105,
+      "y": 2397.9265
+    },
+    "struct:Lang.ConvChainPlan": {
+      "x": 954.58374,
+      "y": 534.87213
+    },
+    "struct:Lang.JoinKeyPlan": {
+      "x": 1184.4069,
+      "y": 1768.373
+    }
+  },
+  "sizes": {},
+  "scales": {
+    "canvas": 0.70000005
+  },
+  "fills": {},
+  "options": {}
+}

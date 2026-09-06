@@ -1,0 +1,15 @@
+// ---------------------------------------------------------------------------
+// Reactor deployment topology
+// ---------------------------------------------------------------------------
+
+node ReactorNode
+node SpillDisk
+node PrimaryPostgres
+
+network ReactorNetwork {
+  ingress internal_only
+  trust_level internal
+  contains ReactorNode
+  contains SpillDisk
+  contains PrimaryPostgres
+}

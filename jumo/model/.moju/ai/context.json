@@ -1,0 +1,46 @@
+{
+  "project_root": "/Users/zuowenjian/devspace/rust/wfusion/wp-reactor/moju/model",
+  "selected": {
+    "kind": "file",
+    "name": "crates/wf-lang/src/preprocess/mod.rs"
+  },
+  "diagnostics": [],
+  "related_files": [
+    {
+      "path": "/Users/zuowenjian/devspace/rust/wfusion/wp-reactor/moju/model/moju-layout/code-quality.json"
+    }
+  ],
+  "source_snippets": [],
+  "model_summary": "代码质量报告为采集快照，重构前须核对当前源码；下方度量为派发任务时的值，任务完成后须重算并比较。",
+  "active_domain": "",
+  "active_view": "Code Quality",
+  "quality": {
+    "target_kind": "file",
+    "target_name": "crates/wf-lang/src/preprocess/mod.rs",
+    "metrics": [
+      "代码行 535 行（拆分敏感）",
+      "文件复杂度密度 338.3/KLOC（7/10 档）（拆分敏感）",
+      "最大圈复杂度 43",
+      "最长函数 176 行",
+      "超圈复杂度函数 3 个",
+      "超长函数 0 个",
+      "行覆盖率 —",
+      "目标告警数 4 条"
+    ],
+    "offenders": [
+      "`crates/wf-lang/src/preprocess/mod.rs:79` `preprocess_impl_with_preserved_bare_vars` 圈复杂度 43 · 长度 176 行",
+      "`crates/wf-lang/src/preprocess/mod.rs:556` `try_skip_pattern_block` 圈复杂度 36 · 长度 101 行",
+      "`crates/wf-lang/src/preprocess/mod.rs:295` `yield_preset_decl_range` 圈复杂度 21 · 长度 54 行",
+      "`crates/wf-lang/src/preprocess/mod.rs:421` `find_matching_angle` 圈复杂度 15 · 长度 47 行",
+      "`crates/wf-lang/src/preprocess/mod.rs:378` `skip_param_default_or_separator` 圈复杂度 14 · 长度 42 行"
+    ],
+    "warnings": [
+      "`crates/wf-lang/src/preprocess/mod.rs:295` cyclomatic 21 > 阈值 20",
+      "`crates/wf-lang/src/preprocess/mod.rs:556` cyclomatic 36 > 阈值 20",
+      "`crates/wf-lang/src/preprocess/mod.rs:79` cyclomatic 43 > 阈值 20",
+      "`crates/wf-lang/src/preprocess/mod.rs:79` nesting_depth 9 > 阈值 4"
+    ],
+    "report_path": "/Users/zuowenjian/devspace/rust/wfusion/wp-reactor/moju/model/moju-layout/code-quality.json",
+    "rerun_command": "moju-code code-quality /Users/zuowenjian/devspace/rust/wfusion/wp-reactor --out /Users/zuowenjian/devspace/rust/wfusion/wp-reactor/moju/model/moju-layout/code-quality.json"
+  }
+}

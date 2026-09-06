@@ -1,0 +1,32 @@
+{
+  "pan": {
+    "x": 0.0,
+    "y": 0.0
+  },
+  "nodes": {
+    "state:Lang.Severity": {
+      "x": 692.64453,
+      "y": 102.65625
+    },
+    "state:Lang.ValType": {
+      "x": 682.2344,
+      "y": 279.77734
+    },
+    "struct:Lang.StatLabelInfo": {
+      "x": 200.0,
+      "y": 629.95703
+    },
+    "state:Lang.Measure": {
+      "x": 679.6367,
+      "y": 472.47656
+    },
+    "state:Lang.StatLabelStage": {
+      "x": 679.90625,
+      "y": 782.72656
+    }
+  },
+  "sizes": {},
+  "scales": {},
+  "fills": {},
+  "options": {}
+}

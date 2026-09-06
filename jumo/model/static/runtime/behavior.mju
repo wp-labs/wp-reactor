@@ -1,0 +1,8 @@
+// ---------------------------------------------------------------------------
+// runtime domain — flows
+// Crate: wf-runtime
+// ---------------------------------------------------------------------------
+// （无代码背书的 CLI/管理消息 Admin / RunCommand / ShutdownSignal / ConfigChange /
+//  IncomingData 已随模型瘦身删除，ReactorStart / DataIngest / HotReload 概念流一并
+//  移除 —— reactor 生命周期与热重载以 ReactorLifecycle / HotReload 模块的代码类型为准，
+//  启动/接入/更新的外部触发在 CLI（warp-fusion）侧，不在本模型内建模。）

@@ -1,0 +1,19 @@
+// ---------------------------------------------------------------------------
+// wp-reactor daemon service
+// Single binary daemon that ingests Arrow IPC streams, runs CEP match/stats
+// rules, and dispatches alert records to configured sinks.
+// ---------------------------------------------------------------------------
+
+service wp-reactor {
+  kind bin
+  uses module Lang.LangCompile
+  uses module Lang.LangChecker
+  uses module Config.ConfigLoader
+  uses module Config.SinkConfig
+  uses module Engine.WindowManager
+  uses module Engine.MatchEngine
+  uses module Engine.StatsEngine
+  uses module Runtime.ReactorLifecycle
+  uses module Runtime.EngineTask
+  uses module Runtime.Receiver
+}
