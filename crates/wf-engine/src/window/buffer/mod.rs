@@ -491,6 +491,128 @@ pub struct Window {
     /// window-tail commit vs rule-flush ordering race (e2e_datagen_brute_force
     /// CI flake: close_all at a stale machine watermark).
     actor_drained: AtomicBool,
+    /// 内存驱逐 WARN 聚合（issue #86）：窗口持续贴住 `max_window_bytes`、
+    /// 每批 1 行时曾逐 append 打一条 WARN（~21ms 12 条刷屏）。现改为首条
+    /// 驱逐详报 + 静默累计，达标（行数/时长）或 episode 结束时输出汇总。
+    eviction_warn: std::sync::Mutex<EvictionWarnTracker>,
+}
+
+// ---------------------------------------------------------------------------
+// 内存驱逐 WARN 聚合（issue #86）
+// ---------------------------------------------------------------------------
+
+/// 驱逐 WARN 滚动汇总阈值：累计行数或时长任一达标即输出一条滚动汇总并重新起算。
+const EVICTION_WARN_ROLLUP_ROWS: usize = 10_000;
+const EVICTION_WARN_ROLLUP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 一条滚动/收尾汇总的数据。
+#[derive(Debug, Clone, Copy)]
+struct EvictionWarnRollup {
+    rows: usize,
+    bytes: usize,
+    appends: usize,
+    elapsed: Duration,
+}
+
+/// `record` 的返回：首条驱逐详报 / 滚动汇总 / 静默累计。
+#[derive(Debug, Clone, Copy)]
+enum EvictionWarnNote {
+    FirstDetail,
+    Rollup(EvictionWarnRollup),
+    Silent,
+}
+
+/// 驱逐 WARN 聚合状态机（`Instant` 由调用方注入以便测试用合成时间推进）：
+/// - 新一轮（上次输出后第一条驱逐 append）→ 详报，同时开始累计；
+/// - 累计行数 ≥ `EVICTION_WARN_ROLLUP_ROWS` 或时长 ≥ `EVICTION_WARN_ROLLUP_INTERVAL`
+///   → 输出滚动汇总并归零重新起算；
+/// - 其余逐条 append 静默累计（不刷屏）；
+/// - episode 结束（未触发驱逐的 append，经 [`Self::finish`]）时若有 ≥2 次驱逐
+///   append 未汇出 → 输出收尾汇总。
+#[derive(Debug, Default)]
+struct EvictionWarnTracker {
+    started_at: Option<Instant>,
+    rows: usize,
+    bytes: usize,
+    appends: usize,
+}
+
+impl EvictionWarnTracker {
+    fn record(
+        &mut self,
+        dropped_rows: usize,
+        dropped_bytes: usize,
+        now: Instant,
+    ) -> EvictionWarnNote {
+        let started = *self.started_at.get_or_insert(now);
+        self.rows += dropped_rows;
+        self.bytes += dropped_bytes;
+        self.appends += 1;
+        if self.appends == 1 {
+            return EvictionWarnNote::FirstDetail;
+        }
+        let elapsed = now.duration_since(started);
+        if self.rows >= EVICTION_WARN_ROLLUP_ROWS || elapsed >= EVICTION_WARN_ROLLUP_INTERVAL {
+            let rollup = EvictionWarnRollup {
+                rows: self.rows,
+                bytes: self.bytes,
+                appends: self.appends,
+                elapsed,
+            };
+            self.started_at = None;
+            self.rows = 0;
+            self.bytes = 0;
+            self.appends = 0;
+            EvictionWarnNote::Rollup(rollup)
+        } else {
+            EvictionWarnNote::Silent
+        }
+    }
+
+    /// episode 结束：仍有未汇出的多次驱逐（≥2 次 append）时返回收尾汇总。
+    fn finish(&mut self, now: Instant) -> Option<EvictionWarnRollup> {
+        if self.appends < 2 {
+            self.started_at = None;
+            self.rows = 0;
+            self.bytes = 0;
+            self.appends = 0;
+            return None;
+        }
+        let started = self.started_at?;
+        let rollup = EvictionWarnRollup {
+            rows: self.rows,
+            bytes: self.bytes,
+            appends: self.appends,
+            elapsed: now.duration_since(started),
+        };
+        self.started_at = None;
+        self.rows = 0;
+        self.bytes = 0;
+        self.appends = 0;
+        Some(rollup)
+    }
+}
+
+/// 滚动汇总日志文案（可单测）。
+fn eviction_rollup_message(name: &str, max_bytes: usize, rollup: &EvictionWarnRollup) -> String {
+    format!(
+        "window `{name}` memory eviction continuing: {} row(s) / {} bytes dropped across {} append(s) in {} ms (max_window_bytes={max_bytes} bytes); per-append warnings suppressed",
+        rollup.rows,
+        rollup.bytes,
+        rollup.appends,
+        rollup.elapsed.as_millis()
+    )
+}
+
+/// episode 收尾汇总日志文案（可单测）。
+fn eviction_ended_message(name: &str, max_bytes: usize, rollup: &EvictionWarnRollup) -> String {
+    format!(
+        "window `{name}` memory eviction episode ended: {} row(s) / {} bytes dropped across {} append(s) in {} ms (max_window_bytes={max_bytes} bytes); per-append warnings suppressed",
+        rollup.rows,
+        rollup.bytes,
+        rollup.appends,
+        rollup.elapsed.as_millis()
+    )
 }
 
 impl Window {
@@ -521,6 +643,7 @@ impl Window {
             progress: RwLock::new(None),
             parked_pin: RwLock::new(None),
             actor_drained: AtomicBool::new(true),
+            eviction_warn: std::sync::Mutex::new(EvictionWarnTracker::default()),
         }
     }
 
@@ -957,25 +1080,51 @@ impl Window {
             }
         }
         if evicted_rows > 0 {
-            // The incoming batch was dropped (in whole or part) because it pushed
-            // the window over max_window_bytes — e.g. a single oversized Arrow
-            // frame exceeds the cap and is silently discarded. Log it so rules
-            // that stop seeing events aren't a mystery.
-            // `join_pin_floor_ns` = D4 join-retention frontier (oldest event time
-            // a join-target reader still needs); only meaningful when a join
-            // target pinned rows. Plain (non-join) windows have no pin
-            // (`pinned=false`) — the field is omitted rather than printed as a
-            // noise `i64::MAX`. It is NOT the time-eviction cutoff.
-            log::warn!(
-                "window `{}` dropped {} row(s) / {} bytes in memory eviction (max_window_bytes={} bytes, incoming batch = {} rows / {} bytes{})",
-                self.name,
-                evicted_rows,
-                evicted_bytes,
-                max_bytes,
-                row_count,
-                byte_size,
-                Self::eviction_warn_pin_suffix(pinned, retention_ns),
-            );
+            // 驱逐 WARN 防刷屏（issue #86）：首条驱逐详报 + 静默累计；累计达标
+            // 输出滚动汇总。持续驱逐（如每批 1 行贴住 max_window_bytes）不再
+            // 逐 append 刷 WARN，同时保留「规则为何看不到旧行」的可观测性。
+            let mut warn_state = self
+                .eviction_warn
+                .lock()
+                .expect("eviction warn lock poisoned");
+            let now = Instant::now();
+            let evicted = EvictionWarnRollup {
+                rows: evicted_rows,
+                bytes: evicted_bytes,
+                appends: 1,
+                elapsed: Duration::ZERO,
+            };
+            match warn_state.record(evicted_rows, evicted_bytes, now) {
+                EvictionWarnNote::FirstDetail => {
+                    // 首条详报沿用原格式（含 incoming batch 明细与 D4 pin 后缀）。
+                    log::warn!(
+                        "window `{}` dropped {} row(s) / {} bytes in memory eviction (max_window_bytes={} bytes, incoming batch = {} rows / {} bytes{})",
+                        self.name,
+                        evicted.rows,
+                        evicted.bytes,
+                        max_bytes,
+                        row_count,
+                        byte_size,
+                        Self::eviction_warn_pin_suffix(pinned, retention_ns),
+                    );
+                }
+                EvictionWarnNote::Rollup(rollup) => {
+                    log::warn!(
+                        "{}",
+                        eviction_rollup_message(&self.name, max_bytes, &rollup)
+                    );
+                }
+                EvictionWarnNote::Silent => {}
+            }
+        } else {
+            // episode 结束：多次驱逐未汇出则给一条收尾汇总。
+            let mut warn_state = self
+                .eviction_warn
+                .lock()
+                .expect("eviction warn lock poisoned");
+            if let Some(rollup) = warn_state.finish(Instant::now()) {
+                log::warn!("{}", eviction_ended_message(&self.name, max_bytes, &rollup));
+            }
         }
 
         // Content changed (append + any accompanying eviction): bump the
@@ -1438,5 +1587,99 @@ fn smol_str_heap_bytes(s: &SmolStr) -> usize {
         s.len() + 1
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod eviction_warn_tests {
+    use super::*;
+
+    #[test]
+    fn first_detail_then_silent_then_rollup_by_rows() {
+        let mut tracker = EvictionWarnTracker::default();
+        let t0 = Instant::now();
+        assert!(matches!(
+            tracker.record(1, 100, t0),
+            EvictionWarnNote::FirstDetail
+        ));
+        // 累计行数到达阈值前静默；到达后输出滚动汇总并归零
+        for i in 1..EVICTION_WARN_ROLLUP_ROWS {
+            let now = t0 + Duration::from_millis(i as u64);
+            match tracker.record(1, 100, now) {
+                EvictionWarnNote::Silent => {}
+                EvictionWarnNote::Rollup(rollup) => {
+                    assert_eq!(rollup.rows, EVICTION_WARN_ROLLUP_ROWS);
+                    assert_eq!(rollup.appends, EVICTION_WARN_ROLLUP_ROWS);
+                    assert_eq!(rollup.bytes, 100 * EVICTION_WARN_ROLLUP_ROWS);
+                }
+                EvictionWarnNote::FirstDetail => panic!("unexpected re-detail before rollup"),
+            }
+        }
+        // 归零后新一轮重新从详报开始
+        let t_end = t0 + Duration::from_millis(EVICTION_WARN_ROLLUP_ROWS as u64 + 1);
+        assert!(matches!(
+            tracker.record(1, 100, t_end),
+            EvictionWarnNote::FirstDetail
+        ));
+    }
+
+    #[test]
+    fn rollup_by_elapsed_time_without_row_threshold() {
+        let mut tracker = EvictionWarnTracker::default();
+        let t0 = Instant::now();
+        assert!(matches!(
+            tracker.record(1, 10, t0),
+            EvictionWarnNote::FirstDetail
+        ));
+        // 远低于行阈值但时长超过滚动间隔 → 汇总
+        assert!(matches!(
+            tracker.record(2, 20, t0 + Duration::from_secs(61)),
+            EvictionWarnNote::Rollup(_)
+        ));
+    }
+
+    #[test]
+    fn episode_end_rolls_up_only_after_multiple_evicting_appends() {
+        // 单次驱逐：详报已足够，收尾不再重复
+        let mut tracker = EvictionWarnTracker::default();
+        let t0 = Instant::now();
+        tracker.record(1, 10, t0);
+        assert!(tracker.finish(t0 + Duration::from_secs(1)).is_none());
+
+        // 短爆发（如 issue #86 样本 21ms 12 条）：首条详报 + 收尾汇总一次
+        let mut tracker = EvictionWarnTracker::default();
+        let t0 = Instant::now();
+        tracker.record(1, 10, t0);
+        tracker.record(2, 20, t0 + Duration::from_millis(1));
+        tracker.record(3, 30, t0 + Duration::from_millis(2));
+        let end = tracker
+            .finish(t0 + Duration::from_millis(21))
+            .expect("episode end rollup");
+        assert_eq!(end.rows, 6);
+        assert_eq!(end.bytes, 60);
+        assert_eq!(end.appends, 3);
+        assert_eq!(end.elapsed.as_millis(), 21);
+        // 状态已清空：再次 finish 无输出
+        assert!(tracker.finish(t0 + Duration::from_millis(30)).is_none());
+    }
+
+    #[test]
+    fn rollup_messages_carry_counts_and_suppression_note() {
+        let rollup = EvictionWarnRollup {
+            rows: 16,
+            bytes: 44_093,
+            appends: 12,
+            elapsed: Duration::from_millis(21),
+        };
+        let continuing = eviction_rollup_message("sdm_event", 268_435_456, &rollup);
+        assert!(continuing.contains("sdm_event"));
+        assert!(
+            continuing.contains("16 row(s) / 44093 bytes dropped across 12 append(s) in 21 ms")
+        );
+        assert!(continuing.contains("268435456"));
+        assert!(continuing.contains("per-append warnings suppressed"));
+        let ended = eviction_ended_message("sdm_event", 268_435_456, &rollup);
+        assert!(ended.contains("episode ended"));
+        assert!(ended.contains("16 row(s)"));
     }
 }
