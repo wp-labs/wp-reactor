@@ -1,7 +1,6 @@
 //! measure — eval/ 子模块（从 eval.rs 拆分）。
 use super::*;
 
-
 // ---------------------------------------------------------------------------
 // 桶键求值（P2 复合键: Field / bucket() / tier()）
 // ---------------------------------------------------------------------------
@@ -43,7 +42,6 @@ pub(crate) fn measure_values_soa(
         .collect()
 }
 
-
 /// 桶累加器 → 每度量 f64 值（按桶形态分派）。
 pub(crate) fn bucket_measure_values(
     plan: &StatsPlan,
@@ -56,7 +54,6 @@ pub(crate) fn bucket_measure_values(
         StatsBucketAccs::Classic(accs) => measure_values(plan, accs, measure_field_idx),
     }
 }
-
 
 /// 桶累加器 → close 条目列表（按桶形态分派）。SoA 全标量（无 row_fields——
 /// SoA 计划不含 last/top）; Classic 走 [`bucket_measure_entries`]。
@@ -85,7 +82,6 @@ pub(crate) fn bucket_close_entries(
             .collect(),
     }
 }
-
 
 pub(crate) fn measure_values(
     plan: &StatsPlan,
@@ -122,7 +118,6 @@ pub(crate) fn measure_values(
         .collect()
 }
 
-
 /// 每桶输出条目: 度量值 + 可选行字段紧凑存储（last/top 注入 yield 用; 标量 =
 /// None）。行字段为 Arc（与状态共享, close 零拷贝; 构造 alert 时才逐值构造）。
 /// 列序 = `StatsExecutor::row_field_names()`（None 子集 = schema 列序）。
@@ -133,7 +128,6 @@ pub struct StatsCloseEntry {
     pub row_fields: Option<std::sync::Arc<RowFields>>,
 }
 
-
 /// 每桶 close 输出: 每度量一个值列表（标量 = 1; top = N, 按 rank 序）。
 #[derive(Debug, Clone, ::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
@@ -141,7 +135,6 @@ pub struct StatsCloseBucket {
     pub key: ScopeKey,
     pub measures: Vec<Vec<StatsCloseEntry>>,
 }
-
 
 /// 单个度量的 close 条目列表（标量 = 1; last = 1 带行字段列数组; top = N 带行
 /// 字段列数组）。行字段为 Arc（与状态共享, close 零拷贝; 构造 alert 时才逐值

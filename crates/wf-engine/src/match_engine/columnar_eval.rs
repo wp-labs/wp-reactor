@@ -1107,8 +1107,14 @@ mod tests {
             Some(CScalar::Float(12.0))
         );
         // 比较算子不是算术 → None; 非数值操作数 → None。
-        assert_eq!(arithmetic(BinOp::Eq, &CScalar::Int(1), &CScalar::Int(1)), None);
-        assert_eq!(arithmetic(BinOp::Add, &CScalar::Str("a".into()), &CScalar::Int(1)), None);
+        assert_eq!(
+            arithmetic(BinOp::Eq, &CScalar::Int(1), &CScalar::Int(1)),
+            None
+        );
+        assert_eq!(
+            arithmetic(BinOp::Add, &CScalar::Str("a".into()), &CScalar::Int(1)),
+            None
+        );
     }
 
     /// 比较内核（2026-09-06 拆分回归）: Str 有序 / Bool 仅 Eq/Ne / Int 原生 /
@@ -1149,7 +1155,11 @@ mod tests {
             !compare_scalars(BinOp::Lt, &CScalar::Bool(false), &CScalar::Bool(true)),
             "Bool 仅支持 Eq/Ne"
         );
-        assert!(compare_scalars(BinOp::Lt, &CScalar::Int(1), &CScalar::Int(2)));
+        assert!(compare_scalars(
+            BinOp::Lt,
+            &CScalar::Int(1),
+            &CScalar::Int(2)
+        ));
         assert!(compare_scalars(
             BinOp::Eq,
             &CScalar::Int(1),

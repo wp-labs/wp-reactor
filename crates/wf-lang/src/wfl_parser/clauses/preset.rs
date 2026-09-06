@@ -273,20 +273,20 @@ mod tests {
     }
 }
 
-    #[test]
-    fn angle_close_respects_nested_parens_brackets() {
-        // 括号内的 '>' 不闭合; 深度归零后的 '>' 才有效
-        let body = "f(a > 1) >x";
-        let idx = find_angle_close(body, |after| after.starts_with('x')).unwrap();
-        assert_eq!(&body[idx..], ">x", "括号内 > 被跳过");
-        let body = "arr[0 > 1] >x";
-        let idx = find_angle_close(body, |after| after.starts_with('x')).unwrap();
-        assert_eq!(&body[idx..], ">x", "方括号内 > 被跳过");
-    }
+#[test]
+fn angle_close_respects_nested_parens_brackets() {
+    // 括号内的 '>' 不闭合; 深度归零后的 '>' 才有效
+    let body = "f(a > 1) >x";
+    let idx = find_angle_close(body, |after| after.starts_with('x')).unwrap();
+    assert_eq!(&body[idx..], ">x", "括号内 > 被跳过");
+    let body = "arr[0 > 1] >x";
+    let idx = find_angle_close(body, |after| after.starts_with('x')).unwrap();
+    assert_eq!(&body[idx..], ">x", "方括号内 > 被跳过");
+}
 
-    #[test]
-    fn angle_items_reject_unconsumed_tail() {
-        // 形参列表后残留非法内容 → 语法错误（parse_angle_items 的 rest 空校验）
-        let mut s = "<n = 1; junk>(a = 1)";
-        assert!(yield_preset_params.parse_next(&mut s).is_err());
-    }
+#[test]
+fn angle_items_reject_unconsumed_tail() {
+    // 形参列表后残留非法内容 → 语法错误（parse_angle_items 的 rest 空校验）
+    let mut s = "<n = 1; junk>(a = 1)";
+    assert!(yield_preset_params.parse_next(&mut s).is_err());
+}

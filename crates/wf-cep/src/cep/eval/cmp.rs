@@ -449,13 +449,22 @@ mod tests {
     #[test]
     fn const_fold_zero_guards_and_non_arithmetic_ops() {
         // 除/模零（含 -0.0）→ None; 非算术算子 → None（fold_f64_binop 提取回归）
-        assert_eq!(try_eval_expr_to_f64(&bin(BinOp::Div, en(1.0), en(-0.0))), None);
-        assert_eq!(try_eval_expr_to_f64(&bin(BinOp::Mod, en(7.0), en(-0.0))), None);
+        assert_eq!(
+            try_eval_expr_to_f64(&bin(BinOp::Div, en(1.0), en(-0.0))),
+            None
+        );
+        assert_eq!(
+            try_eval_expr_to_f64(&bin(BinOp::Mod, en(7.0), en(-0.0))),
+            None
+        );
         assert_eq!(
             try_eval_expr_to_f64(&bin(BinOp::Sub, en(5.0), en(2.0))),
             Some(3.0)
         );
-        assert_eq!(try_eval_expr_to_f64(&bin(BinOp::Eq, en(1.0), en(1.0))), None);
+        assert_eq!(
+            try_eval_expr_to_f64(&bin(BinOp::Eq, en(1.0), en(1.0))),
+            None
+        );
         // 未知名路径: 与既有的字面折叠一致
         assert_eq!(
             try_eval_expr_to_f64(&Expr::Bool(true)),

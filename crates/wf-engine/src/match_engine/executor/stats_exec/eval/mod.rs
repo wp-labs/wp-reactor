@@ -12,8 +12,8 @@ use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsPlan};
 
-use super::*;
 use super::row_acc::{max_fold, min_fold};
+use super::*;
 use crate::match_engine::Value;
 use crate::match_engine::cep::ScopeKey;
 use crate::match_engine::event_bridge::extract_field_value;

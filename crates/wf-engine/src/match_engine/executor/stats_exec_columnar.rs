@@ -877,7 +877,10 @@ fn stats_soa_empty_bucket_domain_split_matches_single() {
     ];
     let batch = rows_to_batch(&rows);
     let mut single = StatsExecutor::new(plan.clone());
-    assert!(single.process_batch_rows(&batch, None), "数值度量应可列式化");
+    assert!(
+        single.process_batch_rows(&batch, None),
+        "数值度量应可列式化"
+    );
     let expect = single.final_measure_values();
     let mut a = StatsExecutor::new(plan.clone());
     let mut b = StatsExecutor::new(plan);

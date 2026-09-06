@@ -1,15 +1,15 @@
 //! fmt 族内置函数（eval/funcs.rs 拆分; 见 eval_func_call）
 
-use wf_lang::ast::Expr;
-use super::super::types::Value;
+use super::super::key::value_to_string;
 use super::super::types::EngineHashMap;
 use super::super::types::FieldSource;
 use super::super::types::RollingStats;
+use super::super::types::Value;
 use super::super::types::WindowLookup;
-use super::super::key::value_to_string;
-use super::eval_expr_ext;
 use super::cmp::apply_fmt_template;
 use super::cmp::is_blank_str;
+use super::eval_expr_ext;
+use wf_lang::ast::Expr;
 
 pub(super) fn eval_func_fmt(
     args: &[Expr],

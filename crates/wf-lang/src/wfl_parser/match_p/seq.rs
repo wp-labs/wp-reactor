@@ -126,7 +126,6 @@ fn parse_within(input: &mut &str) -> ModalResult<Option<std::time::Duration>> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

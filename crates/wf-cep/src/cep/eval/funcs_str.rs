@@ -1,15 +1,15 @@
 //! count_char 族内置函数（eval/funcs.rs 拆分; 见 eval_func_call）
 
-use wf_lang::ast::Expr;
-use super::super::types::Value;
+use super::super::key::value_to_string;
 use super::super::types::EngineHashMap;
 use super::super::types::FieldSource;
 use super::super::types::RollingStats;
+use super::super::types::Value;
 use super::super::types::WindowLookup;
-use super::super::key::value_to_string;
+use super::cmp::normalize_index;
 use super::eval_expr_ext;
 use super::values_equal;
-use super::cmp::normalize_index;
+use wf_lang::ast::Expr;
 
 pub(super) fn eval_func_count_char(
     args: &[Expr],

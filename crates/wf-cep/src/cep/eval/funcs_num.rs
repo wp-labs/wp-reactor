@@ -1,14 +1,14 @@
 //! abs 族内置函数（eval/funcs.rs 拆分; 见 eval_func_call）
 
-use wf_lang::ast::Expr;
-use super::super::types::Value;
 use super::super::types::EngineHashMap;
 use super::super::types::FieldSource;
 use super::super::types::RollingStats;
+use super::super::types::Value;
 use super::super::types::WindowLookup;
-use super::eval_expr_ext;
 use super::cmp::f64_to_i64_trunc;
 use super::cmp::round_with_precision;
+use super::eval_expr_ext;
+use wf_lang::ast::Expr;
 
 pub(super) fn eval_func_abs(
     args: &[Expr],

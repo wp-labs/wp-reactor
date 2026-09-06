@@ -488,38 +488,41 @@ mod tests {
     }
 }
 
-    #[test]
-    fn within_sugar_interval_and_expr_bounds() {
-        let mut s = "within 10s";
-        let w = within_clause.parse_next(&mut s).unwrap();
-        // `within 10s` 糖 ≡ within [-10s, 0s]
-        assert!(matches!(
-            (w.lo.val, w.hi.val),
-            (BoundVal::Dur { neg: true, .. }, BoundVal::Dur { neg: false, .. })
-        ));
-        assert!(s.is_empty());
+#[test]
+fn within_sugar_interval_and_expr_bounds() {
+    let mut s = "within 10s";
+    let w = within_clause.parse_next(&mut s).unwrap();
+    // `within 10s` 糖 ≡ within [-10s, 0s]
+    assert!(matches!(
+        (w.lo.val, w.hi.val),
+        (
+            BoundVal::Dur { neg: true, .. },
+            BoundVal::Dur { neg: false, .. }
+        )
+    ));
+    assert!(s.is_empty());
 
-        // 开/闭记号: `<` 开、`<=` 闭（时长界）
-        let mut s = "within [<5s, <=10s]";
-        let w = within_clause.parse_next(&mut s).unwrap();
-        assert!(w.lo.open && !w.hi.open);
-        assert!(matches!(w.lo.val, BoundVal::Dur { .. }) && matches!(w.hi.val, BoundVal::Dur { .. }));
+    // 开/闭记号: `<` 开、`<=` 闭（时长界）
+    let mut s = "within [<5s, <=10s]";
+    let w = within_clause.parse_next(&mut s).unwrap();
+    assert!(w.lo.open && !w.hi.open);
+    assert!(matches!(w.lo.val, BoundVal::Dur { .. }) && matches!(w.hi.val, BoundVal::Dur { .. }));
 
-        // 非时长界 → 左行绝对时间表达式
-        let mut s = "within [a.t, <b.t]";
-        let w = within_clause.parse_next(&mut s).unwrap();
-        assert!(!w.lo.open && w.hi.open);
-        assert!(matches!(w.lo.val, BoundVal::Expr(_)) && matches!(w.hi.val, BoundVal::Expr(_)));
-    }
+    // 非时长界 → 左行绝对时间表达式
+    let mut s = "within [a.t, <b.t]";
+    let w = within_clause.parse_next(&mut s).unwrap();
+    assert!(!w.lo.open && w.hi.open);
+    assert!(matches!(w.lo.val, BoundVal::Expr(_)) && matches!(w.hi.val, BoundVal::Expr(_)));
+}
 
-    #[test]
-    fn tie_direction_defaults_asc_and_desc_parses() {
-        // tie_spec 自 '(' 起解析（'tie' 关键字由 opt_tie 消费）
-        let mut s = "(ts)";
-        let t = tie_spec.parse_next(&mut s).unwrap();
-        assert!(!t.desc, "tie 缺省 asc");
-        let mut s = "(ts, desc)";
-        let t = tie_spec.parse_next(&mut s).unwrap();
-        assert!(t.desc, "尾逗号 + desc");
-        assert_eq!(t.field, FieldRef::Simple("ts".into()));
-    }
+#[test]
+fn tie_direction_defaults_asc_and_desc_parses() {
+    // tie_spec 自 '(' 起解析（'tie' 关键字由 opt_tie 消费）
+    let mut s = "(ts)";
+    let t = tie_spec.parse_next(&mut s).unwrap();
+    assert!(!t.desc, "tie 缺省 asc");
+    let mut s = "(ts, desc)";
+    let t = tie_spec.parse_next(&mut s).unwrap();
+    assert!(t.desc, "尾逗号 + desc");
+    assert_eq!(t.field, FieldRef::Simple("ts".into()));
+}

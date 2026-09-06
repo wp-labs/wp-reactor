@@ -206,7 +206,6 @@ fn cmp_op_step(input: &mut &str) -> ModalResult<CmpOp> {
     .parse_next(input)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,11 +226,16 @@ mod tests {
     #[test]
     fn has_branch_defaults_to_count_ge_one() {
         let mut s = "a";
-        let b = parse_has_branch
-            .parse_next(&mut s)
-            .expect("has a");
+        let b = parse_has_branch.parse_next(&mut s).expect("has a");
         assert_eq!(b.source, "a");
-        assert!(matches!(b.pipe, PipeChain { measure: Measure::Count, cmp: CmpOp::Ge, .. }));
+        assert!(matches!(
+            b.pipe,
+            PipeChain {
+                measure: Measure::Count,
+                cmp: CmpOp::Ge,
+                ..
+            }
+        ));
         assert!(s.is_empty());
     }
 }
