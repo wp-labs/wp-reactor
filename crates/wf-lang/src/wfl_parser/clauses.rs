@@ -374,6 +374,69 @@ fn named_arg(input: &mut &str) -> ModalResult<NamedArg> {
 // join clause
 // ---------------------------------------------------------------------------
 
+/// 解析 `within` / `reduce` 修饰语：两者可任一顺序、各至多一次。
+/// 每个位置尝试失败后回退输入，保证顺序无关（对齐 join_clause 原行为）。
+fn parse_within_or_reduce_modifiers(
+    input: &mut &str,
+) -> ModalResult<(Option<WithinSpec>, Option<ReduceClause>)> {
+    let mut within = None;
+    let mut reduce = None;
+    loop {
+        ws_skip.parse_next(input)?;
+        let saved = *input;
+        if within.is_none()
+            && let Ok(w) = within_clause.parse_next(input)
+        {
+            within = Some(w);
+            continue;
+        }
+        *input = saved;
+        if reduce.is_none()
+            && let Ok(r) = reduce_clause.parse_next(input)
+        {
+            reduce = Some(r);
+            continue;
+        }
+        *input = saved;
+        break;
+    }
+    Ok((within, reduce))
+}
+
+/// 解析 `&&` 分隔的连接条件（首个条件为 cut）。
+fn parse_join_conditions(input: &mut &str) -> ModalResult<Vec<JoinCondition>> {
+    let first = cut_err(join_cond).parse_next(input)?;
+    let mut conditions = vec![first];
+    loop {
+        ws_skip.parse_next(input)?;
+        if opt(literal("&&")).parse_next(input)?.is_some() {
+            ws_skip.parse_next(input)?;
+            let cond = cut_err(join_cond).parse_next(input)?;
+            conditions.push(cond);
+        } else {
+            break;
+        }
+    }
+    Ok(conditions)
+}
+
+/// 把 `as <label>`（可空）挂到 reduce 上；无 reduce 或 label 已存在均为语法错误。
+fn attach_join_label(
+    reduce: &mut Option<ReduceClause>,
+    label: Option<String>,
+) -> Result<(), ErrMode<ContextError>> {
+    let Some(label) = label else {
+        return Ok(());
+    };
+    match reduce.as_mut() {
+        Some(rc) if rc.label.is_none() => {
+            rc.label = Some(label);
+            Ok(())
+        }
+        _ => Err(parse_cut_error()),
+    }
+}
+
 /// `join WINDOW [mode] [within ...] [reduce ...] on cond [&& cond] [as label] [emit at expr]`
 ///
 /// - `within` / `reduce` 位于 mode 与 `on` 之间，两者可任一顺序、各至多一次；
@@ -395,28 +458,7 @@ pub(super) fn join_clause(input: &mut &str) -> ModalResult<JoinClause> {
     ws_skip.parse_next(input)?;
     let mode = opt(join_mode).parse_next(input)?.unwrap_or(JoinMode::Inner);
 
-    // `within` / `reduce` 任一顺序、各至多一次
-    let mut within: Option<WithinSpec> = None;
-    let mut reduce: Option<ReduceClause> = None;
-    loop {
-        ws_skip.parse_next(input)?;
-        let saved = *input;
-        if within.is_none()
-            && let Ok(w) = within_clause.parse_next(input)
-        {
-            within = Some(w);
-            continue;
-        }
-        *input = saved;
-        if reduce.is_none()
-            && let Ok(r) = reduce_clause.parse_next(input)
-        {
-            reduce = Some(r);
-            continue;
-        }
-        *input = saved;
-        break;
-    }
+    let (within, mut reduce) = parse_within_or_reduce_modifiers(input)?;
 
     ws_skip.parse_next(input)?;
     cut_err(kw("on"))
@@ -426,31 +468,12 @@ pub(super) fn join_clause(input: &mut &str) -> ModalResult<JoinClause> {
         .parse_next(input)?;
     ws_skip.parse_next(input)?;
 
-    // Parse join conditions separated by &&
-    let first = cut_err(join_cond).parse_next(input)?;
-    let mut conditions = vec![first];
-    loop {
-        ws_skip.parse_next(input)?;
-        if opt(literal("&&")).parse_next(input)?.is_some() {
-            ws_skip.parse_next(input)?;
-            let cond = cut_err(join_cond).parse_next(input)?;
-            conditions.push(cond);
-        } else {
-            break;
-        }
-    }
+    let conditions = parse_join_conditions(input)?;
 
     // `as label`（Q9 形态：跟在 on 条件之后；需 reduce 且未重复）
     ws_skip.parse_next(input)?;
-    if let Some(label) = opt(as_label).parse_next(input)? {
-        let Some(rc) = &mut reduce else {
-            return Err(parse_cut_error());
-        };
-        if rc.label.is_some() {
-            return Err(parse_cut_error());
-        }
-        rc.label = Some(label);
-    }
+    let label = opt(as_label).parse_next(input)?;
+    attach_join_label(&mut reduce, label)?;
 
     // `emit at <expr>`（deferred 标记）
     ws_skip.parse_next(input)?;
@@ -552,6 +575,31 @@ fn reduce_clause(input: &mut &str) -> ModalResult<ReduceClause> {
     Ok(ReduceClause { measure, label })
 }
 
+/// 按度量名构造 ReduceMeasure：maxrow/minrow 尾随可选 tie，top 携带 N。
+fn finish_reduce_measure(
+    name: &str,
+    field: FieldRef,
+    n: Option<u64>,
+    input: &mut &str,
+) -> ModalResult<ReduceMeasure> {
+    match name {
+        "maxrow" => Ok(ReduceMeasure::Maxrow {
+            field,
+            tie: opt_tie(input)?,
+        }),
+        "minrow" => Ok(ReduceMeasure::Minrow {
+            field,
+            tie: opt_tie(input)?,
+        }),
+        "last" => Ok(ReduceMeasure::Last { field }),
+        "top" => Ok(ReduceMeasure::Top {
+            n: n.expect("top parsed n"),
+            field,
+        }),
+        _ => Err(parse_cut_error()),
+    }
+}
+
 fn reduce_measure(input: &mut &str) -> ModalResult<ReduceMeasure> {
     let name = cut_err(ident).parse_next(input)?.to_string();
     ws_skip.parse_next(input)?;
@@ -570,24 +618,7 @@ fn reduce_measure(input: &mut &str) -> ModalResult<ReduceMeasure> {
     };
     ws_skip.parse_next(input)?;
     cut_err(literal(")")).parse_next(input)?;
-    match name.as_str() {
-        "maxrow" => Ok(ReduceMeasure::Maxrow {
-            field,
-            tie: opt_tie(input)?,
-        }),
-        "minrow" => Ok(ReduceMeasure::Minrow {
-            field,
-            tie: opt_tie(input)?,
-        }),
-        "last" => Ok(ReduceMeasure::Last { field }),
-        "top" => Ok(ReduceMeasure::Top {
-            n: n.expect("top parsed n"),
-            field,
-        }),
-        _ => Err(winnow::error::ErrMode::Cut(
-            winnow::error::ContextError::new(),
-        )),
-    }
+    finish_reduce_measure(&name, field, n, input)
 }
 
 /// `tie(field asc|desc)`（闭括号后）。
@@ -693,4 +724,110 @@ fn limit_value(input: &mut &str) -> ModalResult<String> {
         .map(|s: &str| s.to_string()),
     ))
     .parse_next(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winnow::Parser;
+
+    fn join(input: &str) -> JoinClause {
+        let mut s = input;
+        join_clause
+            .parse_next(&mut s)
+            .unwrap_or_else(|e| panic!("join parse failed for {input:?}: {e:?}"))
+    }
+
+    fn join_err(input: &str) {
+        let mut s = input;
+        assert!(
+            join_clause.parse_next(&mut s).is_err(),
+            "expected join parse error for {input:?}"
+        );
+    }
+
+    fn measure(input: &str) -> ReduceMeasure {
+        let mut s = input;
+        reduce_measure
+            .parse_next(&mut s)
+            .unwrap_or_else(|e| panic!("reduce_measure failed for {input:?}: {e:?}"))
+    }
+
+    #[test]
+    fn join_modifiers_any_order() {
+        // within 在前
+        let j = join("join w within 10s reduce maxrow(price) on a == w.b");
+        assert!(j.within.is_some());
+        assert!(matches!(
+            j.reduce.as_ref().map(|r| &r.measure),
+            Some(ReduceMeasure::Maxrow { .. })
+        ));
+        // reduce 在前
+        let j = join("join w reduce last(x) within 5s on a == w.b");
+        assert!(matches!(
+            j.reduce.as_ref().map(|r| &r.measure),
+            Some(ReduceMeasure::Last { .. })
+        ));
+        assert!(j.within.is_some());
+    }
+
+    #[test]
+    fn join_defaults_to_inner_and_accepts_snapshot() {
+        let j = join("join w on a.x == w.y");
+        assert_eq!(j.mode, JoinMode::Inner);
+        assert_eq!(j.conditions.len(), 1);
+        assert!(j.within.is_none() && j.reduce.is_none() && j.emit_at.is_none());
+
+        let j = join("join w snapshot on a == w.b");
+        assert_eq!(j.mode, JoinMode::Snapshot);
+    }
+
+    #[test]
+    fn join_parses_multiple_conditions() {
+        let j = join("join w on a.x == w.y && a.z == w.q && a.t == w.u");
+        assert_eq!(j.conditions.len(), 3);
+        assert!(matches!(&j.conditions[1], JoinCondition { .. }));
+    }
+
+    #[test]
+    fn join_attach_label_requires_reduce() {
+        // as label 无 reduce → 语法错误
+        join_err("join w on a == w.b as best");
+        // reduce 后 as label（BNF 形态）合法
+        let j = join("join w reduce minrow(count) as best on a == w.b");
+        assert_eq!(
+            j.reduce.as_ref().and_then(|r| r.label.as_deref()),
+            Some("best")
+        );
+    }
+
+    #[test]
+    fn join_rejects_duplicate_reduce_and_unknown_measure() {
+        join_err("join w reduce last(x) reduce last(y) on a == w.b");
+        join_err("join w reduce bogus(x) on a == w.b");
+    }
+
+    #[test]
+    fn reduce_measure_variants() {
+        assert!(matches!(measure("last(ts)"), ReduceMeasure::Last { .. }));
+        assert!(matches!(
+            measure("top(3, dist)"),
+            ReduceMeasure::Top { n: 3, .. }
+        ));
+        match measure("minrow(count) tie(ts desc)") {
+            ReduceMeasure::Minrow { tie: Some(tie), .. } => {
+                assert!(tie.desc);
+                assert_eq!(tie.field, FieldRef::Simple("ts".into()));
+            }
+            other => panic!("expected Minrow with tie, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_emit_at_and_open_bound_within() {
+        let j = join("join w within [a.t, <b.t] on a == w.b emit at a.t");
+        assert!(j.emit_at.is_some());
+        let w = j.within.expect("within");
+        assert!(!w.lo.open && w.hi.open);
+    }
 }

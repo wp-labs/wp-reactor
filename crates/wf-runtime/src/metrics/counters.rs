@@ -407,19 +407,7 @@ impl RuntimeMetrics {
     }
 
     fn drain_source_machine_rows(&self) -> BTreeMap<String, BTreeMap<String, u64>> {
-        let map = self.receiver_source_machine_rows.lock().unwrap();
-        let mut result = BTreeMap::new();
-        for (source, by_machine) in map.iter() {
-            let drained: BTreeMap<String, u64> = by_machine
-                .iter()
-                .map(|(machine, v)| (machine.clone(), v.swap(0, Ordering::Relaxed)))
-                .filter(|(_, v)| *v > 0)
-                .collect();
-            if !drained.is_empty() {
-                result.insert(source.clone(), drained);
-            }
-        }
-        result
+        Self::drain_second_level(&self.receiver_source_machine_rows)
     }
 
     fn drain_emitted_detail(&self) -> BTreeMap<String, BTreeMap<String, BTreeMap<String, u64>>> {
@@ -453,16 +441,24 @@ impl RuntimeMetrics {
     }
 
     fn drain_receiver_window_misses(&self) -> BTreeMap<String, BTreeMap<String, u64>> {
-        let map = self.receiver_window_miss_total.lock().unwrap();
+        Self::drain_second_level(&self.receiver_window_miss_total)
+    }
+
+    /// 二维计数（`String → String → AtomicU64`）的原位 drain：内层逐计数 swap 清零,
+    /// 过滤掉 0, 空内层不出现。receiver source-machine / window-miss 两图共用。
+    fn drain_second_level(
+        m: &std::sync::Mutex<BTreeMap<String, BTreeMap<String, AtomicU64>>>,
+    ) -> BTreeMap<String, BTreeMap<String, u64>> {
+        let map = m.lock().unwrap();
         let mut result = BTreeMap::new();
-        for (source, by_reason) in map.iter() {
-            let drained: BTreeMap<String, u64> = by_reason
+        for (key, inner) in map.iter() {
+            let drained: BTreeMap<String, u64> = inner
                 .iter()
-                .map(|(reason, v)| (reason.clone(), v.swap(0, Ordering::Relaxed)))
+                .map(|(sub, v)| (sub.clone(), v.swap(0, Ordering::Relaxed)))
                 .filter(|(_, v)| *v > 0)
                 .collect();
             if !drained.is_empty() {
-                result.insert(source.clone(), drained);
+                result.insert(key.clone(), drained);
             }
         }
         result
@@ -684,5 +680,54 @@ impl RuntimeMetrics {
                 .sum::<u64>(),
             self.total_window_bytes()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metrics() -> RuntimeMetrics {
+        RuntimeMetrics::new(&[], &[], &[], BTreeMap::new())
+    }
+
+    #[test]
+    fn emitted_detail_drain_clears_and_counts() {
+        let m = metrics();
+        m.inc_alert_emitted("r1", "m1", "s1");
+        m.inc_alert_emitted("r1", "m1", "s1");
+        m.inc_alert_emitted("r1", "m1", "s2");
+        // machine 与 scope 均空 → 不落 detail
+        m.inc_alert_emitted_detail("r1", "", "");
+        let d = m.drain_emitted_detail();
+        assert_eq!(d["r1"]["m1"]["s1"], 2);
+        assert_eq!(d["r1"]["m1"]["s2"], 1);
+        assert!(!d["r1"].contains_key("-"));
+        // 二次 drain 为空
+        assert!(m.drain_emitted_detail().is_empty());
+    }
+
+    #[test]
+    fn source_machine_rows_two_level_drain() {
+        let m = metrics();
+        m.add_receiver_source_machine_rows("s1", "node-1", 3);
+        m.add_receiver_source_machine_rows("s1", "node-1", 2);
+        m.add_receiver_source_machine_rows("s1", "node-2", 4);
+        let d = m.drain_source_machine_rows();
+        assert_eq!(d["s1"]["node-1"], 5);
+        assert_eq!(d["s1"]["node-2"], 4);
+        assert!(m.drain_source_machine_rows().is_empty());
+    }
+
+    #[test]
+    fn window_miss_two_level_drain() {
+        let m = metrics();
+        m.add_receiver_window_miss("src", "late", 2);
+        m.add_receiver_window_miss("src", "late", 3);
+        m.add_receiver_window_miss("src", "other", 1);
+        let d = m.drain_receiver_window_misses();
+        assert_eq!(d["src"]["late"], 5);
+        assert_eq!(d["src"]["other"], 1);
+        assert!(m.drain_receiver_window_misses().is_empty());
     }
 }

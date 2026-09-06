@@ -3,6 +3,7 @@
 //! `metrics_record_to_data_record` 转 DataRecord。生命周期编排见 `lifecycle/mod.rs`。
 
 use super::*;
+use crate::metrics::MonSend;
 
 pub(crate) async fn spawn_metrics_task(
     config: &FusionConfig,
@@ -22,17 +23,7 @@ pub(crate) async fn spawn_metrics_task(
     let metrics_config = config.metrics.clone();
 
     // Create monitor channel if dispatcher is available
-    let mon_send = match dispatcher {
-        Some(ref d) if d.has_monitor_sinks() => {
-            let (tx, rx) = mpsc::channel::<Vec<MetricsRecord>>(64);
-            let d = Arc::clone(d);
-            tokio::spawn(async move {
-                run_monitor_consumer(rx, d).await;
-            });
-            Some(tx)
-        }
-        _ => None,
-    };
+    let mon_send = spawn_monitor_channel(&dispatcher);
 
     group.push(tokio::spawn(async move {
         run_metrics_task(metrics, metrics_config, router_clone, cancel, mon_send)
@@ -41,6 +32,21 @@ pub(crate) async fn spawn_metrics_task(
         Ok(())
     }));
     Ok(group)
+}
+
+/// dispatcher 配置了 monitor sink 时建立 64 槽监控通道并拉起消费者，供
+/// metrics 任务转发监控帧；否则返回 `None`。
+fn spawn_monitor_channel(dispatcher: &Option<Arc<SinkDispatcher>>) -> Option<MonSend> {
+    let dispatcher = dispatcher.as_ref()?;
+    if !dispatcher.has_monitor_sinks() {
+        return None;
+    }
+    let (tx, rx) = mpsc::channel::<Vec<MetricsRecord>>(64);
+    let dispatcher = Arc::clone(dispatcher);
+    tokio::spawn(async move {
+        run_monitor_consumer(rx, dispatcher).await;
+    });
+    Some(tx)
 }
 
 async fn run_monitor_consumer(mut rx: MonRecv, dispatcher: Arc<SinkDispatcher>) {
@@ -72,4 +78,54 @@ pub(crate) fn metrics_record_to_data_record(record: &MetricsRecord) -> DataRecor
         Value::from(ts.as_str()),
     )));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_dispatcher() -> Arc<SinkDispatcher> {
+        // 无路由/默认/error/monitor sink 的裸 dispatcher：monitor 派发为 noop。
+        Arc::new(SinkDispatcher::new(vec![], vec![], vec![], vec![]))
+    }
+
+    #[test]
+    fn monitor_channel_absent_without_monitor_sinks() {
+        // None dispatcher 与未配置 monitor sink 的 dispatcher 都不建监控通道。
+        assert!(spawn_monitor_channel(&None).is_none());
+        assert!(spawn_monitor_channel(&Some(empty_dispatcher())).is_none());
+    }
+
+    #[tokio::test]
+    async fn monitor_consumer_drains_batches_until_channel_closes() {
+        let dispatcher = empty_dispatcher();
+        let (tx, rx) = mpsc::channel::<Vec<MetricsRecord>>(4);
+        let d = Arc::clone(&dispatcher);
+        let consumer = tokio::spawn(async move {
+            run_monitor_consumer(rx, d).await;
+        });
+        tx.send(vec![MetricsRecord {
+            fields: vec![("stage".to_string(), "receiver".to_string())],
+        }])
+        .await
+        .expect("send batch");
+        tx.send(vec![MetricsRecord { fields: vec![] }])
+            .await
+            .expect("send batch");
+        drop(tx);
+        // 通道关闭后消费者逐条转发完毕并退出（空 monitor sink 为 noop，不 panic）。
+        consumer.await.expect("consumer joins cleanly");
+    }
+
+    #[test]
+    fn empty_record_keeps_only_timestamp_field() {
+        let record = MetricsRecord { fields: vec![] };
+        let data = metrics_record_to_data_record(&record);
+        assert!(data.field("stage").is_none());
+        let time = data
+            .field("time")
+            .map(|f| f.get_value().to_string())
+            .expect("time field must always exist");
+        chrono::DateTime::parse_from_rfc3339(&time).expect("time must be RFC3339");
+    }
 }

@@ -7,7 +7,7 @@
 
 use std::cell::Cell;
 
-use wf_lang::ast::{BinOp, Expr};
+use wf_lang::ast::{BinOp, Expr, MatchArm, ObjectItem};
 
 use super::key::{eval_field_value_src, field_ref_leaf_name, value_to_string};
 use super::types::{EngineHashMap, FieldSource, RollingStats, Value, WindowLookup};
@@ -84,102 +84,175 @@ pub fn eval_expr_ext(
         Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
         Expr::Bool(b) => Some(Value::Bool(*b)),
         Expr::Field(fr) => eval_field_value_src(event, fr),
-        Expr::Object(items) => {
-            let mut map = EngineHashMap::default();
-            for item in items {
-                let value = eval_expr_ext(&item.value, event, windows, baselines)?;
-                for target in &item.targets {
-                    map.insert(target.clone().into(), value.clone());
-                }
-            }
-            Some(Value::Object(map))
-        }
-        Expr::Array(items) => items
-            .iter()
-            .map(|item| eval_expr_ext(item, event, windows, baselines))
-            .collect::<Option<Vec<_>>>()
-            .map(Value::Array),
-        Expr::Neg(inner) => {
-            let v = eval_expr_ext(inner, event, windows, baselines)?;
-            match v {
-                Value::Number(n) => Some(Value::Number(-n)),
-                _ => None,
-            }
-        }
-        Expr::Not(inner) => match eval_expr_ext(inner, event, windows, baselines)? {
-            Value::Bool(b) => Some(Value::Bool(!b)),
-            _ => None,
-        },
+        Expr::Object(items) => eval_object_literal(items, event, windows, baselines),
+        Expr::Array(items) => eval_array_literal(items, event, windows, baselines),
+        Expr::Neg(inner) => eval_neg(inner, event, windows, baselines),
+        Expr::Not(inner) => eval_not(inner, event, windows, baselines),
         Expr::BinOp { op, left, right } => eval_binop(*op, left, right, event, windows, baselines),
         Expr::InList {
-            expr: target,
+            expr,
             list,
             negated,
-        } => {
-            let target_val = eval_expr_ext(target, event, windows, baselines)?;
-            // InList items are typically literals — context not needed, but
-            // we pass it for correctness in case of field refs / func calls.
-            let found = list.iter().any(|item| {
-                eval_expr_ext(item, event, windows, baselines)
-                    .map(|v| values_equal(&target_val, &v))
-                    .unwrap_or(false)
-            });
-            Some(Value::Bool(if *negated { !found } else { found }))
-        }
+        } => eval_in_list(expr, list, *negated, event, windows, baselines),
         Expr::FuncCall {
             qualifier,
             name,
             args,
-        } => {
-            // Handle window.has()
-            if let Some(window_name) = qualifier
-                && name == "has"
-            {
-                return eval_window_has(window_name, args, event, windows);
-            }
-            // Handle baseline()
-            if name == "baseline" && (args.len() == 2 || args.len() == 3) {
-                return eval_baseline(args, event, baselines);
-            }
-            eval_func_call(name, args, event, windows, baselines)
-        }
+        } => eval_func_call_expr(qualifier.as_deref(), name, args, event, windows, baselines),
         Expr::IfThenElse {
             cond,
             then_expr,
             else_expr,
-        } => {
-            let cond_val = eval_expr_ext(cond, event, windows, baselines);
-            match cond_val {
-                Some(Value::Bool(true)) => eval_expr_ext(then_expr, event, windows, baselines),
-                Some(Value::Bool(false)) => eval_expr_ext(else_expr, event, windows, baselines),
-                _ => None,
-            }
-        }
-        // 模式匹配（issue #79 Issue 2）：subject 求值后逐分支比较模式
-        // （`in` 同款 values_equal），命中即返回分支值（短路）；未命中继续；
-        // `_` 默认兜底；无默认且全部未命中 → None。
+        } => eval_if_then_else(cond, then_expr, else_expr, event, windows, baselines),
         Expr::Match {
             expr,
             arms,
             default,
-        } => {
-            let subject = eval_expr_ext(expr, event, windows, baselines)?;
-            for arm in arms {
-                let hit = arm.patterns.iter().any(|pattern| {
-                    eval_expr_ext(pattern, event, windows, baselines)
-                        .map(|v| values_equal(&subject, &v))
-                        .unwrap_or(false)
-                });
-                if hit {
-                    return eval_expr_ext(&arm.value, event, windows, baselines);
-                }
-            }
-            match default {
-                Some(d) => eval_expr_ext(d, event, windows, baselines),
-                None => None,
-            }
-        }
+        } => eval_match_expr(expr, arms, default.as_deref(), event, windows, baselines),
         _ => None,
+    }
+}
+
+/// `object { k1 = e1; ... }` 字面量：逐 item 求值，一个 value 可写多个 target。
+fn eval_object_literal(
+    items: &[ObjectItem],
+    event: &dyn FieldSource,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
+) -> Option<Value> {
+    let mut map = EngineHashMap::default();
+    for item in items {
+        let value = eval_expr_ext(&item.value, event, windows, baselines)?;
+        for target in &item.targets {
+            map.insert(target.clone().into(), value.clone());
+        }
+    }
+    Some(Value::Object(map))
+}
+
+/// `array [e1, ...]` 字面量：任一元素求值失败整体为 None。
+fn eval_array_literal(
+    items: &[Expr],
+    event: &dyn FieldSource,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
+) -> Option<Value> {
+    items
+        .iter()
+        .map(|item| eval_expr_ext(item, event, windows, baselines))
+        .collect::<Option<Vec<_>>>()
+        .map(Value::Array)
+}
+
+/// 一元负号：仅数值可取反。
+fn eval_neg(
+    inner: &Expr,
+    event: &dyn FieldSource,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
+) -> Option<Value> {
+    let v = eval_expr_ext(inner, event, windows, baselines)?;
+    match v {
+        Value::Number(n) => Some(Value::Number(-n)),
+        _ => None,
+    }
+}
+
+/// 逻辑非：仅布尔可取反。
+fn eval_not(
+    inner: &Expr,
+    event: &dyn FieldSource,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
+) -> Option<Value> {
+    match eval_expr_ext(inner, event, windows, baselines)? {
+        Value::Bool(b) => Some(Value::Bool(!b)),
+        _ => None,
+    }
+}
+
+/// `expr in (...)` / `expr not in (...)`：任一成员等值即命中（成员通常为字面量）。
+fn eval_in_list(
+    target: &Expr,
+    list: &[Expr],
+    negated: bool,
+    event: &dyn FieldSource,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
+) -> Option<Value> {
+    let target_val = eval_expr_ext(target, event, windows, baselines)?;
+    // InList items are typically literals — context not needed, but
+    // we pass it for correctness in case of field refs / func calls.
+    let found = list.iter().any(|item| {
+        eval_expr_ext(item, event, windows, baselines)
+            .map(|v| values_equal(&target_val, &v))
+            .unwrap_or(false)
+    });
+    Some(Value::Bool(if negated { !found } else { found }))
+}
+
+/// 函数调用分派：`window.has(...)` 与 `baseline(...)` 有专门路径，其余走
+/// `eval_func_call`（funcs.rs 的内建分派表）。
+fn eval_func_call_expr(
+    qualifier: Option<&str>,
+    name: &str,
+    args: &[Expr],
+    event: &dyn FieldSource,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
+) -> Option<Value> {
+    if let Some(window_name) = qualifier
+        && name == "has"
+    {
+        return eval_window_has(window_name, args, event, windows);
+    }
+    if name == "baseline" && (args.len() == 2 || args.len() == 3) {
+        return eval_baseline(args, event, baselines);
+    }
+    eval_func_call(name, args, event, windows, baselines)
+}
+
+/// `if cond then yes else no`：cond 必须为布尔。
+fn eval_if_then_else(
+    cond: &Expr,
+    then_expr: &Expr,
+    else_expr: &Expr,
+    event: &dyn FieldSource,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
+) -> Option<Value> {
+    let cond_val = eval_expr_ext(cond, event, windows, baselines);
+    match cond_val {
+        Some(Value::Bool(true)) => eval_expr_ext(then_expr, event, windows, baselines),
+        Some(Value::Bool(false)) => eval_expr_ext(else_expr, event, windows, baselines),
+        _ => None,
+    }
+}
+
+/// `match <subject> { pat => arm, ... , _ => default }`：模式按值比较（同
+/// `in` 的相等语义），短路命中；无默认且未命中 → None。
+fn eval_match_expr(
+    expr: &Expr,
+    arms: &[MatchArm],
+    default: Option<&Expr>,
+    event: &dyn FieldSource,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
+) -> Option<Value> {
+    let subject = eval_expr_ext(expr, event, windows, baselines)?;
+    for arm in arms {
+        let hit = arm.patterns.iter().any(|pattern| {
+            eval_expr_ext(pattern, event, windows, baselines)
+                .map(|v| values_equal(&subject, &v))
+                .unwrap_or(false)
+        });
+        if hit {
+            return eval_expr_ext(&arm.value, event, windows, baselines);
+        }
+    }
+    match default {
+        Some(d) => eval_expr_ext(d, event, windows, baselines),
+        None => None,
     }
 }
 
@@ -342,5 +415,165 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cep::types::Event;
+    use wf_lang::ast::{FieldRef, MatchArm, ObjectItem};
+
+    fn empty_event() -> Event {
+        Event {
+            fields: EngineHashMap::default(),
+        }
+    }
+
+    fn eval_ok(expr: &Expr) -> Value {
+        eval_expr(expr, &empty_event()).expect("expr should evaluate")
+    }
+
+    fn num(v: f64) -> Expr {
+        Expr::Number(v)
+    }
+
+    fn field(name: &str) -> Expr {
+        Expr::Field(FieldRef::Simple(name.to_string()))
+    }
+
+    #[test]
+    fn binop_arithmetic_and_zero_division() {
+        assert_eq!(
+            eval_ok(&Expr::BinOp {
+                op: BinOp::Add,
+                left: Box::new(num(1.0)),
+                right: Box::new(num(2.0)),
+            }),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            eval_arithmetic(BinOp::Sub, 5.0, 3.0),
+            Some(Value::Number(2.0))
+        );
+        assert_eq!(
+            eval_arithmetic(BinOp::Mul, 2.0, 4.0),
+            Some(Value::Number(8.0))
+        );
+        assert_eq!(
+            eval_arithmetic(BinOp::Mod, 5.0, 2.0),
+            Some(Value::Number(1.0))
+        );
+        // 除零 / 模零 → None
+        assert_eq!(eval_arithmetic(BinOp::Div, 1.0, 0.0), None);
+        assert_eq!(eval_arithmetic(BinOp::Mod, 1.0, 0.0), None);
+        // 非算术 op → None（eval_binop 不会下发，纯函数自身防御）
+        assert_eq!(eval_arithmetic(BinOp::Eq, 1.0, 1.0), None);
+    }
+
+    #[test]
+    fn in_list_membership_and_negation() {
+        let in_list = Expr::InList {
+            expr: Box::new(num(2.0)),
+            list: vec![num(1.0), num(2.0), num(3.0)],
+            negated: false,
+        };
+        assert_eq!(eval_ok(&in_list), Value::Bool(true));
+        // 值相等按 epsilon 语义：2.0 命中
+        assert_eq!(
+            eval_ok(&Expr::InList {
+                expr: Box::new(num(9.0)),
+                list: vec![num(1.0), num(2.0)],
+                negated: false,
+            }),
+            Value::Bool(false)
+        );
+        // negated 翻转
+        assert_eq!(
+            eval_ok(&Expr::InList {
+                expr: Box::new(num(9.0)),
+                list: vec![num(1.0)],
+                negated: true,
+            }),
+            Value::Bool(true)
+        );
+        // 成员求值失败（含非法字段）不 panic、视为未命中
+        assert_eq!(
+            eval_ok(&Expr::InList {
+                expr: Box::new(num(1.0)),
+                list: vec![field("missing")],
+                negated: false,
+            }),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn if_then_else_and_unary_ops() {
+        let ite = |cond: Expr| Expr::IfThenElse {
+            cond: Box::new(cond),
+            then_expr: Box::new(num(1.0)),
+            else_expr: Box::new(num(2.0)),
+        };
+        assert_eq!(eval_ok(&ite(Expr::Bool(true))), Value::Number(1.0));
+        assert_eq!(eval_ok(&ite(Expr::Bool(false))), Value::Number(2.0));
+        assert_eq!(eval_expr(&ite(num(3.0)), &empty_event()), None); // 非布尔条件
+        assert_eq!(eval_ok(&Expr::Neg(Box::new(num(3.0)))), Value::Number(-3.0));
+        assert_eq!(
+            eval_expr(
+                &Expr::Neg(Box::new(Expr::StringLit("x".into()))),
+                &empty_event()
+            ),
+            None
+        );
+        assert_eq!(
+            eval_ok(&Expr::Not(Box::new(Expr::Bool(false)))),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_expr(&Expr::Not(Box::new(num(1.0))), &empty_event()),
+            None
+        );
+    }
+
+    #[test]
+    fn match_expr_short_circuits_and_default() {
+        let arms = vec![MatchArm {
+            patterns: vec![num(2.0)],
+            value: Expr::StringLit("two".into()),
+        }];
+        let m = |subject: Expr, default: Option<Expr>| Expr::Match {
+            expr: Box::new(subject),
+            arms: arms.clone(),
+            default: default.map(Box::new),
+        };
+        // 命中分支
+        assert_eq!(
+            eval_ok(&m(num(2.0), Some(num(0.0)))),
+            Value::Str("two".into())
+        );
+        // 未命中 → 默认分支
+        assert_eq!(eval_ok(&m(num(9.0), Some(num(0.0)))), Value::Number(0.0));
+        // 未命中且无默认 → None
+        assert_eq!(eval_expr(&m(num(9.0), None), &empty_event()), None);
+    }
+
+    #[test]
+    fn object_and_array_literals() {
+        let array = Expr::Array(vec![num(1.0), num(2.0)]);
+        assert_eq!(
+            eval_ok(&array),
+            Value::Array(vec![Value::Number(1.0), Value::Number(2.0)])
+        );
+        let object = Expr::Object(vec![ObjectItem {
+            targets: vec!["a".to_string(), "b".to_string()],
+            type_hint: None,
+            value: num(7.0),
+        }]);
+        let Value::Object(map) = eval_ok(&object) else {
+            panic!("expected object");
+        };
+        assert_eq!(map.get("a"), Some(&Value::Number(7.0)));
+        assert_eq!(map.get("b"), Some(&Value::Number(7.0)));
     }
 }

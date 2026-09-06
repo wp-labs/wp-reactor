@@ -26,9 +26,12 @@ pub(crate) use state::StatsBucket;
 
 mod exec;
 pub use exec::StatsExecutor;
-// accumulate_* 经 executor:: 转发（引擎 lib-tests / 分片统计消费）。
+// 单行/桶累加自由函数簇已迁入 row_acc.rs（exec.rs 过长拆分）——mod.rs 统一
+// re-export 保持对外路径不变（引擎 lib-tests / 分片统计消费）。
 #[allow(unused_imports)]
-pub(crate) use exec::{accumulate_column_row, accumulate_soa};
+pub(crate) use row_acc::{accumulate_bucket_row, accumulate_column_row, accumulate_soa};
+
+mod row_acc;
 
 mod eval;
 pub(crate) use eval::*;

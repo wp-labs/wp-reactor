@@ -10,8 +10,16 @@ use super::*;
 
 impl MetricsSnapshot {
     #[allow(clippy::vec_init_then_push)]
+    #[allow(clippy::vec_init_then_push)]
     pub(crate) fn to_records(&self) -> Vec<MetricsRecord> {
         let mut out = Vec::new();
+        self.emit_receiver_records(&mut out);
+        self.emit_pipeline_records(&mut out);
+        self.emit_alert_rule_records(&mut out);
+        self.emit_window_hist_records(&mut out);
+        out
+    }
+    fn emit_receiver_records(&self, out: &mut Vec<MetricsRecord>) {
         out.push(metric(
             "receiver",
             "connections_total",
@@ -66,6 +74,8 @@ impl MetricsSnapshot {
                 ));
             }
         }
+    }
+    fn emit_pipeline_records(&self, out: &mut Vec<MetricsRecord>) {
         out.push(metric(
             "router",
             "route_calls_total",
@@ -121,6 +131,8 @@ impl MetricsSnapshot {
             out.push(metric("alloc", "peak_commit_bytes", "", a.peak_commit));
             out.push(metric("alloc", "page_faults_total", "", a.page_faults));
         }
+    }
+    fn emit_alert_rule_records(&self, out: &mut Vec<MetricsRecord>) {
         out.push(metric(
             "alert",
             "channel_send_failed_total",
@@ -216,6 +228,8 @@ impl MetricsSnapshot {
                 }
             }
         }
+    }
+    fn emit_window_hist_records(&self, out: &mut Vec<MetricsRecord>) {
         for (window, v) in &self.window_memory_bytes {
             out.push(metric("window", "memory_bytes", window, *v));
         }
@@ -309,6 +323,5 @@ impl MetricsSnapshot {
             "",
             &self.event_e2e_latency,
         ));
-        out
     }
 }

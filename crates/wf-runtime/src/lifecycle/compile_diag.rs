@@ -33,26 +33,24 @@ pub(super) fn format_prelude_yield_preset_error(
         .rules
         .iter()
         .find(|rule| rule.name == rule_name)?;
+    let (line, column) = prelude_error_location(&error.message, rule, prelude)?;
+    Some(render_prelude_diagnostic(
+        prelude, error, rule_name, line, column,
+    ))
+}
 
-    let (line, column) = if let Some(arg_name) =
-        extract_backtick_token_after(&error.message, "argument")
-    {
-        if rule
-            .yield_clause
-            .args
-            .iter()
-            .any(|arg| arg.name == arg_name)
-        {
-            return None;
-        }
-        let preset_ref = rule.yield_clause.presets.iter().rev().find(|preset_ref| {
-            prelude.file.yield_presets.iter().any(|preset| {
-                preset.name == preset_ref.name && preset.args.iter().any(|arg| arg.name == arg_name)
-            })
-        })?;
-        find_prelude_yield_preset_arg_location(&prelude.source, &preset_ref.name, &arg_name)?
+/// 把错误定位到 prelude `yield preset` 声明体内部：
+/// - 消息带 `argument `name`` → 去 prelude 里命中该参数（规则自身已给出则与 prelude 无关）；
+/// - 否则按消息中的 backtick token 在 prelude 声明体中定位。
+fn prelude_error_location(
+    message: &str,
+    rule: &wf_lang::ast::RuleDecl,
+    prelude: &ParsedRuleFile,
+) -> Option<(usize, usize)> {
+    if let Some(arg_name) = extract_backtick_token_after(message, "argument") {
+        prelude_arg_location(rule, prelude, &arg_name)
     } else {
-        let tokens = backtick_tokens(&error.message);
+        let tokens = backtick_tokens(message);
         if tokens.is_empty() {
             return None;
         }
@@ -61,8 +59,41 @@ pub(super) fn format_prelude_yield_preset_error(
             rule,
             &prelude.file.yield_presets,
             &tokens,
-        )?
-    };
+        )
+    }
+}
+
+/// 在规则引用的 prelude preset 声明中查找 `arg_name` 出现位置；规则自身
+/// yield 参数已含该名时视为非 prelude 错误返回 `None`。
+fn prelude_arg_location(
+    rule: &wf_lang::ast::RuleDecl,
+    prelude: &ParsedRuleFile,
+    arg_name: &str,
+) -> Option<(usize, usize)> {
+    if rule
+        .yield_clause
+        .args
+        .iter()
+        .any(|arg| arg.name == arg_name)
+    {
+        return None;
+    }
+    let preset_ref = rule.yield_clause.presets.iter().rev().find(|preset_ref| {
+        prelude.file.yield_presets.iter().any(|preset| {
+            preset.name == preset_ref.name && preset.args.iter().any(|arg| arg.name == arg_name)
+        })
+    })?;
+    find_prelude_yield_preset_arg_location(&prelude.source, &preset_ref.name, arg_name)
+}
+
+/// 组装指向 prelude 文件的诊断文本（含源码行与脱字符片段）。
+fn render_prelude_diagnostic(
+    prelude: &ParsedRuleFile,
+    error: &wf_lang::CheckError,
+    rule_name: &str,
+    line: usize,
+    column: usize,
+) -> String {
     let mut out = format!(
         "file: {}\ncategory: yield\n{}\nrule: {}\nlocation: line {}, column {}",
         prelude.path.display(),
@@ -76,7 +107,7 @@ pub(super) fn format_prelude_yield_preset_error(
         out.push('\n');
         out.push_str(&snippet);
     }
-    Some(out)
+    out
 }
 
 pub(super) fn backtick_tokens(message: &str) -> Vec<String> {
@@ -105,12 +136,13 @@ pub(super) fn extract_backtick_token_after(message: &str, label: &str) -> Option
     Some(after_start[..end].to_string())
 }
 
-pub(super) fn find_prelude_yield_preset_arg_location(
+/// 计算 preset 声明所在行（0-based `start`）与声明体结束行（0-based、
+/// 不含边界行）的扫描区间；找不到声明则 `None`。
+fn preset_decl_scan_range(
     source: &str,
     preset_name: &str,
-    arg_name: &str,
+    lines: &[&str],
 ) -> Option<(usize, usize)> {
-    let lines: Vec<&str> = source.lines().collect();
     let decls = yield_preset_decl_locations(source);
     let start_idx = decls
         .iter()
@@ -121,7 +153,17 @@ pub(super) fn find_prelude_yield_preset_arg_location(
                 .iter()
                 .position(|line| line_declares_yield_preset(line, preset_name))
         })?;
-    let end_idx = yield_preset_source_end(&lines, &decls, start_idx);
+    let end_idx = yield_preset_source_end(lines, &decls, start_idx);
+    Some((start_idx, end_idx))
+}
+
+pub(super) fn find_prelude_yield_preset_arg_location(
+    source: &str,
+    preset_name: &str,
+    arg_name: &str,
+) -> Option<(usize, usize)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let (start_idx, end_idx) = preset_decl_scan_range(source, preset_name, &lines)?;
     lines
         .iter()
         .enumerate()
@@ -160,26 +202,18 @@ pub(super) fn find_prelude_yield_preset_token_location(
     tokens: &[String],
 ) -> Option<(usize, usize)> {
     let lines: Vec<&str> = source.lines().collect();
-    let decls = yield_preset_decl_locations(source);
-    let start_idx = decls
+    let (start_idx, end_idx) = preset_decl_scan_range(source, preset_name, &lines)?;
+    lines
         .iter()
-        .find(|decl| decl.name == preset_name)
-        .map(|decl| decl.line.saturating_sub(1))
-        .or_else(|| {
-            lines
+        .enumerate()
+        .take(end_idx)
+        .skip(start_idx)
+        .find_map(|(idx, line)| {
+            tokens
                 .iter()
-                .position(|line| line_declares_yield_preset(line, preset_name))
-        })?;
-    let end_idx = yield_preset_source_end(&lines, &decls, start_idx);
-    for (idx, line) in lines.iter().enumerate().take(end_idx).skip(start_idx) {
-        if let Some(column) = tokens
-            .iter()
-            .find_map(|token| find_token_column(line, token))
-        {
-            return Some((idx + 1, column));
-        }
-    }
-    None
+                .find_map(|token| find_token_column(line, token))
+                .map(|column| (idx + 1, column))
+        })
 }
 
 pub(super) fn yield_preset_source_end(
@@ -411,4 +445,188 @@ pub(super) fn source_line_snippet(source: &str, line: usize, column: usize) -> S
         return String::new();
     };
     format!("  {}\n  {}^", text, " ".repeat(column.saturating_sub(1)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use wf_lang::{CheckError, Severity};
+
+    fn parsed_file(path: &str, source: &str) -> ParsedRuleFile {
+        ParsedRuleFile {
+            path: PathBuf::from(path),
+            source: source.to_string(),
+            file: wf_lang::parse_wfl(source).expect("wfl source should parse"),
+        }
+    }
+
+    fn rule_error(rule: &str, message: &str) -> CheckError {
+        CheckError {
+            severity: Severity::Error,
+            rule: Some(rule.to_string()),
+            test: None,
+            message: message.to_string(),
+        }
+    }
+
+    const PRELUDE: &str =
+        "yield preset base_alerts (\n    y = \"base\",\n    n = 1,\n    port = 80\n)\n";
+    const RULE: &str = "rule preset_rule {\n    events { e : auth_events }\n    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)\n    entity(ip, e.sip)\n    yield out : base_alerts (port = e.dport)\n}\n";
+
+    #[test]
+    fn prelude_diag_locates_missing_preset_argument() {
+        let prelude = parsed_file("_global.wfl", PRELUDE);
+        let rule = parsed_file("rules.wfl", RULE);
+        // 规则自身给了 port，缺的是 base_alerts 的必填参数 y → 定位到 prelude 声明
+        let error = rule_error(
+            "preset_rule",
+            "yield preset `base_alerts` missing required argument `y`",
+        );
+        let diag = format_rule_check_error(&error, &rule, Some(&prelude));
+        assert!(diag.contains("file: _global.wfl"), "{diag}");
+        assert!(diag.contains("category: yield"), "{diag}");
+        assert!(diag.contains("rule: preset_rule"), "{diag}");
+        assert!(diag.contains("location: line 2, column 5"), "{diag}");
+        assert!(diag.contains("    y = \"base\","), "{diag}");
+    }
+
+    #[test]
+    fn prelude_diag_locates_backtick_token_in_preset_body() {
+        let prelude = parsed_file("_global.wfl", PRELUDE);
+        let rule = parsed_file("rules.wfl", RULE);
+        // 无 `argument` 标记：按消息 backtick token 在 prelude 声明体中定位
+        let error = rule_error(
+            "preset_rule",
+            "conflicting field `port` for yield preset usage",
+        );
+        let diag = format_rule_check_error(&error, &rule, Some(&prelude));
+        assert!(diag.contains("category: yield"), "{diag}");
+        assert!(diag.contains("location: line 4, column 5"), "{diag}");
+        assert!(diag.contains("    port = 80"), "{diag}");
+    }
+
+    #[test]
+    fn prelude_diag_falls_back_when_rule_supplies_the_argument() {
+        let prelude = parsed_file("_global.wfl", PRELUDE);
+        let rule = parsed_file("rules.wfl", RULE);
+        // port 已在规则自身 yield 参数中给出 → 不是 prelude 引用错误，走常规格式
+        let error = rule_error(
+            "preset_rule",
+            "yield preset `base_alerts` missing required argument `port`",
+        );
+        let diag = format_rule_check_error(&error, &rule, Some(&prelude));
+        // port 已在规则自身 yield 参数中给出 → 不是 prelude 引用错误，走常规格式（指回 rules.wfl）
+        assert!(!diag.contains("file: _global.wfl"), "{diag}");
+        assert!(diag.contains("missing required argument `port`"), "{diag}");
+    }
+
+    #[test]
+    fn format_without_prelude_uses_plain_check_format() {
+        let rule = parsed_file("rules.wfl", RULE);
+        let error = rule_error(
+            "preset_rule",
+            "yield preset `base_alerts` missing required argument `y`",
+        );
+        let diag = format_rule_check_error(&error, &rule, None);
+        // 无 prelude：一律走常规格式并指回规则文件自身
+        assert!(!diag.contains("file: _global.wfl"), "{diag}");
+        assert!(diag.contains("file: rules.wfl"), "{diag}");
+        assert!(diag.contains("preset_rule"), "{diag}");
+    }
+
+    #[test]
+    fn preset_decl_locations_skip_comments_and_quoted_text() {
+        let src = "// yield preset hidden (\nx = \"yield preset quoted (nope)\"\nyield preset target (\n    a = 1\n)\nyield preset target (\n    b = 2\n)\n";
+        let locs = yield_preset_decl_locations(src);
+        assert_eq!(locs.len(), 2, "comments/quoted text must not count");
+        assert_eq!(locs[0].name, "target");
+        assert_eq!((locs[0].line, locs[0].column), (3, 1));
+        assert_eq!((locs[1].line, locs[1].column), (6, 1));
+        assert_eq!(find_yield_preset_decl_location(src, "target"), Some((3, 1)));
+        assert_eq!(
+            find_nth_yield_preset_decl_location(src, "target", 2),
+            Some((6, 1))
+        );
+        assert_eq!(find_nth_yield_preset_decl_location(src, "target", 0), None);
+        assert_eq!(find_nth_yield_preset_decl_location(src, "target", 3), None);
+    }
+
+    #[test]
+    fn keyword_scan_respects_ident_boundaries() {
+        assert_eq!(keyword_at(b"yield preset alpha (", 0, b"yield"), Some(5));
+        assert_eq!(keyword_at(b"yielder ", 0, b"yield"), None);
+        assert_eq!(keyword_at(b"myield ", 1, b"yield"), None);
+        assert_eq!(keyword_at(b"a yield preset", 2, b"yield"), Some(7));
+        assert_eq!(keyword_at(b"yie", 0, b"yield"), None);
+    }
+
+    #[test]
+    fn parse_preset_decl_and_skip_helpers() {
+        // 名称可含下划线，关键字之间允许空白与 // 行注释
+        let (name, after) = parse_yield_preset_decl_at("yield preset alpha_x (\n", 0).unwrap();
+        assert_eq!(name, "alpha_x");
+        assert_eq!(&"yield preset alpha_x (\n"[after..after + 1], " ");
+        let with_comment = "yield // c\n preset beta (\n";
+        assert_eq!(
+            parse_yield_preset_decl_at(with_comment, 0).map(|(n, _)| n),
+            Some("beta".to_string())
+        );
+        let skip = "  // comment\n  rest";
+        let rest = skip_ws_and_line_comments(skip.as_bytes(), 0);
+        assert_eq!(&skip[rest..], "rest");
+        assert!(line_declares_yield_preset("yield preset aaa (", "aaa"));
+        assert!(!line_declares_yield_preset("yield preset aaa2 (", "aaa"));
+        assert!(!line_declares_yield_preset("yield preset aa (", "aaa"));
+        assert!(!line_declares_yield_preset("rule x {", "x"));
+    }
+
+    #[test]
+    fn named_token_columns_require_boundaries_and_assignment() {
+        assert_eq!(find_named_arg_column("y = 1, yy = 2", "y"), Some(1));
+        assert_eq!(find_named_arg_column("y = 1, yy = 2", "yy"), Some(8));
+        assert_eq!(find_named_arg_column("y = 1, yyy = 3", "yy"), None);
+        assert_eq!(find_token_column("yield preset x (", "preset"), Some(7));
+        // 未闭合/空的 backtick 不产生 token
+        assert_eq!(
+            backtick_tokens("a `x` b `y`"),
+            vec!["x".to_string(), "y".to_string()]
+        );
+        assert_eq!(backtick_tokens("unclosed `x"), Vec::<String>::new());
+        assert_eq!(backtick_tokens("empty `` skips"), Vec::<String>::new());
+        assert_eq!(
+            extract_backtick_token_after("missing required argument `port`", "argument"),
+            Some("port".to_string())
+        );
+        assert_eq!(
+            extract_backtick_token_after("no backtick after argument", "argument"),
+            None
+        );
+    }
+
+    #[test]
+    fn source_snippet_caret_and_scan_ranges() {
+        assert_eq!(
+            source_line_snippet("a\nhello world\nc", 2, 7),
+            "  hello world\n        ^"
+        );
+        assert_eq!(source_line_snippet("a\nhello world\nc", 5, 1), "");
+        // 直接在 prelude 文本上验证声明体扫描区间
+        assert_eq!(
+            find_prelude_yield_preset_arg_location(PRELUDE, "base_alerts", "port"),
+            Some((4, 5))
+        );
+        assert_eq!(
+            find_prelude_yield_preset_token_location(PRELUDE, "base_alerts", &["port".to_string()]),
+            Some((4, 5))
+        );
+        assert_eq!(
+            find_prelude_yield_preset_token_location(
+                PRELUDE,
+                "base_alerts",
+                &["absent".to_string()]
+            ),
+            None
+        );
+    }
 }

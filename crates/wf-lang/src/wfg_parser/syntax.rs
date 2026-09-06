@@ -274,35 +274,12 @@ fn parse_wave(input: &mut &str) -> ModalResult<RateExpr> {
     ws_skip(input)?;
     cut_err(literal("(")).parse_next(input)?;
     ws_skip(input)?;
-    cut_err(crate::parse_utils::kw("base")).parse_next(input)?;
-    cut_err(literal("=")).parse_next(input)?;
-    let base = cut_err(rate).parse_next(input)?;
-    ws_skip(input)?;
-    cut_err(literal(",")).parse_next(input)?;
-    ws_skip(input)?;
-    cut_err(crate::parse_utils::kw("amp")).parse_next(input)?;
-    cut_err(literal("=")).parse_next(input)?;
-    let amp = cut_err(rate).parse_next(input)?;
-    ws_skip(input)?;
-    cut_err(literal(",")).parse_next(input)?;
-    ws_skip(input)?;
-    cut_err(crate::parse_utils::kw("period")).parse_next(input)?;
-    cut_err(literal("=")).parse_next(input)?;
-    let period = cut_err(crate::parse_utils::duration_value).parse_next(input)?;
-
-    let mut shape = WaveShape::Sine;
-    ws_skip(input)?;
-    if opt(literal(",")).parse_next(input)?.is_some() {
-        ws_skip(input)?;
-        cut_err(crate::parse_utils::kw("shape")).parse_next(input)?;
-        cut_err(literal("=")).parse_next(input)?;
-        shape = cut_err(alt((
-            crate::parse_utils::kw("sine").value(WaveShape::Sine),
-            crate::parse_utils::kw("triangle").value(WaveShape::Triangle),
-            crate::parse_utils::kw("square").value(WaveShape::Square),
-        )))
-        .parse_next(input)?;
-    }
+    let base = parse_named_rate(input, "base")?;
+    comma(input)?;
+    let amp = parse_named_rate(input, "amp")?;
+    comma(input)?;
+    let period = parse_named_duration(input, "period")?;
+    let shape = parse_wave_shape(input)?;
     ws_skip(input)?;
     cut_err(literal(")")).parse_next(input)?;
 
@@ -314,31 +291,60 @@ fn parse_wave(input: &mut &str) -> ModalResult<RateExpr> {
     })
 }
 
+/// `,` 字段分隔符（前后允许空白）。
+fn comma(input: &mut &str) -> ModalResult<()> {
+    ws_skip(input)?;
+    cut_err(literal(",")).parse_next(input)?;
+    ws_skip(input)
+}
+
+/// `keyword =` 字段头。
+fn kw_equals(input: &mut &str, keyword: &'static str) -> ModalResult<()> {
+    cut_err(crate::parse_utils::kw(keyword)).parse_next(input)?;
+    cut_err(literal("=")).parse_next(input)?;
+    Ok(())
+}
+
+/// `name = <rate>` 字段：供 wave/burst 复用。
+fn parse_named_rate(input: &mut &str, name: &'static str) -> ModalResult<Rate> {
+    kw_equals(input, name)?;
+    cut_err(rate).parse_next(input)
+}
+
+/// `name = <duration>` 字段。
+fn parse_named_duration(input: &mut &str, name: &'static str) -> ModalResult<Duration> {
+    kw_equals(input, name)?;
+    cut_err(crate::parse_utils::duration_value).parse_next(input)
+}
+
+/// wave 的可选 `, shape = sine|triangle|square`（缺省 Sine）。
+fn parse_wave_shape(input: &mut &str) -> ModalResult<WaveShape> {
+    let mut shape = WaveShape::Sine;
+    ws_skip(input)?;
+    if opt(literal(",")).parse_next(input)?.is_some() {
+        ws_skip(input)?;
+        kw_equals(input, "shape")?;
+        shape = cut_err(alt((
+            crate::parse_utils::kw("sine").value(WaveShape::Sine),
+            crate::parse_utils::kw("triangle").value(WaveShape::Triangle),
+            crate::parse_utils::kw("square").value(WaveShape::Square),
+        )))
+        .parse_next(input)?;
+    }
+    Ok(shape)
+}
+
 fn parse_burst(input: &mut &str) -> ModalResult<RateExpr> {
     ws_skip(input)?;
     cut_err(literal("(")).parse_next(input)?;
     ws_skip(input)?;
-    cut_err(crate::parse_utils::kw("base")).parse_next(input)?;
-    cut_err(literal("=")).parse_next(input)?;
-    let base = cut_err(rate).parse_next(input)?;
-    ws_skip(input)?;
-    cut_err(literal(",")).parse_next(input)?;
-    ws_skip(input)?;
-    cut_err(crate::parse_utils::kw("peak")).parse_next(input)?;
-    cut_err(literal("=")).parse_next(input)?;
-    let peak = cut_err(rate).parse_next(input)?;
-    ws_skip(input)?;
-    cut_err(literal(",")).parse_next(input)?;
-    ws_skip(input)?;
-    cut_err(crate::parse_utils::kw("every")).parse_next(input)?;
-    cut_err(literal("=")).parse_next(input)?;
-    let every = cut_err(crate::parse_utils::duration_value).parse_next(input)?;
-    ws_skip(input)?;
-    cut_err(literal(",")).parse_next(input)?;
-    ws_skip(input)?;
-    cut_err(crate::parse_utils::kw("hold")).parse_next(input)?;
-    cut_err(literal("=")).parse_next(input)?;
-    let hold = cut_err(crate::parse_utils::duration_value).parse_next(input)?;
+    let base = parse_named_rate(input, "base")?;
+    comma(input)?;
+    let peak = parse_named_rate(input, "peak")?;
+    comma(input)?;
+    let every = parse_named_duration(input, "every")?;
+    comma(input)?;
+    let hold = parse_named_duration(input, "hold")?;
     ws_skip(input)?;
     cut_err(literal(")")).parse_next(input)?;
 
@@ -501,21 +507,7 @@ fn parse_seq_step(input: &mut &str) -> ModalResult<SeqStep> {
         .parse_next(input)?
         .is_some()
     {
-        ws_skip(input)?;
-        cut_err(literal("(")).parse_next(input)?;
-        let predicates = parse_predicates(input)?;
-        cut_err(literal(")")).parse_next(input)?;
-        ws_skip(input)?;
-        cut_err(crate::parse_utils::kw("within")).parse_next(input)?;
-        ws_skip(input)?;
-        cut_err(literal("(")).parse_next(input)?;
-        ws_skip(input)?;
-        let within = cut_err(crate::parse_utils::duration_value).parse_next(input)?;
-        ws_skip(input)?;
-        cut_err(literal(")")).parse_next(input)?;
-        ws_skip(input)?;
-        let _ = opt(literal(";")).parse_next(input)?;
-        return Ok(SeqStep::Not { predicates, within });
+        return parse_not_step(input);
     }
 
     Err(winnow::error::ErrMode::Cut(
@@ -527,6 +519,25 @@ fn parse_seq_step(input: &mut &str) -> ModalResult<SeqStep> {
             )),
         ),
     ))
+}
+
+/// `not (predicates) within (duration)` 序列步骤。
+fn parse_not_step(input: &mut &str) -> ModalResult<SeqStep> {
+    ws_skip(input)?;
+    cut_err(literal("(")).parse_next(input)?;
+    let predicates = parse_predicates(input)?;
+    cut_err(literal(")")).parse_next(input)?;
+    ws_skip(input)?;
+    cut_err(crate::parse_utils::kw("within")).parse_next(input)?;
+    ws_skip(input)?;
+    cut_err(literal("(")).parse_next(input)?;
+    ws_skip(input)?;
+    let within = cut_err(crate::parse_utils::duration_value).parse_next(input)?;
+    ws_skip(input)?;
+    cut_err(literal(")")).parse_next(input)?;
+    ws_skip(input)?;
+    let _ = opt(literal(";")).parse_next(input)?;
+    Ok(SeqStep::Not { predicates, within })
 }
 
 fn parse_use_step_after_keyword(input: &mut &str) -> ModalResult<SeqStep> {
@@ -706,4 +717,137 @@ fn derive_total(traffic: &TrafficBlock, duration: Duration) -> u64 {
     }
     let total = (eps_sum * duration.as_secs_f64()).round() as u64;
     total.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rate(count: u64, unit: RateUnit) -> Rate {
+        Rate { count, unit }
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn wave_parses_fields_and_optional_shape() {
+        let mut input = "( base=80/s, amp=20/s, period=2m, shape=triangle )";
+        let r = parse_wave(&mut input).expect("wave with shape");
+        assert_eq!(
+            r,
+            RateExpr::Wave {
+                base: rate(80, RateUnit::PerSecond),
+                amp: rate(20, RateUnit::PerSecond),
+                period: secs(120),
+                shape: WaveShape::Triangle,
+            }
+        );
+        // 缺省 shape → Sine
+        let mut input2 = "(base=1/s, amp=1/s, period=5s)";
+        let r2 = parse_wave(&mut input2).expect("wave default shape");
+        assert_eq!(
+            r2,
+            RateExpr::Wave {
+                base: rate(1, RateUnit::PerSecond),
+                amp: rate(1, RateUnit::PerSecond),
+                period: secs(5),
+                shape: WaveShape::Sine,
+            }
+        );
+        // 非法 shape → 解析失败
+        let mut bad = "(base=1/s, amp=1/s, period=5s, shape=zigzag)";
+        assert!(parse_wave(&mut bad).is_err());
+        // 缺必填字段 → 解析失败
+        let mut missing = "(base=1/s, amp=1/s)";
+        assert!(parse_wave(&mut missing).is_err());
+    }
+
+    #[test]
+    fn burst_parses_four_fields() {
+        let mut input = "(base=40/s, peak=300/s, every=3m, hold=20s)";
+        let r = parse_burst(&mut input).expect("burst");
+        assert_eq!(
+            r,
+            RateExpr::Burst {
+                base: rate(40, RateUnit::PerSecond),
+                peak: rate(300, RateUnit::PerSecond),
+                every: secs(180),
+                hold: secs(20),
+            }
+        );
+    }
+
+    #[test]
+    fn timeline_parses_segments_and_derives_base_rate() {
+        let mut input = "{ 0m..2m=20/s; 2m..4m=60/s }";
+        let r = parse_timeline(&mut input).expect("timeline");
+        let RateExpr::Timeline(segments) = &r else {
+            panic!("expected timeline");
+        };
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].start, secs(0));
+        assert_eq!(segments[0].end, secs(120));
+        assert_eq!(segments[0].rate, rate(20, RateUnit::PerSecond));
+        assert_eq!(segments[1].rate, rate(60, RateUnit::PerSecond));
+        // legacy 路径取首段 rate；空 timeline → 兜底 1/s
+        assert_eq!(rate_from_expr(&r), rate(20, RateUnit::PerSecond));
+        assert_eq!(
+            rate_from_expr(&RateExpr::Timeline(Vec::new())),
+            rate(1, RateUnit::PerSecond)
+        );
+    }
+
+    #[test]
+    fn seq_steps_use_and_not() {
+        let mut use_input = "use(a=\"1\") with(2)";
+        let use_step = parse_seq_step(&mut use_input).expect("use step");
+        assert_eq!(
+            use_step,
+            SeqStep::Use {
+                predicates: vec![FieldPredicate {
+                    field: "a".to_string(),
+                    value: AttrValue::String("1".to_string()),
+                }],
+                count: 2,
+            }
+        );
+        // `then use(...)` 前缀与 `not(...) within(...)`
+        let mut then_input = "then use(b=\"x\") with(1)";
+        assert!(matches!(
+            parse_seq_step(&mut then_input).expect("then use"),
+            SeqStep::Use { .. }
+        ));
+        let mut not_input = "not(x=1, y=2) within(5s)";
+        let not_step = parse_seq_step(&mut not_input).expect("not step");
+        match not_step {
+            SeqStep::Not { predicates, within } => {
+                assert_eq!(predicates.len(), 2);
+                assert_eq!(within, secs(5));
+            }
+            other => panic!("unexpected step {other:?}"),
+        }
+        // 未知步骤头 → Cut 错误
+        let mut bad = "whenever(1)";
+        assert!(parse_seq_step(&mut bad).is_err());
+    }
+
+    #[test]
+    fn injection_case_modes_and_target_rule() {
+        let mut hit = "hit<30%> auth_events { k seq { use(a=\"1\") with(2) } }";
+        let case = parse_injection_case(&mut hit).expect("hit case");
+        assert_eq!(case.mode, InjectCaseMode::Hit);
+        assert_eq!(case.percent, 30.0);
+        assert_eq!(case.target_rule, None);
+        assert_eq!(case.stream, "auth_events");
+        assert_eq!(case.seq.entity, "k");
+        assert_eq!(case.seq.steps.len(), 1);
+
+        let mut miss = "miss<10%> for guard_rule evs { k seq { then use(a=\"b\") with(1) } }";
+        let case2 = parse_injection_case(&mut miss).expect("miss case");
+        assert_eq!(case2.mode, InjectCaseMode::Miss);
+        assert_eq!(case2.target_rule.as_deref(), Some("guard_rule"));
+        assert_eq!(case2.stream, "evs");
+    }
 }

@@ -74,55 +74,20 @@ pub(crate) fn compile_rules(
         .source_err(RuntimeReason::core_conf(), "resolve rule glob")?;
     let prelude_path = rule_prelude_path(glob_pattern, base_dir);
     let prelude = load_rule_prelude(&prelude_path, ctx, base_dir)?;
+
     let mut parsed_files = Vec::new();
     let mut all_rules = Vec::new();
     for full_path in &wfl_paths {
         if same_path(full_path, &prelude_path) {
             continue;
         }
-        let preprocessed = load_wfl_with_context(full_path, ctx, Some(base_dir))
-            .source_err(RuntimeReason::data_error(), "load rule file")
-            .position(full_path.display().to_string())?;
-        let mut wfl_file = wf_lang::parse_wfl_with_diagnostics(&preprocessed, full_path)
-            .map_err(lang_diagnostic)?;
-        validate_rule_prelude_conflicts(&wfl_file, &preprocessed, full_path, prelude.as_ref())?;
-        apply_rule_prelude(&mut wfl_file, prelude.as_ref());
-        // issue #73: `use "file.wfl"` 导入顶层列表（include 语义, 递归/循环/重名报错）。
-        wfl_file =
-            wf_lang::compiler::lists::resolve_imports(&wfl_file, full_path, &mut |import_path| {
-                load_wfl_with_context(import_path, ctx, Some(base_dir)).map_err(|e| {
-                    wf_lang::error::error(
-                        wf_lang::LangReason::Compile,
-                        e.detail().clone().unwrap_or_else(|| e.to_string()),
-                    )
-                })
-            })
-            .map_err(lang_diagnostic)?;
-        all_rules.extend(wfl_file.rules.iter().cloned());
-        parsed_files.push(ParsedRuleFile {
-            path: full_path.clone(),
-            source: preprocessed,
-            file: wfl_file,
-        });
+        let parsed = load_parsed_rule_file(full_path, ctx, base_dir, prelude.as_ref())?;
+        all_rules.extend(parsed.file.rules.iter().cloned());
+        parsed_files.push(parsed);
     }
 
     let effective_schemas = wf_lang::effective_schemas_for_rules(&all_rules, schemas);
-    let mut topology_errors = Vec::new();
-    wf_lang::check_intermediate_target_graph(&all_rules, &mut topology_errors);
-    let topology_hard_errors: Vec<_> = topology_errors
-        .into_iter()
-        .filter(|error| error.severity == wf_lang::Severity::Error)
-        .collect();
-    if !topology_hard_errors.is_empty() {
-        let msgs: Vec<String> = topology_hard_errors
-            .into_iter()
-            .map(|error| format_topology_error(&error, &parsed_files))
-            .collect();
-        return RuntimeReason::Bootstrap
-            .to_err()
-            .with_detail(msgs.join("\n"))
-            .err();
-    }
+    reject_topology_hard_errors(&all_rules, &parsed_files)?;
 
     let mut all_rule_plans = Vec::new();
     for parsed in &parsed_files {
@@ -135,6 +100,61 @@ pub(crate) fn compile_rules(
         all_rule_plans.extend(plans);
     }
     Ok((all_rule_plans, effective_schemas))
+}
+
+/// 加载并预处理单个规则文件：上下文替换 → 解析 → prelude preset 冲突校验与
+/// 合并 → `use` 导入解析，返回可诊断定位的 `ParsedRuleFile`。
+fn load_parsed_rule_file(
+    path: &Path,
+    ctx: &ConfigVarContext,
+    base_dir: &Path,
+    prelude: Option<&ParsedRuleFile>,
+) -> RuntimeResult<ParsedRuleFile> {
+    let source = load_wfl_with_context(path, ctx, Some(base_dir))
+        .source_err(RuntimeReason::data_error(), "load rule file")
+        .position(path.display().to_string())?;
+    let mut file = wf_lang::parse_wfl_with_diagnostics(&source, path).map_err(lang_diagnostic)?;
+    validate_rule_prelude_conflicts(&file, &source, path, prelude)?;
+    apply_rule_prelude(&mut file, prelude);
+    // issue #73: `use "file.wfl"` 导入顶层列表（include 语义, 递归/循环/重名报错）。
+    let file = wf_lang::compiler::lists::resolve_imports(&file, path, &mut |import_path| {
+        load_wfl_with_context(import_path, ctx, Some(base_dir)).map_err(|e| {
+            wf_lang::error::error(
+                wf_lang::LangReason::Compile,
+                e.detail().clone().unwrap_or_else(|| e.to_string()),
+            )
+        })
+    })
+    .map_err(lang_diagnostic)?;
+    Ok(ParsedRuleFile {
+        path: path.to_path_buf(),
+        source,
+        file,
+    })
+}
+
+/// 跨规则中间窗口依赖图存在硬错误时，返回聚合拓扑诊断。
+fn reject_topology_hard_errors(
+    rules: &[wf_lang::ast::RuleDecl],
+    parsed_files: &[ParsedRuleFile],
+) -> RuntimeResult<()> {
+    let mut topology_errors = Vec::new();
+    wf_lang::check_intermediate_target_graph(rules, &mut topology_errors);
+    let hard_errors: Vec<_> = topology_errors
+        .into_iter()
+        .filter(|error| error.severity == wf_lang::Severity::Error)
+        .collect();
+    if hard_errors.is_empty() {
+        return Ok(());
+    }
+    let msgs: Vec<String> = hard_errors
+        .into_iter()
+        .map(|error| format_topology_error(&error, parsed_files))
+        .collect();
+    RuntimeReason::Bootstrap
+        .to_err()
+        .with_detail(msgs.join("\n"))
+        .err()
 }
 
 fn compile_rule_file_with_prelude_diagnostics(
@@ -250,22 +270,7 @@ fn validate_rule_prelude(
     source: &str,
     path: &Path,
 ) -> RuntimeResult<()> {
-    let invalid = if !file.uses.is_empty() {
-        Some("use declarations")
-    } else if !file.patterns.is_empty() {
-        Some("pattern declarations")
-    } else if !file.lists.is_empty() {
-        // issue #73 定稿: 列表走 `use` 导入, prelude 只管 yield preset。
-        Some("list declarations (declare lists in a separate file and `use` it)")
-    } else if !file.rules.is_empty() {
-        Some("rule declarations")
-    } else if !file.tests.is_empty() {
-        Some("test blocks")
-    } else {
-        None
-    };
-
-    if let Some(kind) = invalid {
+    if let Some(kind) = forbidden_prelude_content(file) {
         return RuntimeReason::Bootstrap
             .to_err()
             .with_detail(format!(
@@ -275,8 +280,28 @@ fn validate_rule_prelude(
             ))
             .err();
     }
-    validate_unique_yield_presets(file, source, path, "rule prelude")?;
-    Ok(())
+    validate_unique_yield_presets(file, source, path, "rule prelude")
+}
+
+/// rule prelude 只允许 `yield preset`：返回首类违禁声明（按诊断优先级）。
+fn forbidden_prelude_content(file: &wf_lang::ast::WflFile) -> Option<&'static str> {
+    if !file.uses.is_empty() {
+        return Some("use declarations");
+    }
+    if !file.patterns.is_empty() {
+        return Some("pattern declarations");
+    }
+    if !file.lists.is_empty() {
+        // issue #73 定稿: 列表走 `use` 导入, prelude 只管 yield preset。
+        return Some("list declarations (declare lists in a separate file and `use` it)");
+    }
+    if !file.rules.is_empty() {
+        return Some("rule declarations");
+    }
+    if !file.tests.is_empty() {
+        return Some("test blocks");
+    }
+    None
 }
 
 fn validate_rule_prelude_conflicts(
@@ -665,31 +690,41 @@ fn resolve_key_field_type(
             resolve_bind_field_type(&plan.binds, schemas, alias, field)
         }
         FieldRef::Simple(field) => {
-            let mut found: Vec<FieldType> = Vec::new();
-            for bind in &plan.binds {
-                let Some(ws) = schemas.get(&bind.window) else {
-                    continue;
-                };
-                let Some(field_type) = ws
-                    .fields
-                    .iter()
-                    .find(|f| f.name == *field)
-                    .map(|f| f.field_type.clone())
-                else {
-                    continue;
-                };
-                if !found.contains(&field_type) {
-                    found.push(field_type);
-                }
-            }
+            let found = unique_bind_field_types(&plan.binds, schemas, field);
             if found.len() == 1 {
-                Some(found.remove(0))
+                Some(found[0].clone())
             } else {
                 None
             }
         }
         _ => None,
     }
+}
+
+/// 收集字段在多个绑定窗口 schema 中出现的去重类型列表。
+fn unique_bind_field_types(
+    binds: &[wf_lang::plan::BindPlan],
+    schemas: &HashMap<String, WindowSchema>,
+    field: &str,
+) -> Vec<FieldType> {
+    let mut found: Vec<FieldType> = Vec::new();
+    for bind in binds {
+        let Some(ws) = schemas.get(&bind.window) else {
+            continue;
+        };
+        let Some(field_type) = ws
+            .fields
+            .iter()
+            .find(|f| f.name == *field)
+            .map(|f| f.field_type.clone())
+        else {
+            continue;
+        };
+        if !found.contains(&field_type) {
+            found.push(field_type);
+        }
+    }
+    found
 }
 
 fn resolve_bind_field_type(
@@ -721,9 +756,7 @@ fn infer_branch_output_types(plan: &wf_lang::plan::RulePlan) -> HashMap<String, 
                 .unwrap_or_else(|| measure_output_name(branch.agg.measure).to_string());
             let field_type = match branch.agg.measure {
                 Measure::Count => FieldType::Base(BaseType::Digit),
-                Measure::Sum | Measure::Avg | Measure::Min | Measure::Max => {
-                    FieldType::Base(BaseType::Float)
-                }
+                // sum/avg/min/max 等聚合统一按数值（Float）推断
                 _ => FieldType::Base(BaseType::Float),
             };
             map.insert(name, field_type);
@@ -775,4 +808,143 @@ pub(crate) fn load_static_schemas(
         schemas.extend(parsed);
     }
     Ok(schemas)
+}
+
+#[cfg(test)]
+mod refactor_tests {
+    use super::*;
+
+    const PRELUDE: &str =
+        "yield preset base_alerts (\n    y = \"base\",\n    n = 1,\n    port = 80\n)\n";
+    const RULE: &str = "rule preset_rule {\n    events { e : auth_events }\n    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)\n    entity(ip, e.sip)\n    yield out : base_alerts (port = e.dport)\n}\n";
+
+    fn parse(text: &str) -> wf_lang::ast::WflFile {
+        wf_lang::parse_wfl(text).expect("wfl source should parse")
+    }
+
+    fn parsed_file(path: &str, source: &str) -> ParsedRuleFile {
+        ParsedRuleFile {
+            path: PathBuf::from(path),
+            source: source.to_string(),
+            file: parse(source),
+        }
+    }
+
+    fn bootstrap_error(err: crate::error::RuntimeError) -> String {
+        err.detail().as_deref().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn rule_prelude_accepts_presets_only() {
+        let file = parse(PRELUDE);
+        validate_rule_prelude(&file, PRELUDE, Path::new("_global.wfl")).unwrap();
+    }
+
+    #[test]
+    fn rule_prelude_rejects_forbidden_declaration_kinds() {
+        let cases: [(&str, &str); 3] = [
+            ("use \"lib.wfl\"\n", "use declarations"),
+            (RULE, "rule declarations"),
+            (
+                "pattern burst(alias) {\n    match<${alias}:5m> { on event { ${alias} | count >= 1; } } -> score(50.0)\n}\n",
+                "pattern declarations",
+            ),
+        ];
+        for (text, kind) in cases {
+            let file = parse(text);
+            let err = validate_rule_prelude(&file, text, Path::new("_global.wfl")).unwrap_err();
+            let detail = bootstrap_error(err);
+            assert!(detail.contains(kind), "expect {kind:?} in {detail}");
+            assert!(detail.contains("only allows `yield preset`"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn duplicate_yield_preset_decl_is_rejected_with_location() {
+        let text = "yield preset dup (\n    a = 1\n)\nyield preset dup (\n    b = 2\n)\n";
+        let file = parse(text);
+        let err = validate_unique_yield_presets(&file, text, Path::new("rules.wfl"), "rule file")
+            .unwrap_err();
+        let detail = bootstrap_error(err);
+        assert!(detail.contains("duplicate yield preset `dup`"), "{detail}");
+        assert!(detail.contains("location: line 4, column 1"), "{detail}");
+    }
+
+    #[test]
+    fn rule_preset_conflicting_with_prelude_is_rejected() {
+        let prelude = parsed_file("_global.wfl", PRELUDE);
+        let text = "yield preset base_alerts (\n    own = 1\n)\n";
+        let file = parse(text);
+        let err =
+            validate_rule_prelude_conflicts(&file, text, Path::new("rules.wfl"), Some(&prelude))
+                .unwrap_err();
+        let detail = bootstrap_error(err);
+        assert!(detail.contains("already exists in prelude"), "{detail}");
+        assert!(detail.contains("base_alerts"), "{detail}");
+    }
+
+    #[test]
+    fn apply_rule_prelude_prepends_prelude_presets() {
+        let prelude = parsed_file("_global.wfl", PRELUDE);
+        let mut file = parse("yield preset local_alerts (\n    z = 1\n)\n");
+        apply_rule_prelude(&mut file, Some(&prelude));
+        let names: Vec<&str> = file.yield_presets.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["base_alerts", "local_alerts"]);
+    }
+
+    #[test]
+    fn unique_bind_field_types_dedupes_across_windows() {
+        use wf_lang::{FieldDef, WindowSchema};
+        fn schema(name: &str, field_type: FieldType) -> WindowSchema {
+            WindowSchema {
+                name: name.into(),
+                streams: vec![],
+                time_field: None,
+                over: Duration::ZERO,
+                fields: vec![FieldDef {
+                    name: "k".into(),
+                    field_type,
+                }],
+            }
+        }
+        fn bind(alias: &str, window: &str) -> wf_lang::plan::BindPlan {
+            wf_lang::plan::BindPlan {
+                window: window.into(),
+                alias: alias.into(),
+                filter: None,
+            }
+        }
+        let binds = vec![bind("ea", "a"), bind("eb", "b")];
+        // 同名字段跨窗同类型 → 去重后仅一个类型
+        let schemas: HashMap<String, WindowSchema> = [
+            (
+                "a".to_string(),
+                schema("a", FieldType::Base(BaseType::Digit)),
+            ),
+            (
+                "b".to_string(),
+                schema("b", FieldType::Base(BaseType::Digit)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let types = unique_bind_field_types(&binds, &schemas, "k");
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0], FieldType::Base(BaseType::Digit));
+        // 类型分歧（a 为 Digit、b 为 Float）→ 两个候选类型
+        let schemas: HashMap<String, WindowSchema> = [
+            (
+                "a".to_string(),
+                schema("a", FieldType::Base(BaseType::Digit)),
+            ),
+            (
+                "b".to_string(),
+                schema("b", FieldType::Base(BaseType::Float)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let types = unique_bind_field_types(&binds, &schemas, "k");
+        assert_eq!(types.len(), 2);
+    }
 }
