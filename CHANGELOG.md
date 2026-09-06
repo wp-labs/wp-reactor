@@ -2,6 +2,20 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [2.0.19] -- latest
+
+### Fixed
+
+- **wf-engine: 内存驱逐 WARN 防刷屏（warp-fusion#86）**——驱逐告警改为首条详报 + 滚动/收尾汇总，不再每条驱逐刷屏；保留拒收/抖动计数跨窗口供指标告警。
+
+### Changed
+
+- **代码质量系列重构（moju/jumo Code Quality 视图驱动：按文件/模块拆分、降复杂度并补单测，公开 API 与行为不变）**：
+  - `wf-engine`：`executor/eval` 目录化（`builtins.rs` 拆 handler 族 / `walkers.rs` 等）；`stats_exec/exec.rs` 巨型方法拆为 `row_acc.rs` 单行与整批域累加自由函数簇（`process_rows` CC 47→7、`process_batch_rows_impl` CC 37→7）；`eval/mod.rs` / `builtins.rs` / `utils.rs` / `rows.rs` / `keys.rs` 降复杂度；`spill_serde.rs` serialize/deserialize 拆变体级 helper（max CC 37→14，去重读回 Arc 语义保留）；`columnar_eval.rs` `eval_vec`/`col_vec`/`list_index_vec`/`compare_scalars`/`arithmetic` 拆分（max CC 19→13）；各文件配套行式/列式/序列化边界回归单测；
+  - `wf-lang`：`wfl_parser/clauses.rs` 目录化为 `clauses/{mod,join,preset}.rs`；`match_p/steps.rs` 按职责拆 `branch.rs`/`seq.rs`；`contract`/`expr` 子模块内函数级拆分（`case_expr`/`test_block`/`options_block`/`stats_clause_only` 等）；`events.rs`/`conv_p.rs`/`stats_p.rs` 与 join/preset/limits 子句解析降复杂度——超阈值函数与告警清零；
+  - `wf-cep`：`eval/funcs.rs`（1384 行）按内置函数族拆 `funcs_{str,num,misc,time}.rs`（分派表瘦身，handler 逐字搬移）；`eval/cmp.rs` 常量折叠提取 `fold_f64_binop`（max CC 13→8）；
+  - 验证：`wf-engine` 1040 / `wf-lang` 1162 / `wf-cep` 357 全绿；双 clippy（all-targets + lib `unreachable_pub`）与 fmt 0；workspace check 通过（jumo/moju code-quality 报告同步重算）。
+
 ## [2.0.18] -- latest
 
 ### Changed
