@@ -456,6 +456,7 @@ fn load_knowledge_into_windows(
     _base_dir: &Path,
     registry: &mut WindowRegistry,
 ) -> RuntimeResult<()> {
+    crate::lifecycle::provider_refresh::reset_specs();
     let content = std::fs::read_to_string(knowdb_path).source_err(
         RuntimeReason::Bootstrap,
         format!("read {}", knowdb_path.display()),
@@ -513,64 +514,91 @@ fn load_knowledge_into_windows(
             continue;
         }
 
-        let mut reader = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .flexible(true)
-            .from_path(&csv_path)
-            .map_err(|e| {
-                RuntimeReason::Bootstrap.to_err().with_detail(format!(
-                    "open csv {}: {}",
-                    csv_path.display(),
-                    e
-                ))
-            })?;
-
-        let headers: Vec<String> = reader
-            .headers()
-            .map_err(|e| {
-                RuntimeReason::Bootstrap
-                    .to_err()
-                    .with_detail(format!("csv headers: {}", e))
-            })?
-            .iter()
-            .map(|h| h.to_string())
-            .collect();
-
-        let mut rows: Vec<std::collections::HashMap<String, EngineValue>> =
-            Vec::with_capacity(1024);
-        for result in reader.records() {
-            let record = result.map_err(|e| {
-                RuntimeReason::Bootstrap
-                    .to_err()
-                    .with_detail(format!("csv row: {}", e))
-            })?;
-            let mut map = std::collections::HashMap::new();
-            for (i, value) in record.iter().enumerate() {
-                let field = headers
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("col_{}", i));
-                map.insert(field, infer_knowledge_value(value));
-            }
-            rows.push(map);
-        }
+        let rows = read_knowledge_csv(&csv_path)?;
         if rows.is_empty() {
             continue;
         }
 
+        // 定期刷新（S2-M3b，v1 = CSV 重载）：knowdb.toml [[tables]] `refresh`。
+        let refresh = parse_knowledge_refresh(table);
         let row_count = rows.len();
         let mut pw = wf_engine::window::ProviderWindow::new(
             name.to_string(),
             format!("SELECT * FROM {}", name),
-            None,
+            refresh,
         );
         pw.load(rows);
         registry
             .register_provider(name.to_string(), pw)
             .source_err(RuntimeReason::Bootstrap, "register provider window")?;
-        wf_info!(conf, table = %name, rows = row_count, "knowdb data loaded");
+        wf_info!(conf, table = %name, rows = row_count, refresh = refresh.map(|d| d.as_secs()), "knowdb data loaded");
+        if let Some(interval) = refresh {
+            crate::lifecycle::provider_refresh::register_spec(
+                crate::lifecycle::provider_refresh::ReloadSpec {
+                    name: name.to_string(),
+                    interval,
+                    kind: crate::lifecycle::provider_refresh::ReloadKind::Csv(csv_path),
+                },
+            );
+        }
     }
     Ok(())
+}
+
+/// 读 knowdb [[tables]] 的 CSV 数据行（启动与定时刷新共用同一 reader，保证
+/// 列映射/类型推断语义一致）。行 = 列名 → 引擎值（`infer_knowledge_value`）。
+pub(super) fn read_knowledge_csv(
+    csv_path: &Path,
+) -> RuntimeResult<Vec<std::collections::HashMap<String, EngineValue>>> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_path(csv_path)
+        .map_err(|e| {
+            RuntimeReason::Bootstrap.to_err().with_detail(format!(
+                "open csv {}: {}",
+                csv_path.display(),
+                e
+            ))
+        })?;
+
+    let headers: Vec<String> = reader
+        .headers()
+        .map_err(|e| {
+            RuntimeReason::Bootstrap
+                .to_err()
+                .with_detail(format!("csv headers: {}", e))
+        })?
+        .iter()
+        .map(|h| h.to_string())
+        .collect();
+
+    let mut rows: Vec<std::collections::HashMap<String, EngineValue>> = Vec::with_capacity(1024);
+    for result in reader.records() {
+        let record = result.map_err(|e| {
+            RuntimeReason::Bootstrap
+                .to_err()
+                .with_detail(format!("csv row: {}", e))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for (i, value) in record.iter().enumerate() {
+            let field = headers
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("col_{}", i));
+            map.insert(field, infer_knowledge_value(value));
+        }
+        rows.push(map);
+    }
+    Ok(rows)
+}
+
+/// 解析 knowdb [[tables]] 的 `refresh` 键（如 `"5m"`）为刷新周期。
+fn parse_knowledge_refresh(table: &toml::Value) -> Option<Duration> {
+    let raw = table.get("refresh")?.as_str()?;
+    raw.parse::<wf_config::HumanDuration>()
+        .ok()
+        .map(|d| d.as_duration())
 }
 
 /// 近端 B warm（S2-M2）：读 t_baseline 逐窗 CSV 装载共享 BaselineStore。

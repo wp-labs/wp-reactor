@@ -221,6 +221,21 @@ pub(super) fn spawn_window_actors(
     group
 }
 
+/// Spawn the periodic provider-window refresh task（S2-M3b，daemon）——规格经
+/// `provider_refresh::take_specs()` 取出（bootstrap 注册）；空规格 = 空任务组。
+pub(super) fn spawn_provider_refresh_task(
+    router: &Arc<Router>,
+    cancel: CancellationToken,
+) -> TaskGroup {
+    let router = Arc::clone(router);
+    let mut group = TaskGroup::new("provider_refresh");
+    group.push(tokio::spawn(async move {
+        crate::lifecycle::provider_refresh::run_provider_refresh(router, cancel).await;
+        Ok(())
+    }));
+    group
+}
+
 /// Spawn the periodic window evictor task.
 pub(super) fn spawn_evictor_task(
     config: &FusionConfig,

@@ -1,6 +1,7 @@
 mod bootstrap;
 pub(crate) mod compile;
 pub(crate) mod ingest;
+pub(crate) mod provider_refresh;
 mod reload;
 mod signal;
 mod spawn;
@@ -39,8 +40,8 @@ pub use signal::{ShutdownTrigger, wait_for_signal};
 use bootstrap::load_and_compile;
 use spawn::{
     cleanup_leftover_spill_files, metrics_record_to_data_record, spawn_alert_task,
-    spawn_evictor_task, spawn_metrics_task, spawn_receiver_task, spawn_rule_tasks,
-    spawn_window_actors,
+    spawn_evictor_task, spawn_metrics_task, spawn_provider_refresh_task, spawn_receiver_task,
+    spawn_rule_tasks, spawn_window_actors,
 };
 use types::TaskGroup;
 
@@ -418,6 +419,15 @@ impl Reactor {
             ),
             cancel.clone(),
         );
+
+        // 远端 A 定期刷新（S2-M3b）：daemon 下按 knowdb [[tables]] refresh 周期
+        // 重载 provider 静态窗（v1 = CSV）。batch 单次回放不刷新。
+        if config.mode == wf_config::FusionMode::Daemon {
+            tail_watchers.push(watch_group(
+                spawn_provider_refresh_task(&data.router, cancel.clone()),
+                cancel.clone(),
+            ));
+        }
 
         // End-of-stream counter shared with the rule tasks: incremented each
         // time the input sources report the stream ended (EOS-driven
