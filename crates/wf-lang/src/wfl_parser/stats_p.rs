@@ -203,10 +203,11 @@ fn stats_agg(input: &mut &str) -> ModalResult<(StatsAgg, Option<FieldRef>, Optio
     let name = cut_err(ident).parse_next(input)?.to_string();
     match name.as_str() {
         "count" => Ok((StatsAgg::Count, None, None)),
-        "sum" | "avg" | "min" | "max" | "distinct_count" => {
+        "sum" | "sumsq" | "avg" | "min" | "max" | "distinct_count" => {
             let f = agg_field_parens(input)?;
             let agg = match name.as_str() {
                 "sum" => StatsAgg::Sum,
+                "sumsq" => StatsAgg::SumSq,
                 "avg" => StatsAgg::Avg,
                 "min" => StatsAgg::Min,
                 "max" => StatsAgg::Max,

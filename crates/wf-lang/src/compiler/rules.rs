@@ -101,6 +101,7 @@ fn compile_stats_rule(
             agg: match m.agg {
                 crate::ast::StatsAgg::Count => StatsAggPlan::Count,
                 crate::ast::StatsAgg::Sum => StatsAggPlan::Sum,
+                crate::ast::StatsAgg::SumSq => StatsAggPlan::SumSq,
                 crate::ast::StatsAgg::Avg => StatsAggPlan::Avg,
                 crate::ast::StatsAgg::Min => StatsAggPlan::Min,
                 crate::ast::StatsAgg::Max => StatsAggPlan::Max,

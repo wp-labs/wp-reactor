@@ -12,8 +12,9 @@ use super::field_name;
 // 状态结构（v6 §6.1 — 无匹配进度, 纯累加）
 // ---------------------------------------------------------------------------
 
-/// 数值累加器（count/sum/avg/min/max 度量共享）。avg 不作状态——输出时
-/// sum/count 求得（D6）。Box 化后每度量仅 8B 指针（2026-08-26 q18 紧凑化）。
+/// 数值累加器（count/sum/sumsq/avg/min/max 度量共享）。avg 不作状态——输出时
+/// sum/count 求得（D6）。SumSq 度量复用 `sum` 字段存 ∑v²。Box 化后每度量仅
+/// 8B 指针（2026-08-26 q18 紧凑化）。
 #[derive(Debug, Clone, Default, ::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct NumericAccum {
@@ -157,7 +158,7 @@ impl NumericSoALayout {
 /// `Top` 24B）。
 ///
 /// 变体与 `StatsAggPlan` 一一对应：
-///   count/sum/avg/min/max → [`Numeric`](StatsAccum::Numeric)（Box 8B）
+///   count/sum/sumsq/avg/min/max → [`Numeric`](StatsAccum::Numeric)（Box 8B）
 ///   distinct_count        → [`Distinct`](StatsAccum::Distinct)（Box 8B）
 ///   last                  → [`Last`](StatsAccum::Last)（`Option<Arc<RowFields>>` 16B）
 ///   top                   → [`Top`](StatsAccum::Top)（`Vec<TopEntry>` 24B）
@@ -190,6 +191,7 @@ impl StatsAccum {
         match agg {
             wf_lang::plan::StatsAggPlan::Count
             | wf_lang::plan::StatsAggPlan::Sum
+            | wf_lang::plan::StatsAggPlan::SumSq
             | wf_lang::plan::StatsAggPlan::Avg
             | wf_lang::plan::StatsAggPlan::Min
             | wf_lang::plan::StatsAggPlan::Max => StatsAccum::Numeric(Box::default()),

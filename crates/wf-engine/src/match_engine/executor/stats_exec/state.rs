@@ -113,7 +113,8 @@ impl StatsWindowState {
     /// 新建窗口状态（无内存限制, 由 spawn 层按规则 limits 注入）。空键规则
     /// 在此预建 Empty 单桶（快路径）。
     pub(crate) fn new(buckets: EngineHashMap<u64, Vec<StatsBucket>>, plan: &StatsPlan) -> Self {
-        // 全数值计划（count/sum/avg/min/max）→ SoA 桶; 含 distinct/last/top → Classic。
+        // 全数值计划（count/sum/avg/min/max）→ SoA 桶; 含 distinct/last/top
+        // 或 SumSq（平方和, 不同折叠需独立列——见 ast SumSq 注释）→ Classic。
         let soa_layout = plan
             .measures
             .iter()

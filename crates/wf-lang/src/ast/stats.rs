@@ -69,6 +69,9 @@ pub struct StatsMeasure {
 pub enum StatsAgg {
     Count,
     Sum,
+    /// 平方和聚合（∑v²，基线记录的 sum_sq——消费侧与 sum/count 合并推导 std）。
+    /// 与 `sum` 同形接受 `(field)`，仅走 Classic 数值累加（不进 SoA 快路径）。
+    SumSq,
     Avg,
     Min,
     Max,

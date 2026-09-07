@@ -143,6 +143,7 @@ pub(crate) fn accumulate_column_row(
         match measure.agg {
             StatsAggPlan::Count
             | StatsAggPlan::Sum
+            | StatsAggPlan::SumSq
             | StatsAggPlan::Avg
             | StatsAggPlan::Min
             | StatsAggPlan::Max => {
@@ -186,10 +187,12 @@ pub(crate) fn accumulate_column_row(
 }
 
 /// Numeric 度量的单值落账（调用方已 `count += 1`）——sum/avg 同路径; min/max
-/// 极值折叠。Count 变体无字段更新（调用方给字段值即为无操作）。
+/// 极值折叠。Count 变体无字段更新（调用方给字段值即为无操作）。SumSq 与 sum
+/// 同门控（仅数值行落账）但折叠 v·v——saturating 防 i128 溢出回绕。
 fn accumulate_numeric_value(nacc: &mut NumericAccum, agg: &StatsAggPlan, v: i128) {
     match agg {
         StatsAggPlan::Sum | StatsAggPlan::Avg => nacc.sum += v,
+        StatsAggPlan::SumSq => nacc.sum = nacc.sum.saturating_add(v.saturating_mul(v)),
         StatsAggPlan::Min => nacc.min = min_fold(nacc.min, v),
         StatsAggPlan::Max => nacc.max = max_fold(nacc.max, v),
         _ => {}
@@ -336,6 +339,7 @@ pub(crate) fn accumulate_row_map_classic(
         match measure.agg {
             StatsAggPlan::Count
             | StatsAggPlan::Sum
+            | StatsAggPlan::SumSq
             | StatsAggPlan::Avg
             | StatsAggPlan::Min
             | StatsAggPlan::Max => {
@@ -508,6 +512,19 @@ pub(crate) fn accumulate_empty_bucket_classic(
                     && let Some(col) = numeric_col(batch, field_name(field))
                 {
                     nacc.sum += sum_domain(&col, rows, n, masks, wi);
+                }
+            }
+            StatsAggPlan::SumSq => {
+                let nacc = acc.numeric_mut();
+                nacc.count += rows_in;
+                if let Some(field) = &measure.field
+                    && let Some(col) = numeric_col(batch, field_name(field))
+                {
+                    // 平方域归并（saturating）——与 sum 同门控（null/非数值跳过）,
+                    // 与逐行 [`accumulate_numeric_value`] 的 SumSq 折叠同语义。
+                    nacc.sum = nacc
+                        .sum
+                        .saturating_add(sum_sq_domain(&col, rows, n, masks, wi));
                 }
             }
             StatsAggPlan::Min | StatsAggPlan::Max => {

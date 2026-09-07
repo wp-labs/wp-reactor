@@ -36,6 +36,31 @@ rule q15_bidding_stats {
 }
 
 #[test]
+fn stats_sumsq_measure_parses() {
+    let rule = parse_stats_rule(
+        r#"
+rule baseline_producer {
+    events { b : bid_events }
+    stats<1h:fixed> group by (b.auction) {
+        b | count          as n;
+        b | sum(b.price)   as s;
+        b | sumsq(b.price) as ss;
+    }
+    entity(digit, b.auction)
+    yield alerts ( id = 1, alert_type = "x", detail = "y" )
+}
+"#,
+    );
+    let stats = rule.stats_clause.expect("应有 stats_clause");
+    assert_eq!(stats.measures.len(), 3);
+    assert_eq!(stats.measures[0].agg, StatsAgg::Count);
+    assert_eq!(stats.measures[1].agg, StatsAgg::Sum);
+    assert_eq!(stats.measures[2].agg, StatsAgg::SumSq, "sumsq 解析为 SumSq");
+    assert_eq!(stats.measures[2].label, "ss");
+    assert!(stats.measures[2].field.is_some(), "sumsq(field) 携带字段");
+}
+
+#[test]
 fn stats_tier_columns() {
     let rule = parse_stats_rule(
         r#"

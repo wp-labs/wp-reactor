@@ -95,6 +95,7 @@ pub(crate) fn measure_values(
         .map(|((m, acc), fidx)| match m.agg {
             StatsAggPlan::Count => acc.numeric().count as f64,
             StatsAggPlan::Sum => acc.numeric().sum as f64,
+            StatsAggPlan::SumSq => acc.numeric().sum as f64,
             StatsAggPlan::Avg => {
                 let n = acc.numeric();
                 if n.count == 0 {
@@ -151,6 +152,7 @@ pub(crate) fn bucket_measure_entries(
     match m.agg {
         StatsAggPlan::Count => vec![scalar(acc.numeric().count as f64)],
         StatsAggPlan::Sum => vec![scalar(acc.numeric().sum as f64)],
+        StatsAggPlan::SumSq => vec![scalar(acc.numeric().sum as f64)],
         StatsAggPlan::Avg => {
             let n = acc.numeric();
             vec![scalar(if n.count == 0 {

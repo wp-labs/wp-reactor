@@ -306,3 +306,5 @@ mod stats_exec_grouped;
 mod stats_exec_last_top;
 #[path = "stats_exec_state.rs"]
 mod stats_exec_state;
+#[path = "stats_exec_sumsq.rs"]
+mod stats_exec_sumsq;

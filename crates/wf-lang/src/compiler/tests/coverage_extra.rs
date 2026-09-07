@@ -63,6 +63,38 @@ pub(super) fn bid_events_window() -> WindowSchema {
     )
 }
 
+/// baseline 生产规则用指标流（entity/metric 双键 + 数值 value）。
+pub(super) fn metrics_stream_window() -> WindowSchema {
+    make_window(
+        "metrics_stream",
+        vec!["metrics_stream"],
+        vec![
+            ("entity", bt(BaseType::Chars)),
+            ("metric", bt(BaseType::Chars)),
+            ("value", bt(BaseType::Float)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    )
+}
+
+/// baseline 产出记录（= BaselineRecord: 隔离键 + 窗口边界 + n/sum/sum_sq）。
+/// 度量值经 stat.value(final(...)) 读出为数值（引擎统一 f64 口径）→ 字段为
+/// float（含 n——静态推断 Float, digit 会编译拒绝）。
+pub(super) fn baseline_out_window() -> WindowSchema {
+    make_output_window(
+        "baseline_out",
+        vec![
+            ("entity", bt(BaseType::Chars)),
+            ("metric", bt(BaseType::Chars)),
+            ("win_start", bt(BaseType::Time)),
+            ("win_end", bt(BaseType::Time)),
+            ("n", bt(BaseType::Float)),
+            ("sum", bt(BaseType::Float)),
+            ("sum_sq", bt(BaseType::Float)),
+        ],
+    )
+}
+
 // ---------------------------------------------------------------------------
 // compile_rule rejection branches
 // ---------------------------------------------------------------------------
@@ -236,6 +268,59 @@ rule stats_rows {
 // ---------------------------------------------------------------------------
 // compile_limits
 // ---------------------------------------------------------------------------
+
+#[test]
+fn compile_stats_baseline_producer_sumsq_and_window_times() {
+    // baseline 生产规则（设计方案 §4.1 形态）: 1h 固定窗 + group by
+    // (entity, metric) + count/sum/sumsq 三元组 + yield 读窗口起止系统变量。
+    // 断言: ① sumsq 编译为 StatsAggPlan::SumSq; ② 含 SumSq 的规则不触发
+    // 任何 checker 类型错误（stat.value / 窗口变量 / float 字段赋值）;
+    // ③ yield 字段完整进入 plan。
+    let src = r#"
+rule baseline_producer {
+    events { e : metrics_stream }
+    stats<1h:fixed> group by (e.entity, e.metric) {
+        e | count          as n;
+        e | sum(e.value)   as s;
+        e | sumsq(e.value) as ss;
+    }
+    entity(str, e.entity)
+    yield baseline_out (
+        entity    = e.entity,
+        metric    = e.metric,
+        win_start = @window_start_time,
+        win_end   = @window_end_time,
+        n         = stat.value(final(n)),
+        sum       = stat.value(final(s)),
+        sum_sq    = stat.value(final(ss))
+    )
+}
+"#;
+    let plans = compile_with(src, &[metrics_stream_window(), baseline_out_window()]);
+    let plan = plans
+        .iter()
+        .find(|p| p.name == "baseline_producer")
+        .expect("rule");
+    let stats = plan.stats_plan.as_ref().expect("stats plan");
+    assert_eq!(stats.keys.len(), 2, "group by 双键");
+    let aggs: Vec<StatsAggPlan> = stats.measures.iter().map(|m| m.agg).collect();
+    assert_eq!(
+        aggs,
+        vec![StatsAggPlan::Count, StatsAggPlan::Sum, StatsAggPlan::SumSq,]
+    );
+    let yield_names: Vec<&str> = plan
+        .yield_plan
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    for want in ["win_start", "win_end", "n", "sum", "sum_sq"] {
+        assert!(
+            yield_names.contains(&want),
+            "yield 缺字段 {want}: {yield_names:?}"
+        );
+    }
+}
 
 #[test]
 fn compile_limits_plan_carries_parsed_values() {

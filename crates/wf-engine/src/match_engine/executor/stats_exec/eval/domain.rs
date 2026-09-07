@@ -52,6 +52,28 @@ pub(crate) fn sum_domain(
     }
 }
 
+/// 行域驱动的平方和（∑v², null/where 门控与 [`sum_domain`] 一致）。
+/// SumSq 度量专用（基线 sum_sq）; v·v 与累加均 saturating（防 i128 溢出回绕）
+/// ——与逐行 [`accumulate_numeric_value`] 的 SumSq 折叠同口径。
+pub(crate) fn sum_sq_domain(
+    col: &NumCol<'_>,
+    rows: Option<&[u32]>,
+    n: usize,
+    masks: &[BooleanArray],
+    wi: Option<usize>,
+) -> i128 {
+    let passes = |r: usize| wi.is_none_or(|wi| masks[wi].value(r));
+    let fold = |acc: i128, v: i128| acc.saturating_add(v.saturating_mul(v));
+    match col {
+        NumCol::Int64(c) => domain_rows(rows, n)
+            .filter(|&r| passes(r) && !c.is_null(r))
+            .fold(0i128, |acc, r| fold(acc, c.value(r) as i128)),
+        NumCol::Float64(c) => domain_rows(rows, n)
+            .filter(|&r| passes(r) && !c.is_null(r))
+            .fold(0i128, |acc, r| fold(acc, c.value(r) as i128)),
+    }
+}
+
 /// 行域驱动 min/max（null 跳过）。
 pub(crate) fn minmax_domain(
     col: &NumCol<'_>,
@@ -303,5 +325,22 @@ mod tests {
         // 行 0 被 where 滤掉（值 7 不参与极值）
         assert_eq!(min, Some(1));
         assert_eq!(max, Some(9));
+    }
+
+    #[test]
+    fn sum_sq_domain_sums_squares_skipping_nulls_and_where() {
+        let arr = int_col(&[Some(3), None, Some(5), Some(4), Some(7)]);
+        let col = NumCol::Int64(&arr);
+        // 无 where: 9 + 25 + 16 + 49 = 99（null 行跳过）
+        assert_eq!(sum_sq_domain(&col, None, arr.len(), &[], None), 99);
+        // where mask: 行 {0,1,3} 通过（5/7 被滤）→ 9 + 16 = 25
+        let mask = arrow::array::BooleanArray::from(vec![true, true, false, true, false]);
+        assert_eq!(sum_sq_domain(&col, None, arr.len(), &[mask], Some(0)), 25);
+
+        // Float64 分支（与 Int64 同口径: 截断后平方）
+        let farr = arrow::array::Float64Array::from(vec![Some(2.0), Some(1.5), None]);
+        let fcol = NumCol::Float64(&farr);
+        // 2² + trunc(1.5)=1² = 5（null 跳过）
+        assert_eq!(sum_sq_domain(&fcol, None, farr.len(), &[], None), 5);
     }
 }

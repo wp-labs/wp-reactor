@@ -222,6 +222,9 @@ pub struct StatsMeasurePlan {
 pub enum StatsAggPlan {
     Count,
     Sum,
+    /// 平方和聚合（∑v²）。见 ast::StatsAgg::SumSq——Classic 数值路径专用
+    /// （SoA 资格判定只认 count/sum/avg/min/max，含 SumSq 的规则自动落 Classic）。
+    SumSq,
     Avg,
     Min,
     Max,

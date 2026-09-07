@@ -316,7 +316,7 @@ fn populate_stats_measure_labels(scope: &mut Scope<'_>, stats: &StatsClause) {
                 stage: StatLabelStage::Close,
                 uses_distinct: m.agg == StatsAgg::DistinctCount,
                 measure: match m.agg {
-                    StatsAgg::Sum => Measure::Sum,
+                    StatsAgg::Sum | StatsAgg::SumSq => Measure::Sum,
                     StatsAgg::Avg => Measure::Avg,
                     StatsAgg::Min => Measure::Min,
                     StatsAgg::Max => Measure::Max,
