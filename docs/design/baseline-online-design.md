@@ -1,10 +1,10 @@
-<!-- 角色：引擎架构师 | 状态：设计方案 v2.2（评审后修正并源码实证：WFL 语法形态、持久化与 spill 解耦、消费侧聚合语义、yield 读取聚合值写法均已闭环验证；①dur=半衰期 ②存储=独立持久基线库(非spill) ③WARMUP=30 ④周期=一等公民） | 创建：2026-08-30 | 更新：2026-08-30 -->
+<!-- 角色：引擎架构师 | 状态：设计方案 v2.2（评审后修正并源码实证：WFL 语法形态、持久化与 spill 解耦、消费侧聚合语义、yield 读取聚合值写法均已闭环验证；①dur=半衰期 ②存储=独立持久基线库(非spill) ③WARMUP=30 ④周期=一等公民） | 创建：2026-08-30 | 更新：2026-09-07（§11 Step 2 补充：历史加载分层记忆架构——外部 sink=唯一事实源 + 近端规则级表 + 远端 knowdb/ProviderWindow + 统一可加三元组契约；§4 本地 redb 作为事实源之一，与外部 sink 二选一/并存） -->
 
 # baseline() 在线基线能力设计方案
 
 > 目标：把 `baseline(expr, dur, method)` 从"占位能力"（dur 被忽略、无持久化、语义夸大）升级为**可信的在线行为基线原语**，使 wfusion 从"检测已知模式/硬阈值"扩展到"检测每个实体自身历史的偏离"（UEBA 级）。
 >
-> 基线模型态落本地 `redb` 持久化（进程重启可 warm start）；引擎 CEP 匹配态仍纯内存、无 checkpoint 屏障。
+> 基线模型态落持久存储（本地 redb 或外部 sink：PG/Doris，见 §11），进程重启可 warm start；引擎 CEP 匹配态仍纯内存、无 checkpoint 屏障。
 
 ---
 
@@ -477,3 +477,129 @@ SRE/AIOps 的 SLA 几乎都是百分位定义，不看均值。`StatsAggPlan` �
 - **`wfl-dsl-comparison.md`**：将原"内置基线 + 持久化（规划/夸大）"行升级为"在线基线（dur 生效、按实体隔离、事件时间、可跨淘汰续命、**跨重启本地持久化**）"——如实区分两种持久化层级。
 - **`wfl-design.md`**：新增 `baseline()` 语义小节（API + 数学）。
 - **README**：本方案落地前**不**在 README 写 baseline（延续"先不写基线"决定）；落地且经测试后，可在一行差异化中恢复"内置在线基线"表述。
+
+---
+
+## 11. Step 2 补充：历史加载与判定通道（分层记忆架构，2026-09-07 评审）
+
+> 承接 §4/§5。本文档此前默认"历史载入内存 join snapshot"（§4.3 表格行），但未定
+> **谁提供历史、引擎如何读到、相位如何推进**。本补充把三条评审出的通道收敛为
+> 一个架构，并确立数据契约（任何通道/实现都必须对齐）。
+>
+> 评审输入：① step 1 已闭环（sumsq 全链 + baseline_producer 落文件，`wf-examples/baseline`）；
+> ② 相位是**不断推进**的——静态加载会冻结在加载时点；③ knowdb/ProviderWindow
+> 是"refresh 期整表替换 + join 纯内存"，适合低频全量、不适合事件时间动态相位；
+> ④ 引擎 join 条件左侧必须是字段（不能 `phase(e.time)==ref.phase` 动态派生键）。
+
+### 11.1 架构总览：单事实源 + 双读前端 + 统一合并
+
+```
+metrics 事件 ─▶ baseline_producer（stats 窗 + sumsq）
+                 └─▶ yield ─▶ sink ─▶ t_baseline（PG/Doris/本地 redb，唯一事实源）
+                                        │ 主键 (entity, metric, win_start)
+          ┌─────────────────────────────┼──────────────────────────────┐
+          ▼                             ▼                              ▼
+  近端 B：规则级基线历史表       远端 A：SQL 视图 v_baseline_phase   external 壳 C：低频/
+  （逐窗/桶态三元组，            （全历史相位桶三元组，             服务化出口（复用同一
+   收盘增量 append，             knowdb ProviderWindow               合并服务，不重复实现）
+   启动 warm，事件时间精确）       refresh → join）
+          └─────────────────────────────┼──────────────────────────────┘
+                                        ▼
+                  引擎内合并函数（§5 语义，唯一一份）
+                  半衰期加权：w = 0.5^(age/近期窗口)
+                  （近端近期窗口高权重 + 远端长程低权重）
+                                        ▼
+                              判定规则 → 偏离 → 告警
+```
+
+**分工**：近端 B 管"近"（事件时间精确、方法可演进、每事件内存读）；远端 A 管
+"远"（长留存/跨进程共享、处理时间近似）；external 壳 C 只把同一查询语义暴露给
+低频/外部消费者。三者同源、合并函数唯一、数据契约唯一。
+
+### 11.2 决策（S2-1 ~ S2-6）
+
+| # | 决策 | 内容 | 备注 |
+|---|---|---|---|
+| **S2-1** | 事实源 | 基线记录经 **规则级 yield→sink** 落外部持久库 `t_baseline`（PG/Doris 为生产首选；本地 redb 独立库为单机降级/替代，§4.5）；字段 `(entity, metric, win_start, win_end, n, sum, sum_sq[, phase_bucket])`，主键 `(entity, metric, win_start)`；**追加即幂等**，重放/多实例需主键去重或 replace | 外部库=唯一事实源；引擎不持有另一份权威态 |
+| **S2-2** | 读侧分层 | **近端 B**（规则级内存历史表，`(entity,metric)→近期窗口记录`，收盘增量 append + 启动 warm）+ **远端 A**（全历史相位桶三元组，供给形态三选一：CSV 文件导出 → knowdb `[[tables]]` / PG SQL 视图 `v_baseline_phase` → knowdb provider / 本地 redb；见 11.4） | 内存上界 = 近期留存 × 实体；长程由 A 覆盖；**A v1 用 CSV（零新增接线）** |
+| **S2-3** | 合并语义唯一 | 只有一个合并函数（§5：按事件时间 → 同相位窗口集 → 半衰期加权矩）；近端近期窗口与远端长程桶态**在同一函数内按权重合并** | 见 11.3 数据契约 |
+| **S2-4** | 判定热路径 | 每事件判定走**近端 B**（≈内存读，不碰库/不碰 join）；A 仅作长程/冷/跨进程；C（external）仅低频/服务化 | 高 EPS 不下网络、不阻塞 worker |
+| **S2-5** | 相位推进 | 近端 B：引擎按**事件时间**现算相位（无打标，重放/乱序正确）；远端 A：join 需事件带 `phase_bucket` **冗余列**（上游打标）或接受"当前整段"退化；A 通道限定**处理时间近似**，接受"提前更新"（refresh 对齐相位边界前完成） | 两通道语义口径显式区分：B=精确，A=近似 |
+| **S2-6** | 一致性/保留 | 收盘写入与 B append 同一触发点；A 的 refresh 幂等（主键 upsert）；保留策略 = B 近期**逐窗**（可重解释方法/周期）+ A 长程**相位桶归档**（不可再细分）；存储不可用 → 降级仅失长程（近端 B 继续） | §4.5 降级方向扩展 |
+
+### 11.3 数据契约（唯一，A/B/C 全对齐）v0.1
+
+**可加性是底线**：任何一层（表/视图/外部壳）对外输出必须保留
+`n/sum/sum_sq`（可加三元组，§4.2），**禁止只吐 μ/σ**——否则无法在同一合并函数
+中与其它层相加，方法（mean/median/percentile）也无法在消费侧重新推导。
+
+```
+-- t_baseline（事实源，sink 写入）
+entity:   chars          -- 隔离键
+metric:   chars
+win_start/win_end: time  -- 窗口边界（相位由消费侧推导/冗余列表达）
+n: u64（对外数值）; sum/sum_sq: numeric
+-- 预留: phase_bucket: chars（A 通道等值 join 用，上游打标；编码待定见 11.6）
+
+-- v_baseline_phase（A 通道读模型，最少列）
+entity, metric, phase_bucket,
+win_span_start, win_span_end,      -- 该桶覆盖的历史跨度
+n, sum, sum_sq                     -- 可加三元组（消费侧推导 μ/σ/任意方法）
+```
+
+**桶编码待定项**：UTC vs 本地时区、`hour_of_week`/`hour_of_day` 粒度、与 §5
+`周期`（日/周/月）的关系——A 通道的桶粒度是静态属性（视图焊死），B 通道不受限
+（按事件时间现算，粒度任选）。
+
+### 11.4 通道形态对照（评审结论）
+
+| 通道 | 采纳 | 理由 |
+|---|---|---|
+| 近端 B（规则级历史表） | **主线（MVP）** | 事件时间精确、方法可演进、可解释/可单测、每事件≈0 开销（§5 语义天然宿主） |
+| 远端 A（ProviderWindow） | **长程/跨进程层** | 低频全量替换语义整齐；接受处理时间近似 + 事件带相位列；**v1 实现 = knowdb CSV 文件加载（原生支持，bootstrap 已接线）** |
+| external 壳 C | **低频服务化出口** | 参数自由、无 join 键限制；同步 handler + 缓存需自管；不做高 EPS 主路径 |
+| 基线记录回流 BufferWindow（事件流自循环） | 备用 | 纯引擎无外部依赖，但内存=窗留存、重启重灌 |
+| 判定下放外部（引擎外闭环） | 拒绝 | 规则不在引擎，偏离产品定位 |
+
+**远端 A 的供给形态（v1 → 生产顺序）**：
+
+1. **CSV 文件导出（v1，最小成本）**：外部侧把最新全桶三元组物化为 CSV →
+   knowdb `[[tables]]`（`dir/data_file`，`columns.by_header`）→ bootstrap 启动
+   加载为 ProviderWindow（`load_knowledge_into_windows`，**生产接线已存在**，
+   nexmark_pk `side_input` 同路径）。**无需补调度/新增 provider 即可跑通 A 通道概念**。
+2. **PG SQL 视图（生产）**：`v_baseline_phase`（§11.3 最少列）→ knowdb
+   `[provider] kind="postgres"` 直接读（PG 失败自动回退 CSV）。
+3. **Doris**：仅作事实源，供给经 CSV/PG 出口（Doris 无 knowdb provider，见 11.6）。
+
+CSV 装载为**启动一次性**；定期推进 = 导出侧重建 CSV + reload（S2-M3b 补运行时
+调度）。导出需物化原子性（先写 tmp 再 rename，避免读到半写文件）。
+
+### 11.5 里程碑（S2-M1 ~ M4）
+
+| 阶段 | 内容 | 估时 |
+|---|---|---|
+| **S2-M1** | 数据契约落地：`t_baseline` 落库（file→Doris/PG 切换）+ 表结构/主键 + sink 幂等 | 1–2 天 |
+| **S2-M2** | 近端 B 最小闭环：收盘增量 append + 启动 warm（读 t_baseline）+ 判定规则（z-score/相对偏离）对拍 | 2–3 天 |
+| **S2-M3a** | 远端 A 最小验证（**CSV 供给，零新增接线**）：step1 基线记录导出全桶 CSV → knowdb `[[tables]]` → ProviderWindow join 判定闭环；同时验证 11.3 契约（三元组/相位列）与双源合并数值 | 1 天（**✅ 已闭环 2026-09-07**，wf-examples/baseline `scripts/run_m3a.sh`：受控 5 实体×4×60 样本基线 + svc_e 9× 越界，knowdb 载入 5 行，判定仅 svc_e 告警、CSV 契约自洽） |
+| **S2-M3b** | 远端 A 生产化：PG `v_baseline_phase` 视图 + ProviderWindow 运行时 refresh 调度（现缺失）+ Doris 落库对接 | 2–3 天 |
+| S2-M4 | external 壳 C（低频服务化） | +1 天（可选） |
+
+验收口径：重放/对拍/乱序用近端 B；实时近似用远端 A；双源合并数学用引擎单测
+锁（半衰期权重边界：远期为 0 时长程不参与；近期权重归一）。**S2-M3a 是整条
+远端 A 路线的投入产出验证点**——CSV 闭环跑通后再决定是否投入 PG/Doris 生产化。
+
+### 11.6 未决/风险（实现前逐项验证）
+
+- **Doris 不可作 knowdb provider**（provider 清单 = CSV/SQLite/Postgres，代码已核实）：
+  **不再阻塞**——Doris 作事实源经 CSV/PG 出口供给 A；仅当要 SQL 直读 Doris 才需新增
+  provider（低优先）；
+- **PG sink factory 是否现成**待确认（wp-connectors 注册清单；现确认 doris sink 存在）；
+- **ProviderWindow 运行期 refresh 调度缺失**：bootstrap **一次性加载已生产接线**
+  （`load_knowledge_into_windows`：PG 优先、失败回退 CSV），缺的是运行时定时
+  `load()` 重载（refresh 字段 + 替换语义已具备）——S2-M3b 补；
+- **CSV 供给注意**：启动一次性装载；导出需原子替换（tmp→rename）；行必须含
+  可加三元组（§11.3），禁只吐 μ/σ；
+- **join 左侧必须是字段**（已核实 checker 约束）：A 通道动态相位只能靠事件带
+  `phase_bucket` 冗余列，引擎内派生键不可行；
+- 近端 B 表归属层（规则任务级 vs 共享基线服务）与 §6.4 `RuleBaselines` 同层，实现时定；
+- `phase_bucket` 编码/时区约定；A 视图与 B 桶定义的等价性测试。
