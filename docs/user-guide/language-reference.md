@@ -126,6 +126,7 @@ rule <规则名> {
 
 - `meta` 目前是字符串键值对
 - `entity` 与 `yield` 仍然是规则必需部分
+- 规则级 `let` 声明可出现在 `events` 块之前或之后；`events` 条件内仅可引用字符串字面量 `let`（正则复用，issue #90），非字面量 let 引用会在静态检查报错
 - `|>` 管道中，只有最终 stage 可以带 `-> score(...)`
 - 当前 checker 还不支持 `on each` 与 pipeline stages 组合
 
@@ -177,6 +178,30 @@ events {
 ```
 
 不推荐展开成很长的 `a == x || a == y || ...`。
+
+#### 复用正则：`events` 条件引用常量字符串 `let`（issue #90）
+
+同一正则需要在多个字段上匹配时（如 HTTP 敏感信息检测里的 URI / 请求头 / 请求体），可先用规则级 `let` 把正则声明为字符串字面量，再在 `events` 条件的 `regex_match` 中按名引用：
+
+```wfl
+rule sensitive_info_alert {
+    events {
+        s : sdm_event && (
+            regex_match(s.facets_obj.http.request.uri, sensitive_regex)
+            || regex_match(s.facets_obj.http.request.headers, sensitive_regex)
+            || regex_match(s.facets_obj.http.request.body, sensitive_regex)
+        )
+    }
+    let sensitive_regex = "\\b62\\d{14,17}\\b"
+    match<:5m> { on event { s | count >= 1; } } -> score(50.0)
+    entity(ip, s.sip)
+    yield alerts (v = 1)
+}
+```
+
+- `let` 声明既可位于 `events` 块**之前**也可位于其后（多处声明按文本顺序合并，引用解析不依赖书写位置）；需要引用事件字段的派生 `let` 仍写在其后。
+- `events` 条件只在**事件绑定阶段**求值，早于 per-event `let` 注入，因此这里只能引用**字符串字面量** `let`（正则复用）；引用非字面量 `let`（如字段派生）会在静态检查报错并给出变量名。
+- 语义与把正则直接内联进 `regex_match` 完全一致：pattern 仍在编译期做正则合法性校验；null / 空字符串 / 空白字段行为不变；未声明的名字在静态检查阶段报出名称（并提示可用规则级 `let` 声明字面量模式复用）。既有内联写法保持兼容。
 
 ### `match`
 
