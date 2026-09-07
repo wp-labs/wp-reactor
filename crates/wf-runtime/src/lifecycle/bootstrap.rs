@@ -450,10 +450,26 @@ fn infer_knowledge_value(cell: &str) -> EngineValue {
     }
 }
 
-/// Load knowdb CSV tables directly into matching static windows.
+/// 一个待装载的引擎 CSV 表（KnowDB authority 单表）。
+struct CsvTable {
+    name: String,
+    csv_path: PathBuf,
+    refresh: Option<Duration>,
+    /// (列名, 是否整列数值) —— 数值列生成 REAL，其余 TEXT。
+    cols: Vec<(String, bool)>,
+}
+
+/// Load knowdb tables into matching static (provider) windows.
+///
+/// CSV 供给（v1）全部经 **KnowDB loader**（wp_knowledge V2 authority）装载与
+/// 刷新——引擎不再自行解析 CSV（`read_knowledge_csv` 已退役，2026-09-07）：
+/// bootstrap 逐列探测类型（整列每个非空单元可解析有限 f64 → REAL，否则 TEXT）
+/// 在 `base_dir/.run/knowdb_providers/` 生成类型化 create.sql/insert.sql 与派生
+/// V2 conf，调 `loader::reload_table_rows` 取 DDL 类型化原生行，边界转引擎行。
+/// PG 供给走 [`load_from_postgres`]（refresh 后续补）。
 fn load_knowledge_into_windows(
     knowdb_path: &Path,
-    _base_dir: &Path,
+    base_dir: &Path,
     registry: &mut WindowRegistry,
 ) -> RuntimeResult<()> {
     crate::lifecycle::provider_refresh::reset_specs();
@@ -487,13 +503,16 @@ fn load_knowledge_into_windows(
         }
     }
 
-    // CSV fallback
+    // -----------------------------------------------------------------------
+    // CSV fallback —— KnowDB authority 单表装载（loader 语义，见上 doc）
+    // -----------------------------------------------------------------------
     let base = config
         .get("base_dir")
         .and_then(|b| b.as_str())
         .unwrap_or(".");
     let data_base_dir = knowdb_path.parent().unwrap_or(Path::new(".")).join(base);
 
+    let mut found: Vec<CsvTable> = Vec::new();
     for table in tables {
         let name = table.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let enabled = table
@@ -503,7 +522,6 @@ fn load_knowledge_into_windows(
         if !enabled || name.is_empty() {
             continue;
         }
-
         let dir = table.get("dir").and_then(|d| d.as_str()).unwrap_or(name);
         let data_file = table
             .get("data_file")
@@ -513,43 +531,82 @@ fn load_knowledge_into_windows(
         if !csv_path.exists() {
             continue;
         }
-
-        let rows = read_knowledge_csv(&csv_path)?;
-        if rows.is_empty() {
+        let cols = sniff_csv_schema(&csv_path)?;
+        if cols.is_empty() {
             continue;
         }
+        found.push(CsvTable {
+            name: name.to_string(),
+            csv_path,
+            refresh: parse_knowledge_refresh(table),
+            cols,
+        });
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
 
-        // 定期刷新（S2-M3b，v1 = CSV 重载）：knowdb.toml [[tables]] `refresh`。
-        let refresh = parse_knowledge_refresh(table);
+    // 派生 KnowDB V2 资产（root conf + 每表类型化 DDL），权威库文件共用。
+    let assets = base_dir.join(".run").join("knowdb_providers");
+    write_derived_knowdb_assets(&assets, &found)?;
+    let authority_uri = format!("file:{}", assets.join("authority.sqlite").display());
+    let conf_rel = PathBuf::from("knowdb.toml");
+    let dict = orion_variate::EnvDict::default();
+
+    for t in &found {
+        let native = wp_knowledge::loader::reload_table_rows(
+            &assets,
+            &conf_rel,
+            &authority_uri,
+            &t.name,
+            &dict,
+        )
+        .source_err(
+            RuntimeReason::Bootstrap,
+            format!("knowdb reload table {}", t.name),
+        )?;
+        if native.is_empty() {
+            continue;
+        }
+        let rows = engine_rows_from_knowdb(native);
         let row_count = rows.len();
-        let mut pw = wf_engine::window::ProviderWindow::new(
-            name.to_string(),
-            format!("SELECT * FROM {}", name),
-            refresh,
+        let mut pw = ProviderWindow::new(
+            t.name.clone(),
+            format!("SELECT * FROM {}", t.name),
+            t.refresh,
         );
         pw.load(rows);
         registry
-            .register_provider(name.to_string(), pw)
+            .register_provider(t.name.clone(), pw)
             .source_err(RuntimeReason::Bootstrap, "register provider window")?;
-        wf_info!(conf, table = %name, rows = row_count, refresh = refresh.map(|d| d.as_secs()), "knowdb data loaded");
-        if let Some(interval) = refresh {
-            crate::lifecycle::provider_refresh::register_spec(
-                crate::lifecycle::provider_refresh::ReloadSpec {
-                    name: name.to_string(),
-                    interval,
-                    kind: crate::lifecycle::provider_refresh::ReloadKind::Csv(csv_path),
+        wf_info!(
+            conf,
+            table = %t.name,
+            rows = row_count,
+            refresh = t.refresh.map(|d| d.as_secs()),
+            "knowdb data loaded"
+        );
+        if let Some(interval) = t.refresh {
+            crate::lifecycle::provider_refresh::register_spec(wp_knowledge::refresh::RefreshSpec {
+                name: t.name.clone(),
+                interval,
+                source: wp_knowledge::refresh::RefreshSource::Authority {
+                    root: assets.clone(),
+                    conf: conf_rel.clone(),
+                    authority_uri: authority_uri.clone(),
+                    table: t.name.clone(),
                 },
-            );
+            });
         }
     }
     Ok(())
 }
 
-/// 读 knowdb [[tables]] 的 CSV 数据行（启动与定时刷新共用同一 reader，保证
-/// 列映射/类型推断语义一致）。行 = 列名 → 引擎值（`infer_knowledge_value`）。
-pub(super) fn read_knowledge_csv(
-    csv_path: &Path,
-) -> RuntimeResult<Vec<std::collections::HashMap<String, EngineValue>>> {
+/// 探测 CSV 列（顺序 = 表头序）与列数值性：某列每个**非空**单元都能解析为
+/// 有限 f64 → 数值列（派生 DDL 用 REAL），否则文本列（TEXT）。空单元不拖累
+/// 数值列（老引擎对空单元给 Str('')，与数值共存时按列型会产生歧义，这里数值
+/// 列仅由非空样本判定）。空文件（仅表头）也返回列清单。
+fn sniff_csv_schema(csv_path: &Path) -> RuntimeResult<Vec<(String, bool)>> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
@@ -561,7 +618,6 @@ pub(super) fn read_knowledge_csv(
                 e
             ))
         })?;
-
     let headers: Vec<String> = reader
         .headers()
         .map_err(|e| {
@@ -572,25 +628,132 @@ pub(super) fn read_knowledge_csv(
         .iter()
         .map(|h| h.to_string())
         .collect();
-
-    let mut rows: Vec<std::collections::HashMap<String, EngineValue>> = Vec::with_capacity(1024);
+    if headers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut numeric = vec![true; headers.len()];
     for result in reader.records() {
         let record = result.map_err(|e| {
             RuntimeReason::Bootstrap
                 .to_err()
                 .with_detail(format!("csv row: {}", e))
         })?;
-        let mut map = std::collections::HashMap::new();
-        for (i, value) in record.iter().enumerate() {
-            let field = headers
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("col_{}", i));
-            map.insert(field, infer_knowledge_value(value));
+        for (i, cell) in record.iter().enumerate() {
+            if i >= numeric.len() {
+                break;
+            }
+            let cell = cell.trim();
+            if cell.is_empty() {
+                continue; // 空单元不参与列型判定
+            }
+            if numeric[i] && !(cell.parse::<f64>().map(|n| n.is_finite()).unwrap_or(false)) {
+                numeric[i] = false;
+            }
         }
-        rows.push(map);
     }
-    Ok(rows)
+    Ok(headers.into_iter().zip(numeric).collect())
+}
+
+/// 写派生 KnowDB V2 资产：`<root>/knowdb.toml`（每表一条 [[tables]]，
+/// `columns.by_header` 表头序 + 绝对 `data_file`）与 `<root>/<table>/` 下的
+/// 类型化 create.sql/insert.sql（列名直写，loader 的 `{{table}}` 替换为空转）。
+/// 每次启动全量重写（确定性）：权威库若有旧 schema，DDL 走 IF NOT EXISTS，
+/// 换列需清 `.run/knowdb_providers/authority.sqlite`。
+fn write_derived_knowdb_assets(root: &Path, tables: &[CsvTable]) -> RuntimeResult<()> {
+    std::fs::create_dir_all(root).source_raw_err(
+        RuntimeReason::Bootstrap,
+        format!("create {}", root.display()),
+    )?;
+
+    let mut conf = String::from(
+        "version = 2\nbase_dir = \".\"\n\n[default]\ntransaction = true\nbatch_size = 2000\non_error = \"fail\"\n\n[csv]\nhas_header = true\ndelimiter = \",\"\nencoding = \"utf-8\"\ntrim = true\n",
+    );
+    for t in tables {
+        let cols = t
+            .cols
+            .iter()
+            .map(|(n, _)| format!("\"{}\"", n.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conf.push_str(&format!(
+            "\n[[tables]]\nname = \"{}\"\ndir = \"{}\"\nenabled = true\ndata_file = \"{}\"\ncolumns.by_header = [{}]\n",
+            t.name.replace('"', "\\\""),
+            t.name.replace('"', "\\\""),
+            t.csv_path.display().to_string().replace('"', "\\\""),
+            cols
+        ));
+    }
+    std::fs::write(root.join("knowdb.toml"), conf).source_raw_err(
+        RuntimeReason::Bootstrap,
+        format!("write {}", root.join("knowdb.toml").display()),
+    )?;
+
+    for t in tables {
+        let table_dir = root.join(&t.name);
+        std::fs::create_dir_all(&table_dir).source_raw_err(
+            RuntimeReason::Bootstrap,
+            format!("create {}", table_dir.display()),
+        )?;
+        let mut create = String::from("CREATE TABLE IF NOT EXISTS ");
+        create.push_str(&t.name);
+        create.push_str(" (\n");
+        for (i, (col, num)) in t.cols.iter().enumerate() {
+            if i > 0 {
+                create.push_str(",\n");
+            }
+            create.push_str(&format!("  {} {}", col, if *num { "REAL" } else { "TEXT" }));
+        }
+        create.push_str("\n);\n");
+        std::fs::write(table_dir.join("create.sql"), create).source_raw_err(
+            RuntimeReason::Bootstrap,
+            format!("write create.sql for {}", t.name),
+        )?;
+
+        let cols = t
+            .cols
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = (1..=t.cols.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert = format!(
+            "INSERT INTO {} ({}) VALUES ({});\n",
+            t.name, cols, placeholders
+        );
+        std::fs::write(table_dir.join("insert.sql"), insert).source_raw_err(
+            RuntimeReason::Bootstrap,
+            format!("write insert.sql for {}", t.name),
+        )?;
+    }
+    Ok(())
+}
+
+/// 引擎行边界转换：KnowDB 原生行（`RowData` = 列 → 值，DDL 类型化）→ 引擎
+/// `Value` 行。值语义与 PG 路径一致：`Bool` 直接映射，其余经 Display 走
+/// [`infer_knowledge_value`]（数字文本 → Number，true/false → Bool，其余 Str），
+/// 与老引擎逐单元推断结果一致（2026-08-23 q13 契约）。
+pub(super) fn engine_rows_from_knowdb(
+    rows: Vec<wp_knowledge::mem::RowData>,
+) -> Vec<std::collections::HashMap<String, EngineValue>> {
+    rows.into_iter()
+        .map(|row| {
+            let mut map = HashMap::new();
+            for field in row {
+                map.insert(
+                    field.get_name().to_string(),
+                    match field.get_value() {
+                        wp_model_core::model::Value::Null => EngineValue::Str(String::new().into()),
+                        wp_model_core::model::Value::Bool(b) => EngineValue::Bool(*b),
+                        other => infer_knowledge_value(&other.to_string()),
+                    },
+                );
+            }
+            map
+        })
+        .collect()
 }
 
 /// 解析 knowdb [[tables]] 的 `refresh` 键（如 `"5m"`）为刷新周期。
