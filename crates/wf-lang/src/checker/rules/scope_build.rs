@@ -45,9 +45,32 @@ pub(crate) fn build_scope<'a>(
             }
         }
 
-        // Check filter expression if present
+        // Check filter expression if present. Const-string rule-level `let`s
+        // (regex reuse, issue #90) are inlined to literals first so the checker
+        // sees the same AST as the compiler/runtime; references to non-literal
+        // lets are rejected explicitly (bind filters run before per-event `let`
+        // injection, so only string-literal lets can be referenced there).
         if let Some(ref filter) = decl.filter {
-            check_expr_type(filter, &scope, rule_name, errors);
+            let mut visiting = Vec::new();
+            let inlined = crate::ast::inline_const_string_lets(filter, &rule.lets, &mut visiting);
+            let leftover_lets = crate::ast::collect_rule_let_refs(&inlined, &rule.lets);
+            if !leftover_lets.is_empty() {
+                // 非字面量 let 引用已显式报错；继续检查会级联出
+                // “field not found” 噪音，跳过本条件的深层检查。
+                for name in leftover_lets {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "rule-level let `{}` used in the events condition must be a string literal (regex pattern); non-literal lets are evaluated after the bind filter and cannot be referenced here",
+                            name
+                        ),
+                    });
+                }
+                continue;
+            }
+            check_expr_type(&inlined, &scope, rule_name, errors);
         }
     }
 

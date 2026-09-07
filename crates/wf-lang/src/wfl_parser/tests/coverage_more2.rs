@@ -172,3 +172,27 @@ rule r {
     assert!(each.filter.is_some(), "each filter must be parsed");
     assert_eq!(rule.score.expr, crate::ast::Expr::Number(1.0));
 }
+
+#[test]
+fn parse_leading_and_trailing_lets_merge_in_textual_order() {
+    // issue #90：规则级 let 可置于 events 之前；前置与尾部 let 合并且保持
+    // 文本顺序（events 条件内联依赖规则级 let 集合，顺序影响链式引用检查）。
+    let input = r#"
+rule r {
+    let base = "\\b62\\d{14,17}\\b"
+    events { e : win && regex_match(e.sip, re) }
+    let re = base
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).expect("parse should succeed");
+    let rule = &file.rules[0];
+    let names: Vec<&str> = rule.lets.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, vec!["base", "re"]);
+    assert_eq!(
+        rule.lets[1].expr,
+        crate::ast::Expr::Field(crate::ast::FieldRef::Simple("base".to_string(),))
+    );
+}

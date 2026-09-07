@@ -60,6 +60,13 @@ pub(super) fn rule_decl_with_patterns(
     ws_skip.parse_next(input)?;
     let meta = opt(meta_block).parse_next(input)?;
 
+    // Optional leading `let` declarations (issue #90): string-literal lets
+    // (regex reuse) may be declared before the events block; merged with the
+    // trailing lets below in textual order (checker/compiler treat all
+    // rule-level lets uniformly).
+    ws_skip.parse_next(input)?;
+    let leading_lets: Vec<LetDecl> = repeat(0.., clauses::let_clause).parse_next(input)?;
+
     // Required events block
     ws_skip.parse_next(input)?;
     let events = cut_err(events::events_block)
@@ -71,7 +78,9 @@ pub(super) fn rule_decl_with_patterns(
     // Optional per-event `let` bindings (evaluated once per event on the
     // on-each path; referenced by bare name in later expressions).
     ws_skip.parse_next(input)?;
-    let lets: Vec<LetDecl> = repeat(0.., clauses::let_clause).parse_next(input)?;
+    let trailing_lets: Vec<LetDecl> = repeat(0.., clauses::let_clause).parse_next(input)?;
+    let mut lets = leading_lets;
+    lets.extend(trailing_lets);
 
     // Parse either:
     // 1) stats rule (声明式窗口统计, 无 score/join/conv),
