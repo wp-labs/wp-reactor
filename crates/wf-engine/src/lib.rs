@@ -22,6 +22,10 @@ pub mod error {
 pub mod external {
     pub use wf_cep::external::*;
 }
+// baseline（近端 B 共享历史表，2026-09-07）已下沉 wf-cep；shim 重导出
+pub mod baseline {
+    pub use wf_cep::baseline::*;
+}
 pub mod match_engine;
 pub mod pipe;
 pub mod sink;

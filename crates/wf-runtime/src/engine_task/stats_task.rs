@@ -484,6 +484,64 @@ impl StatsTask {
         }
     }
 
+    /// 近端 B 收盘 append（S2-M2，B-b）：仅 baseline_out 形态（group by 双键 +
+    /// Count/Sum/SumSq 三元组）把本窗 `(entity, metric)` 的可加三元组写入
+    /// 跨规则共享 BaselineStore（judge 规则经 `baseline_dev` 读取）。
+    fn append_baseline_history(
+        &self,
+        window_start: i64,
+        window_end: i64,
+        scope_key: &ScopeKey,
+        values: &[f64],
+    ) {
+        if self.executor.static_yield_target().as_ref() != "baseline_out" {
+            return;
+        }
+        let plan = &self.stats.plan;
+        if plan.keys.len() != 2 || plan.measures.len() != 3 {
+            return;
+        }
+        let find = |agg: StatsAggPlan| plan.measures.iter().position(|m| m.agg == agg);
+        let (Some(i_n), Some(i_sum), Some(i_sq)) = (
+            find(StatsAggPlan::Count),
+            find(StatsAggPlan::Sum),
+            find(StatsAggPlan::SumSq),
+        ) else {
+            return;
+        };
+        let Some(n) = values.get(i_n).copied() else {
+            return;
+        };
+        let Some(sum) = values.get(i_sum).copied() else {
+            return;
+        };
+        let Some(sum_sq) = values.get(i_sq).copied() else {
+            return;
+        };
+        let kv = scope_key_to_values(scope_key);
+        let to_str = |v: &wf_engine::match_engine::Value| match v {
+            wf_engine::match_engine::Value::Str(s) => s.to_string(),
+            wf_engine::match_engine::Value::Number(x) => x.to_string(),
+            wf_engine::match_engine::Value::Bool(b) => b.to_string(),
+            _ => String::new(),
+        };
+        if kv.len() != 2 {
+            return;
+        }
+        let store = wf_engine::baseline::store();
+        store.append(
+            &to_str(&kv[0]),
+            &to_str(&kv[1]),
+            wf_engine::baseline::BaselineWindow {
+                win_start_nanos: window_start,
+                win_end_nanos: window_end,
+                n,
+                sum,
+                sum_sq,
+            },
+        );
+    }
+
     /// close 当前窗口: 冻结度量值 → 按桶合成 CloseOutput → alert 构建 → 投递。
     ///
     /// 带 key（P2）: 每桶一条 alert; 桶键拆解为 `scope_key` + 键字段值注入
@@ -700,6 +758,8 @@ impl StatsTask {
                     break;
                 }
                 for (scope_key, values) in self.stats.close_bucket_values(buckets) {
+                    // 近端 B（S2-M2）：baseline_out 形态收盘即写共享历史表。
+                    self.append_baseline_history(window_start, window_end, &scope_key, &values);
                     let close = build_stats_close_output(
                         self.rule_name(),
                         &values,

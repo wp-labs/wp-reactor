@@ -20,6 +20,7 @@
 #[cfg(test)]
 mod sem_tests;
 
+pub mod baseline;
 pub mod cep;
 pub mod cidr_cache;
 pub mod error;

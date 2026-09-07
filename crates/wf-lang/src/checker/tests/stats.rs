@@ -1,6 +1,57 @@
 use super::*;
 
 // =========================================================================
+// baseline_dev（近端 B judge）校验（2026-09-07）
+// =========================================================================
+
+#[test]
+fn baseline_dev_valid_usage_in_each_filter() {
+    let input = r#"
+rule r {
+    events { a : auth_events }
+    on each a where baseline_dev(a.sip, a.user, a.count) > 3.0 -> score(50.0)
+    entity(ip, a.sip)
+    yield out (x = a.sip, y = a.user, n = 1)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
+}
+
+#[test]
+fn baseline_dev_arity_rejected() {
+    let input = r#"
+rule r {
+    events { a : auth_events }
+    on each a where baseline_dev(a.sip, a.count) > 3.0 -> score(50.0)
+    entity(ip, a.sip)
+    yield out (x = a.sip, y = a.user, n = 1)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "baseline_dev() requires exactly 3 arguments: (entity, metric, value)",
+    );
+}
+
+#[test]
+fn baseline_dev_non_numeric_value_rejected() {
+    let input = r#"
+rule r {
+    events { a : auth_events }
+    on each a where baseline_dev(a.sip, a.user, a.user) > 3.0 -> score(50.0)
+    entity(ip, a.sip)
+    yield out (x = a.sip, y = a.user, n = 1)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "baseline_dev() third argument (value) must be numeric",
+    );
+}
+
+// =========================================================================
 // stats 形态 stat.value(final(label)) 校验（P1 步骤④b）
 // =========================================================================
 

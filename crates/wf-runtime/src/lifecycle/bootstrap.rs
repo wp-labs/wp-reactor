@@ -45,6 +45,15 @@ pub(super) async fn load_and_compile(
         crate::lifecycle::compile::load_static_schemas(&config.runtime.schemas, base_dir)
             .unwrap_or_default();
 
+    // 近端 B warm（S2-M2）：启动装载共享基线历史（judge 规则读）。文件缺失/
+    // 解析失败直接报错——静默空历史会让 judge 全部不告警，难排查。
+    warm_baseline_history(
+        config.runtime.baseline_history.as_deref(),
+        config.runtime.baseline_history_k,
+        config.runtime.baseline_history_decay,
+        base_dir,
+    )?;
+
     // 2. Preprocess .wfl with config.vars → parse → compile → Vec<RulePlan>
     let var_ctx = build_runtime_var_context(config, base_dir);
     let (all_rule_plans, effective_schemas) =
@@ -564,6 +573,107 @@ fn load_knowledge_into_windows(
     Ok(())
 }
 
+/// 近端 B warm（S2-M2）：读 t_baseline 逐窗 CSV 装载共享 BaselineStore。
+/// CSV 头：`entity,metric,win_start,win_end,n,sum,sum_sq`（win_* = epoch
+/// 纳秒整数）。见 baseline-online-design.md §11 S2-M2。
+fn warm_baseline_history(
+    path: Option<&str>,
+    k: usize,
+    decay: bool,
+    base_dir: &Path,
+) -> RuntimeResult<()> {
+    let Some(rel) = path else {
+        return Ok(());
+    };
+    let full = base_dir.join(rel);
+    let content = std::fs::read_to_string(&full).source_err(
+        RuntimeReason::Bootstrap,
+        format!("read baseline history {}", full.display()),
+    )?;
+    let mut lines = content.lines();
+    let Some(header_line) = lines.next() else {
+        return RuntimeReason::Bootstrap
+            .to_err()
+            .with_detail("baseline history csv 为空".to_string())
+            .err();
+    };
+    // BOM 容错（Excel 导出常带 \u{feff}）。
+    let header_line = header_line.trim_start_matches('\u{feff}');
+    let header: Vec<&str> = header_line.split(',').map(|s| s.trim()).collect();
+    let col = |name: &str| -> RuntimeResult<usize> {
+        header.iter().position(|h| *h == name).ok_or_else(|| {
+            RuntimeReason::Bootstrap.to_err().with_detail(format!(
+                "baseline history csv 缺列 '{name}'：{header_line:?}"
+            ))
+        })
+    };
+    let (i_ent, i_met, i_ws, i_we, i_n, i_s, i_ss) = (
+        col("entity")?,
+        col("metric")?,
+        col("win_start")?,
+        col("win_end")?,
+        col("n")?,
+        col("sum")?,
+        col("sum_sq")?,
+    );
+
+    let installed_ok = wf_engine::baseline::install(k, decay);
+    let store = wf_engine::baseline::store();
+    // install 失败 = 本进程已存在共享实例（多配置/测试等）——warm 仍写入既有实例，
+    // 但 k/decay 以先安装者为准；提示以免误以为本次配置生效。
+    if !installed_ok || store.k() != k || store.decayed() != decay {
+        wf_warn!(
+            conf,
+            k,
+            decay,
+            "baseline store 已被占用或参数不符，使用既有实例（warm 照常写入）"
+        );
+    }
+    let mut rows = 0u64;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let field: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        let at = |i: usize| field.get(i).copied().unwrap_or("");
+        let parse_i64 = |i: usize, what: &str| -> RuntimeResult<i64> {
+            at(i).parse::<i64>().map_err(|_| {
+                RuntimeReason::Bootstrap.to_err().with_detail(format!(
+                    "baseline history csv 第 {} 行列 '{what}' 非法：{:?}",
+                    rows + 2,
+                    at(i)
+                ))
+            })
+        };
+        let parse_f64 = |i: usize, what: &str| -> RuntimeResult<f64> {
+            at(i).parse::<f64>().map_err(|_| {
+                RuntimeReason::Bootstrap.to_err().with_detail(format!(
+                    "baseline history csv 第 {} 行列 '{what}' 非法：{:?}",
+                    rows + 2,
+                    at(i)
+                ))
+            })
+        };
+        let entity = at(i_ent);
+        let metric = at(i_met);
+        if entity.is_empty() || metric.is_empty() {
+            continue; // 空隔离键行防御性跳过（不建空键基线）
+        }
+        let window = wf_engine::baseline::BaselineWindow {
+            win_start_nanos: parse_i64(i_ws, "win_start")?,
+            win_end_nanos: parse_i64(i_we, "win_end")?,
+            n: parse_f64(i_n, "n")?,
+            sum: parse_f64(i_s, "sum")?,
+            sum_sq: parse_f64(i_ss, "sum_sq")?,
+        };
+        store.append(entity, metric, window);
+        rows += 1;
+    }
+    wf_info!(conf, path = %full.display(), rows, k, "baseline history warm loaded");
+    Ok(())
+}
+
 fn load_from_postgres(
     config: &toml::Value,
     tables: &[toml::Value],
@@ -794,6 +904,9 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+#[path = "baseline_warm_tests.rs"]
+mod baseline_warm_tests;
 #[cfg(test)]
 #[path = "bootstrap_coverage.rs"]
 mod bootstrap_coverage;

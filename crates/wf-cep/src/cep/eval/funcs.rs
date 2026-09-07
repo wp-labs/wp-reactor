@@ -5,7 +5,7 @@
 use super::super::types::{EngineHashMap, FieldSource, RollingStats, Value, WindowLookup};
 use wf_lang::ast::Expr;
 
-use super::{funcs_misc::*, funcs_num::*, funcs_str::*, funcs_time::*};
+use super::{funcs_baseline::*, funcs_misc::*, funcs_num::*, funcs_str::*, funcs_time::*};
 
 pub(super) fn eval_func_call(
     name: &str,
@@ -101,6 +101,7 @@ fn eval_handler(name: &str) -> Option<FuncHandler> {
         map.insert("stddev", eval_func_stddev);
         map.insert("percentile", eval_func_stddev);
         map.insert("external", eval_func_external);
+        map.insert("baseline_dev", eval_func_baseline_dev);
         map
     });
     map.get(name).copied()

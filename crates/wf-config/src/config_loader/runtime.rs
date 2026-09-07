@@ -57,6 +57,18 @@ pub struct RuntimeConfig {
     pub schemas: String,
     /// Glob pattern for WFL rule (.wfl) files, relative to config dir.
     pub rules: String,
+    /// 近端 B（baseline-online-design §11）：启动时从该 CSV 装载共享
+    /// BaselineStore（每键 K 窗，见 `baseline_history_k`）。CSV 头：
+    /// `entity,metric,win_start,win_end,n,sum,sum_sq`（win_* 为 epoch 纳秒整数）。
+    /// None = 不 warm（judge 规则对无历史键返回 None/不告警）。
+    #[serde(default)]
+    pub baseline_history: Option<String>,
+    /// 近端 B：每键保留的最近窗口数（默认 8）。
+    #[serde(default = "default_baseline_k")]
+    pub baseline_history_k: usize,
+    /// 近端 B：半衰期加权合并（§5.3，默认 true；false = 等权，对拍用）。
+    #[serde(default = "default_true")]
+    pub baseline_history_decay: bool,
 }
 
 fn default_parse_parallelism() -> usize {
@@ -73,6 +85,14 @@ fn default_window_buffer_bytes() -> usize {
 
 fn default_rule_shards() -> usize {
     1
+}
+
+fn default_baseline_k() -> usize {
+    8
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Expand a glob `pattern` relative to `base_dir` and return matched paths

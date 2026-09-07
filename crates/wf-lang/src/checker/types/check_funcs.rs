@@ -212,6 +212,7 @@ pub(crate) fn check_func_call(
         name,
         "has"
             | "baseline"
+            | "baseline_dev"
             | "coalesce"
             | "merge"
             | "isnull"
@@ -1488,6 +1489,27 @@ fn check_misc_func(
                         }
                     }
                 }
+            }
+        }
+        "baseline_dev" => {
+            // 近端 B judge：baseline_dev(entity, metric, value) → z-score。
+            // 参数 0/1 为隔离键字段（Chars/可转字符串），参数 2 数值。
+            if args.len() != 3 {
+                errors.push(rule_error(
+                    rule_name,
+                    "baseline_dev() requires exactly 3 arguments: (entity, metric, value)"
+                        .to_string(),
+                ));
+            } else if let Some(t) = infer_type(&args[2], scope)
+                && !is_numeric(&t)
+            {
+                errors.push(rule_error(
+                    rule_name,
+                    format!(
+                        "baseline_dev() third argument (value) must be numeric, got {:?}",
+                        t
+                    ),
+                ));
             }
         }
         "coalesce" => {
