@@ -12,16 +12,16 @@ use crate::schema::WindowSchema;
 use crate::yield_preset::{expand_rule_yield_presets, validate_yield_presets};
 
 /// Severity level for semantic check diagnostics.
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangChecker")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangChecker")]
 pub enum Severity {
     Error,
     Warning,
 }
 
 /// Semantic check error with optional rule/test context.
-#[derive(::moju_derive::MoJu, Debug, Clone)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangChecker")]
+#[derive(::jumo_derive::Jumo, Debug, Clone)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangChecker")]
 pub struct CheckError {
     pub severity: Severity,
     pub rule: Option<String>,

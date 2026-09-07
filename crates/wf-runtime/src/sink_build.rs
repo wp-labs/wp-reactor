@@ -14,8 +14,8 @@ use wf_engine::sink::{SinkDispatcher, SinkRuntime, WfMetaDisableMatcher};
 // ---------------------------------------------------------------------------
 
 /// Registry of `SinkFactory` implementations keyed by sink kind (e.g. `"file"`).
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.SinkFactory")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.SinkFactory")]
 pub struct SinkFactoryRegistry {
     factories: HashMap<String, Arc<dyn SinkFactory>>,
 }

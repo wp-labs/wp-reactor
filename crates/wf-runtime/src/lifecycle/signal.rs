@@ -1,7 +1,7 @@
 use tokio_util::sync::CancellationToken;
 
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(
     kind = "state",
     domain = "Runtime",
     module = "Runtime.ReactorLifecycle"

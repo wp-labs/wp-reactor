@@ -17,8 +17,8 @@ use sections::{
 };
 
 /// Human-readable explanation of a compiled rule.
-#[derive(Debug, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangExplain")]
+#[derive(Debug, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangExplain")]
 pub struct RuleExplanation {
     pub name: String,
     pub pattern_origin: Option<(String, Vec<String>)>,
@@ -35,16 +35,16 @@ pub struct RuleExplanation {
     pub lineage: Vec<(String, String)>,
 }
 
-#[derive(Debug, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangExplain")]
+#[derive(Debug, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangExplain")]
 pub struct BindingExpl {
     pub alias: String,
     pub window: String,
     pub filter: Option<String>,
 }
 
-#[derive(Debug, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangExplain")]
+#[derive(Debug, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangExplain")]
 pub struct MatchExpl {
     pub keys: String,
     pub window_spec: String,

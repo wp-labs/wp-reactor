@@ -3,8 +3,8 @@ use wp_connector_api::SinkSpec as ResolvedSinkSpec;
 use super::expect::GroupExpectSpec;
 use super::types::WildArray;
 
-#[derive(::moju_derive::MoJu, Debug)]
-#[moju(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
+#[derive(::jumo_derive::Jumo, Debug)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
 pub struct ResolvedRouteSink {
     pub spec: ResolvedSinkSpec,
     pub fields: Option<Vec<String>>,
@@ -17,8 +17,8 @@ pub struct ResolvedRouteSink {
 /// A business routing group with compiled window patterns and resolved sink specs.
 ///
 /// Created from a `RouteGroup` after connector resolution and parameter merging.
-#[derive(::moju_derive::MoJu, Debug)]
-#[moju(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
+#[derive(::jumo_derive::Jumo, Debug)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
 pub struct FlexGroup {
     /// Group name.
     pub name: String,
@@ -43,8 +43,8 @@ pub struct FlexGroup {
 // ---------------------------------------------------------------------------
 
 /// An infrastructure group (default or error fallback) without window patterns.
-#[derive(::moju_derive::MoJu, Debug)]
-#[moju(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
+#[derive(::jumo_derive::Jumo, Debug)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
 pub struct FixedGroup {
     /// Group name (e.g. `"__default"`, `"__error"`).
     pub name: String,

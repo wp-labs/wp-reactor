@@ -6,8 +6,8 @@
 
 use wf_engine::match_engine::Value;
 
-#[derive(Default, ::moju_derive::MoJu)]
-#[moju(
+#[derive(Default, ::jumo_derive::Jumo)]
+#[jumo(
     kind = "struct",
     domain = "Runtime",
     module = "Runtime.ExternalRuntime"

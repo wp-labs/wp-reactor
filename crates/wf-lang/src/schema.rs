@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 /// Base data types supported in window schemas.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangSchema")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangSchema")]
 pub enum BaseType {
     Chars,
     Digit,
@@ -14,8 +14,8 @@ pub enum BaseType {
 }
 
 /// A field type: either a base type, a typed array, or a structured value.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangSchema")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangSchema")]
 pub enum FieldType {
     Base(BaseType),
     /// Heterogeneous structured array.
@@ -25,16 +25,16 @@ pub enum FieldType {
 }
 
 /// A single field definition within a window schema.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangSchema")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq, Eq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangSchema")]
 pub struct FieldDef {
     pub name: String,
     pub field_type: FieldType,
 }
 
 /// A parsed window schema declaration.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangSchema")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangSchema")]
 pub struct WindowSchema {
     /// Window name (must be globally unique).
     pub name: String,
@@ -50,8 +50,8 @@ pub struct WindowSchema {
 
 /// A static (provider-backed) window schema. No stream, time, or over.
 /// Data comes from an external source (knowdb), not event streams.
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangSchema")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangSchema")]
 pub struct StaticWindowSchema {
     pub name: String,
     pub fields: Vec<FieldDef>,

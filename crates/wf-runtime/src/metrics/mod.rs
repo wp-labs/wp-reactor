@@ -65,8 +65,8 @@ const DEFAULT_HISTOGRAM_BUCKETS_SECONDS: &[f64] = &[
 /// Lock-free histogram with fixed buckets.
 ///
 /// Each observation increments exactly one bucket (non-cumulative storage).
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
 struct Histogram {
     upper_bounds_nanos: Vec<u64>,
     bucket_counts: Vec<AtomicU64>,
@@ -113,8 +113,8 @@ impl Histogram {
     }
 }
 
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
 struct HistogramSnapshot {
     upper_bounds_nanos: Vec<u64>,
     bucket_counts: Vec<u64>,
@@ -123,14 +123,14 @@ struct HistogramSnapshot {
 }
 
 /// A single metrics data point — lightweight key-value pairs for sink transport.
-#[derive(Debug, Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
+#[derive(Debug, Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
 pub struct MetricsRecord {
     pub fields: Vec<(String, String)>,
 }
 
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
 pub(crate) struct MetricsSnapshot {
     source_types: BTreeMap<String, String>,
     receiver_connections: u64,
@@ -316,8 +316,8 @@ fn percentile(h: &HistogramSnapshot, p: f64) -> f64 {
         .unwrap_or(0.0)
 }
 
-#[derive(::moju_derive::MoJu, Clone, Copy)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
+#[derive(::jumo_derive::Jumo, Clone, Copy)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
 pub(crate) struct IntervalRates {
     row_s: f64,
     late_s: f64,
@@ -327,8 +327,8 @@ pub(crate) struct IntervalRates {
     memory_bytes: u64,
 }
 
-#[derive(::moju_derive::MoJu, Clone, Copy)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
+#[derive(::jumo_derive::Jumo, Clone, Copy)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
 pub(crate) struct IntervalSnapshot {
     at: Instant,
     rx_rows: u64,
@@ -339,8 +339,8 @@ pub(crate) struct IntervalSnapshot {
     window_bytes: u64,
 }
 
-#[derive(::moju_derive::MoJu, Clone, Copy)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
+#[derive(::jumo_derive::Jumo, Clone, Copy)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
 pub(crate) struct TotalCounts {
     rows: u64,
     late: u64,
@@ -349,8 +349,8 @@ pub(crate) struct TotalCounts {
     sm_delta: i64,
 }
 
-#[derive(::moju_derive::MoJu, Default)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
+#[derive(::jumo_derive::Jumo, Default)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
 pub(crate) struct RunSummary {
     interval_count: u64,
     sum_row_s: f64,
@@ -439,8 +439,8 @@ impl RunSummary {
 ///
 /// Counters are lock-free atomics. Label sets (`rule`, `window`) are fixed at
 /// startup to keep hot-path updates allocation-free.
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
 pub struct RuntimeMetrics {
     receiver_connections_total: AtomicU64,
     receiver_frames_total: AtomicU64,

@@ -33,8 +33,8 @@ type MaskCacheMap =
 /// 批级时间信息缓存表: key = (首列 Arc 指针, 行数), value = (批 Arc, max_time)。
 type TimeCacheMap = std::collections::HashMap<(usize, usize), (Arc<RecordBatch>, i64)>;
 
-#[derive(Debug, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct StatsMaskCache {
     inner: std::sync::Mutex<MaskCacheMap>,
     time_inner: std::sync::Mutex<TimeCacheMap>,

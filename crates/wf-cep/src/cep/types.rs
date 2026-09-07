@@ -19,8 +19,8 @@ pub use crate::value::{EngineHashMap, EngineHashSet, MACHINE_ID, Value};
 ///
 /// M14 works exclusively with this type. Arrow RecordBatch bridging (M16)
 /// will provide a zero-copy adapter later.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct Event {
     pub fields: EngineHashMap<SmolStr, Value>,
 }
@@ -92,8 +92,8 @@ impl FieldSource for Event {
 /// hashable (f64/recursive), so join lookups convert the key field to this
 /// concrete scalar form. Object/array values map to `None` (rejected at
 /// compile time — see checker join key constraint).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 pub enum JoinKey {
     Int(i64),
     Str(String),
@@ -118,8 +118,8 @@ impl JoinKey {
 // ---------------------------------------------------------------------------
 
 /// Outcome of feeding one event into the state machine.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 #[allow(clippy::large_enum_variant)] // MatchedContext 携带 step/时间元数据；Box 化会给热路径加分配
 pub enum StepResult {
     /// Event was consumed but no step boundary was crossed.
@@ -131,8 +131,8 @@ pub enum StepResult {
 }
 
 /// Diagnostic progress produced while an event is evaluated against a step.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct StepProgress {
     pub rule_name: String,
     pub scope_key: Vec<Value>,
@@ -150,16 +150,16 @@ pub struct StepProgress {
 }
 
 /// Result of feeding one event with optional diagnostic progress.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct StepOutcome {
     pub result: StepResult,
     pub progress: Option<StepProgress>,
 }
 
 /// Context returned when a full match fires.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct MatchedContext {
     pub rule_name: String,
     pub scope_key: Vec<Value>,
@@ -196,8 +196,8 @@ pub struct MatchedContext {
 }
 
 /// Per-step snapshot captured when a step is satisfied.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct StepData {
     pub satisfied_branch_index: usize,
     pub label: Option<String>,
@@ -211,8 +211,8 @@ pub struct StepData {
 }
 
 /// Snapshot of all events accepted by a bound alias within the current instance.
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct BindData {
     pub alias: String,
     pub count: u64,
@@ -224,8 +224,8 @@ pub struct BindData {
 // ---------------------------------------------------------------------------
 
 /// Reason why a window instance was closed.
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 pub enum CloseReason {
     Timeout,
     Flush,
@@ -245,8 +245,8 @@ impl CloseReason {
 use wf_lang::ast::CloseMode;
 
 /// Output produced when an instance is closed (by timeout, flush, or eos).
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct CloseOutput {
     pub rule_name: String,
     pub scope_key: Vec<Value>,
@@ -376,8 +376,8 @@ pub trait WindowLookup: Send + Sync {
 }
 
 /// Outcome of the asof-join O(1) fast path ([`WindowLookup::asof_lookup_max`]).
-#[derive(Clone, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 pub enum AsofLookup {
     /// Fast-path hit: the unique row whose timestamp is the maximum within
     /// `[event_time - within, event_time]`.
@@ -398,8 +398,8 @@ pub enum AsofLookup {
 
 /// Cumulative statistics tracker for `baseline()` function.
 /// Supports three methods: mean (standard deviation), ewma (exponential weighted), median.
-#[derive(Debug, Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(Debug, Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct RollingStats {
     count: u64,
     sum: f64,

@@ -19,8 +19,8 @@ use toml::Value as TomlValue;
 /// ```toml
 /// tags = ["env:dev"]
 /// ```
-#[derive(Debug, Clone, Default, Deserialize, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
+#[derive(Debug, Clone, Default, Deserialize, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
 pub struct DefaultsBody {
     /// Default tags applied to all groups/sinks (lowest priority).
     #[serde(default)]

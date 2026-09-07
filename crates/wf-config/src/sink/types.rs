@@ -12,8 +12,8 @@ pub use wp_connector_api::ParamMap;
 /// windows = "security_*"        # single
 /// windows = ["sec_*", "auth_*"] # array
 /// ```
-#[derive(Debug, Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
+#[derive(Debug, Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
 pub struct StringOrArray(pub Vec<String>);
 
 impl<'de> Deserialize<'de> for StringOrArray {
@@ -54,8 +54,8 @@ impl<'de> Deserialize<'de> for StringOrArray {
 /// A set of wildcard patterns compiled from string globs.
 ///
 /// Matches against yield-target window names during sink routing.
-#[derive(Debug, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
+#[derive(Debug, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
 pub struct WildArray {
     patterns: Vec<String>,
     compiled: Vec<wildmatch::WildMatch>,

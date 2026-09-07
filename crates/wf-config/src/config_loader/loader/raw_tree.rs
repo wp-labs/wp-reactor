@@ -6,15 +6,15 @@ use toml::Value as TomlValue;
 
 use crate::{ConfigReason, ConfigResult};
 
-#[derive(::moju_derive::MoJu, Debug, Clone)]
-#[moju(kind = "struct", domain = "Config", module = "Config.ConfigLoader")]
+#[derive(::jumo_derive::Jumo, Debug, Clone)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.ConfigLoader")]
 pub struct RawFusionConfigTree {
     pub(crate) value: TomlValue,
     pub(crate) origins: HashMap<String, PathBuf>,
 }
 
-#[derive(::moju_derive::MoJu, Debug, Clone)]
-#[moju(kind = "struct", domain = "Config", module = "Config.ConfigLoader")]
+#[derive(::jumo_derive::Jumo, Debug, Clone)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.ConfigLoader")]
 pub struct RawFusionConfigChange {
     pub path: String,
     pub old_value: Option<TomlValue>,

@@ -8,8 +8,8 @@ use crate::value::Value;
 /// 行字段槽型（2026-08-26 q18/q19：stats last/top 行字段紧凑化）。
 /// 每字段一个槽位：数字→`numeric`（f64 8B）、字符串→`strings`（SmolStr 24B
 /// 内联）、其它→`others`（原 `Option<Value>` 万能盒回退）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
 pub enum RowFieldSlot {
     Numeric(usize),
     Str(usize),
@@ -18,8 +18,8 @@ pub enum RowFieldSlot {
 
 /// 字段类型分派表（executor 级，所有桶共享；列式从 batch schema 构建，
 /// 行式无静态类型时退化为全 Other——不紧凑但正确）。
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct RowFieldLayout {
     slots: Vec<RowFieldSlot>,
     n_numeric: usize,
@@ -112,8 +112,8 @@ impl RowFieldLayout {
 /// 数字 8B / 字符串 24B（内联）/ 其它回退。null 由 `null_mask` 位标记
 /// （numeric 的 NaN 与 strings 的空串都是合法数据，不能作哨兵）。
 /// 自包含 layout（Arc），下游（stats_task 注入）可独立读取。
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct RowFields {
     layout: std::sync::Arc<RowFieldLayout>,
     numeric: Box<[f64]>,

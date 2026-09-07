@@ -16,6 +16,6 @@ orion-error = { workspace = true }
 glob = { workspace = true }
 wp-connector-api = { workspace = true }
 wildmatch = { workspace = true }
-moju-derive = { workspace = true }
+jumo-derive = { workspace = true }
 
 [dev-dependencies]

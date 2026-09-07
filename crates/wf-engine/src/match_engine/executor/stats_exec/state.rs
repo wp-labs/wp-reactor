@@ -31,15 +31,15 @@ use super::{
 /// 惰性 spill store 创建规格（P0 修复 2026-08-27）：路径 + 行字段 layout。
 /// 纯数据（`PathBuf` + `Arc<RowFieldLayout>`，天然 Send + Sync）——首次驱逐时
 /// 才 `RedbSpillStore::create`（零驱逐窗口不建库/不起写 worker，零开销）。
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub(crate) struct SpillCreateSpec {
     pub(crate) path: std::path::PathBuf,
     pub(crate) layout: std::sync::Arc<RowFieldLayout>,
 }
 
-#[derive(Default, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Default, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct StatsWindowState {
     pub buckets: EngineHashMap<u64, Vec<StatsBucket>>,
     pub window_start_nanos: i64,
@@ -820,8 +820,8 @@ fn account_bucket_allowed(
 /// 形态）; 含 distinct/last/top → [`Classic`](StatsBucketAccs::Classic)（原有
 /// [`StatsAccum`] 数组）。分派在累积/读取/合并入口各一次（每行, 非每度量）。
 /// spill 序列化以 [`StatsWindowState::accs_to_spill_vec`] 统一转 `Vec<StatsAccum>`。
-#[derive(Debug, Clone, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
 pub enum StatsBucketAccs {
     Numeric(NumericSoA),
     Classic(Vec<StatsAccum>),
@@ -829,8 +829,8 @@ pub enum StatsBucketAccs {
 
 /// 单桶: 完整 [`ScopeKey`]（close 排序/输出; 每桶一次构建）+ 累加器载体 +
 /// 时钟二次机会计数。
-#[derive(Debug, Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct StatsBucket {
     pub scope_key: ScopeKey,
     pub accs: StatsBucketAccs,

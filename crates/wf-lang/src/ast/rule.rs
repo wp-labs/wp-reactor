@@ -6,8 +6,8 @@ use super::*;
 
 /// A complete `.wfl` file.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct WflFile {
     pub uses: Vec<UseDecl>,
     pub patterns: Vec<PatternDecl>,
@@ -22,8 +22,8 @@ pub struct WflFile {
 
 /// `name = ("a", "b", ...)`——顶层命名字面列表声明。
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct ListDecl {
     pub name: String,
     /// 列表元素（字面量; 编译期检查元素类型与展开处 InList 的类型校验一致）。
@@ -32,8 +32,8 @@ pub struct ListDecl {
 
 /// A reusable yield field set: `yield preset name [<params...>] (...)`.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct YieldPresetDecl {
     pub name: String,
     pub params: Vec<YieldPresetParam>,
@@ -42,8 +42,8 @@ pub struct YieldPresetDecl {
 
 /// One parameter declared by a parameterized yield preset.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct YieldPresetParam {
     pub name: String,
     pub default: Option<Expr>,
@@ -55,8 +55,8 @@ pub struct YieldPresetParam {
 /// When a rule invokes the pattern, parameters are textually substituted and the
 /// body is parsed as a concrete `MatchClause` + `ScoreExpr`.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct PatternDecl {
     pub name: String,
     pub params: Vec<String>,
@@ -64,8 +64,8 @@ pub struct PatternDecl {
 }
 
 /// Tracks which pattern was used to generate the match clause (for `wf explain`).
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct PatternOrigin {
     pub pattern_name: String,
     pub args: Vec<String>,
@@ -73,8 +73,8 @@ pub struct PatternOrigin {
 
 /// `use "path.wfs"`
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct UseDecl {
     pub path: String,
 }
@@ -85,8 +85,8 @@ pub struct UseDecl {
 
 /// One `match ... [-> score(...)] [join ...]*` segment in a pipeline.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct PipelineStage {
     pub match_clause: MatchClause,
     pub each_clause: Option<EachClause>,
@@ -95,8 +95,8 @@ pub struct PipelineStage {
 
 /// `rule name { meta events [let ...]* stage_chain entity yield [conv] [limits] }`
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct RuleDecl {
     pub name: String,
     pub meta: Option<MetaBlock>,
@@ -126,8 +126,8 @@ pub struct RuleDecl {
 /// path; the bound value is injected into the event's field map, so later
 /// expressions reference it by bare name).
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct LetDecl {
     pub name: String,
     pub expr: Expr,
@@ -135,15 +135,15 @@ pub struct LetDecl {
 
 /// `meta { key = "value" ... }`
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct MetaBlock {
     pub entries: Vec<MetaEntry>,
 }
 
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct MetaEntry {
     pub key: String,
     pub value: String,

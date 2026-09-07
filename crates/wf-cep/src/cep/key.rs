@@ -8,8 +8,8 @@ use super::types::{EngineHashMap, FieldSource, RollingStats, Value};
 // Value key — typed, hashable key for distinct-like state
 // ---------------------------------------------------------------------------
 
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Hash)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq, Eq, Hash)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 pub enum ValueKey {
     Number(u64),
     Str(String),
@@ -79,8 +79,8 @@ fn canonical_f64_bits(value: f64) -> u64 {
 /// (including `Timestamp(Ns)`, read as `i64`), so a columnar `Int64` column and
 /// the row-based `Value::Number(f64)` (integer, `<2^53`) produce the **same**
 /// variant and hash equal.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 pub enum ScopeKey {
     #[default]
     Empty,
@@ -200,8 +200,8 @@ fn nested_bytes(hash: &mut u64, key: &ScopeKey) {
 /// a separate instance. The scope is a typed [`ScopeKey`] (not a re-serialized
 /// string), so building the key for the per-event lookup is cheap — no
 /// number-to-string formatting on the hot path.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub(super) struct InstanceKey {
     pub scope_key: ScopeKey,
     pub bucket_start: Option<i64>,

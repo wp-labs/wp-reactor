@@ -19,8 +19,8 @@ use super::runtime::SinkRuntime;
 /// 2. If found (and non-empty), send to those sinks.
 /// 3. Otherwise, send to the `default_sinks` (if configured).
 /// 4. If any send fails, additionally send to `error_sinks` (if configured).
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.SinkDispatch")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.SinkDispatch")]
 pub struct SinkDispatcher {
     /// Compiled business routes.
     routes: Vec<SinkRouteBinding>,
@@ -34,8 +34,8 @@ pub struct SinkDispatcher {
     all_sinks: Vec<Arc<SinkRuntime>>,
 }
 
-#[derive(Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.SinkDispatch")]
+#[derive(Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.SinkDispatch")]
 struct WildmatchMatcher {
     patterns: Vec<WildMatch>,
 }
@@ -63,8 +63,8 @@ impl std::fmt::Debug for WildmatchMatcher {
     }
 }
 
-#[derive(Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.SinkDispatch")]
+#[derive(Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.SinkDispatch")]
 struct SinkRouteBinding {
     matcher: WildmatchMatcher,
     sinks: Vec<Arc<SinkRuntime>>,

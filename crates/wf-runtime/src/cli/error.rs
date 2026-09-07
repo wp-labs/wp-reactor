@@ -3,8 +3,8 @@ use orion_error::conversion::ToStructError;
 use orion_error::{OrionError, StructError, UnifiedReason};
 use wf_config::ConfigReason;
 
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, OrionError)]
-#[moju(kind = "state", domain = "Runtime", module = "Runtime.CliEntry")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq, OrionError)]
+#[jumo(kind = "state", domain = "Runtime", module = "Runtime.CliEntry")]
 pub enum EngineReason {
     #[orion_error(message = "CLI error", identity = "sys.wf_engine.cli")]
     Cli,

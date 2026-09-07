@@ -8,8 +8,8 @@ use super::*;
 
 /// `test name for rule_name { input { ... } expect { ... } [options { ... }] }`
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangTest")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangTest")]
 pub struct TestBlock {
     pub name: String,
     pub rule_name: String,
@@ -20,8 +20,8 @@ pub struct TestBlock {
 
 /// Statement inside an `input { ... }` block.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangTest")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangTest")]
 pub enum InputStmt {
     /// `row(alias, field = expr, ...);`
     Row {
@@ -34,8 +34,8 @@ pub enum InputStmt {
 
 /// `name = expr` — field assignment in a `row(...)` statement.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangTest")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangTest")]
 pub struct FieldAssign {
     pub name: String,
     pub value: Expr,
@@ -43,8 +43,8 @@ pub struct FieldAssign {
 
 /// Statement inside an `expect { ... }` block.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangTest")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangTest")]
 pub enum ExpectStmt {
     /// `hits cmp_op INTEGER;`
     Hits { cmp: CmpOp, count: usize },
@@ -54,8 +54,8 @@ pub enum ExpectStmt {
 
 /// Assertion on a specific hit output.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangTest")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangTest")]
 pub enum HitAssert {
     /// `score cmp_op NUMBER`
     Score { cmp: CmpOp, value: f64 },
@@ -75,8 +75,8 @@ pub enum HitAssert {
 
 /// Options for a test block.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Default, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangTest")]
+#[derive(Debug, Clone, PartialEq, Default, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangTest")]
 pub struct TestOptions {
     pub close_trigger: Option<CloseTrigger>,
     pub eval_mode: Option<EvalMode>,
@@ -86,8 +86,8 @@ pub struct TestOptions {
 
 /// Window close trigger mode for test execution.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
 pub enum CloseTrigger {
     Timeout,
     Flush,
@@ -96,8 +96,8 @@ pub enum CloseTrigger {
 
 /// Evaluation mode for test execution.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangTest")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangTest")]
 pub enum EvalMode {
     Strict,
     Lenient,
@@ -105,8 +105,8 @@ pub enum EvalMode {
 
 /// Input permutation mode for conformance testing.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangTest")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangTest")]
 pub enum PermutationMode {
     Shuffle,
 }

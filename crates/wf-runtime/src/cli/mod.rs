@@ -17,21 +17,21 @@ use error::{EngineReason, EngineResult};
 use wf_config::ConfigVarContext;
 use wf_config::{FusionConfigLoader, HumanDuration, parse_vars};
 
-#[derive(Parser, ::moju_derive::MoJu)]
+#[derive(Parser, ::jumo_derive::Jumo)]
 #[command(
     name = "wfusion",
     version,
     about = "WarpFusion CEP engine",
     propagate_version = true
 )]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.CliEntry")]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.CliEntry")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
 
-#[derive(::moju_derive::MoJu, Args, Clone)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.CliEntry")]
+#[derive(::jumo_derive::Jumo, Args, Clone)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.CliEntry")]
 struct ConfigLoadArgs {
     /// Path to wfusion.toml config file (default: conf/wfusion.toml)
     #[arg(short, long, default_value = "conf/wfusion.toml")]
@@ -47,8 +47,8 @@ struct ConfigLoadArgs {
     work_dir: Option<PathBuf>,
 }
 
-#[derive(::moju_derive::MoJu, Args, Clone, Default)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.CliEntry")]
+#[derive(::jumo_derive::Jumo, Args, Clone, Default)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.CliEntry")]
 struct CompareConfigLoadArgs {
     /// Compare against another config file; defaults to the primary --config
     #[arg(long = "to-config")]
@@ -64,24 +64,24 @@ struct CompareConfigLoadArgs {
     to_work_dir: Option<PathBuf>,
 }
 
-#[derive(::moju_derive::MoJu, Args, Clone, Default)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.CliEntry")]
+#[derive(::jumo_derive::Jumo, Args, Clone, Default)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.CliEntry")]
 struct PathFilterArgs {
     /// Limit output to one or more config path prefixes, e.g. runtime, sources, window.auth_events
     #[arg(long = "path-prefix")]
     path_prefix: Vec<String>,
 }
 
-#[derive(::moju_derive::MoJu, Args, Clone, Default)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.CliEntry")]
+#[derive(::jumo_derive::Jumo, Args, Clone, Default)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.CliEntry")]
 struct VarFilterArgs {
     /// Limit output to one or more variable-name prefixes, e.g. WORK, CASE_, FAIL_
     #[arg(long = "var-prefix")]
     var_prefix: Vec<String>,
 }
 
-#[derive(Subcommand, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Runtime", module = "Runtime.CliEntry")]
+#[derive(Subcommand, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Runtime", module = "Runtime.CliEntry")]
 enum Commands {
     /// Start the WarpFusion engine
     Run {
@@ -104,8 +104,8 @@ enum Commands {
     },
 }
 
-#[derive(::moju_derive::MoJu, Subcommand)]
-#[moju(kind = "state", domain = "Runtime", module = "Runtime.CliEntry")]
+#[derive(::jumo_derive::Jumo, Subcommand)]
+#[jumo(kind = "state", domain = "Runtime", module = "Runtime.CliEntry")]
 enum ConfigCommands {
     /// Render the effective TOML after applying overlays and variable expansion
     Render {
@@ -143,8 +143,8 @@ enum ConfigCommands {
     },
 }
 
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.CliEntry")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.CliEntry")]
 struct ResolvedConfigLoad {
     config_path: PathBuf,
     overlay_paths: Vec<PathBuf>,

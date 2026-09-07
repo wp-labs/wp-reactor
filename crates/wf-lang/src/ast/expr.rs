@@ -4,8 +4,8 @@
 
 /// Field selector within a step branch: `.ident` or `["string"]`.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum FieldSelector {
     Dot(String),
     Bracket(String),
@@ -13,8 +13,8 @@ pub enum FieldSelector {
 
 /// Field reference in expressions.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum FieldRef {
     /// Bare identifier, e.g. `sip`.
     Simple(String),
@@ -38,8 +38,8 @@ pub enum FieldRef {
 
 /// One step of a nested field path: a member name or an array index.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
+#[derive(Debug, Clone, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum PathSegment {
     Field(String),
     Index(usize),
@@ -50,8 +50,8 @@ pub enum PathSegment {
 // ---------------------------------------------------------------------------
 
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -62,8 +62,8 @@ pub enum CmpOp {
 }
 
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum BinOp {
     And,
     Or,
@@ -81,8 +81,8 @@ pub enum BinOp {
 }
 
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum SystemVar {
     Score,
     EventFirstTime,
@@ -99,8 +99,8 @@ pub enum SystemVar {
 
 pub use crate::wfu_meta::WfuMetaField;
 
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangExpr")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangExpr")]
 pub struct ObjectItem {
     pub targets: Vec<String>,
     pub type_hint: Option<crate::schema::FieldType>,
@@ -108,8 +108,8 @@ pub struct ObjectItem {
 }
 
 /// 模式匹配分支（issue #79 Issue 2）：`pat1 | pat2 => value`。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangExpr")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangExpr")]
 pub struct MatchArm {
     /// 本分支的模式值表达式（求值后与 subject 比较；`|` 表示多个模式）。
     pub patterns: Vec<Expr>,
@@ -122,8 +122,8 @@ pub struct MatchArm {
 // ---------------------------------------------------------------------------
 
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum Expr {
     /// Number literal (integer or float).
     Number(f64),

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 /// A complete `.wfg` scenario file.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct WfgFile {
     pub uses: Vec<UseDecl>,
     pub scenario: ScenarioDecl,
@@ -17,8 +17,8 @@ pub struct WfgFile {
 
 /// `use "path.wfs"` or `use "path.wfl"`
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct UseDecl {
     pub path: String,
 }
@@ -29,8 +29,8 @@ pub struct UseDecl {
 
 /// `scenario NAME seed NUMBER { ... }`
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct ScenarioDecl {
     pub name: String,
     pub seed: u64,
@@ -44,8 +44,8 @@ pub struct ScenarioDecl {
 
 /// `time "ISO8601" duration DURATION`
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct TimeClause {
     pub start: String,
     pub duration: Duration,
@@ -57,8 +57,8 @@ pub struct TimeClause {
 
 /// new syntax scenario data parsed from the new syntax.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct SyntaxScenario {
     /// `#[key=value, ...]` attributes attached to this scenario.
     pub attrs: Vec<ScenarioAttr>,
@@ -70,16 +70,16 @@ pub struct SyntaxScenario {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct ScenarioAttr {
     pub key: String,
     pub value: AttrValue,
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
 pub enum AttrValue {
     Number(f64),
     Duration(Duration),
@@ -88,23 +88,23 @@ pub enum AttrValue {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct TrafficBlock {
     pub streams: Vec<SyntaxStreamDecl>,
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct SyntaxStreamDecl {
     pub stream: String,
     pub rate: RateExpr,
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
 pub enum RateExpr {
     Constant(Rate),
     Wave {
@@ -138,8 +138,8 @@ impl RateExpr {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
 pub enum WaveShape {
     Sine,
     Triangle,
@@ -147,8 +147,8 @@ pub enum WaveShape {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct TimelineSegment {
     pub start: Duration,
     pub end: Duration,
@@ -156,15 +156,15 @@ pub struct TimelineSegment {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct SyntaxInjectionBlock {
     pub cases: Vec<SyntaxInjectCase>,
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct SyntaxInjectCase {
     pub mode: InjectCaseMode,
     pub percent: f64,
@@ -174,8 +174,8 @@ pub struct SyntaxInjectCase {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
 pub enum InjectCaseMode {
     Hit,
     NearMiss,
@@ -183,8 +183,8 @@ pub enum InjectCaseMode {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct SeqBlock {
     pub entity: String,
     pub steps: Vec<SeqStep>,
@@ -204,23 +204,23 @@ pub enum SeqStep {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct FieldPredicate {
     pub field: String,
     pub value: AttrValue,
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct ExpectBlock {
     pub checks: Vec<ExpectCheck>,
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct ExpectCheck {
     pub metric: ExpectMetric,
     pub rule: String,
@@ -229,8 +229,8 @@ pub struct ExpectCheck {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
 pub enum ExpectMetric {
     Hit,
     NearMiss,
@@ -242,8 +242,8 @@ pub enum ExpectMetric {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
 pub enum CompareOp {
     Gte,
     Lte,
@@ -253,8 +253,8 @@ pub enum CompareOp {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
 pub enum ExpectValue {
     Percent(f64),
     Number(f64),
@@ -267,16 +267,16 @@ pub enum ExpectValue {
 
 /// Event rate, e.g. `100/s`, `50/m`, `10/h`
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct Rate {
     pub count: u64,
     pub unit: RateUnit,
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
 pub enum RateUnit {
     PerSecond,
     PerMinute,
@@ -304,8 +304,8 @@ impl Rate {
 /// - `stream ALIAS : WINDOW RATE { field_override* }` (legacy)
 /// - `stream ALIAS from WINDOW rate RATE { field_override* }` (readable)
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct StreamBlock {
     pub alias: String,
     pub window: String,
@@ -315,8 +315,8 @@ pub struct StreamBlock {
 
 /// `FIELD_NAME = gen_expr`
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct FieldOverride {
     pub field_name: String,
     pub gen_expr: GenExpr,
@@ -324,8 +324,8 @@ pub struct FieldOverride {
 
 /// Generator expression for a field override.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
 pub enum GenExpr {
     StringLit(String),
     NumberLit(f64),
@@ -337,8 +337,8 @@ pub enum GenExpr {
 ///
 /// Supports both positional `ipv4(500)` and named `ipv4(pool: 500)` syntax.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct GenArg {
     pub name: Option<String>,
     pub value: GenExpr,
@@ -363,8 +363,8 @@ impl GenArg {
 
 /// `inject for RULE on [STREAM, ...] { inject_line* }`
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct InjectBlock {
     pub rule: String,
     pub streams: Vec<String>,
@@ -377,8 +377,8 @@ pub struct InjectBlock {
 /// - inline params: `MODE PERCENT% key=value key2=value2;`
 /// - block params: `MODE PERCENT% { key=value; key2=value2; };`
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct InjectLine {
     pub mode: InjectMode,
     pub percent: f64,
@@ -389,16 +389,16 @@ pub struct InjectLine {
 
 /// One `use(...) with(count)` declaration captured for inject generation.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct InjectUseStep {
     pub count: u64,
     pub predicates: Vec<FieldPredicate>,
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
 pub enum InjectMode {
     Hit,
     NearMiss,
@@ -411,16 +411,16 @@ pub enum InjectMode {
 
 /// `faults { fault_line* }`
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct FaultsBlock {
     pub faults: Vec<FaultLine>,
 }
 
 /// Supported fault types for temporal perturbation.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
 pub enum FaultType {
     /// Swap adjacent events' arrival order.
     OutOfOrder,
@@ -445,8 +445,8 @@ impl std::fmt::Display for FaultType {
 
 /// `FAULT_TYPE PERCENT%`
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct FaultLine {
     pub fault_type: FaultType,
     pub percent: f64,
@@ -458,8 +458,8 @@ pub struct FaultLine {
 
 /// `oracle { param_assigns }`
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct OracleBlock {
     pub params: Vec<ParamAssign>,
 }
@@ -470,8 +470,8 @@ pub struct OracleBlock {
 
 /// `NAME = VALUE`
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangScenario")]
 pub struct ParamAssign {
     pub name: String,
     pub value: ParamValue,
@@ -479,8 +479,8 @@ pub struct ParamAssign {
 
 /// Value in a parameter assignment.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangScenario")]
 pub enum ParamValue {
     Number(f64),
     Duration(Duration),

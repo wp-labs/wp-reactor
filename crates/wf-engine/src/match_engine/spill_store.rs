@@ -7,8 +7,8 @@ use crate::match_engine::ScopeKey;
 use crate::match_engine::executor::StatsAccum;
 
 /// spill 存储错误。
-#[derive(Debug, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.SpillStore")]
+#[derive(Debug, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.SpillStore")]
 pub enum SpillError {
     /// 反序列化损坏（长度越界 / 未知 tag / 截断）——致命，调用方须 panic。
     Corrupt(String),
@@ -94,8 +94,8 @@ pub trait SpillStore {
 }
 
 /// 默认空实现：未配置 spill 时零开销。
-#[derive(Default, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.SpillStore")]
+#[derive(Default, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.SpillStore")]
 pub struct NoopSpillStore;
 
 impl SpillStore for NoopSpillStore {
@@ -122,8 +122,8 @@ impl SpillStore for NoopSpillStore {
 
 /// 内存 spill 目录（M2 redb 之前的最小可用版）：HashMap<hash, (ScopeKey, accs)>。
 /// 用于对拍/测试（与 redb 行为等价，纯内存）。
-#[derive(Default, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.SpillStore")]
+#[derive(Default, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.SpillStore")]
 pub struct MemSpillStore {
     map: std::collections::HashMap<u64, (ScopeKey, Vec<StatsAccum>)>,
 }

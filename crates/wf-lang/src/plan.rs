@@ -22,8 +22,8 @@ pub type ExprPlan = Expr;
 // ---------------------------------------------------------------------------
 
 /// Compiled rule — the executable representation consumed by MatchEngine.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct RulePlan {
     pub name: String,
     pub binds: Vec<BindPlan>,
@@ -51,8 +51,8 @@ pub struct RulePlan {
 }
 
 /// One compiled `let <name> = <expr>` binding (on-each per-event evaluation).
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct LetPlan {
     pub name: String,
     pub expr: ExprPlan,
@@ -70,8 +70,8 @@ pub struct LetPlan {
 /// - `slide == None`（fixed）：bucket 对齐 = `over`（每 over 一个桶，现状）；
 /// - `slide == Some(slide)`（hop）：bucket 对齐 = `slide`（每 slide 一个桶，
 ///   实例在 window_start + size 收口），`over` = size（封口长度）。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct ConvWindowPlan {
     /// Seal length：bucket 封口需要 `bucket + over <= min(barrier)`。
     /// fixed = 窗口时长；hop = size。
@@ -83,8 +83,8 @@ pub struct ConvWindowPlan {
 }
 
 /// Stateless per-event trigger: `on each alias [where expr] -> score(...)`.
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct EachPlan {
     pub alias: String,
     pub filter: Option<ExprPlan>,
@@ -95,8 +95,8 @@ pub struct EachPlan {
 // ---------------------------------------------------------------------------
 
 /// Tracks the pattern origin for `wf explain` display.
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct PatternOriginPlan {
     pub pattern_name: String,
     pub args: Vec<String>,
@@ -107,8 +107,8 @@ pub struct PatternOriginPlan {
 // ---------------------------------------------------------------------------
 
 /// A bound event source: alias + window + optional filter.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct BindPlan {
     pub alias: String,
     pub window: String,
@@ -126,8 +126,8 @@ pub struct BindPlan {
 /// datagen/oracle，两仓库 60+ 字面量）即可免于逐点改——需要全字段字面量的地方
 /// 在加字段当次按需更新即可。注意：clippy `needless_struct_update` 禁止
 /// 「全字段字面量 + `..Default::default()`」写法，勿用该模式规避。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Default)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq, Default)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct MatchPlan {
     pub keys: Vec<FieldRef>,
     /// 派生 key 表达式槽（issue #80）：与 `keys` 逐位对齐——`Some(expr)` 表示
@@ -183,8 +183,8 @@ pub struct MatchPlan {
 // ---------------------------------------------------------------------------
 
 /// Compiled stats rule — 桶键表达式 + 度量 + 输出形状, 由 StatsExecutor 消费。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct StatsPlan {
     pub window_spec: WindowSpec,
     /// 桶键表达式列表（group by + tier 桶键函数统一; 空 = 空键全局）。
@@ -197,16 +197,16 @@ pub struct StatsPlan {
 }
 
 /// 输出形状（对应 ast::StatsOutputShape）。
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
 pub enum StatsOutputShapePlan {
     Rows,
     Columns,
 }
 
 /// 编译后的统计度量。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct StatsMeasurePlan {
     pub label: String,
     pub source_alias: String,
@@ -217,8 +217,8 @@ pub struct StatsMeasurePlan {
 }
 
 /// 统计聚合函数（对应 ast::StatsAgg）。
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
 pub enum StatsAggPlan {
     Count,
     Sum,
@@ -231,8 +231,8 @@ pub enum StatsAggPlan {
 }
 
 /// Explicit key mapping entry: logical name → source alias + field.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct KeyMapPlan {
     pub logical_name: String,
     pub source_alias: String,
@@ -244,8 +244,8 @@ pub struct KeyMapPlan {
 /// `right_field` from the joined row (e.g. bid.auction → auction_events.id →
 /// auction_events.category). Carries everything the runtime needs so the state
 /// machine can do the lookup without reaching into `RulePlan.joins`.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct JoinKeyPlan {
     /// Index into `RulePlan.joins` whose right window provides the key value
     /// (kept for explain / match-time join enrichment reuse).
@@ -262,13 +262,13 @@ pub struct JoinKeyPlan {
     pub right_field: String,
     /// RESERVED — logical key name (defaults to `right_field`). No consumer in
     /// the engine today (v1 forbids key_mapping, so the logical name is always
-    /// the right field); kept for moju/explain compatibility. Do not rely on it.
+    /// the right field); kept for jumo/explain compatibility. Do not rely on it.
     pub key_name: String,
 }
 
 /// Window specification for the match clause.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
 pub enum WindowSpec {
     /// Sliding window with a fixed duration.
     Sliding(Duration),
@@ -291,15 +291,15 @@ impl Default for WindowSpec {
 }
 
 /// One match step containing one or more OR branches.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct StepPlan {
     pub branches: Vec<BranchPlan>,
 }
 
 /// A single branch within a match step.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct BranchPlan {
     pub label: Option<String>,
     pub source: String,
@@ -309,8 +309,8 @@ pub struct BranchPlan {
 }
 
 /// Aggregation pipeline: transforms → measure → cmp → threshold.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct AggPlan {
     pub transforms: Vec<Transform>,
     pub measure: Measure,
@@ -323,8 +323,8 @@ pub struct AggPlan {
 // ---------------------------------------------------------------------------
 
 /// Ordered sequence plan: steps complete in order within the match window.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct SeqPlan {
     /// `consec` — strict adjacency; default: gap.
     pub consec: bool,
@@ -335,8 +335,8 @@ pub struct SeqPlan {
 }
 
 /// After-match skip policy.
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
 pub enum SeqSkipPlan {
     /// Reset all step state after firing (default).
     PastLast,
@@ -345,8 +345,8 @@ pub enum SeqSkipPlan {
 }
 
 /// One ordered chain step: `[not] <branch> [within]`.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct SeqStepPlan {
     /// `not` negation prefix.
     pub neg: bool,
@@ -361,8 +361,8 @@ pub struct SeqStepPlan {
 // ---------------------------------------------------------------------------
 
 /// Cross-source join plan.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct JoinPlan {
     pub right_window: String,
     pub mode: JoinMode,
@@ -376,8 +376,8 @@ pub struct JoinPlan {
 }
 
 /// A single join condition: left field == right field.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct JoinCondPlan {
     pub left: FieldRef,
     pub right: FieldRef,
@@ -402,8 +402,8 @@ impl JoinCondPlan {
 // ---------------------------------------------------------------------------
 
 /// Compiled limits for runtime enforcement.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct LimitsPlan {
     pub max_memory_bytes: Option<usize>,
     pub max_instances: Option<usize>,
@@ -420,16 +420,16 @@ pub struct LimitsPlan {
 }
 
 /// 状态外溢存储模式。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
 pub enum SpillMode {
     /// redb 持久化（B+ 树单文件库）。
     Redb,
 }
 
 /// What to do when a limit is exceeded.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
 pub enum ExceedAction {
     Throttle,
     DropOldest,
@@ -437,8 +437,8 @@ pub enum ExceedAction {
 }
 
 /// Emit rate specification: count per duration.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct RateSpec {
     pub count: u64,
     pub per: Duration,
@@ -451,8 +451,8 @@ pub struct RateSpec {
 /// Entity identification: lowercase-normalized type string + id expression.
 ///
 /// Both `entity(IP, ...)` and `entity("ip", ...)` compile to `entity_type = "ip"`.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct EntityPlan {
     pub entity_type: String,
     pub entity_id_expr: ExprPlan,
@@ -463,8 +463,8 @@ pub struct EntityPlan {
 // ---------------------------------------------------------------------------
 
 /// Score computation expression.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct ScorePlan {
     pub expr: ExprPlan,
 }
@@ -474,8 +474,8 @@ pub struct ScorePlan {
 // ---------------------------------------------------------------------------
 
 /// Output yield: target window + optional version + fields.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct YieldPlan {
     pub target: String,
     pub version: Option<u32>,
@@ -483,8 +483,8 @@ pub struct YieldPlan {
 }
 
 /// A single yield field: name = expression.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct YieldField {
     pub name: String,
     pub value: ExprPlan,
@@ -495,22 +495,22 @@ pub struct YieldField {
 // ---------------------------------------------------------------------------
 
 /// Compiled conv plan — post-close result set transformations.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct ConvPlan {
     pub chains: Vec<ConvChainPlan>,
 }
 
 /// One semicolon-separated chain of piped operations.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct ConvChainPlan {
     pub ops: Vec<ConvOpPlan>,
 }
 
 /// A single conv operation.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
 pub enum ConvOpPlan {
     Sort(Vec<SortKeyPlan>),
     Top(u64),
@@ -525,8 +525,8 @@ pub enum ConvOpPlan {
 }
 
 /// Sort key with direction.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
 pub struct SortKeyPlan {
     pub expr: ExprPlan,
     pub descending: bool,

@@ -28,8 +28,8 @@ pub(crate) use wf_lang::wfu_meta::{
 };
 
 /// Which path produced this alert.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.AlertOutput")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.AlertOutput")]
 pub enum AlertOrigin {
     Event,
     Close {
@@ -102,8 +102,8 @@ impl<'de> Deserialize<'de> for AlertOrigin {
 /// `on each` path / `yield_target` / `scope_key` on the `on each` path) and
 /// the typed yield field list are shared via `Arc` — producing a record
 /// clones references, not heap strings.
-#[derive(::moju_derive::MoJu, Debug, Clone, serde::Serialize)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.AlertOutput")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, serde::Serialize)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.AlertOutput")]
 pub struct OutputRecord {
     /// SHA-256 content hash (16 hex).
     pub wfx_id: String,

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-#[derive(::moju_derive::MoJu, Debug, Clone)]
-#[moju(kind = "struct", domain = "Config", module = "Config.ConfigVars")]
+#[derive(::jumo_derive::Jumo, Debug, Clone)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.ConfigVars")]
 pub struct ConfigVarContext {
     explicit_vars: HashMap<String, String>,
     env_vars: HashMap<String, String>,

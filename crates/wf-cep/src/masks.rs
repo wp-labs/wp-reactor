@@ -18,8 +18,8 @@ use crate::value::EngineHashMap;
 ///   `(close_step_idx, branch_idx)`);
 /// - `neg` — `match_plan.seq` negation steps (keyed `(neg_idx, 0)`, the same
 ///   negation-only ordering `SeqRuntime::build` produces).
-#[derive(Default, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.ColumnarBatch")]
+#[derive(Default, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.ColumnarBatch")]
 pub struct GuardMasks {
     event: EngineHashMap<(usize, usize), BooleanArray>,
     close: EngineHashMap<(usize, usize), BooleanArray>,

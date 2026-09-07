@@ -68,8 +68,8 @@ fn mode_name(mode: wf_config::FusionMode) -> &'static str {
 const DEFAULT_RELOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Result of an [`Reactor::apply_reload`] attempt.
-#[derive(::moju_derive::MoJu, Debug)]
-#[moju(
+#[derive(::jumo_derive::Jumo, Debug)]
+#[jumo(
     kind = "state",
     domain = "Runtime",
     module = "Runtime.ReactorLifecycle"
@@ -95,8 +95,8 @@ const RELOAD_CONTROL_CHANNEL_CAPACITY: usize = 8;
 pub const RESTART_EXIT_CODE: i32 = 75;
 
 /// Outcome of [`Reactor::run`], indicating why the control loop exited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(
     kind = "state",
     domain = "Runtime",
     module = "Runtime.ReactorLifecycle"
@@ -115,8 +115,8 @@ pub enum RunOutcome {
 /// The `reply` oneshot carries both the [`ReloadOutcome`] (on success) and any
 /// `RuntimeResult` error (e.g. a config compile failure), so the caller can
 /// distinguish *blocked* reloads (`Ok(Blocked)`) from *failed* reloads (`Err`).
-#[derive(Debug, ::moju_derive::MoJu)]
-#[moju(
+#[derive(Debug, ::jumo_derive::Jumo)]
+#[jumo(
     kind = "state",
     domain = "Runtime",
     module = "Runtime.ReactorLifecycle"
@@ -143,8 +143,8 @@ pub enum ReloadRequest {
 ///
 /// Also exposes the root [`CancellationToken`] (for the existing `status`
 /// route's `accepting` field) without letting the holder cancel the engine.
-#[derive(Clone, ::moju_derive::MoJu)]
-#[moju(
+#[derive(Clone, ::jumo_derive::Jumo)]
+#[jumo(
     kind = "struct",
     domain = "Runtime",
     module = "Runtime.ReactorLifecycle"
@@ -242,8 +242,8 @@ impl RuntimeControlHandle {
 /// receiver, alert sink, evictor, or metrics tasks. CEP window state lives in
 /// the shared `Arc<Router>`/registry, so swapping rule tasks does not lose
 /// in-flight window data.
-#[derive(::moju_derive::MoJu)]
-#[moju(
+#[derive(::jumo_derive::Jumo)]
+#[jumo(
     kind = "struct",
     domain = "Runtime",
     module = "Runtime.ReactorLifecycle"
