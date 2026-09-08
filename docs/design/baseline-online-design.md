@@ -618,6 +618,12 @@ CSV 装载为**启动一次性**；定期推进 = 导出侧重建 CSV + reload�
   conf/loop.phase.wfusion.toml（run_phase --constants 交叉校验只覆盖 conf↔gen；wfl 错位 →
   detect join miss → run.sh 健康检查 A=0 报错）；A 供给与 B 桶定义的**等价性测试**仍待补
   （A=列打标秒粒度 vs B=引擎纳秒 `bucket_of`，BASE 对齐时等价）。
+- **供给刷新动态变量（2026-09-08 落地 demo，PG）**：knowdb `RefreshSource::NamedSql` 支持静态
+  变量定义 `RefreshVarDef`（`CyclePhase{period_s,bucket_s,offset_slots,prefix}` 按 knowdb 自身
+  tick 时钟折桶现算 `$cur`/`$next`；`Static` 透传 `$max_age`），每次执行前 `render_sql_at` 替换
+  ——引擎只读表级 `phase_period_s/phase_bucket_s/retention` 三键组配置（boot 装载经同源渲染）。
+  价值 ∝ N=period/bucket（N=1 无相位可言，退化为滚动全量）；口径 = A 通道处理时间近似 → PG
+  实时模式注入事件须跟随墙钟（gen LIVE_BASE），CSV/批量回放保持固定基座全相位供给。
 
 ### 11.7 近端 B 相位同窗（2026-09-08 实现）
 
