@@ -69,6 +69,15 @@ pub struct RuntimeConfig {
     /// 近端 B：半衰期加权合并（§5.3，默认 true；false = 等权，对拍用）。
     #[serde(default = "default_true")]
     pub baseline_history_decay: bool,
+    /// 近端 B：相位同窗（2026-09-08，默认关）。与 `baseline_history_k/decay` 配合：
+    /// 两字段**成对设置**才开启 `phase(ts)=(ts mod period) div bucket`（epoch 折叠）；
+    /// 开启后 store 按键分相位桶、`baseline_dev` 只与事件时间的同相位历史比较。
+    /// 示例：`"7d"` / `"5m"`（生产）；测试可用小周期（如 `"60s"`/`"15s"`）。
+    #[serde(default)]
+    pub baseline_history_phase_period: Option<HumanDuration>,
+    /// 近端 B 相位桶宽（须 ≤ period 且 >0；与 `baseline_history_phase_period` 成对）。
+    #[serde(default)]
+    pub baseline_history_phase_bucket: Option<HumanDuration>,
 }
 
 fn default_parse_parallelism() -> usize {

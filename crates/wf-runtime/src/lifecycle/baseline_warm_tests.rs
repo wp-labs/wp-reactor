@@ -30,7 +30,7 @@ fn warm_loads_rows_into_store() {
     content.push_str("t_ok_b,qps,0,60000000000,1.0,10.0,100.0\n");
     let rel = write_csv(&dir, &content);
 
-    let r = warm_baseline_history(Some(&rel), 8, true, &dir);
+    let r = warm_baseline_history(Some(&rel), 8, true, None, &dir);
     assert!(r.is_ok(), "warm 应成功: {r:?}");
     let st = wf_engine::baseline::store();
     assert_eq!(st.window_count("t_ok_a", "qps"), 2);
@@ -46,7 +46,7 @@ fn warm_missing_required_column_errors() {
     let content = "entity,metric,win_start,win_end,n,sum\nsvc_a,qps,0,1,1.0,2.0\n";
     let rel = write_csv(&dir, content);
     assert!(
-        warm_baseline_history(Some(&rel), 8, true, &dir).is_err(),
+        warm_baseline_history(Some(&rel), 8, true, None, &dir).is_err(),
         "缺 sum_sq 列应报错（防静默空历史）"
     );
 }
@@ -59,7 +59,7 @@ fn warm_skips_empty_key_rows_and_accepts_bom() {
         header = header()
     );
     let rel = write_csv(&dir, &content);
-    assert!(warm_baseline_history(Some(&rel), 8, true, &dir).is_ok());
+    assert!(warm_baseline_history(Some(&rel), 8, true, None, &dir).is_ok());
     let st = wf_engine::baseline::store();
     assert_eq!(st.window_count("t_emp_a", "qps"), 1, "BOM 头仍应解析");
     assert_eq!(st.window_count("", ""), 0, "空键行应跳过");
@@ -67,5 +67,5 @@ fn warm_skips_empty_key_rows_and_accepts_bom() {
 
 #[test]
 fn warm_none_path_is_noop() {
-    assert!(warm_baseline_history(None, 8, true, Path::new(".")).is_ok());
+    assert!(warm_baseline_history(None, 8, true, None, Path::new(".")).is_ok());
 }

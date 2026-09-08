@@ -26,7 +26,14 @@ pub(super) fn eval_func_baseline_dev(
         Value::Number(n) => n,
         _ => return None,
     };
+    // 相位同窗：按事件时间（event_time 字段，epoch 纳秒）折叠相位桶——只与历史
+    // 同期比较。事件无 event_time 字段 → None：相位关闭时无影响；相位开启时退化为
+    // 全桶并集（保守：仅无时间来源的诊断场景）。
+    let at = match event.field_value("event_time") {
+        Some(Value::Number(n)) if n.is_finite() => Some(n as i64),
+        _ => None,
+    };
     crate::baseline::store()
-        .deviation(&entity, &metric, value)
+        .deviation_at(&entity, &metric, value, at)
         .map(Value::Number)
 }

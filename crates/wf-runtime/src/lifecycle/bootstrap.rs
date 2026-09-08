@@ -50,12 +50,24 @@ pub(super) async fn load_and_compile(
         crate::lifecycle::compile::load_static_schemas(&config.runtime.schemas, base_dir)
             .unwrap_or_default();
 
-    // 近端 B warm（S2-M2）：启动装载共享基线历史（judge 规则读）。文件缺失/
-    // 解析失败直接报错——静默空历史会让 judge 全部不告警，难排查。
+    // 近端 B（S2-M2/B-b/相位同窗 2026-09-08）：先按 runtime 配置安装共享
+    // BaselineStore（即使无 warm 文件，judge 也需要正确 k/decay/相位参数）；
+    // 然后 warm（如有）。文件缺失/解析失败直接报错——静默空历史会让 judge 全部
+    // 不告警，难排查。
+    let phase = resolve_baseline_phase(
+        &config.runtime.baseline_history_phase_period,
+        &config.runtime.baseline_history_phase_bucket,
+    )?;
+    install_baseline_store(
+        config.runtime.baseline_history_k,
+        config.runtime.baseline_history_decay,
+        phase,
+    );
     warm_baseline_history(
         config.runtime.baseline_history.as_deref(),
         config.runtime.baseline_history_k,
         config.runtime.baseline_history_decay,
+        phase,
         base_dir,
     )?;
 
@@ -769,6 +781,57 @@ fn parse_knowledge_refresh(table: &toml::Value) -> Option<Duration> {
         .map(|d| d.as_duration())
 }
 
+/// 解析近端 B 相位配置：`period`/`bucket` 必须成对、且 `0 < bucket ≤ period`。
+fn resolve_baseline_phase(
+    period: &Option<wf_config::HumanDuration>,
+    bucket: &Option<wf_config::HumanDuration>,
+) -> RuntimeResult<Option<wf_engine::baseline::Phase>> {
+    match (period, bucket) {
+        (Some(p), Some(b)) => {
+            let period_nanos = p.as_duration().as_nanos();
+            let bucket_nanos = b.as_duration().as_nanos();
+            if bucket_nanos == 0 || period_nanos < bucket_nanos {
+                return RuntimeReason::core_conf()
+                    .to_err()
+                    .with_detail(
+                        "baseline_history_phase：bucket 须 >0 且 ≤ period（如 period=7d bucket=5m）"
+                            .to_string(),
+                    )
+                    .err();
+            }
+            Ok(Some(wf_engine::baseline::Phase {
+                period_nanos: period_nanos as u64,
+                bucket_nanos: bucket_nanos as u64,
+            }))
+        }
+        (None, None) => Ok(None),
+        _ => RuntimeReason::core_conf()
+            .to_err()
+            .with_detail("baseline_history_phase_period/bucket 须成对设置（相位模式）".to_string())
+            .err(),
+    }
+}
+
+/// 按 runtime 配置安装共享 BaselineStore（幂等：被占用且参数一致 → 静默空转；
+/// 参数不符 → 提示用既有实例）。无 warm 的 judge 也需要正确 k/decay/相位。
+fn install_baseline_store(k: usize, decay: bool, phase: Option<wf_engine::baseline::Phase>) {
+    let installed_ok = match phase {
+        Some(ph) => wf_engine::baseline::install_phased(k, decay, ph),
+        None => wf_engine::baseline::install(k, decay),
+    };
+    let store = wf_engine::baseline::store();
+    if !installed_ok || store.k() != k || store.decayed() != decay || store.phase() != phase {
+        wf_warn!(
+            conf,
+            k,
+            decay,
+            phase_period_ns = phase.map(|p| p.period_nanos),
+            phase_bucket_ns = phase.map(|p| p.bucket_nanos),
+            "baseline store 已被占用或参数不符，使用既有实例（append/warm 照常写入）"
+        );
+    }
+}
+
 /// 近端 B warm（S2-M2）：读 t_baseline 逐窗 CSV 装载共享 BaselineStore。
 /// CSV 头：`entity,metric,win_start,win_end,n,sum,sum_sq`（win_* = epoch
 /// 纳秒整数）。见 baseline-online-design.md §11 S2-M2。
@@ -776,11 +839,14 @@ fn warm_baseline_history(
     path: Option<&str>,
     k: usize,
     decay: bool,
+    phase: Option<wf_engine::baseline::Phase>,
     base_dir: &Path,
 ) -> RuntimeResult<()> {
     let Some(rel) = path else {
         return Ok(());
     };
+    // 兼容直接单测/独立调用：先确保 store 参数正确（load_and_compile 已装 → 幂等空转）。
+    install_baseline_store(k, decay, phase);
     let full = base_dir.join(rel);
     let content = std::fs::read_to_string(&full).source_err(
         RuntimeReason::Bootstrap,
@@ -813,18 +879,7 @@ fn warm_baseline_history(
         col("sum_sq")?,
     );
 
-    let installed_ok = wf_engine::baseline::install(k, decay);
     let store = wf_engine::baseline::store();
-    // install 失败 = 本进程已存在共享实例（多配置/测试等）——warm 仍写入既有实例，
-    // 但 k/decay 以先安装者为准；提示以免误以为本次配置生效。
-    if !installed_ok || store.k() != k || store.decayed() != decay {
-        wf_warn!(
-            conf,
-            k,
-            decay,
-            "baseline store 已被占用或参数不符，使用既有实例（warm 照常写入）"
-        );
-    }
     let mut rows = 0u64;
     for line in lines {
         let line = line.trim();

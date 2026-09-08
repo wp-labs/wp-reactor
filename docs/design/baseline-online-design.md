@@ -1,4 +1,4 @@
-<!-- 角色：引擎架构师 | 状态：设计方案 v2.2（评审后修正并源码实证：WFL 语法形态、持久化与 spill 解耦、消费侧聚合语义、yield 读取聚合值写法均已闭环验证；①dur=半衰期 ②存储=独立持久基线库(非spill) ③WARMUP=30 ④周期=一等公民） | 创建：2026-08-30 | 更新：2026-09-07（§11 Step 2 补充：历史加载分层记忆架构——外部 sink=唯一事实源 + 近端规则级表 + 远端 knowdb/ProviderWindow + 统一可加三元组契约；§4 本地 redb 作为事实源之一，与外部 sink 二选一/并存） -->
+<!-- 角色：引擎架构师 | 状态：设计方案 v2.2（评审后修正并源码实证：WFL 语法形态、持久化与 spill 解耦、消费侧聚合语义、yield 读取聚合值写法均已闭环验证；①dur=半衰期 ②存储=独立持久基线库(非spill) ③WARMUP=30 ④周期=一等公民） | 创建：2026-08-30 | 更新：2026-09-07（§11 Step 2 补充：历史加载分层记忆架构——外部 sink=唯一事实源 + 近端规则级表 + 远端 knowdb/ProviderWindow + 统一可加三元组契约；§4 本地 redb 作为事实源之一，与外部 sink 二选一/并存）；2026-09-08（§11.7 近端 B 相位同窗：事件时间折叠相位桶 + 同相位历史同期比较 + 半衰期参照=4×period） -->
 
 # baseline() 在线基线能力设计方案
 
@@ -603,3 +603,54 @@ CSV 装载为**启动一次性**；定期推进 = 导出侧重建 CSV + reload�
   `phase_bucket` 冗余列，引擎内派生键不可行；
 - 近端 B 表归属层（规则任务级 vs 共享基线服务）与 §6.4 `RuleBaselines` 同层，实现时定；
 - `phase_bucket` 编码/时区约定；A 视图与 B 桶定义的等价性测试。
+
+### 11.7 近端 B 相位同窗（2026-09-08 实现）
+
+> 补充 S2-2/S2-5 的近端 B 落地形态：judge 不只与“最近 K 窗”比，而按**事件时间**
+> 折叠相位桶，只与**历史同期**（同相位）比较——早高峰只跟早高峰比。统计全在
+> 引擎内现算（不依赖外部供给/不依赖 refresh，相位随收盘自然推进）。
+
+**配置**（`[runtime]`，两字段成对才开启）：
+
+```toml
+[runtime]
+baseline_history_k           = 8        # 每相位桶保留窗口数
+baseline_history_decay       = true     # 半衰期加权合并
+baseline_history_phase_period = "240s" # 对比周期（如 7d/24h；示例=小周期演示）
+baseline_history_phase_bucket = "15s"  # 相位桶宽（须 ≤ period；与窗宽同格推荐）
+```
+
+**语义**：
+
+- **折叠**：`phase(ts) = (ts mod period) div bucket`（epoch 折叠、无时区；周期内
+  相位位置随时间推进自然循环，无需外部刷新）。store 键从 `(entity, metric)` 扩展为
+  `(entity, metric, phase_bucket)`，每桶独立保留最近 K 窗；`append` 按 `win_start`
+  折桶、幂等 upsert。
+- **判定**：`baseline_dev` 取事件 `event_time` 字段折桶，只合并**同桶**窗口得 μ/σ
+  再算 z；事件缺 `event_time` → 全桶并集（保守回退，仅无时间来源的诊断场景）。
+- **使用约束（粒度自洽）**：收盘窗宽 = 相位桶宽的**整数倍或相等**时，每周期每桶
+  只有 1 个窗口（跨期对比干净）；若桶宽显著大于窗宽，单桶内每周期多窗会先占满
+  K → 跨期历史被当日多窗挤掉，相位对比退化为日内滚动。演示配置取**桶宽=窗宽**。
+- **半衰期参照**（2026-09-08 修正）：相位开启时同相位窗按 `period` 重现（非相邻），
+  故 decay 半衰期 = **4×period**（`HALF_LIFE_WINDOWS=4` 的“序列间距”语义），保留
+  最近 ~4 期同相位画像、更早渐隐；相位关闭维持原 4×窗宽（相邻窗语义），行为不变。
+- 相位关闭（默认）= 原近端 B 行为（`(entity,metric)` 键最近 K 窗），**完全兼容**。
+
+**落地**：
+
+- `wf-cep/src/baseline.rs`：`Phase{period_nanos,bucket_nanos}` + `install_phased` +
+  `summary_at/deviation_at(.., at)`；单元测试锁定分桶/同相位过滤/相位下 decay/非法参数回退。
+- `wf-config runtime`：`baseline_history_phase_period/bucket` 两字段（成对校验在 bootstrap）。
+- `wf-runtime bootstrap`：`resolve_baseline_phase`（成对 + `0<桶≤周期`）→ `install_baseline_store`
+  （幂等，参数不符提示用既有实例）→ warm 沿用同相位分桶装载。
+- 引擎 e2e：wf-examples/baseline `conf/loop.phase.wfusion.toml` + `scripts/run_phase.sh`——
+  忙/闲双档（3000/1000 按相位位置注入）+ 每轮 1 个 5号线=9000 越界，8 轮逐轮断言
+  judge 恰 1 条/轮、仅 5号线、z>3、其余零误报；首条 z≈10（相位桶内仅越界自窗；
+  若相位配置未生效、滚动混合多窗 → z≈21，作接线 canary）。
+  **注意（实测 2026-09-08）**：批量注入下事件判定会滞后于收盘——越界事件所在窗
+  已先 append 进其自身桶（自窗），故 z 被摊薄（~10 而非理论 400），仍 ≫3；滚动
+  模式在此批量形态下也会因“自窗+邻窗已入缓冲”而稀释 σ，逐轮也恰 1 条——因此
+  **同相位隔离的精确语义不以 daemon e2e 计数为准**，由 `wf-cep baseline::` 单测
+  （`phase_appends_are_partitioned_per_bucket`/`deviation_at_uses_same_phase_only`/
+  `phase_decay_uses_period_referenced_half_life`）精确锁定；本 e2e 防的是配置→
+  install_phased→分桶 append→judge 读 event_time 的全引擎接线回归。
