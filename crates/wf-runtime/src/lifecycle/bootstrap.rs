@@ -471,7 +471,7 @@ struct CsvTable {
 /// bootstrap 逐列探测类型（整列每个非空单元可解析有限 f64 → REAL，否则 TEXT）
 /// 在 `base_dir/.run/knowdb_providers/` 生成类型化 create.sql/insert.sql 与派生
 /// V2 conf，调 `loader::reload_table_rows` 取 DDL 类型化原生行，边界转引擎行。
-/// PG 供给走 [`load_from_postgres`]（refresh 后续补）。
+/// PG 供给走 [`load_from_postgres`]（boot + 表级 refresh 经 NamedSql 刷新）。
 fn load_knowledge_into_windows(
     knowdb_path: &Path,
     base_dir: &Path,
@@ -910,7 +910,14 @@ fn load_from_postgres(
             continue;
         }
 
-        let sql = format!("SELECT * FROM {}", name);
+        // 供给查询：默认 SELECT * FROM <name>；可用表级 `query` 覆盖——PG 模式下
+        // 直接聚合事实源（如 baseline_records GROUP BY entity），不再需要外部
+        // 中转供给表（2026-09-08，见 pg/baseline_records.sql 说明）。
+        let sql = table
+            .get("query")
+            .and_then(|q| q.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("SELECT * FROM {}", name));
         let native = wp_knowledge::facade::query_for(ENGINE_PG_PROVIDER, &sql).map_err(|e| {
             RuntimeReason::Bootstrap
                 .to_err()
