@@ -49,9 +49,14 @@ pub struct BaselineWindow {
     pub sum_sq: f64,
 }
 
-/// (entity, metric, phase) 复合键；`phase` 关闭时恒为 0。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct Key(String, String, u32);
+/// 桶级窗口容器（一个相位桶的窗口列表）。
+type BucketMap = HashMap<u32, Entry>;
+/// metric → 桶表。
+type MetricMap = HashMap<String, BucketMap>;
+/// entity → metric 表。内层为 (entity, metric[, phase]) 三层嵌套——judge 每事件
+/// 按 (entity, metric) 查只触碰目标键（2026-09-08 bench 驱动：旧全表扫描在
+/// 共享大实体空间下每事件 O(store 键数)，改嵌套后 O(该键桶数)，查询零分配）。
+type EntityMap = HashMap<String, MetricMap>;
 
 #[derive(Debug)]
 struct Entry {
@@ -73,11 +78,14 @@ impl Default for Entry {
 /// 4×窗跨度（`HALF_LIFE_WINDOWS=4`）；相位开启 = 同相位窗按 `period` 重现，
 /// 4×period（保留 ~4 期同相位画像、更早渐隐）。`decay=false` 为等权（对拍 oracle 用）。
 /// `phase=Some` 时按键的相位桶分桶（见模块 doc）。
+///
+/// 内部为 `entity → metric → 相位桶 → Entry` 三层嵌套（见 [`EntityMap`]），
+/// 同一把 Mutex 保护。
 pub struct BaselineStore {
     k: usize,
     decay: bool,
     phase: Option<Phase>,
-    inner: Mutex<HashMap<Key, Entry>>,
+    inner: Mutex<EntityMap>,
 }
 
 /// 半衰期（相对序列重现间距的倍数）：权重降半的龄期。
@@ -138,9 +146,13 @@ impl BaselineStore {
         self.phase
     }
 
-    /// 当前复合键数（含空窗键，demo/诊断用）。
+    /// 当前复合键数（含空窗键，demo/诊断用）= 桶级 Entry 总数。
     pub fn key_count(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        let inner = self.inner.lock().unwrap();
+        inner
+            .values()
+            .map(|metrics| metrics.values().map(|b| b.len()).sum::<usize>())
+            .sum()
     }
 
     /// 某 (entity, metric) 当前保留的窗口总数（跨相位求和；相位关闭时即原语义，
@@ -148,10 +160,19 @@ impl BaselineStore {
     pub fn window_count(&self, entity: &str, metric: &str) -> usize {
         let inner = self.inner.lock().unwrap();
         inner
-            .iter()
-            .filter(|(k, _)| k.0 == entity && k.1 == metric)
-            .map(|(_, e)| e.windows.len())
-            .sum()
+            .get(entity)
+            .and_then(|metrics| metrics.get(metric))
+            .map_or(0, |buckets| buckets.values().map(|e| e.windows.len()).sum())
+    }
+
+    /// 某 (entity, metric, 相位桶) 的窗口数（诊断/单测）。
+    pub fn bucket_window_count(&self, entity: &str, metric: &str, bucket: u32) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .get(entity)
+            .and_then(|metrics| metrics.get(metric))
+            .and_then(|buckets| buckets.get(&bucket))
+            .map_or(0, |e| e.windows.len())
     }
 
     fn bucket_for(&self, ts: i64) -> u32 {
@@ -165,10 +186,15 @@ impl BaselineStore {
         if !window.n.is_finite() || !window.sum.is_finite() || !window.sum_sq.is_finite() {
             return;
         }
-        let phase = self.bucket_for(window.win_start_nanos);
-        let key = Key(entity.to_string(), metric.to_string(), phase);
+        let bucket = self.bucket_for(window.win_start_nanos);
         let mut inner = self.inner.lock().unwrap();
-        let entry = inner.entry(key).or_default();
+        let entry = inner
+            .entry(entity.to_string())
+            .or_default()
+            .entry(metric.to_string())
+            .or_default()
+            .entry(bucket)
+            .or_default();
 
         if let Some(pos) = entry
             .windows
@@ -201,24 +227,29 @@ impl BaselineStore {
     }
 
     /// 收集某 (entity, metric) 的窗口（相位关闭 = 全部；相位开启 = 指定桶；None = 全部
-    /// 桶的并集），按 win_start 升序。
+    /// 桶的并集），按 win_start 升序。嵌套索引：只触碰目标 (entity, metric) 的桶，
+    /// 不扫全 store（bench 2026-09-08：旧全表扫描在共享大实体空间下每事件 O(store
+    /// 键数)，见 baseline_bench.rs）。
     fn windows_for(&self, entity: &str, metric: &str, at: Option<i64>) -> Vec<BaselineWindow> {
         let inner = self.inner.lock().unwrap();
+        let Some(metrics) = inner.get(entity) else {
+            return Vec::new();
+        };
+        let Some(buckets) = metrics.get(metric) else {
+            return Vec::new();
+        };
         let target_phase = match (self.phase, at) {
             (Some(_), Some(ts)) => Some(self.bucket_for(ts)),
             _ => None, // 相位关闭，或开启但未给时间 → 全桶并集（时间未知的旧调用）
         };
         let mut out = Vec::new();
-        for (k, e) in inner.iter() {
-            if k.0 != entity || k.1 != metric {
-                continue;
-            }
+        for (&b, entry) in buckets {
             if let Some(p) = target_phase {
-                if k.2 != p {
+                if b != p {
                     continue;
                 }
             }
-            out.extend(e.windows.iter().copied());
+            out.extend(entry.windows.iter().copied());
         }
         out.sort_by_key(|w| w.win_start_nanos);
         out
@@ -361,9 +392,14 @@ mod tests {
         assert_eq!(mu, 10.0);
         let inner = s.inner.lock().unwrap();
         let starts: Vec<i64> = inner
-            .values()
-            .flat_map(|e| e.windows.iter().map(|w| w.win_start_nanos))
-            .collect();
+            .get("e")
+            .and_then(|m| m.get("m"))
+            .map(|b| {
+                b.values()
+                    .flat_map(|en| en.windows.iter().map(|w| w.win_start_nanos))
+                    .collect()
+            })
+            .unwrap_or_default();
         assert_eq!(starts, vec![120, 180, 240]);
     }
 
@@ -444,9 +480,14 @@ mod tests {
         s.append("e", "m", win(60, 1.0, 10.0, 100.0));
         let inner = s.inner.lock().unwrap();
         let starts: Vec<i64> = inner
-            .values()
-            .flat_map(|e| e.windows.iter().map(|w| w.win_start_nanos))
-            .collect();
+            .get("e")
+            .and_then(|m| m.get("m"))
+            .map(|b| {
+                b.values()
+                    .flat_map(|en| en.windows.iter().map(|w| w.win_start_nanos))
+                    .collect()
+            })
+            .unwrap_or_default();
         assert_eq!(starts, vec![0, 60, 120], "乱序 append 仍按 win_start 升序");
     }
 
@@ -754,12 +795,13 @@ mod tests {
             assert!(total <= 8 * 4, "跨桶求和 ≤ K×桶数，实际 {total}");
             assert!(total > 0, "每实体应有数据");
             for b in 0..4u32 {
-                let key = Key(entity.clone(), "m".to_string(), b);
                 let cnt = s
                     .inner
                     .lock()
                     .unwrap()
-                    .get(&key)
+                    .get(&entity)
+                    .and_then(|m| m.get("m"))
+                    .and_then(|bm| bm.get(&b))
                     .map_or(0, |en| en.windows.len());
                 assert!(cnt <= 8, "桶 {b} 窗口数超 K：{cnt}");
             }
