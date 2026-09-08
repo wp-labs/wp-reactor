@@ -976,13 +976,24 @@ fn load_from_postgres(
             .and_then(|q| q.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("SELECT * FROM {}", name));
-        let vars = parse_supply_vars(table);
-        // boot 装载与 knowdb 每次刷新用同一渲染（值计算在 wp_knowledge，knowdb
-        // 拥有 tick 时钟；此处只按此刻值渲染一次供启动装载）。
-        let boot_sql = if vars.is_empty() {
+        // 供给动态变量代码（[[tables]].code，见 wp_knowledge parse_refresh_code）：
+        // 每行 `$name = 字面量/函数`，由 knowdb 每次刷新按自身时钟求值并替换
+        // SQL 里的 `$name`；引擎只读透传。boot 与每次刷新同源渲染。
+        let code = table
+            .get("code")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        let boot_sql = if code.trim().is_empty() {
             sql_template.clone()
         } else {
-            crate::lifecycle::provider_refresh::render_supply_sql(&sql_template, &vars)
+            crate::lifecycle::provider_refresh::render_supply_sql(&sql_template, &code).map_err(
+                |e| {
+                    RuntimeReason::Bootstrap
+                        .to_err()
+                        .with_detail(format!("PG supply code {}: {}", name, e))
+                },
+            )?
         };
         let native =
             wp_knowledge::facade::query_for(ENGINE_PG_PROVIDER, &boot_sql).map_err(|e| {
@@ -1010,7 +1021,7 @@ fn load_from_postgres(
             table = %name,
             rows = row_count,
             refresh = refresh.map(|d| d.as_secs()),
-            vars = !vars.is_empty(),
+            code = !code.is_empty(),
             "knowdb data loaded from PG"
         );
         if let Some(interval) = refresh {
@@ -1020,38 +1031,12 @@ fn load_from_postgres(
                 source: wp_knowledge::refresh::RefreshSource::NamedSql {
                     provider: ENGINE_PG_PROVIDER.to_string(),
                     sql: sql_template,
-                    vars,
+                    code,
                 },
             });
         }
     }
     Ok(())
-}
-
-/// 解析供给表动态变量配置：`phase_period_s`/`phase_bucket_s`/`retention` 三键
-/// 齐全且 0<桶≤周期 时返回 [`RefreshVarDef`] 列表（cur/next/max_age）；否则空。
-/// 值计算在 wp_knowledge（CyclePhase 折桶/Static 透传），引擎只组配置。
-fn parse_supply_vars(table: &toml::Value) -> Vec<wp_knowledge::refresh::RefreshVarDef> {
-    let Some(period_s) = table.get("phase_period_s").and_then(|v| v.as_integer()) else {
-        return Vec::new();
-    };
-    let Some(bucket_s) = table.get("phase_bucket_s").and_then(|v| v.as_integer()) else {
-        return Vec::new();
-    };
-    let Some(retention) = table.get("retention").and_then(|v| v.as_str()) else {
-        return Vec::new();
-    };
-    if period_s <= 0 || bucket_s <= 0 || bucket_s > period_s {
-        wf_warn!(
-            conf,
-            table = table.get("name").and_then(|n| n.as_str()),
-            period_s,
-            bucket_s,
-            "supply 相位参数非法（须 0<桶≤周期）；退化为静态 SQL"
-        );
-        return Vec::new();
-    }
-    crate::lifecycle::provider_refresh::supply_var_defs(period_s as u64, bucket_s as u64, retention)
 }
 
 #[cfg(test)]
@@ -1219,48 +1204,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_supply_vars_accepts_valid_phase_params() {
-        let t: toml::Value = toml::from_str(
-            r#"
-name = "baseline_ref"
-phase_period_s = 240
-phase_bucket_s = 15
-retention = "30 days"
-"#,
-        )
-        .expect("toml");
-        let defs = parse_supply_vars(&t);
-        assert_eq!(defs.len(), 3, "cur/next/max_age 三变量");
-        // 值计算在 wp_knowledge（CyclePhase 折桶 / Static 透传）：固定时刻渲染验证。
-        let sql =
-            "WHERE phase_bucket IN ('$cur','$next') AND win_start >= now() - interval '$max_age'";
+    fn pg_supply_code_rendering_is_passthrough_at_engine_side() {
+        // 引擎对供给 code 只做透传 + boot 渲染（值计算/替换在 wp_knowledge）。
+        // 这里验证引擎入口渲染函数与 knowdb 同源（固定时刻语义已在 wp_knowledge
+        // 单测锁定，此处只验证 code 原样进入渲染、非法 code 报错）。
+        let code = "$cur = cur_phase_bucket(240, 15)\n$next = next_phase_bucket(240, 15)";
+        let sql = "WHERE phase_bucket IN ('$cur','$next')";
         let rendered =
-            wp_knowledge::refresh::render_sql_at(sql, &defs, 120u64.saturating_mul(1_000_000_000));
-        assert_eq!(
-            rendered,
-            "WHERE phase_bucket IN ('p8','p9') AND win_start >= now() - interval '30 days'"
+            crate::lifecycle::provider_refresh::render_supply_sql(sql, code).expect("render");
+        assert!(
+            rendered.starts_with("WHERE phase_bucket IN ('p"),
+            "渲染含标签: {rendered}"
         );
-    }
-
-    #[test]
-    fn parse_supply_vars_empty_without_keys_or_invalid_params() {
-        // 无三键（静态 SQL 路径）
-        let plain: toml::Value = toml::from_str("name = \"baseline_ref\"\n").unwrap();
-        assert!(parse_supply_vars(&plain).is_empty());
-        // 只给部分键 → 空
-        let partial: toml::Value = toml::from_str("name = \"t\"\nphase_period_s = 240\n").unwrap();
-        assert!(parse_supply_vars(&partial).is_empty());
-        // 桶 > 周期 → 空（warn 回退静态）
-        let bad: toml::Value = toml::from_str(
-            r#"
-name = "t"
-phase_period_s = 15
-phase_bucket_s = 240
-retention = "2 hours"
-"#,
-        )
-        .unwrap();
-        assert!(parse_supply_vars(&bad).is_empty());
+        // 无 code = 原样
+        assert_eq!(
+            crate::lifecycle::provider_refresh::render_supply_sql(sql, "").unwrap(),
+            sql
+        );
+        // 非法 code → 报错（boot 期暴露）
+        assert!(crate::lifecycle::provider_refresh::render_supply_sql(sql, "$x = nope()").is_err());
     }
 }
 

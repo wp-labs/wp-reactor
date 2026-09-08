@@ -21,7 +21,6 @@ use wf_engine::window::Router;
 use super::bootstrap::engine_rows_from_knowdb;
 use wp_knowledge::refresh::RefreshService;
 use wp_knowledge::refresh::RefreshSpec;
-use wp_knowledge::refresh::RefreshVarDef;
 
 /// 刷新规格库（bootstrap 装载时登记；daemon 刷新任务启动时一次性取出）。
 static SPECS: OnceLock<Mutex<Vec<RefreshSpec>>> = OnceLock::new();
@@ -90,41 +89,18 @@ fn apply_event(router: &Router, event: wp_knowledge::refresh::RefreshEvent) {
 }
 
 // ---------------------------------------------------------------------------
-// 供给动态变量（$cur/$next/$max_age）——knowdb 计算，引擎只读配置并透传
+// 供给动态变量代码（$cur/$next/$max_age）——knowdb 求值，引擎只透传配置
 // ---------------------------------------------------------------------------
 
-/// 由表级相位配置构造供给变量定义（静态配置）：
-/// - `$cur`  = 当前相位格（offset 0）
-/// - `$next` = 下一相位格（offset +1，周期末由 knowdb 自动回绕）
-/// - `$max_age` = 保留期字面量透传（写死，如 `30 days`）
-/// 值计算在 wp_knowledge（[`RefreshVarDef::CyclePhase`]——knowdb 拥有 tick 时钟，
-/// "当前时刻折桶"是刷新服务的职责）；引擎不重复折桶实现，只在此组配置。
-pub(crate) fn supply_var_defs(period_s: u64, bucket_s: u64, retention: &str) -> Vec<RefreshVarDef> {
-    vec![
-        RefreshVarDef::CyclePhase {
-            name: "cur".to_string(),
-            period_s,
-            bucket_s,
-            offset_slots: 0,
-            prefix: "p".to_string(),
-        },
-        RefreshVarDef::CyclePhase {
-            name: "next".to_string(),
-            period_s,
-            bucket_s,
-            offset_slots: 1,
-            prefix: "p".to_string(),
-        },
-        RefreshVarDef::Static {
-            name: "max_age".to_string(),
-            value: retention.to_string(),
-        },
-    ]
-}
-
-/// boot 装载同源渲染：与 knowdb 每次刷新的渲染是同一函数（此刻值）。
-pub(crate) fn render_supply_sql(sql: &str, defs: &[RefreshVarDef]) -> String {
-    wp_knowledge::refresh::render_sql_at(sql, defs, wp_knowledge::refresh::current_wall_nanos())
+/// boot 装载同源渲染：与 knowdb 每次刷新的渲染是同一函数（[`RefreshSpec`]
+/// NamedSql 携带 `code` 原样交给 knowdb；这里按此刻值渲染一次供启动装载）。
+/// 空代码 = 原样返回。
+pub(crate) fn render_supply_sql(sql: &str, code: &str) -> wp_knowledge::KnowledgeResult<String> {
+    wp_knowledge::refresh::render_refresh_code(
+        sql,
+        code,
+        wp_knowledge::refresh::current_wall_nanos(),
+    )
 }
 
 #[cfg(test)]
@@ -145,7 +121,7 @@ mod tests {
             source: RefreshSource::NamedSql {
                 provider: "pg".into(),
                 sql: "SELECT * FROM t".into(),
-                vars: vec![],
+                code: String::new(),
             },
         });
         register_spec(RefreshSpec {
@@ -167,44 +143,11 @@ mod tests {
     }
 
     #[test]
-    fn supply_var_defs_names_cur_next_and_static_max_age() {
-        let defs = supply_var_defs(240, 15, "30 days");
-        assert_eq!(defs.len(), 3);
-        assert_eq!(
-            defs[0],
-            RefreshVarDef::CyclePhase {
-                name: "cur".into(),
-                period_s: 240,
-                bucket_s: 15,
-                offset_slots: 0,
-                prefix: "p".into(),
-            }
-        );
-        assert_eq!(
-            defs[1],
-            RefreshVarDef::CyclePhase {
-                name: "next".into(),
-                period_s: 240,
-                bucket_s: 15,
-                offset_slots: 1,
-                prefix: "p".into(),
-            }
-        );
-        assert_eq!(
-            defs[2],
-            RefreshVarDef::Static {
-                name: "max_age".into(),
-                value: "30 days".into(),
-            }
-        );
-        // 渲染（值计算在 knowdb：固定时刻折桶/静态透传）
-        let sql =
-            "WHERE phase_bucket IN ('$cur','$next') AND win_start >= now() - interval '$max_age'";
-        let rendered =
-            wp_knowledge::refresh::render_sql_at(sql, &defs, 120u64.saturating_mul(1_000_000_000));
-        assert_eq!(
-            rendered,
-            "WHERE phase_bucket IN ('p8','p9') AND win_start >= now() - interval '30 days'"
-        );
+    fn render_supply_sql_empty_code_passes_through() {
+        let sql = "SELECT * FROM t";
+        assert_eq!(render_supply_sql(sql, "").unwrap(), sql);
+        assert_eq!(render_supply_sql(sql, "  \n# comment\n").unwrap(), sql);
+        // 非法代码 → 报错（boot 期即暴露配置错误，而非静默）
+        assert!(render_supply_sql(sql, "$x = nope(1)").is_err());
     }
 }
