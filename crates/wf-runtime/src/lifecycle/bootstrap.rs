@@ -29,6 +29,11 @@ use super::compile::{
 };
 use super::types::BootstrapData;
 
+/// 全局周期基线供给（PG）的命名 provider：引擎把 knowdb.conf 扁平
+/// `[provider] kind="postgres"` 安装为 wp_knowledge 命名 provider，boot 装载与
+/// 周期刷新（`NamedSql` 规格）都经它路由（见 `load_from_postgres`）。
+const ENGINE_PG_PROVIDER: &str = "engine_pg";
+
 // ---------------------------------------------------------------------------
 // Phase 1: load_and_compile — pure data transforms + async sink build
 // ---------------------------------------------------------------------------
@@ -880,11 +885,20 @@ fn load_from_postgres(
         .and_then(|p| p.as_integer())
         .unwrap_or(4) as u32;
 
-    wp_knowledge::facade::init_postgres_provider(uri, Some(pool_size)).map_err(|e| {
-        RuntimeReason::Bootstrap
-            .to_err()
-            .with_detail(format!("init PG provider: {}", e))
-    })?;
+    // 安装命名 PG provider（幂等）：boot 查询用同步 `query_for`，周期刷新用
+    // `NamedSql` 规格的 `query_async_for`，两条路径路由同一 provider。
+    if !wp_knowledge::facade::provider_exists(ENGINE_PG_PROVIDER) {
+        wp_knowledge::facade::init_postgres_provider_named_uri(
+            ENGINE_PG_PROVIDER,
+            uri,
+            Some(pool_size),
+        )
+        .map_err(|e| {
+            RuntimeReason::Bootstrap
+                .to_err()
+                .with_detail(format!("init PG provider {}: {}", ENGINE_PG_PROVIDER, e))
+        })?;
+    }
 
     for table in tables {
         let name = table.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -897,35 +911,42 @@ fn load_from_postgres(
         }
 
         let sql = format!("SELECT * FROM {}", name);
-        let result = wp_knowledge::facade::query(&sql).map_err(|e| {
+        let native = wp_knowledge::facade::query_for(ENGINE_PG_PROVIDER, &sql).map_err(|e| {
             RuntimeReason::Bootstrap
                 .to_err()
                 .with_detail(format!("PG query {}: {}", name, e))
         })?;
-
-        let mut rows: Vec<std::collections::HashMap<String, EngineValue>> =
-            Vec::with_capacity(result.len());
-        for row in &result {
-            let mut map = std::collections::HashMap::new();
-            for field in row.iter() {
-                map.insert(
-                    field.name.to_string(),
-                    infer_knowledge_value(&field.value.to_string()),
-                );
-            }
-            rows.push(map);
-        }
-        if rows.is_empty() {
+        if native.is_empty() {
             continue;
         }
+        let rows = engine_rows_from_knowdb(native);
 
+        // 周期刷新（S2-M3c-PG）：knowdb [[tables]] `refresh` → NamedSql 规格，
+        // daemon 下由 RefreshService 周期重跑 SELECT 并搬入本 provider 窗。
+        let refresh = parse_knowledge_refresh(table);
         let row_count = rows.len();
-        let mut pw = wf_engine::window::ProviderWindow::new(name.to_string(), sql.clone(), None);
+        let mut pw = wf_engine::window::ProviderWindow::new(name.to_string(), sql.clone(), refresh);
         pw.load(rows);
         registry
             .register_provider(name.to_string(), pw)
             .source_err(RuntimeReason::Bootstrap, "register provider window")?;
-        wf_info!(conf, table = %name, rows = row_count, "knowdb data loaded from PG");
+        wf_info!(
+            conf,
+            table = %name,
+            rows = row_count,
+            refresh = refresh.map(|d| d.as_secs()),
+            "knowdb data loaded from PG"
+        );
+        if let Some(interval) = refresh {
+            crate::lifecycle::provider_refresh::register_spec(wp_knowledge::refresh::RefreshSpec {
+                name: name.to_string(),
+                interval,
+                source: wp_knowledge::refresh::RefreshSource::NamedSql {
+                    provider: ENGINE_PG_PROVIDER.to_string(),
+                    sql,
+                },
+            });
+        }
     }
     Ok(())
 }
