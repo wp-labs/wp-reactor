@@ -977,16 +977,12 @@ fn load_from_postgres(
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("SELECT * FROM {}", name));
         let vars = parse_supply_vars(table);
-        let boot_sql = match &vars {
-            Some(v) => {
-                crate::lifecycle::provider_refresh::render_supply_sql(&sql_template, Some(v))
-                    .map_err(|e| {
-                        RuntimeReason::Bootstrap
-                            .to_err()
-                            .with_detail(format!("PG supply vars {}: {}", name, e))
-                    })?
-            }
-            None => sql_template.clone(),
+        // boot 装载与 knowdb 每次刷新用同一渲染（值计算在 wp_knowledge，knowdb
+        // 拥有 tick 时钟；此处只按此刻值渲染一次供启动装载）。
+        let boot_sql = if vars.is_empty() {
+            sql_template.clone()
+        } else {
+            crate::lifecycle::provider_refresh::render_supply_sql(&sql_template, &vars)
         };
         let native =
             wp_knowledge::facade::query_for(ENGINE_PG_PROVIDER, &boot_sql).map_err(|e| {
@@ -1014,7 +1010,7 @@ fn load_from_postgres(
             table = %name,
             rows = row_count,
             refresh = refresh.map(|d| d.as_secs()),
-            vars = vars.is_some(),
+            vars = !vars.is_empty(),
             "knowdb data loaded from PG"
         );
         if let Some(interval) = refresh {
@@ -1033,11 +1029,18 @@ fn load_from_postgres(
 }
 
 /// 解析供给表动态变量配置：`phase_period_s`/`phase_bucket_s`/`retention` 三键
-/// 齐全且 0<桶≤周期 时返回引擎现算的 [`RefreshVars`]；否则 None（静态 SQL）。
-fn parse_supply_vars(table: &toml::Value) -> Option<wp_knowledge::refresh::RefreshVars> {
-    let period_s = table.get("phase_period_s")?.as_integer()?;
-    let bucket_s = table.get("phase_bucket_s")?.as_integer()?;
-    let retention = table.get("retention")?.as_str()?.to_string();
+/// 齐全且 0<桶≤周期 时返回 [`RefreshVarDef`] 列表（cur/next/max_age）；否则空。
+/// 值计算在 wp_knowledge（CyclePhase 折桶/Static 透传），引擎只组配置。
+fn parse_supply_vars(table: &toml::Value) -> Vec<wp_knowledge::refresh::RefreshVarDef> {
+    let Some(period_s) = table.get("phase_period_s").and_then(|v| v.as_integer()) else {
+        return Vec::new();
+    };
+    let Some(bucket_s) = table.get("phase_bucket_s").and_then(|v| v.as_integer()) else {
+        return Vec::new();
+    };
+    let Some(retention) = table.get("retention").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
     if period_s <= 0 || bucket_s <= 0 || bucket_s > period_s {
         wf_warn!(
             conf,
@@ -1046,13 +1049,9 @@ fn parse_supply_vars(table: &toml::Value) -> Option<wp_knowledge::refresh::Refre
             bucket_s,
             "supply 相位参数非法（须 0<桶≤周期）；退化为静态 SQL"
         );
-        return None;
+        return Vec::new();
     }
-    Some(crate::lifecycle::provider_refresh::phase_refresh_vars(
-        period_s as u64,
-        bucket_s as u64,
-        retention,
-    ))
+    crate::lifecycle::provider_refresh::supply_var_defs(period_s as u64, bucket_s as u64, retention)
 }
 
 #[cfg(test)]
@@ -1230,31 +1229,28 @@ retention = "30 days"
 "#,
         )
         .expect("toml");
-        let vars = parse_supply_vars(&t).expect("齐全且合法 → Some");
-        let kv = vars.compute().expect("compute");
-        let map: HashMap<&str, &str> = kv.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        assert!(
-            map["cur"].starts_with('p'),
-            "cur 为相位标签: {}",
-            map["cur"]
+        let defs = parse_supply_vars(&t);
+        assert_eq!(defs.len(), 3, "cur/next/max_age 三变量");
+        // 值计算在 wp_knowledge（CyclePhase 折桶 / Static 透传）：固定时刻渲染验证。
+        let sql =
+            "WHERE phase_bucket IN ('$cur','$next') AND win_start >= now() - interval '$max_age'";
+        let rendered =
+            wp_knowledge::refresh::render_sql_at(sql, &defs, 120u64.saturating_mul(1_000_000_000));
+        assert_eq!(
+            rendered,
+            "WHERE phase_bucket IN ('p8','p9') AND win_start >= now() - interval '30 days'"
         );
-        assert!(
-            map["next"].starts_with('p'),
-            "next 为相位标签: {}",
-            map["next"]
-        );
-        assert_eq!(map["max_age"], "30 days");
     }
 
     #[test]
-    fn parse_supply_vars_none_without_keys_or_invalid_params() {
+    fn parse_supply_vars_empty_without_keys_or_invalid_params() {
         // 无三键（静态 SQL 路径）
         let plain: toml::Value = toml::from_str("name = \"baseline_ref\"\n").unwrap();
-        assert!(parse_supply_vars(&plain).is_none());
-        // 只给部分键 → None
+        assert!(parse_supply_vars(&plain).is_empty());
+        // 只给部分键 → 空
         let partial: toml::Value = toml::from_str("name = \"t\"\nphase_period_s = 240\n").unwrap();
-        assert!(parse_supply_vars(&partial).is_none());
-        // 桶 > 周期 → None（warn 回退静态）
+        assert!(parse_supply_vars(&partial).is_empty());
+        // 桶 > 周期 → 空（warn 回退静态）
         let bad: toml::Value = toml::from_str(
             r#"
 name = "t"
@@ -1264,7 +1260,7 @@ retention = "2 hours"
 "#,
         )
         .unwrap();
-        assert!(parse_supply_vars(&bad).is_none());
+        assert!(parse_supply_vars(&bad).is_empty());
     }
 }
 

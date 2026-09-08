@@ -13,15 +13,15 @@
 //! 日志/回归用，勿改格式）。
 
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio_util::sync::CancellationToken;
 
 use wf_engine::window::Router;
 
 use super::bootstrap::engine_rows_from_knowdb;
-use wp_knowledge::refresh::resolve_sql_vars;
-use wp_knowledge::refresh::{RefreshService, RefreshSpec, RefreshVars};
+use wp_knowledge::refresh::RefreshService;
+use wp_knowledge::refresh::RefreshSpec;
+use wp_knowledge::refresh::RefreshVarDef;
 
 /// 刷新规格库（bootstrap 装载时登记；daemon 刷新任务启动时一次性取出）。
 static SPECS: OnceLock<Mutex<Vec<RefreshSpec>>> = OnceLock::new();
@@ -90,68 +90,41 @@ fn apply_event(router: &Router, event: wp_knowledge::refresh::RefreshEvent) {
 }
 
 // ---------------------------------------------------------------------------
-// 供给动态变量（$cur/$next/$max_age）——引擎现算，knowdb 只做值替换
+// 供给动态变量（$cur/$next/$max_age）——knowdb 计算，引擎只读配置并透传
 // ---------------------------------------------------------------------------
 
-/// 相位标签：桶序号 → chars 标签（与供给窗/事件打标同口径 'p0'..）。
-pub(crate) fn phase_bucket_label(idx: u64) -> String {
-    format!("p{idx}")
-}
-
-/// 在给定时刻 `now_ns` 现算供给变量：
-/// - `cur`  = 当前相位标签（`fold(now)`：`(now mod period) div bucket`，epoch 折叠）；
-/// - `next` = 下一相位标签（`fold(now + bucket)`，周期末回绕到 p0）；
-/// - `max_age` = 静态保留期字面量（写死，如 `30 days`）。
-/// 语义 = A 通道处理时间近似：供给只取当前/下一相位对应格（N=period/bucket 由
-/// 调用侧配置）；SQL 模板里的 `$cur/$next/$max_age` 由 wp_knowledge 在每次
-/// 执行前替换（refresh::resolve_sql_vars）。
-pub(crate) fn phase_vars_at(
-    now_ns: u64,
-    period_s: u64,
-    bucket_s: u64,
-    retention: &str,
-) -> Vec<(String, String)> {
-    let period_ns = period_s.saturating_mul(1_000_000_000);
-    let bucket_ns = bucket_s.saturating_mul(1_000_000_000);
-    // 0<桶≤周期 已由调用侧校验；此处防御性回退 p0（不 panic）。
-    let fold = |t: u64| {
-        if period_ns == 0 || bucket_ns == 0 || bucket_ns > period_ns {
-            0
-        } else {
-            (t % period_ns) / bucket_ns
-        }
-    };
+/// 由表级相位配置构造供给变量定义（静态配置）：
+/// - `$cur`  = 当前相位格（offset 0）
+/// - `$next` = 下一相位格（offset +1，周期末由 knowdb 自动回绕）
+/// - `$max_age` = 保留期字面量透传（写死，如 `30 days`）
+/// 值计算在 wp_knowledge（[`RefreshVarDef::CyclePhase`]——knowdb 拥有 tick 时钟，
+/// "当前时刻折桶"是刷新服务的职责）；引擎不重复折桶实现，只在此组配置。
+pub(crate) fn supply_var_defs(period_s: u64, bucket_s: u64, retention: &str) -> Vec<RefreshVarDef> {
     vec![
-        ("cur".to_string(), phase_bucket_label(fold(now_ns))),
-        (
-            "next".to_string(),
-            phase_bucket_label(fold(now_ns.saturating_add(bucket_ns))),
-        ),
-        ("max_age".to_string(), retention.to_string()),
+        RefreshVarDef::CyclePhase {
+            name: "cur".to_string(),
+            period_s,
+            bucket_s,
+            offset_slots: 0,
+            prefix: "p".to_string(),
+        },
+        RefreshVarDef::CyclePhase {
+            name: "next".to_string(),
+            period_s,
+            bucket_s,
+            offset_slots: 1,
+            prefix: "p".to_string(),
+        },
+        RefreshVarDef::Static {
+            name: "max_age".to_string(),
+            value: retention.to_string(),
+        },
     ]
 }
 
-/// 构造"每 tick 现算"的 [`RefreshVars`]（wall-clock）；参数已在调用侧校验
-/// （period/bucket/retention 齐全且 0<桶≤周期）。
-pub(crate) fn phase_refresh_vars(period_s: u64, bucket_s: u64, retention: String) -> RefreshVars {
-    RefreshVars::new(move || {
-        let now_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        Ok(phase_vars_at(now_ns, period_s, bucket_s, &retention))
-    })
-}
-
-/// boot 装载同源渲染：与 [`phase_refresh_vars`] 同一口径（此刻值）。
-pub(crate) fn render_supply_sql(
-    sql: &str,
-    vars: Option<&RefreshVars>,
-) -> wp_knowledge::KnowledgeResult<String> {
-    match vars {
-        Some(v) => Ok(resolve_sql_vars(sql, &v.compute()?)),
-        None => Ok(sql.to_string()),
-    }
+/// boot 装载同源渲染：与 knowdb 每次刷新的渲染是同一函数（此刻值）。
+pub(crate) fn render_supply_sql(sql: &str, defs: &[RefreshVarDef]) -> String {
+    wp_knowledge::refresh::render_sql_at(sql, defs, wp_knowledge::refresh::current_wall_nanos())
 }
 
 #[cfg(test)]
@@ -172,7 +145,7 @@ mod tests {
             source: RefreshSource::NamedSql {
                 provider: "pg".into(),
                 sql: "SELECT * FROM t".into(),
-                vars: None,
+                vars: vec![],
             },
         });
         register_spec(RefreshSpec {
@@ -194,46 +167,44 @@ mod tests {
     }
 
     #[test]
-    fn phase_vars_at_folds_cur_next_and_keeps_static_max_age() {
-        // period=240s/bucket=15s（演示档，N=16）：
-        // 120s → 桶 8；+15s（下一格 135s）→ 桶 9；max_age 静态透传。
-        let ns = |s: u64| s.saturating_mul(1_000_000_000);
-        let v = phase_vars_at(ns(120), 240, 15, "30 days");
+    fn supply_var_defs_names_cur_next_and_static_max_age() {
+        let defs = supply_var_defs(240, 15, "30 days");
+        assert_eq!(defs.len(), 3);
         assert_eq!(
-            v,
-            vec![
-                ("cur".to_string(), "p8".to_string()),
-                ("next".to_string(), "p9".to_string()),
-                ("max_age".to_string(), "30 days".to_string()),
-            ]
+            defs[0],
+            RefreshVarDef::CyclePhase {
+                name: "cur".into(),
+                period_s: 240,
+                bucket_s: 15,
+                offset_slots: 0,
+                prefix: "p".into(),
+            }
         );
-    }
-
-    #[test]
-    fn phase_vars_at_next_wraps_at_period_boundary() {
-        let ns = |s: u64| s.saturating_mul(1_000_000_000);
-        // 225s = 周期末最后一格（桶 15）；下一格 240s 回绕到周期首（桶 0）。
-        let v = phase_vars_at(ns(225), 240, 15, "2 hours");
-        let map: std::collections::HashMap<&str, &str> = v
-            .iter()
-            .map(|(k, val)| (k.as_str(), val.as_str()))
-            .collect();
-        assert_eq!(map["cur"], "p15");
-        assert_eq!(map["next"], "p0");
-    }
-
-    #[test]
-    fn phase_vars_at_defensive_fallback_on_bad_params() {
-        let ns = |s: u64| s.saturating_mul(1_000_000_000);
-        // 桶 > 周期 / 0 参数（调用侧已拦，此处防御）：退化为 p0 不 panic。
-        for (period_s, bucket_s) in [(15u64, 240u64), (240, 0), (0, 15)] {
-            let v = phase_vars_at(ns(120), period_s, bucket_s, "2 hours");
-            let map: std::collections::HashMap<&str, &str> = v
-                .iter()
-                .map(|(k, val)| (k.as_str(), val.as_str()))
-                .collect();
-            assert_eq!(map["cur"], "p0");
-            assert_eq!(map["next"], "p0");
-        }
+        assert_eq!(
+            defs[1],
+            RefreshVarDef::CyclePhase {
+                name: "next".into(),
+                period_s: 240,
+                bucket_s: 15,
+                offset_slots: 1,
+                prefix: "p".into(),
+            }
+        );
+        assert_eq!(
+            defs[2],
+            RefreshVarDef::Static {
+                name: "max_age".into(),
+                value: "30 days".into(),
+            }
+        );
+        // 渲染（值计算在 knowdb：固定时刻折桶/静态透传）
+        let sql =
+            "WHERE phase_bucket IN ('$cur','$next') AND win_start >= now() - interval '$max_age'";
+        let rendered =
+            wp_knowledge::refresh::render_sql_at(sql, &defs, 120u64.saturating_mul(1_000_000_000));
+        assert_eq!(
+            rendered,
+            "WHERE phase_bucket IN ('p8','p9') AND win_start >= now() - interval '30 days'"
+        );
     }
 }
