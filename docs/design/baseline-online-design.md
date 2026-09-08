@@ -606,7 +606,11 @@ CSV 装载为**启动一次性**；定期推进 = 导出侧重建 CSV + reload�
 - **join 左侧必须是字段**（已核实 checker 约束）：A 通道动态相位只能靠事件带
   `phase_bucket` 冗余列，引擎内派生键不可行；
 - 近端 B 表归属层（规则任务级 vs 共享基线服务）与 §6.4 `RuleBaselines` 同层，实现时定；
-- `phase_bucket` 编码/时区约定；A 视图与 B 桶定义的等价性测试。
+- `phase_bucket` 编码/时区约定：**demo 已落地**（2026-09-08，wf-examples）——事件与供给均以
+  十进制 `p0..p15` chars 编码（join 键拒 float、纯数字字符串被 loader 推断 REAL），折叠 = epoch 秒
+  `% period / bucket`（period=240s/bucket=15s 演示档，`phase_cfg.py` 为单一事实源，PG 供给 SQL
+  字面量须同步）；A 供给与 B 桶定义的**等价性测试**仍待补（A=SQL/CSV 秒粒度 vs B=引擎纳秒
+  `bucket_of`，BASE 对齐时等价）。
 
 ### 11.7 近端 B 相位同窗（2026-09-08 实现）
 
