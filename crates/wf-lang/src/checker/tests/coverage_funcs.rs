@@ -452,6 +452,67 @@ rule r {
 }
 
 #[test]
+fn func_phase_bucket_validation() {
+    // 相位折叠：phase_bucket(t, period_s, bucket_s) → 周期内相位桶序号。
+    // 合法形态编译通过（返回值 digit，可 concat 成 'p0'.. 标签）。
+    let valid = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        n = phase_bucket(e.event_time, 240, 15),
+        y = concat("p", phase_bucket(@window_start_time, 240, 15)),
+        f = phase_bucket(@window_start_time, 60.0, 15.0)
+    )
+}
+"#;
+    assert_no_errors(valid, &[auth_events_window(), wide_output_window()]);
+
+    let wrong_count = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (n = phase_bucket(e.event_time, 240))
+}
+"#;
+    assert_has_error(
+        wrong_count,
+        &[auth_events_window(), wide_output_window()],
+        "phase_bucket() requires exactly 3 arguments",
+    );
+
+    let bad_first = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (n = phase_bucket(e.sip, 240, 15))
+}
+"#;
+    assert_has_error(
+        bad_first,
+        &[auth_events_window(), wide_output_window()],
+        "phase_bucket() first argument must be time or numeric",
+    );
+
+    let bad_period = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (n = phase_bucket(e.event_time, e.sip, 15))
+}
+"#;
+    assert_has_error(
+        bad_period,
+        &[auth_events_window(), wide_output_window()],
+        "phase_bucket() argument 2 must be numeric (seconds)",
+    );
+}
+
+#[test]
 fn func_round_validation() {
     let wrong_count = r#"
 rule r {

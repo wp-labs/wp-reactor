@@ -332,6 +332,80 @@ fn test_time_bucket_rejects_invalid_interval_in_yield_eval() {
 }
 
 #[test]
+fn test_phase_bucket_folding_matches_period_grid() {
+    // phase_bucket(t, 240, 15)：epoch 秒折 240s 周期/15s 桶，桶号 = 余秒 div 15。
+    // 折叠口径与近端 B Phase::bucket_of 一致（epoch mod period div bucket）。
+    let ctx = Event {
+        fields: EngineHashMap::default(),
+    };
+    let pb = |t: f64| {
+        eval_expr_with_l3(
+            &Expr::FuncCall {
+                qualifier: None,
+                name: "phase_bucket".to_string(),
+                args: vec![Expr::Number(t), Expr::Number(240.0), Expr::Number(15.0)],
+            },
+            &ctx,
+            YieldMeta::default(),
+        )
+    };
+    // 基线时刻余 80s → 桶 5；+300s（余 140s）→ 桶 9；−75s（余 5s）→ 桶 0；
+    // 周期回绕：+225s（余 65s+240s=305s→65s）→ 桶 4。
+    assert_eq!(pb(1_700_000_000.0), Some(Value::Number(5.0)));
+    assert_eq!(pb(1_700_000_300.0), Some(Value::Number(9.0)));
+    assert_eq!(pb(1_699_999_925.0), Some(Value::Number(0.0)));
+    assert_eq!(pb(1_700_000_225.0), Some(Value::Number(4.0)));
+    // 负时间 → 桶 0（对齐 Phase::bucket_of）。
+    assert_eq!(pb(-60.0), Some(Value::Number(0.0)));
+}
+
+#[test]
+fn test_phase_bucket_label_composition_and_invalid_args() {
+    let ctx = Event {
+        fields: EngineHashMap::default(),
+    };
+    // 演示落库标签：concat("p", phase_bucket(...)) = 'p5'（整值 Number → "5"）。
+    let labeled = Expr::FuncCall {
+        qualifier: None,
+        name: "concat".to_string(),
+        args: vec![
+            Expr::StringLit("p".to_string()),
+            Expr::FuncCall {
+                qualifier: None,
+                name: "phase_bucket".to_string(),
+                args: vec![
+                    Expr::Number(1_700_000_000.0),
+                    Expr::Number(240.0),
+                    Expr::Number(15.0),
+                ],
+            },
+        ],
+    };
+    assert_eq!(
+        eval_expr_with_l3(&labeled, &ctx, YieldMeta::default()),
+        Some(Value::Str("p5".into()))
+    );
+
+    let eval = |args: Vec<f64>| {
+        eval_expr_with_l3(
+            &Expr::FuncCall {
+                qualifier: None,
+                name: "phase_bucket".to_string(),
+                args: args.into_iter().map(Expr::Number).collect::<Vec<_>>(),
+            },
+            &ctx,
+            YieldMeta::default(),
+        )
+    };
+    // 元数不对 / 桶 > 周期 / 桶或周期 ≤ 0 / 非有限时间 → None。
+    assert_eq!(eval(vec![1_700_000_000.0, 240.0]), None);
+    assert_eq!(eval(vec![1_700_000_000.0, 15.0, 240.0]), None);
+    assert_eq!(eval(vec![1_700_000_000.0, 240.0, 0.0]), None);
+    assert_eq!(eval(vec![1_700_000_000.0, 0.0, 15.0]), None);
+    assert_eq!(eval(vec![f64::NAN, 240.0, 15.0]), None);
+}
+
+#[test]
 fn test_mvjoin_with_collect_list_nested_l3() {
     let ctx = make_test_event(vec![
         Value::Str("a".into()),

@@ -154,6 +154,7 @@ pub(crate) fn check_func_call(
         "time_diff"
             | "time_bucket"
             | "bucket_end"
+            | "phase_bucket"
             | "now"
             | "now_s"
             | "now_ms"
@@ -616,6 +617,46 @@ fn check_time_func(
                             name, t
                         ),
                     ));
+                }
+            }
+        }
+        "phase_bucket" => {
+            // 相位折叠：phase_bucket(t, period_s, bucket_s) → 周期内桶序号。
+            // 折叠口径见 baseline-online-design.md §11.7（epoch mod period div bucket）。
+            if args.len() != 3 {
+                errors.push(rule_error(
+                    rule_name,
+                    "phase_bucket() requires exactly 3 arguments: (time, period_seconds, bucket_seconds)"
+                        .to_string(),
+                ));
+            } else {
+                // First argument must be time or numeric
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Time))
+                    && !is_numeric(&t)
+                {
+                    errors.push(rule_error(
+                        rule_name,
+                        format!(
+                            "phase_bucket() first argument must be time or numeric, got {:?}",
+                            t
+                        ),
+                    ));
+                }
+                // Second/third must be numeric (period/bucket in seconds)
+                for (i, arg) in args.iter().enumerate().skip(1) {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !is_numeric(&t)
+                    {
+                        errors.push(rule_error(
+                            rule_name,
+                            format!(
+                                "phase_bucket() argument {} must be numeric (seconds), got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        ));
+                    }
                 }
             }
         }

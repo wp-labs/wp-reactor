@@ -543,7 +543,8 @@ entity:   chars          -- 隔离键
 metric:   chars
 win_start/win_end: time  -- 窗口边界（相位由消费侧推导/冗余列表达）
 n: u64（对外数值）; sum/sum_sq: numeric
--- 预留: phase_bucket: chars（A 通道等值 join 用，上游打标；编码待定见 11.6）
+-- 已落地（2026-09-08）：phase_bucket: chars（A 通道等值 join 用，收盘打标写入，
+-- 引擎 wfl 内建 phase_bucket(t, period_s, bucket_s) 折叠，见 §11.6）
 
 -- v_baseline_phase（A 通道读模型，最少列）
 entity, metric, phase_bucket,
@@ -607,10 +608,16 @@ CSV 装载为**启动一次性**；定期推进 = 导出侧重建 CSV + reload�
   `phase_bucket` 冗余列，引擎内派生键不可行；
 - 近端 B 表归属层（规则任务级 vs 共享基线服务）与 §6.4 `RuleBaselines` 同层，实现时定；
 - `phase_bucket` 编码/时区约定：**demo 已落地**（2026-09-08，wf-examples）——事件与供给均以
-  十进制 `p0..p15` chars 编码（join 键拒 float、纯数字字符串被 loader 推断 REAL），折叠 = epoch 秒
-  `% period / bucket`（period=240s/bucket=15s 演示档，`phase_cfg.py` 为单一事实源，PG 供给 SQL
-  字面量须同步）；A 供给与 B 桶定义的**等价性测试**仍待补（A=SQL/CSV 秒粒度 vs B=引擎纳秒
-  `bucket_of`，BASE 对齐时等价）。
+  十进制 `p0..p15` chars 编码（join 键拒 float、纯数字字符串被 loader 推断 REAL），折叠 = epoch
+  `% period / bucket`（period=240s/bucket=15s 演示档）。**2026-09-08 落库即带桶**：折桶前移到收盘——
+  wfl 新增内建 `phase_bucket(t, period_s, bucket_s) → 周期内桶序号`（wf-engine/wf-cep 双求值表 +
+  checker 三类校验；口径与近端 B `Phase::bucket_of` 一致：epoch 纳秒 mod period div bucket、无时区），
+  producer 收盘 `yield phase_bucket = concat("p", phase_bucket(@window_start_time, 240, 15))`——PG 供给
+  SQL/CSV 导出退化为按列 `GROUP BY`（常量 240/15/'p'/时间解析消失）；`phase_cfg.py` 收窄为仅事件
+  打标 + CSV seed。⚠ wfl 字面量 = 周期/桶宽唯一引擎侧出处，改值须同步 phase_cfg.py 与
+  conf/loop.phase.wfusion.toml（run_phase --constants 交叉校验只覆盖 conf↔gen；wfl 错位 →
+  detect join miss → run.sh 健康检查 A=0 报错）；A 供给与 B 桶定义的**等价性测试**仍待补
+  （A=列打标秒粒度 vs B=引擎纳秒 `bucket_of`，BASE 对齐时等价）。
 
 ### 11.7 近端 B 相位同窗（2026-09-08 实现）
 

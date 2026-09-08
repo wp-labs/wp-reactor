@@ -343,6 +343,7 @@ fn builtin_handler(name: &str) -> Option<BuiltinHandler> {
         map.insert("time_diff", handlers::builtin_time_diff);
         map.insert("time_bucket", handlers::builtin_time_bucket);
         map.insert("bucket_end", handlers::builtin_bucket_end);
+        map.insert("phase_bucket", handlers::builtin_phase_bucket);
         map.insert("external", handlers::builtin_external);
         map
     });

@@ -94,6 +94,7 @@ fn eval_handler(name: &str) -> Option<FuncHandler> {
         map.insert("time_diff", eval_func_time_diff);
         map.insert("time_bucket", eval_func_time_bucket);
         map.insert("bucket_end", eval_func_bucket_end);
+        map.insert("phase_bucket", eval_func_phase_bucket);
         map.insert("collect_set", eval_func_collect_set);
         map.insert("collect_list", eval_func_collect_set);
         map.insert("first", eval_func_collect_set);
@@ -120,6 +121,10 @@ mod tests {
         assert!(eval_handler("merge").is_some(), "misc 族");
         assert!(eval_handler("stable_id").is_some(), "hash 族");
         assert!(eval_handler("strftime").is_some(), "time 族");
+        assert!(
+            eval_handler("phase_bucket").is_some(),
+            "time 族（相位折叠）"
+        );
         assert!(eval_handler("external").is_some(), "外部分派");
         assert!(eval_handler("no_such_func").is_none(), "未知名拒绝");
     }

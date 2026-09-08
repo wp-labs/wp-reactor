@@ -1210,6 +1210,42 @@ pub(super) fn builtin_bucket_end(
         bucketed.checked_add(interval_nanos)?,
     ))
 }
+pub(super) fn builtin_phase_bucket(
+    _name: &str,
+    args: &[wf_lang::ast::Expr],
+    ctx: &dyn FieldSource,
+    score: YieldMeta<'_>,
+) -> Option<Value> {
+    // 相位折叠（baseline 周期基线；见 baseline-online-design.md §11.7）：
+    //   phase_bucket(t, period_s, bucket_s) → 周期内相位桶序号 0..(period/bucket-1)
+    // 折叠口径与近端 B `Phase::bucket_of` 完全一致（epoch 纳秒 mod period div
+    // bucket，无时区；t<0 → 0）。period/bucket 以**秒**为单位的数值参数（如
+    // 240/15 = 每周期 16 桶）。桶宽须 >0 且 ≤ 周期，否则 None（yield 列空）。
+    if args.len() != 3 {
+        return None;
+    }
+    let t = match eval_expr_with_l3(&args[0], ctx, score)? {
+        Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        _ => return None,
+    };
+    let period = match eval_expr_with_l3(&args[1], ctx, score)? {
+        Value::Number(n) => positive_interval_seconds_to_nanos(n)?,
+        _ => return None,
+    };
+    let bucket = match eval_expr_with_l3(&args[2], ctx, score)? {
+        Value::Number(n) => positive_interval_seconds_to_nanos(n)?,
+        _ => return None,
+    };
+    if bucket <= 0 || period < bucket {
+        return None;
+    }
+    let idx: u64 = if t < 0 {
+        0
+    } else {
+        (t as u64 % period as u64) / bucket as u64
+    };
+    Some(Value::Number(idx as f64))
+}
 pub(super) fn builtin_external(
     _name: &str,
     args: &[wf_lang::ast::Expr],
