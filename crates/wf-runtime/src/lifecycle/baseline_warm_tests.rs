@@ -69,3 +69,58 @@ fn warm_skips_empty_key_rows_and_accepts_bom() {
 fn warm_none_path_is_noop() {
     assert!(warm_baseline_history(None, 8, true, None, Path::new(".")).is_ok());
 }
+
+// ---- resolve_baseline_phase（相位配置校验，纯函数，无全局副作用） -----------
+
+fn hd(secs: u64) -> wf_config::HumanDuration {
+    wf_config::HumanDuration::from(std::time::Duration::from_secs(secs))
+}
+
+#[test]
+fn resolve_phase_valid_pair_produces_phase() {
+    let p = resolve_baseline_phase(&Some(hd(240)), &Some(hd(15))).expect("合法成对应成功");
+    let ph = p.expect("应产出 Some(Phase)");
+    assert_eq!(ph.period_nanos, 240_000_000_000);
+    assert_eq!(ph.bucket_nanos, 15_000_000_000);
+}
+
+#[test]
+fn resolve_phase_both_none_is_none() {
+    assert!(
+        resolve_baseline_phase(&None, &None)
+            .expect("全缺省应成功")
+            .is_none(),
+        "两字段都缺 → 相位关闭"
+    );
+}
+
+#[test]
+fn resolve_phase_requires_pair() {
+    assert!(
+        resolve_baseline_phase(&Some(hd(240)), &None).is_err(),
+        "只给 period 应报错（防半配置静默关相位）"
+    );
+    assert!(
+        resolve_baseline_phase(&None, &Some(hd(15))).is_err(),
+        "只给 bucket 应报错"
+    );
+}
+
+#[test]
+fn resolve_phase_rejects_bucket_gt_period_or_zero() {
+    assert!(
+        resolve_baseline_phase(&Some(hd(15)), &Some(hd(60))).is_err(),
+        "bucket>period 应报错（桶会超出周期）"
+    );
+    assert!(
+        resolve_baseline_phase(&Some(hd(60)), &Some(hd(0))).is_err(),
+        "bucket=0 应报错（除零）"
+    );
+}
+
+#[test]
+fn resolve_phase_allows_period_equals_bucket() {
+    let p = resolve_baseline_phase(&Some(hd(60)), &Some(hd(60))).expect("period==bucket 合法");
+    let ph = p.expect("单格周期");
+    assert_eq!(ph.period_nanos, ph.bucket_nanos);
+}

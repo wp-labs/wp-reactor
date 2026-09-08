@@ -599,4 +599,170 @@ mod tests {
         );
         assert!(bad.phase().is_none(), "非法参数应退化为无相位");
     }
+
+    // ---- 相位同窗补测（2026-09-08，六轮 review 后补充） ---------------------
+
+    #[test]
+    fn phase_summary_at_none_unions_all_buckets() {
+        // at=None（事件缺 event_time 的保守回退）= 全桶并集；与 at=Some 的同相位
+        // 过滤必须给出不同（可区分）的基线——并集 σ 含跨相位离散，绝不可与单桶混淆。
+        let s = phase_store(8, false);
+        s.append("e", "m", win(0, 1.0, 10.0, 100.0)); // 桶0 μ=10
+        s.append("e", "m", win(15_000_000_000, 1.0, 20.0, 400.0)); // 桶1 μ=20
+        s.append("e", "m", win(30_000_000_000, 1.0, 30.0, 900.0)); // 桶2 μ=30
+
+        // 同相位：只含桶1 → n=1 μ=20 σ=0
+        let (n1, mu1, sig1) = s.summary_at("e", "m", Some(15_000_000_000)).unwrap();
+        assert_eq!((n1, mu1, sig1), (1.0, 20.0, 0.0), "同相位基线应只含桶1");
+
+        // 全桶并集：n=3 sum=60 sq=900 → μ=20，σ=√(1400/3−400)=√(200/3)≈8.165
+        let (n3, mu3, sig3) = s.summary_at("e", "m", None).unwrap();
+        assert_eq!(n3, 3.0);
+        assert_eq!(mu3, 20.0);
+        let expect_sigma = (200.0f64 / 3.0).sqrt();
+        assert!(
+            (sig3 - expect_sigma).abs() < 1e-9,
+            "并集 σ 失配 {sig3} vs {expect_sigma}"
+        );
+        let d = s.deviation_at("e", "m", 40.0, None).unwrap();
+        assert!((d - 20.0 / expect_sigma).abs() < 1e-9, "并集 z 失配 {d}");
+    }
+
+    #[test]
+    fn phase_deviation_at_empty_bucket_returns_none() {
+        // 目标相位桶无历史而其它桶有 → None（严格隔离：异相位不得泄漏成基线，
+        // 否则会拿"另一时段"的画像给本时段误判）。
+        let s = phase_store(8, false);
+        s.append("e", "m", win(0, 1.0, 1000.0, 1_000_000.0)); // 桶0 高基线
+        s.append("e", "m", win(15_000_000_000, 1.0, 10.0, 100.0)); // 桶1
+        assert!(
+            s.summary_at("e", "m", Some(45_000_000_000)).is_none(),
+            "桶3 无历史 → summary None"
+        );
+        assert!(
+            s.deviation_at("e", "m", 5000.0, Some(45_000_000_000))
+                .is_none(),
+            "桶3 无历史 → deviation None（不误报）"
+        );
+        // 对照：有历史的桶正常判定
+        assert!(
+            s.deviation_at("e", "m", 10.0, Some(15_000_000_000))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn phase_replay_replaces_within_bucket_across_periods() {
+        // 同 (键含桶, win_start) 重放 → 替换不重复计数；跨周期同桶各自保留。
+        let s = phase_store(8, false);
+        s.append("e", "m", win(0, 1.0, 10.0, 100.0)); // 周期0 桶0
+        s.append("e", "m", win(60_000_000_000, 1.0, 10.0, 100.0)); // 周期1 桶0
+        s.append("e", "m", win(0, 2.0, 20.0, 200.0)); // 重放周期0 同窗 → 替换
+        assert_eq!(s.window_count("e", "m"), 2, "重放不得重复计数");
+        let (n, mu, _) = s.summary_at("e", "m", Some(0)).unwrap();
+        assert_eq!((n, mu), (3.0, 10.0), "桶0 = 替换窗(n=2) + 周期1窗(n=1)");
+    }
+
+    #[test]
+    fn phase_trim_is_per_bucket_not_global() {
+        // K=2：某桶 3 窗只留其最新 2，其它桶不受牵连（裁剪作用域=桶）。
+        let s = phase_store(2, false);
+        s.append("e", "m", win(0, 1.0, 10.0, 100.0)); // 桶0
+        s.append("e", "m", win(60_000_000_000, 1.0, 20.0, 400.0)); // 桶0 周期1
+        s.append("e", "m", win(120_000_000_000, 1.0, 30.0, 900.0)); // 桶0 周期2 → 裁掉 ts=0
+        s.append("e", "m", win(15_000_000_000, 1.0, 50.0, 2500.0)); // 桶1（不受牵连）
+        assert_eq!(s.window_count("e", "m"), 3, "桶0 裁到 2 + 桶1 保留 1");
+        let (n, mu, _) = s.summary_at("e", "m", Some(0)).unwrap();
+        assert_eq!((n, mu), (2.0, 25.0), "桶0 仅留 ts=60s/120s（μ 20/30 → 25）");
+        let (n1, mu1, _) = s.summary_at("e", "m", Some(15_000_000_000)).unwrap();
+        assert_eq!((n1, mu1), (1.0, 50.0), "桶1 不受桶0 裁剪影响");
+    }
+
+    #[test]
+    fn phase_bucket_folding_wraps_at_period() {
+        let p = Phase {
+            period_nanos: 60_000_000_000,
+            bucket_nanos: 15_000_000_000,
+        };
+        assert_eq!(p.bucket_of(0), 0);
+        assert_eq!(p.bucket_of(15_000_000_000), 1);
+        assert_eq!(p.bucket_of(59_000_000_000), 3);
+        assert_eq!(p.bucket_of(60_000_000_000), 0, "周期边界折回桶0");
+        assert_eq!(p.bucket_of(60_000_000_000 + 15_000_000_000), 1);
+        assert_eq!(p.bucket_of(2 * 60_000_000_000 + 30_000_000_000), 2);
+        assert_eq!(p.bucket_of(-5), 0, "负时间（防御）→ 桶0");
+        // i64 大值（真实 epoch 纳秒量级）与镜像一致、不溢出
+        let ts = 1_767_225_600_000_000_000i64 + 7 * 86_400_000_000_000i64;
+        assert_eq!(
+            p.bucket_of(ts),
+            ((ts as u64) % 60_000_000_000 / 15_000_000_000) as u32
+        );
+    }
+
+    #[test]
+    fn phase_period_equals_bucket_is_single_slot_and_stable() {
+        // period==bucket：合法（单格周期），折叠退化为全时域同一桶——行为稳定、
+        // 不产生分裂键（相位最细粒度=周期本身，等价关闭的可用形态）。
+        let s = BaselineStore::phased(
+            8,
+            false,
+            Phase {
+                period_nanos: 60_000_000_000,
+                bucket_nanos: 60_000_000_000,
+            },
+        );
+        assert!(s.phase().is_some(), "period==bucket 应保留相位（单桶退化）");
+        s.append("e", "m", win(0, 1.0, 10.0, 100.0));
+        s.append("e", "m", win(120_000_000_000, 1.0, 20.0, 400.0));
+        let (n, mu, _) = s.summary_at("e", "m", Some(7_000_000_000)).unwrap();
+        assert_eq!((n, mu), (2.0, 15.0), "任意时刻看到同一份基线");
+        assert_eq!(s.key_count(), 1, "全时域同桶，无键分裂");
+    }
+
+    #[test]
+    fn concurrent_phase_append_and_read_are_consistent() {
+        // 相位 store 多线程：多实体 × 多桶跨周期 append（含重放）+ summary_at/
+        // deviation_at 并发读——无 panic/死锁；每桶窗口数 ≤ K（裁剪按桶隔离）。
+        let s = std::sync::Arc::new(phase_store(8, true));
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let s = std::sync::Arc::clone(&s);
+                std::thread::spawn(move || {
+                    for i in 0..200 {
+                        let entity = format!("p{t}");
+                        let slot = (i % 4) as i64; // 相位格 0..3
+                        let cycle = i / 4; // 周期序号
+                        let ts = (cycle * 60 + slot * 15) * 1_000_000_000i64;
+                        s.append(&entity, "m", win(ts, 2.0, 20.0, 210.0));
+                        if i % 3 == 0 {
+                            s.append(&entity, "m", win(ts, 2.0, 20.0, 210.0)); // 重放幂等
+                        }
+                        // 同格中部时刻折同桶读
+                        let at = (cycle * 60 + slot * 15 + 7) * 1_000_000_000i64;
+                        let _ = s.summary_at(&entity, "m", Some(at));
+                        let _ = s.deviation_at(&entity, "m", 10.0, Some(at));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread");
+        }
+        for t in 0..8 {
+            let entity = format!("p{t}");
+            let total = s.window_count(&entity, "m");
+            assert!(total <= 8 * 4, "跨桶求和 ≤ K×桶数，实际 {total}");
+            assert!(total > 0, "每实体应有数据");
+            for b in 0..4u32 {
+                let key = Key(entity.clone(), "m".to_string(), b);
+                let cnt = s
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .map_or(0, |en| en.windows.len());
+                assert!(cnt <= 8, "桶 {b} 窗口数超 K：{cnt}");
+            }
+        }
+    }
 }
