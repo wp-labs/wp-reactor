@@ -18,6 +18,8 @@
 //! 后续 P4 扩展（cep 状态机 / event_bridge 视图 / eval）以此为落点。
 
 #[cfg(test)]
+mod baseline_bench;
+#[cfg(test)]
 mod sem_tests;
 
 pub mod baseline;
