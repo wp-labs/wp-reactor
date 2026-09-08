@@ -89,18 +89,14 @@ fn apply_event(router: &Router, event: wp_knowledge::refresh::RefreshEvent) {
 }
 
 // ---------------------------------------------------------------------------
-// 供给动态变量代码（$cur/$next/$max_age）——knowdb 求值，引擎只透传配置
+// 供给动态变量代码（VEL）——knowdb 求值，引擎只透传配置
 // ---------------------------------------------------------------------------
 
 /// boot 装载同源渲染：与 knowdb 每次刷新的渲染是同一函数（[`RefreshSpec`]
 /// NamedSql 携带 `code` 原样交给 knowdb；这里按此刻值渲染一次供启动装载）。
 /// 空代码 = 原样返回。
 pub(crate) fn render_supply_sql(sql: &str, code: &str) -> wp_knowledge::KnowledgeResult<String> {
-    wp_knowledge::refresh::render_refresh_code(
-        sql,
-        code,
-        wp_knowledge::refresh::current_wall_nanos(),
-    )
+    wp_knowledge::vel::render(sql, code, wp_knowledge::vel::current_wall_nanos())
 }
 
 #[cfg(test)]

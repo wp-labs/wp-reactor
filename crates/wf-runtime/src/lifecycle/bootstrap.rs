@@ -976,7 +976,7 @@ fn load_from_postgres(
             .and_then(|q| q.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("SELECT * FROM {}", name));
-        // 供给动态变量代码（[[tables]].code，见 wp_knowledge parse_refresh_code）：
+        // 供给动态变量代码（[[tables]].code，VEL——见 wp_knowledge::vel）：
         // 每行 `$name = 字面量/函数`，由 knowdb 每次刷新按自身时钟求值并替换
         // SQL 里的 `$name`；引擎只读透传。boot 与每次刷新同源渲染。
         let code = table
