@@ -621,7 +621,7 @@ CSV 装载为**启动一次性**；定期推进 = 导出侧重建 CSV + reload�
 - **供给刷新动态变量 = VEL（2026-09-08 落地 demo，PG）**：knowdb `RefreshSource::NamedSql`
   的表级 `code` 块是一小段 **VEL**（变量求值语言，`wp_knowledge::vel`）：每行 `$name =
   字面量/内建函数`，每次刷新按 knowdb 自身时钟求值后替换 SQL 的 `$name`。内建：
-  `cur_phase_bucket/next_phase_bucket(period_s, bucket_s[, prefix])`（prefix 默认 `p`，折桶
+  `phase_now/phase_next(period_s, bucket_s[, prefix])`（prefix 默认 `p`，折桶
   epoch `mod period div bucket`、周期末回绕）→ `$cur`/`$next`；字符串字面量透传 `$max_age`。
   引擎只透传 code（boot 装载经同一 `vel::render` 同源渲染）。
   价值 ∝ N=period/bucket（N=1 无相位可言，退化为滚动全量）；口径 = A 通道处理时间近似 → PG
