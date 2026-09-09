@@ -61,8 +61,8 @@ mod tests;
 ///   → `Rows`（emit_time 按 nanos 缓存跨批不同，R1 2026-08-26）。
 /// - yield 字面量列（`YieldCol::const_value`）：同样语义，values/metas 免
 ///   每行 cell，读时展开 const_value。
-#[derive(Clone, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.AlertOutput")]
+#[derive(Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.AlertOutput")]
 enum ColumnData<T> {
     Const(T),
     Rows(Vec<T>),
@@ -79,8 +79,8 @@ impl<T> ColumnData<T> {
 }
 
 /// One finished columnar alert batch, addressed to a single yield target.
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.AlertOutput")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.AlertOutput")]
 pub struct AlertColumnBatch {
     target: Arc<str>,
     len: usize,
@@ -108,8 +108,8 @@ pub struct AlertColumnBatch {
     yield_cols: Vec<YieldCol>,
 }
 
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.AlertOutput")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.AlertOutput")]
 struct YieldCol {
     name: Arc<str>,
     metas: Vec<DataType>,
@@ -247,8 +247,8 @@ pub struct EachRowCells<'a> {
 
 /// Accumulates records into columns for one yield target; `finish()` produces
 /// the immutable batch handed to the sink channel.
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.AlertOutput")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.AlertOutput")]
 pub struct AlertColumnBuilder {
     target: Arc<str>,
     len: usize,

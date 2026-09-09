@@ -17,8 +17,8 @@ use crate::metrics::RuntimeMetrics;
 // WindowSource -- one window a rule task reads from
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.EngineTask")]
+#[derive(Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.EngineTask")]
 pub(crate) struct WindowSource {
     pub window_name: String,
     pub window: Arc<Window>,
@@ -31,8 +31,8 @@ pub(crate) struct WindowSource {
 // RuleTaskConfig -- everything needed to construct a RuleTask
 // ---------------------------------------------------------------------------
 
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.EngineTask")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.EngineTask")]
 pub(crate) struct RuleTaskConfig {
     pub machine: Option<CepStateMachine>,
     pub each_alias: Option<String>,
@@ -92,8 +92,8 @@ pub(crate) struct RuleTaskConfig {
 /// 与 `RuleTaskConfig` 同构但简化: 无状态机/on-each/conv——stats 执行器消费
 /// fanout 投递的 raw RecordBatch（列式 `process_batch`, 失败回退行式）, 固定
 /// 窗口按事件时间 watermark 越过边界时 close 并复用 alert 构建产出。
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.EngineTask")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.EngineTask")]
 pub(crate) struct StatsTaskConfig {
     /// 窗口统计执行器（含编译后的 StatsPlan）。
     pub stats: StatsExecutor,

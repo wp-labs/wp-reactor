@@ -14,6 +14,8 @@ use super::clause_build::{
 };
 use super::match_build::compile_match;
 
+use crate::ast::inline_const_string_lets;
+
 pub(super) fn compile_rule(
     rule: &RuleDecl,
     file: &WflFile,
@@ -159,7 +161,7 @@ fn compile_stats_rule(
 
     RulePlan {
         name: rule.name.clone(),
-        binds: compile_binds(&rule.events),
+        binds: compile_binds(&rule.events, &rule.lets),
         lets: rule
             .lets
             .iter()
@@ -304,7 +306,7 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
     let score_plan = compile_score(&rule.score, &labels);
     let entity_plan = compile_entity(&rule.entity, &labels);
     let yield_plan = compile_yield(&rule.yield_clause, file, &labels);
-    let binds = compile_binds(&rule.events);
+    let binds = compile_binds(&rule.events, &rule.lets);
     let mut match_plan = compile_match(&rule.match_clause, false, &binds, &rule.joins, schemas);
     // issue #83/#80：派生 key（match key 引用 let 绑定）编译装配。
     // - 纯字段/嵌套路径 let（#83）：内联为等值 FieldRef（与直接写嵌套路径 key
@@ -487,7 +489,7 @@ fn compile_pipeline_rule(
         };
 
         let binds = if idx == 0 {
-            compile_binds(&rule.events)
+            compile_binds(&rule.events, &rule.lets)
         } else {
             vec![BindPlan {
                 alias: PIPE_IN_ALIAS.to_string(),
@@ -598,14 +600,20 @@ fn pipeline_window_name(rule_name: &str, stage_index: usize) -> String {
 // Binds
 // ---------------------------------------------------------------------------
 
-fn compile_binds(events: &EventsBlock) -> Vec<BindPlan> {
+fn compile_binds(events: &EventsBlock, lets: &[LetDecl]) -> Vec<BindPlan> {
     events
         .decls
         .iter()
         .map(|decl| BindPlan {
             alias: decl.alias.clone(),
             window: decl.window.clone(),
-            filter: decl.filter.clone(),
+            filter: decl.filter.as_ref().map(|f| {
+                let mut visiting = Vec::new();
+                // 常量字符串 let（正则复用，issue #90）内联为字面量，行/列
+                // 两路求值与手写内联正则一致；非字面量引用保持原样（checker
+                // 已在 events 条件处拒绝）。
+                inline_const_string_lets(f, lets, &mut visiting)
+            }),
         })
         .collect()
 }

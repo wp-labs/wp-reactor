@@ -12,8 +12,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// 解析后的 CIDR 网络（按网络地址存储，主机位清零）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCidr")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangCidr")]
 pub struct Cidr {
     net: IpAddr,
     prefix: u8,

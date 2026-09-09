@@ -20,8 +20,8 @@ use orion_error::runtime::OperationContext;
 // ---------------------------------------------------------------------------
 
 /// The complete sink configuration loaded from a `sinks/` directory.
-#[derive(::moju_derive::MoJu, Debug)]
-#[moju(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
+#[derive(::jumo_derive::Jumo, Debug)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
 pub struct SinkConfigBundle {
     /// Connector definitions loaded from `sink.d/`.
     pub connectors: BTreeMap<String, ConnectorDef>,

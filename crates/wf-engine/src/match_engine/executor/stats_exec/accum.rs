@@ -15,8 +15,8 @@ use super::field_name;
 /// 数值累加器（count/sum/sumsq/avg/min/max 度量共享）。avg 不作状态——输出时
 /// sum/count 求得（D6）。SumSq 度量复用 `sum` 字段存 ∑v²。Box 化后每度量仅
 /// 8B 指针（2026-08-26 q18 紧凑化）。
-#[derive(Debug, Clone, Default, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, Default, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct NumericAccum {
     pub count: u64,
     pub sum: i128,
@@ -31,8 +31,8 @@ pub struct NumericAccum {
 /// 仅用于**全 Count/Sum/Avg/Min/Max** 计划（q17 形态）；含 distinct/last/top
 /// 的计划仍走 [`StatsAccum`]（[`StatsBucketAccs::Classic`]）。索引映射与同列分
 /// 组见 [`NumericSoALayout`]（executor 构造期预计算，热路径零计算）。
-#[derive(Debug, Clone, Default, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, Default, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct NumericSoA {
     /// 每度量 count（索引 = 度量 idx；含 where 过滤；avg 输出时 sum/count）。
     pub counts: Box<[u64]>,
@@ -45,8 +45,8 @@ pub struct NumericSoA {
 }
 
 /// 数值度量聚合类别（SoA 分派用——比 `StatsAggPlan` 全枚举窄的分支宽度）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
 pub(crate) enum NumericKind {
     Sum,
     Min,
@@ -57,8 +57,8 @@ pub(crate) enum NumericKind {
 /// sum+avg+min+max 4 度量共享 1 次 [`column_i128_at`]——旧路径每度量 1 次
 /// 重复读取同一列）。组内度量同一字段（plan 静态, 构造期分组）；列索引运行
 /// 期从 `measure_field_cols[entries[0].0]` 取一次（组内共享）。
-#[derive(Debug, Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub(crate) struct SoAColGroup {
     /// 该字段的 (度量 idx, 聚合类别) 列表。
     pub entries: Box<[(usize, NumericKind)]>,
@@ -66,8 +66,8 @@ pub(crate) struct SoAColGroup {
 
 /// 纯数值计划的 SoA 布局（executor 构造期预计算一次）：每度量到紧凑数组的
 /// 槽映射 + 同字段分组。仅依赖 plan（无批依赖）——窗口重建后不变。
-#[derive(Debug, Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub(crate) struct NumericSoALayout {
     /// 度量数（= `counts.len()`）。
     pub n_measures: usize,
@@ -165,8 +165,8 @@ impl NumericSoALayout {
 ///
 /// 热路径经 [`StatsAccum::numeric_mut`] 等按调用点已分派的 `measure.agg` 取
 /// 对应变体（变体不符 = plan/构造不一致的内部错误，panic 尽早暴露）。
-#[derive(Debug, Clone, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
 pub enum StatsAccum {
     Numeric(Box<NumericAccum>),
     Distinct(Box<DistinctSet>),
@@ -272,8 +272,8 @@ impl StatsAccum {
 }
 
 /// top-N 条目: 排序键 + 行字段紧凑存储（yield 经 field_values 注入读 `b.*`）。
-#[derive(Debug, Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct TopEntry {
     /// 排序键（数值; 与行式 `value_to_f64` 同口径）。
     pub key: f64,
@@ -284,8 +284,8 @@ pub struct TopEntry {
 
 /// Distinct key: 从列式原生值构造（i64/timestamp 域内哈希, D7）——
 /// 禁止 f64 化（ValueKey::from_value 的 >2^53 分歧）。
-#[derive(Debug, Clone, PartialEq, Eq, Hash, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
 pub enum DistinctKey {
     Int(i64),
     /// 非整数数值（小数）—— 保持原 f64 位（canonical）。
@@ -297,8 +297,8 @@ pub enum DistinctKey {
 /// bidder/auction 主战场）走 `HashSet<i64>`（8B/项）——原 enum `DistinctKey`
 /// 因 `Box<str>` 变体占 16B/项；Float/Str 键保留 enum 集合。两集合语义互斥
 /// （insert 按类型路由），len/merge 各自合并。
-#[derive(Debug, Clone, Default, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(Debug, Clone, Default, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct DistinctSet {
     ints: EngineHashSet<i64>,
     others: EngineHashSet<DistinctKey>,

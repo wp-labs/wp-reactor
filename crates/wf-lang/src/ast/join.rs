@@ -8,8 +8,8 @@ use super::*;
 
 /// `join window [mode] [within ...] [reduce ...] on cond [&& cond] [as label] [emit at expr]`
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangJoin")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangJoin")]
 pub struct JoinClause {
     pub target_window: String,
     pub mode: JoinMode,
@@ -24,8 +24,8 @@ pub struct JoinClause {
 
 /// Join time-point semantics.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangJoin")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangJoin")]
 pub enum JoinMode {
     Snapshot,
     Asof {
@@ -38,8 +38,8 @@ pub enum JoinMode {
 
 /// `left == right` in a join on-clause.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangJoin")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangJoin")]
 pub struct JoinCondition {
     pub left: FieldRef,
     pub right: FieldRef,
@@ -53,24 +53,24 @@ pub struct JoinCondition {
 ///
 /// 界为「相对左事件 ts 的时长偏移」或「左行绝对时间表达式（字段/函数）」。
 /// 常量界由 checker 校验右窗 `over ≥ 跨度`；行内界需 wfs 显式声明（设计 D3）。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangJoin")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangJoin")]
 pub struct WithinSpec {
     pub lo: Bound,
     pub hi: Bound,
 }
 
 /// 区间界：`['<' | '<='] (dur | expr)`。`open` 表 `<` 前缀（开区间）；`<=`/缺省为闭。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangJoin")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangJoin")]
 pub struct Bound {
     pub open: bool,
     pub val: BoundVal,
 }
 
 /// 界值：相对时长（可负）或左行绝对时间表达式。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangJoin")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangJoin")]
 pub enum BoundVal {
     /// 相对左事件 ts 的时长偏移；`neg` 表负向。
     /// `within 10s` 糖 ≡ `within [-10s, 0s]`（lo = -10s, neg = true）。
@@ -87,16 +87,16 @@ pub enum BoundVal {
 ///
 /// `as label`：归约整行以 object value 注入 eval context（`ctx.fields[label]`），
 /// `label.field` 编译为 `FieldRef::Path`（review R2——裸名会丢限定词取错行）。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangJoin")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangJoin")]
 pub struct ReduceClause {
     pub measure: ReduceMeasure,
     pub label: Option<String>,
 }
 
 /// 归约度量：从匹配集里选行（返回行 family）。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangJoin")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangJoin")]
 pub enum ReduceMeasure {
     /// 度量字段最大的那一行（非标量；`max(field)` 是标量值，两者并存）。
     Maxrow {
@@ -115,8 +115,8 @@ pub enum ReduceMeasure {
 }
 
 /// 平手规则：`tie(field asc|desc)` ≡ ORDER BY 次键（设计 §4.2）。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangJoin")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangJoin")]
 pub struct TieSpec {
     pub field: FieldRef,
     /// `desc` = 降序；缺省 `asc`。

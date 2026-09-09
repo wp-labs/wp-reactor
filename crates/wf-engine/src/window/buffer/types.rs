@@ -8,16 +8,16 @@ use arrow::record_batch::RecordBatch;
 use crate::match_engine::{Event, batch_to_events, batch_to_events_filtered};
 
 /// Result of a watermark-aware append.
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.WindowManager")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.WindowManager")]
 pub enum AppendOutcome {
     Appended,
     DroppedLate,
 }
 
 /// Parameters for constructing a [`Window`](super::Window).
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct WindowParams {
     pub name: String,
     pub schema: SchemaRef,
@@ -37,8 +37,8 @@ pub struct WindowParams {
     pub defer_materialization: bool,
 }
 
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub(in crate::window) struct TimedBatch {
     pub(super) batch: Arc<RecordBatch>,
     /// (min, max) event time in nanoseconds.

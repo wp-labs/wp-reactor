@@ -17,8 +17,8 @@ use super::registry::WindowRegistry;
 // ---------------------------------------------------------------------------
 
 /// Per-window route outcome.
-#[derive(::moju_derive::MoJu, Debug, Clone)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
+#[derive(::jumo_derive::Jumo, Debug, Clone)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct WindowRouteOutcome {
     pub window_name: String,
     pub rows: usize,
@@ -26,8 +26,8 @@ pub struct WindowRouteOutcome {
 }
 
 /// Summary of a single [`Router::route`] call.
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct RouteReport {
     pub delivered: usize,
     pub dropped_late: usize,
@@ -80,13 +80,13 @@ pub struct ParsedRoute {
 /// For each subscriber of a stream name the router checks the distribution mode:
 /// - `Local` → calls [`Window::append_with_watermark`].
 /// - non-`Local` → skips (counted in `RouteReport::skipped_non_local`).
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct Router {
     registry: WindowRegistry,
     /// Rule-channel fan-out: after each successful append, the router broadcasts
     /// the parsed `Arc<Vec<Arc<Event>>>` to every rule subscribed to that window.
-    /// Kept alongside the registry (not inside it) so the MoJu model surface is
+    /// Kept alongside the registry (not inside it) so the Jumo model surface is
     /// unchanged.
     rule_fanout: Arc<RuleFanout>,
     /// Per-window actor mailboxes (subscription model). Empty in sync mode —

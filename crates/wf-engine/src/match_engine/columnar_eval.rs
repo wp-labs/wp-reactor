@@ -30,8 +30,8 @@ use crate::time::normalize_epoch_timestamp_float_nanos;
 /// `compare_scalars` / `arithmetic` kernels, so null propagation, three-valued
 /// `&&` / `||`, native `i64`, epsilon float compare, and the documented `>2^53`
 /// divergence are all unchanged.
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.ColumnarBatch")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.ColumnarBatch")]
 pub(crate) enum CVec {
     Int(Vec<Option<i64>>),
     Float(Vec<Option<f64>>),

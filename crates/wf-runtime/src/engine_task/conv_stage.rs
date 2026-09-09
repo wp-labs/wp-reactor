@@ -80,8 +80,8 @@ pub(crate) struct ConvShardSink {
     pub(crate) barrier_index: usize,
 }
 
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.EngineTask")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.EngineTask")]
 pub(crate) struct ConvStageConfig {
     pub(crate) executor: wf_engine::match_engine::RuleExecutor,
     pub(crate) conv_plan: Option<ConvPlan>,
@@ -126,8 +126,8 @@ pub(crate) async fn run_conv_stage_task(config: ConvStageConfig) -> RuntimeResul
     stage.run().await
 }
 
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.EngineTask")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.EngineTask")]
 struct ConvStageTask {
     executor: wf_engine::match_engine::RuleExecutor,
     conv_plan: Option<ConvPlan>,

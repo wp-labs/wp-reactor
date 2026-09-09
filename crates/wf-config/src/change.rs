@@ -1,7 +1,7 @@
 use crate::config_loader::loader::{RawFusionConfigChange, RawFusionConfigTree};
 
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Config", module = "Config.ConfigChange")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Config", module = "Config.ConfigChange")]
 pub enum FusionChangeKind {
     Rules,
     Vars,
@@ -16,16 +16,16 @@ pub enum FusionChangeKind {
     Unknown,
 }
 
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Config", module = "Config.ConfigChange")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Config", module = "Config.ConfigChange")]
 pub enum FusionReloadDisposition {
     HotReloadSupported,
     RequiresRestart,
     Unsupported,
 }
 
-#[derive(::moju_derive::MoJu, Debug, Clone)]
-#[moju(kind = "struct", domain = "Config", module = "Config.ConfigChange")]
+#[derive(::jumo_derive::Jumo, Debug, Clone)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.ConfigChange")]
 pub struct ClassifiedFusionConfigChange {
     pub change: RawFusionConfigChange,
     pub kind: FusionChangeKind,
@@ -33,8 +33,8 @@ pub struct ClassifiedFusionConfigChange {
     pub reason: &'static str,
 }
 
-#[derive(::moju_derive::MoJu, Debug, Clone, Default)]
-#[moju(kind = "struct", domain = "Config", module = "Config.ConfigChange")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Default)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.ConfigChange")]
 pub struct FusionReloadPlan {
     pub hot_reload: Vec<ClassifiedFusionConfigChange>,
     pub requires_restart: Vec<ClassifiedFusionConfigChange>,

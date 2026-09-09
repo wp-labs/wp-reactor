@@ -21,8 +21,8 @@ pub type EngineHashSet<K> = HashSet<K, FoldRandomState>;
 pub const MACHINE_ID: &str = "wp_src_ip";
 
 /// Scalar value carried inside an event row or expression.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 pub enum Value {
     Number(f64),
     Str(SmolStr),

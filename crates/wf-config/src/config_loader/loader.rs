@@ -17,16 +17,16 @@ use crate::vars::{inject_loader_scoped_vars, render_scoped_var_source_label};
 use crate::{ConfigReason, ConfigResult};
 use overlay_paths::rebase_overlay_paths;
 
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq)]
-#[moju(kind = "struct", domain = "Config", module = "Config.ConfigLoader")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq, Eq)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.ConfigLoader")]
 pub struct ResolvedConfigVar {
     pub key: String,
     pub value: String,
     pub source: String,
 }
 
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Config", module = "Config.ConfigLoader")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.ConfigLoader")]
 pub struct FusionConfigLoader<'a> {
     base_path: &'a Path,
     overlay_paths: &'a [PathBuf],

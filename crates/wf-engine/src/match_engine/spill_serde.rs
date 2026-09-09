@@ -24,8 +24,8 @@ use crate::match_engine::executor::{
 /// accs 16 度量、行字段 64 字段的合理上界 ~1MB。
 const MAX_SERIALIZED_BYTES: usize = 1 << 20;
 
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.SpillStore")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.SpillStore")]
 struct Writer {
     buf: Vec<u8>,
 }
@@ -58,8 +58,8 @@ impl Writer {
     }
 }
 
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.SpillStore")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.SpillStore")]
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,

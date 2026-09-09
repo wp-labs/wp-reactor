@@ -516,3 +516,146 @@ test ct for r {
         display
     );
 }
+
+// ===========================================================================
+// issue #90 — 规则级字符串字面量 let（正则复用）在 events 条件中的引用
+// ===========================================================================
+
+#[test]
+fn events_regex_match_accepts_const_string_rule_let_reused_across_fields() {
+    // 同一正则 let 复用于两个字段的 events 条件（规则文本中 let 位于 events 之后）。
+    let input = r#"
+rule r {
+    events { e : auth_events && (regex_match(e.action, re) || regex_match(e.user, re)) }
+    let re = "\\b62\\d{14,17}\\b"
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (y = e.action)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out_window()]);
+}
+
+#[test]
+fn events_regex_match_accepts_leading_const_string_let_before_events() {
+    // let 声明可置于 events 块之前（issue #90 示例形态）；解析后与尾部 let 合并。
+    let input = r#"
+rule r {
+    let re = "\\b62\\d{14,17}\\b"
+    events { e : auth_events && regex_match(e.action, re) }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (y = e.action)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out_window()]);
+}
+
+#[test]
+fn events_regex_match_rejects_non_literal_rule_let() {
+    // events 条件在绑定阶段求值，早于 per-event let 注入：仅字符串字面量 let
+    // 可引用，非字面量（字段派生）let 显式报错并带变量名。
+    let input = r#"
+rule r {
+    events { e : auth_events && regex_match(e.action, pat) }
+    let pat = e.user
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (y = e.action)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), out_window()],
+        "rule-level let `pat` used in the events condition must be a string literal",
+    );
+}
+
+#[test]
+fn events_regex_match_undefined_pattern_name_reports_name() {
+    // 未声明的正则变量：静态检查报出变量名（第二参必须为字面量，且说明引用名）。
+    let input = r#"
+rule r {
+    events { e : auth_events && regex_match(e.action, card_re) }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (y = e.action)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), out_window()],
+        "reference to `card_re`",
+    );
+}
+
+#[test]
+fn events_regex_match_const_let_chain_alias_across_leading_trailing() {
+    // 前置 `let base`（常量）＋ 尾部 `let re = base`（间接别名），events 条件
+    // 引用 re —— 链式展开后仍应内联为字面量（跨前置/尾部边界的 let 引用链）。
+    let input = r#"
+rule r {
+    let base = "\\b62\\d{14,17}\\b"
+    events { e : auth_events && regex_match(e.action, re) }
+    let re = base
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (y = e.action)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out_window()]);
+}
+
+#[test]
+fn events_regex_match_const_let_pattern_still_regex_validated() {
+    // 内联后 pattern 仍走编译期正则校验：let 中携带非法正则须报错（与直接
+    // 内联字面量同语义）。
+    let input = r#"
+rule r {
+    events { e : auth_events && regex_match(e.action, re) }
+    let re = "("
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (y = e.action)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), out_window()],
+        "not valid regex",
+    );
+}
+
+#[test]
+fn events_filter_const_let_reusable_in_plain_comparison() {
+    // 常量字符串 let 不限于 regex 槽位：events 条件中的普通比较同样内联。
+    let input = r#"
+rule r {
+    events { e : auth_events && e.action == code }
+    let code = "A1"
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (y = e.action)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out_window()]);
+}
+
+#[test]
+fn events_filter_non_literal_let_rejected_outside_regex_match() {
+    // 非字面量 let 引用在 events 条件任意位置（非仅 regex 第二参）都拒绝并带名。
+    let input = r#"
+rule r {
+    events { e : auth_events && e.action == p2 }
+    let p2 = e.user
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (y = e.action)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), out_window()],
+        "rule-level let `p2` used in the events condition must be a string literal",
+    );
+}

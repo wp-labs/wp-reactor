@@ -45,8 +45,8 @@ use crate::match_engine::Event;
 pub const WINDOW_CHANNEL_DEPTH: usize = 16;
 
 /// A message for a window actor.
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.WindowManager")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.WindowManager")]
 pub enum WindowMsg {
     /// One source batch dispatched directly by a parse worker after
     /// `route_parse`. `seq` is the per-(source, window) contiguous sequence;
@@ -75,8 +75,8 @@ pub enum WindowMsg {
 }
 
 /// Per-window mailbox: the bounded actor channel plus its byte budget.
-#[derive(Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
+#[derive(Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct WindowMailbox {
     pub tx: mpsc::Sender<WindowMsg>,
     pub budget: Arc<Semaphore>,

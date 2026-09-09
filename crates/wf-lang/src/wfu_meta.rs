@@ -13,8 +13,8 @@ pub const WFU_FIRED_AT: &str = "__wfu_fired_at";
 pub const WFU_EMIT_TIME: &str = "__wfu_emit_time";
 pub const WFU_SUMMARY: &str = "__wfu_summary";
 
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum WfuMetaField {
     Id,
     RuleName,
@@ -41,8 +41,8 @@ pub const WFU_META_FIELDS: &[WfuMetaField] = &[
     WfuMetaField::Summary,
 ];
 
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum WfuIntermediateMetaField {
     RuleName,
     Score,

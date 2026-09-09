@@ -31,15 +31,15 @@ use orion_error::runtime::OperationContext;
 /// file = "default.jsonl"
 /// sync = false
 /// ```
-#[derive(::moju_derive::MoJu, Debug, Deserialize)]
-#[moju(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
+#[derive(::jumo_derive::Jumo, Debug, Deserialize)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
 pub struct ConnectorTomlFile {
     pub connectors: Vec<ConnectorDefRaw>,
 }
 
 /// Raw TOML representation of a connector definition.
-#[derive(::moju_derive::MoJu, Debug, Deserialize)]
-#[moju(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
+#[derive(::jumo_derive::Jumo, Debug, Deserialize)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.SinkConfig")]
 pub struct ConnectorDefRaw {
     pub id: String,
     #[serde(rename = "type")]

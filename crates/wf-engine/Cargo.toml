@@ -33,7 +33,7 @@ hex = { workspace = true }
 regex = { workspace = true }
 wildmatch = { workspace = true }
 chrono = { workspace = true }
-moju-derive = { workspace = true }
+jumo-derive = { workspace = true }
 redb = "4"
 
 [dev-dependencies]

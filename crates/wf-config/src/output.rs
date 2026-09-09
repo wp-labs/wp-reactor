@@ -3,17 +3,17 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_OUTPUT_TIME_FORMAT: &str = wf_lang::DEFAULT_OUTPUT_TIME_FORMAT;
 
 #[derive(
-    ::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default,
+    ::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default,
 )]
 #[serde(rename_all = "snake_case")]
-#[moju(kind = "state", domain = "Config", module = "Config.ConfigIo")]
+#[jumo(kind = "state", domain = "Config", module = "Config.ConfigIo")]
 pub enum OutputTimeZone {
     #[default]
     Utc,
 }
 
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[moju(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[jumo(kind = "struct", domain = "Config", module = "Config.ConfigIo")]
 pub struct OutputConfig {
     pub time_format: String,
     #[serde(default)]

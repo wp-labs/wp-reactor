@@ -14,8 +14,8 @@ mod topology;
 // Re-exports for external consumers
 pub use prepare::{prepare_reload, prepare_reload_with_cached};
 
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Runtime", module = "Runtime.HotReload")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Runtime", module = "Runtime.HotReload")]
 pub struct PreparedRuleReload {
     pub plan: FusionReloadPlan,
     pub next_raw: RawFusionConfigTree,
@@ -43,8 +43,8 @@ pub struct PreparedRuleReload {
     pub(crate) next_window_configs: Vec<WindowConfig>,
 }
 
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Runtime", module = "Runtime.HotReload")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Runtime", module = "Runtime.HotReload")]
 pub enum ReloadPreparation {
     Ready(Box<PreparedRuleReload>),
     Blocked(FusionReloadPlan),

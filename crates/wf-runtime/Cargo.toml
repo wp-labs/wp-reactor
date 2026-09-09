@@ -33,7 +33,7 @@ orion-error = { workspace = true }
 orion-variate = "0.13"
 derive_more = { workspace = true }
 thiserror = { workspace = true }
-moju-derive = { workspace = true }
+jumo-derive = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 csv = { workspace = true }
 toml = { workspace = true }

@@ -18,8 +18,8 @@ use wf_cep::rows::{RowFieldLayout, RowFields};
 use super::*;
 
 /// 执行器: 消费行/批次, 按 StatsPlan 归并, 窗口 close 时产出度量值。
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.StatsEngine")]
 pub struct StatsExecutor {
     pub plan: StatsPlan,
     /// 窗口状态（桶表; 空键规则仅 Empty 桶）。

@@ -1,7 +1,7 @@
 use orion_error::{OrionError, StructError, UnifiedReason};
 
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, OrionError)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq, OrionError)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 pub enum CoreReason {
     #[orion_error(
         message = "window build error",

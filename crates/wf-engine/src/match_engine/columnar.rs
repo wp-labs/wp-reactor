@@ -72,8 +72,8 @@ mod tests;
 /// `Value::Object` / `Value::Array` (e.g. a whole array field read bare).
 /// `Int` carries native integer precision for `Int64` / `Timestamp(Ns)`
 /// columns and integer-valued literals.
-#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.ColumnarBatch")]
+#[derive(Debug, Clone, PartialEq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.ColumnarBatch")]
 pub(crate) enum CScalar {
     Int(i64),
     Float(f64),
@@ -92,8 +92,8 @@ pub(crate) enum CScalar {
 /// `projection` is the rule-visible field list mapped to batch column indices;
 /// `field_map` maps a normalized field name (`Simple` / `Qualified` /
 /// `Bracketed` all collapse to the bare field name) to its projection index.
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.ColumnarBatch")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.ColumnarBatch")]
 pub struct ColumnarBatch<'a> {
     batch: &'a RecordBatch,
     projection: Vec<usize>,
@@ -212,8 +212,8 @@ fn schema_index_of(batch: &RecordBatch, name: &str) -> Option<usize> {
 /// Arrow list columns. All four carry the array shape used by
 /// [`ColumnExpr::ListIndex`]; read as a bare field they are a non-null
 /// structured value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.ColumnarBatch")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.ColumnarBatch")]
 pub(crate) enum ColKind {
     Int64,
     Float64,
@@ -232,8 +232,8 @@ pub(crate) enum ColKind {
 /// A resolved, typed reference to a batch column: a projection slot index into
 /// the eval-time [`ColumnarBatch`] plus the compile-time [`ColKind`]. Carrying
 /// no `'a`, it is the leaf of a reusable compiled [`ColumnExpr`] tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.ColumnarBatch")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.ColumnarBatch")]
 pub(crate) struct ColRef {
     proj: usize,
     kind: ColKind,
@@ -256,8 +256,8 @@ fn col_kind(data_type: &DataType) -> ColKind {
 }
 
 /// The string-search operation of a [`ColumnExpr::StrFunc`] node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.ColumnarBatch")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.ColumnarBatch")]
 pub(crate) enum StrFuncOp {
     Contains,
     StartsWith,
@@ -288,8 +288,8 @@ pub(crate) enum Needle {
 /// reused across batches of a window (same schema) instead of recompiling per
 /// batch. At eval time the view resolves each [`ColRef`] to its column; the
 /// per-row hot loop still reads native columns with no `HashMap` lookup.
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Engine", module = "Engine.ColumnarBatch")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Engine", module = "Engine.ColumnarBatch")]
 pub(crate) enum ColumnExpr {
     Lit(CScalar),
     Col(ColRef),

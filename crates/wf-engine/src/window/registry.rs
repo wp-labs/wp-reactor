@@ -22,8 +22,8 @@ use super::provider::ProviderWindow;
 ///
 /// The caller (compiler bridge) converts `WindowSchema` → `WindowDef` so that
 /// wf-core stays free of wf-lang / compiler dependencies.
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct WindowDef {
     pub params: WindowParams,
     /// Stream names this window subscribes to.
@@ -60,8 +60,8 @@ type HasValueCache = RwLock<HashMap<(String, String), (u64, Arc<HashSet<String>>
 /// The registry maps keep `std::sync::RwLock` (cold — registration and reload
 /// only); the windows themselves are internally synchronized (single writer
 /// via the window actor, `RwLock`-guarded batch log — see [`Window`]).
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct WindowRegistry {
     windows: RwLock<HashMap<String, Arc<Window>>>,
     provider_windows: RwLock<HashMap<String, Arc<RwLock<ProviderWindow>>>>,

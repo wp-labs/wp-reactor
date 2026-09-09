@@ -34,7 +34,7 @@ mod lib_ver_adm {
   #[usage(desp="update version of feature ")]
   flow v_feat |  ver.feature   { }
   #[usage(desp="add tag by version ")]
-  flow tag_stable{
+  flow v_tag {
     gx.ver ( file : "${GXL_START_ROOT}/version.txt" ,  inc : "null"  );
     gx.cmd (  "git tag v${VERSION}" );
     gx.cmd (  "git push --tags" );

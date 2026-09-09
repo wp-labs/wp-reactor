@@ -9,8 +9,8 @@ use super::types::{BindData, EngineHashMap, EngineHashSet, FieldSource, RollingS
 // Internal — per-branch / per-step / per-instance state
 // ---------------------------------------------------------------------------
 
-#[derive(::moju_derive::MoJu, Debug, Clone)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub(super) struct BranchState {
     pub(super) count: u64,
     pub(super) sum: f64,
@@ -78,8 +78,8 @@ impl BranchState {
     }
 }
 
-#[derive(Debug, Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(Debug, Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub(super) struct AliasState {
     pub(super) count: u64,
     /// Lazy, boxed — only aliases with tracked bind fields allocate.
@@ -100,8 +100,8 @@ impl AliasState {
     }
 }
 
-#[derive(::moju_derive::MoJu, Debug, Clone)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct StepState {
     pub(super) branch_states: Vec<BranchState>,
 }
@@ -114,8 +114,8 @@ impl StepState {
     }
 }
 
-#[derive(::moju_derive::MoJu, Debug, Clone)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+#[derive(::jumo_derive::Jumo, Debug, Clone)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub(super) struct Instance {
     // Note: no `scope_key` here — the instance key (String form) lives in the
     // `InstanceKey` that keys the instance map and the expiry heap. Storing a

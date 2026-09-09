@@ -49,8 +49,8 @@ const ABORT_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 ///
 /// This ensures upstream producers exit before downstream consumers,
 /// and consumers can drain all in-flight work before the reactor stops.
-#[derive(::moju_derive::MoJu)]
-#[moju(
+#[derive(::jumo_derive::Jumo)]
+#[jumo(
     kind = "struct",
     domain = "Runtime",
     module = "Runtime.ReactorLifecycle"
@@ -247,8 +247,8 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::large_enum_variant)] // Match carries the compiled MatchPlan; boxing it would churn the hot path
-#[derive(::moju_derive::MoJu)]
-#[moju(
+#[derive(::jumo_derive::Jumo)]
+#[jumo(
     kind = "state",
     domain = "Runtime",
     module = "Runtime.ReactorLifecycle"
@@ -271,8 +271,8 @@ pub(crate) enum RunRuleKind {
 
 /// Pairs a rule execution kind with its [`RuleExecutor`] and precomputed
 /// routing from stream names to CEP aliases.
-#[derive(::moju_derive::MoJu)]
-#[moju(
+#[derive(::jumo_derive::Jumo)]
+#[jumo(
     kind = "struct",
     domain = "Runtime",
     module = "Runtime.ReactorLifecycle"
@@ -290,8 +290,8 @@ pub(crate) struct RunRule {
 // ---------------------------------------------------------------------------
 
 /// Compiled artifacts from the config-loading phase, ready for task spawning.
-#[derive(::moju_derive::MoJu)]
-#[moju(
+#[derive(::jumo_derive::Jumo)]
+#[jumo(
     kind = "struct",
     domain = "Runtime",
     module = "Runtime.ReactorLifecycle"

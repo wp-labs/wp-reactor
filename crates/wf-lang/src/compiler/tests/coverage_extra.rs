@@ -1247,3 +1247,183 @@ rule r {
     assert_eq!(plan.lets.len(), 1);
     assert_eq!(plan.lets[0].name, "u");
 }
+
+// ---------------------------------------------------------------------------
+// issue #90 — 常量字符串 let（正则）在 events 条件中内联为字面量
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compile_binds_inline_const_string_let_regex_pattern_in_events_filter() {
+    let src = r#"
+rule r {
+    events { e : auth_events && (regex_match(e.action, re) || regex_match(e.user, re)) }
+    let re = "\\b62\\d{14,17}\\b"
+    match<:5m> { on event { e | count >= 1; } } -> score(2.0)
+    entity(ip, e.sip)
+    yield out (y = e.action)
+}
+"#;
+    let plans = compile_with(src, &[auth_events_window(), output_window()]);
+    let filter = plans[0]
+        .binds
+        .first()
+        .expect("bind")
+        .filter
+        .as_ref()
+        .expect("bind filter");
+    fn contains_string_lit(e: &Expr, want: &str) -> bool {
+        match e {
+            Expr::StringLit(s) => s == want,
+            Expr::BinOp { left, right, .. } => {
+                contains_string_lit(left, want) || contains_string_lit(right, want)
+            }
+            Expr::Not(i) | Expr::Neg(i) => contains_string_lit(i, want),
+            Expr::FuncCall { args, .. } => args.iter().any(|a| contains_string_lit(a, want)),
+            Expr::Array(items) => items.iter().any(|i| contains_string_lit(i, want)),
+            Expr::InList { expr, list, .. } => {
+                contains_string_lit(expr, want) || list.iter().any(|i| contains_string_lit(i, want))
+            }
+            Expr::IfThenElse {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                contains_string_lit(cond, want)
+                    || contains_string_lit(then_expr, want)
+                    || contains_string_lit(else_expr, want)
+            }
+            Expr::Match {
+                expr,
+                arms,
+                default,
+                ..
+            } => {
+                contains_string_lit(expr, want)
+                    || arms.iter().any(|a| {
+                        a.patterns.iter().any(|p| contains_string_lit(p, want))
+                            || contains_string_lit(&a.value, want)
+                    })
+                    || default
+                        .as_ref()
+                        .is_some_and(|d| contains_string_lit(d, want))
+            }
+            Expr::Object(items) => items.iter().any(|i| contains_string_lit(&i.value, want)),
+            _ => false,
+        }
+    }
+    fn contains_simple_field(e: &Expr, want: &str) -> bool {
+        match e {
+            Expr::Field(FieldRef::Simple(s)) => s == want,
+            Expr::BinOp { left, right, .. } => {
+                contains_simple_field(left, want) || contains_simple_field(right, want)
+            }
+            Expr::Not(i) | Expr::Neg(i) => contains_simple_field(i, want),
+            Expr::FuncCall { args, .. } => args.iter().any(|a| contains_simple_field(a, want)),
+            Expr::Array(items) => items.iter().any(|i| contains_simple_field(i, want)),
+            Expr::InList { expr, list, .. } => {
+                contains_simple_field(expr, want)
+                    || list.iter().any(|i| contains_simple_field(i, want))
+            }
+            Expr::IfThenElse {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                contains_simple_field(cond, want)
+                    || contains_simple_field(then_expr, want)
+                    || contains_simple_field(else_expr, want)
+            }
+            Expr::Match {
+                expr,
+                arms,
+                default,
+                ..
+            } => {
+                contains_simple_field(expr, want)
+                    || arms.iter().any(|a| {
+                        a.patterns.iter().any(|p| contains_simple_field(p, want))
+                            || contains_simple_field(&a.value, want)
+                    })
+                    || default
+                        .as_ref()
+                        .is_some_and(|d| contains_simple_field(d, want))
+            }
+            Expr::Object(items) => items.iter().any(|i| contains_simple_field(&i.value, want)),
+            _ => false,
+        }
+    }
+    // 两处 regex_match 的 pattern 槽位都被内联为字面量（非字段/let 引用）。
+    assert!(contains_string_lit(filter, r"\\b62\\d{14,17}\\b"));
+    assert!(!contains_simple_field(filter, "re"));
+}
+
+#[test]
+fn compile_binds_inline_leading_chain_const_let_regex_in_filter() {
+    // 前置常量 + 尾部间接别名（re = base）的规则：plan 层 filter 仍内联为
+    // 字面量，且 plan.lets 保持文本顺序 [base, re]。
+    let src = r#"
+rule r {
+    let base = "\\b62\\d{14,17}\\b"
+    events { e : auth_events && regex_match(e.action, re) }
+    let re = base
+    match<:5m> { on event { e | count >= 1; } } -> score(2.0)
+    entity(ip, e.sip)
+    yield out (y = e.action)
+}
+"#;
+    let plans = compile_with(src, &[auth_events_window(), output_window()]);
+    let plan = &plans[0];
+    assert_eq!(plan.lets.len(), 2);
+    assert_eq!(plan.lets[0].name, "base");
+    assert_eq!(plan.lets[1].name, "re");
+    let filter = plan
+        .binds
+        .first()
+        .expect("bind")
+        .filter
+        .as_ref()
+        .expect("bind filter");
+    fn has_lit(e: &Expr, want: &str) -> bool {
+        match e {
+            Expr::StringLit(s) => s == want,
+            Expr::BinOp { left, right, .. } => has_lit(left, want) || has_lit(right, want),
+            Expr::Not(i) | Expr::Neg(i) => has_lit(i, want),
+            Expr::FuncCall { args, .. } => args.iter().any(|a| has_lit(a, want)),
+            Expr::Array(items) => items.iter().any(|i| has_lit(i, want)),
+            Expr::InList { expr, list, .. } => {
+                has_lit(expr, want) || list.iter().any(|i| has_lit(i, want))
+            }
+            Expr::IfThenElse {
+                cond,
+                then_expr,
+                else_expr,
+            } => has_lit(cond, want) || has_lit(then_expr, want) || has_lit(else_expr, want),
+            Expr::Object(items) => items.iter().any(|i| has_lit(&i.value, want)),
+            _ => false,
+        }
+    }
+    fn has_simple(e: &Expr, want: &str) -> bool {
+        match e {
+            Expr::Field(FieldRef::Simple(s)) => s == want,
+            Expr::BinOp { left, right, .. } => has_simple(left, want) || has_simple(right, want),
+            Expr::Not(i) | Expr::Neg(i) => has_simple(i, want),
+            Expr::FuncCall { args, .. } => args.iter().any(|a| has_simple(a, want)),
+            Expr::Array(items) => items.iter().any(|i| has_simple(i, want)),
+            Expr::InList { expr, list, .. } => {
+                has_simple(expr, want) || list.iter().any(|i| has_simple(i, want))
+            }
+            Expr::IfThenElse {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                has_simple(cond, want) || has_simple(then_expr, want) || has_simple(else_expr, want)
+            }
+            Expr::Object(items) => items.iter().any(|i| has_simple(&i.value, want)),
+            _ => false,
+        }
+    }
+    assert!(has_lit(filter, r"\\b62\\d{14,17}\\b"));
+    assert!(!has_simple(filter, "re"));
+    assert!(!has_simple(filter, "base"));
+}

@@ -11,4 +11,4 @@ name = "wf_lang"
 winnow = { workspace = true }
 orion-error = { workspace = true }
 regex-syntax = "0.8"
-moju-derive = { workspace = true }
+jumo-derive = { workspace = true }

@@ -31,8 +31,8 @@ const REDB_TABLE: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new
 ///   "已提交 = 已落盘"。
 /// - 读失败 = 致命：redb 错误在无 Result 通道的 trait 方法里直接 panic
 ///   （绝不静默丢键）；`put_batch` 保留 Result 供 M3 三层预算回退拒收。
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.SpillStore")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.SpillStore")]
 pub struct RedbSpillStore {
     /// 读侧数据库句柄（写侧 RedbBatchWriter 持 Arc clone 共用同一库）。
     db: Option<std::sync::Arc<redb::Database>>,
@@ -160,8 +160,8 @@ pub type SpillItem = (u64, ScopeKey, Vec<StatsAccum>);
 /// durability 策略与 M5-1 一致：默认 `None`（无 fsync，close 期 drain 读内存页
 /// 更快），每 `fsync_every` 批一次 `Immediate` 周期 flush（redb 连带持久化之前
 /// 所有 None 提交——脏页有界）。
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.SpillStore")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.SpillStore")]
 pub struct RedbBatchWriter {
     db: std::sync::Arc<redb::Database>,
     put_batches: u64,

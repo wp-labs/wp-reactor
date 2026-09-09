@@ -8,8 +8,8 @@ use super::*;
 
 /// `stats<dur[:mode]> [group by (k1, k2, ...)] [tier f [b1, b2, ...]] { measure; ... }`
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangStats")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangStats")]
 pub struct StatsClause {
     pub window: StatsWindow,
     /// 桶键表达式列表（`group by`），空 = 空键全局。
@@ -22,24 +22,24 @@ pub struct StatsClause {
 }
 
 /// 窗口规格：`<dur[:mode]>`。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangStats")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangStats")]
 pub struct StatsWindow {
     pub duration: Duration,
     pub mode: StatsWindowMode,
 }
 
 /// stats 窗口模式（复用 match 的 fixed/session；sliding 为后续扩展）。
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangStats")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangStats")]
 pub enum StatsWindowMode {
     Fixed,
     Session,
 }
 
 /// 输出形状。
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangStats")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangStats")]
 pub enum StatsOutputShape {
     /// 每桶一行（缺省）。
     Rows,
@@ -49,8 +49,8 @@ pub enum StatsOutputShape {
 
 /// 一个度量声明：`b | agg(field) as label [where expr]`。
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangStats")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangStats")]
 pub struct StatsMeasure {
     pub label: String,
     pub source_alias: String,
@@ -64,8 +64,8 @@ pub struct StatsMeasure {
 }
 
 /// 统计聚合函数。
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangStats")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangStats")]
 pub enum StatsAgg {
     Count,
     Sum,

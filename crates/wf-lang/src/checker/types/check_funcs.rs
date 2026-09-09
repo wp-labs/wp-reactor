@@ -1043,10 +1043,19 @@ fn check_pattern_func(
                         }
                     }
                     _ => {
+                        let detail = match &args[1] {
+                            Expr::Field(FieldRef::Simple(n)) => format!(
+                                " (reference to `{}` — declare a rule-level `let` with a string-literal pattern to reuse a regex)",
+                                n
+                            ),
+                            _ => String::new(),
+                        };
                         errors.push(rule_error(
                             rule_name,
-                            "regex_match() second argument must be a string literal pattern"
-                                .to_string(),
+                            format!(
+                                "regex_match() second argument must be a string literal pattern{}",
+                                detail
+                            ),
                         ));
                     }
                 }

@@ -9,8 +9,8 @@ use wp_model_core::model::{DataRecord, DataType};
 use crate::alert::{AlertColumnBatch, WFU_PREFIX};
 use crate::error::{CoreReason, CoreResult};
 
-#[derive(Clone, ::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.SinkDispatch")]
+#[derive(Clone, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.SinkDispatch")]
 pub struct WfMetaDisableMatcher {
     patterns: Vec<WildMatch>,
 }
@@ -46,8 +46,8 @@ impl std::fmt::Debug for WfMetaDisableMatcher {
 ///
 /// Wraps a `SinkHandle` (from wp-connector-api) with metadata and provides
 /// convenience methods for sending alert JSON data and lifecycle management.
-#[derive(::moju_derive::MoJu)]
-#[moju(kind = "struct", domain = "Engine", module = "Engine.SinkDispatch")]
+#[derive(::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Engine", module = "Engine.SinkDispatch")]
 pub struct SinkRuntime {
     pub name: String,
     pub spec: ResolvedSinkSpec,

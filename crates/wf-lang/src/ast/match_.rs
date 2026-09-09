@@ -8,8 +8,8 @@ use super::*;
 
 /// Window mode: sliding (default), fixed (L3), session (L3), or hop (sliding
 /// window, L3/HOP)。
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
 pub enum WindowMode {
     Sliding,
     Fixed,
@@ -22,8 +22,8 @@ pub enum WindowMode {
 }
 
 /// Close block mode: OR (independent paths) or AND (both required).
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
 pub enum CloseMode {
     /// `on close { ... }` — event path and close path fire independently.
     #[default]
@@ -33,16 +33,16 @@ pub enum CloseMode {
 }
 
 /// A parsed close block with its mode and steps.
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
 pub struct CloseBlock {
     pub mode: CloseMode,
     pub steps: Vec<MatchStep>,
 }
 
 /// Ordering mode of an `on event` block.
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
 pub enum MatchMode {
     /// Ordered (default): step i+1 evaluates only after step i completes.
     #[default]
@@ -53,8 +53,8 @@ pub enum MatchMode {
 
 /// `match<keys:dur[:fixed]> { [key {...}] on event [seq|any] { ... } [on close|and close { ... }] }`
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
 pub struct MatchClause {
     pub keys: Vec<FieldRef>,
     pub key_mapping: Option<Vec<KeyMapItem>>,
@@ -92,8 +92,8 @@ impl MatchClause {
 
 /// `on each alias [where expr]`
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
 pub struct EachClause {
     pub alias: String,
     pub filter: Option<Expr>,
@@ -101,8 +101,8 @@ pub struct EachClause {
 
 /// Explicit key mapping: `logical = alias.field`
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
 pub struct KeyMapItem {
     pub logical_name: String,
     pub source_field: FieldRef,
@@ -110,16 +110,16 @@ pub struct KeyMapItem {
 
 /// One semicolon-terminated match step, potentially with `||` OR branches.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
 pub struct MatchStep {
     pub branches: Vec<StepBranch>,
 }
 
 /// `[label:] source[.field]["field"] [&& guard] pipe_chain`
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
 pub struct StepBranch {
     pub label: Option<String>,
     pub source: String,
@@ -130,8 +130,8 @@ pub struct StepBranch {
 
 /// `{ | transform } | measure cmp threshold`
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
 pub struct PipeChain {
     pub transforms: Vec<Transform>,
     pub measure: Measure,
@@ -140,15 +140,15 @@ pub struct PipeChain {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
 pub enum Transform {
     Distinct,
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::moju_derive::MoJu)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
 pub enum Measure {
     Count,
     Sum,
@@ -163,8 +163,8 @@ pub enum Measure {
 
 /// `chain [consec] [skip = past_last|to_next] { [not] step_body [within dur] ... }`
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
 pub struct SeqClause {
     /// `consec` — strict adjacency (no other events between steps). Default: gap.
     pub consec: bool,
@@ -175,8 +175,8 @@ pub struct SeqClause {
 }
 
 /// After-match skip policy.
-#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
-#[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
 pub enum SeqSkip {
     /// Reset all step state after firing (default).
     PastLast,
@@ -186,8 +186,8 @@ pub enum SeqSkip {
 
 /// One ordered chain step: `[not] <body> [within dur]`.
 #[non_exhaustive]
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
-#[moju(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
+#[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
+#[jumo(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
 pub struct SeqStep {
     /// `not` negation prefix.
     pub neg: bool,

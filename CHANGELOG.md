@@ -24,6 +24,15 @@ All notable changes to wp-reactor will be documented in this file.
 ### Fixed
 
 - **修复刷新与动态 join 配置并发时的偶发 join 退化**（漏命中 / 降级为全表扫描）。
+## [2.0.20] -- latest
+
+### Added
+
+- **wf-lang: 规则级字符串字面量 let 可在 `events` 条件复用正则（issue #90）**——`regex_match` 的 pattern 可用规则级常量字符串 `let` 按名引用（同一正则可复用于 URI / 请求头 / 请求体等多个字段）；`let` 声明可位于 `events` 块之前或之后；编译期把常量引用内联为字面量，行/列求值路径与手写内联正则一致，pattern 仍编译期校验；非字面量 let 与未声明名在静态检查报错并带变量名。配套 parser/checker/compiler 11 项用例与语言参考文档小节。
+
+### Changed
+
+- **建模工具链 moju → jumo 更名（公开 API 与行为不变）**：注解宏依赖 `moju-derive`（git `dayu-sec/moju-derive`）迁移为 crates.io `jumo-derive 0.1`——5 个 crate manifest 与全部 383 对类型注解（`#[moju(kind/domain/module)]` + `::moju_derive::MoJu`）更名为 `#[jumo(...)]` + `::jumo_derive::Jumo`（元数据语义不变）；`Cargo.lock` 同步重解析；代码注释同步；验证：workspace check、全量单测（wf-cep 357 / wf-engine 1040+73 ignored / wf-lang 1162 / wf-runtime 639 等全绿）与 fmt 0。
 
 ## [2.0.19] -- latest
 
