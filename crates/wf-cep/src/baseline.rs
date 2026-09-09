@@ -568,10 +568,6 @@ mod tests {
         )
     }
 
-    fn bucket_of(ts: i64) -> u32 {
-        ((ts as u64) % 60_000_000_000 / 15_000_000_000) as u32
-    }
-
     #[test]
     fn phase_appends_are_partitioned_per_bucket() {
         let s = phase_store(8, false);

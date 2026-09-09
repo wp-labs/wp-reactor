@@ -318,6 +318,11 @@ mod tests {
                 window_buffer_bytes: 64 * 1024 * 1024,
                 schemas: "schemas/*.wfs".into(),
                 rules: "rules/*.wfl".into(),
+                baseline_history: None,
+                baseline_history_k: 8,
+                baseline_history_decay: true,
+                baseline_history_phase_period: None,
+                baseline_history_phase_bucket: None,
             },
             window_defaults: crate::window::WindowDefaults {
                 evict_interval: "30s".parse().unwrap(),
