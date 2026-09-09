@@ -1001,9 +1001,9 @@ fn load_from_postgres(
                     .to_err()
                     .with_detail(format!("PG query {}: {}", name, e))
             })?;
-        if native.is_empty() {
-            continue;
-        }
+        // 空装载也注册（live 首窗未收盘时供给可为空）：ProviderWindow 先空挂，
+        // 随周期刷新（refresh spec 照常登记）在首个收盘后自动填充——否则空 boot
+        // 会跳过 spec，之后永远不刷新（fixed 保留期过滤下的冷启动路径）。
         let rows = engine_rows_from_knowdb(native);
 
         // 周期刷新（S2-M3c-PG）：knowdb [[tables]] `refresh` → NamedSql 规格，
