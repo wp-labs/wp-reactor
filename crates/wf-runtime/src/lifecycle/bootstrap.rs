@@ -585,7 +585,7 @@ fn load_knowledge_into_windows(
         if native.is_empty() {
             continue;
         }
-        let rows = engine_rows_from_knowdb(native);
+        let rows = engine_rows_from_knowdb(&native);
         let row_count = rows.len();
         let mut pw = ProviderWindow::new(
             t.name.clone(),
@@ -604,6 +604,14 @@ fn load_knowledge_into_windows(
             "knowdb data loaded"
         );
         if let Some(interval) = t.refresh {
+            // 启动 seed：同一代数据先入共享 store（daemon 刷新换代同库）——
+            // 数据由 knowdb 持有、调用者函数取数（见 provider_refresh 模块文档）。
+            crate::lifecycle::provider_refresh::seed_store(std::sync::Arc::new(
+                wp_knowledge::refresh::TableData {
+                    name: t.name.clone(),
+                    rows: native,
+                },
+            ));
             crate::lifecycle::provider_refresh::register_spec(wp_knowledge::refresh::RefreshSpec {
                 name: t.name.clone(),
                 interval,
@@ -752,10 +760,11 @@ fn write_derived_knowdb_assets(root: &Path, tables: &[CsvTable]) -> RuntimeResul
 /// `Value` 行。值语义与 PG 路径一致：`Bool` 直接映射，其余经 Display 走
 /// [`infer_knowledge_value`]（数字文本 → Number，true/false → Bool，其余 Str），
 /// 与老引擎逐单元推断结果一致（2026-08-23 q13 契约）。
+/// 借用入参：store 当前代快照由调用者持有（Arc），此处不复制整份原生行。
 pub(super) fn engine_rows_from_knowdb(
-    rows: Vec<wp_knowledge::mem::RowData>,
+    rows: &[wp_knowledge::mem::RowData],
 ) -> Vec<std::collections::HashMap<String, EngineValue>> {
-    rows.into_iter()
+    rows.iter()
         .map(|row| {
             let mut map = HashMap::new();
             for field in row {
@@ -779,6 +788,35 @@ fn parse_knowledge_refresh(table: &toml::Value) -> Option<Duration> {
     raw.parse::<wf_config::HumanDuration>()
         .ok()
         .map(|d| d.as_duration())
+}
+
+/// PG [[tables]] 供给解析产物：sql/code 引擎**只读透传**（渲染在 knowdb
+/// `load_rows`/tick），refresh 周期另存供登记。
+struct PgTableSupply {
+    sql: String,
+    code: String,
+    refresh: Option<Duration>,
+}
+
+/// 解析 PG [[tables]] 供给：`query` 模板（默认 `SELECT * FROM <name>`）+ VEL
+/// `code` + `refresh` 周期。本函数不渲染、不求值——保证引擎侧零变换（回归锚点：
+/// code 里 `$cur/$next` 必须原样进入 RefreshSpec，由 knowdb 按自身时钟求值）。
+fn parse_pg_table_supply(name: &str, table: &toml::Value) -> PgTableSupply {
+    let sql = table
+        .get("query")
+        .and_then(|q| q.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("SELECT * FROM {}", name));
+    let code = table
+        .get("code")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    PgTableSupply {
+        sql,
+        code,
+        refresh: parse_knowledge_refresh(table),
+    }
 }
 
 /// 解析近端 B 相位配置：`period`/`bucket` 必须成对、且 `0 < bucket ≤ period`。
@@ -967,51 +1005,36 @@ fn load_from_postgres(
 
         // 供给查询：默认 SELECT * FROM <name>；可用表级 `query` 覆盖——PG 模式下
         // 直接聚合事实源（如 baseline_records GROUP BY entity），不再需要外部
-        // 中转供给表（2026-09-08，见 pg/baseline_records.sql 说明）。
-        // 动态变量：表级 phase_period_s/phase_bucket_s/retention 三键齐全时，
-        // query 模板的 $cur/$next/$max_age 由引擎现算（A 通道处理时间近似：
-        // 当前/下一相位 + 写死的保留期），boot 与每次刷新同源渲染。
-        let sql_template = table
-            .get("query")
-            .and_then(|q| q.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("SELECT * FROM {}", name));
-        // 供给动态变量代码（[[tables]].code，VEL——见 wp_knowledge::vel）：
-        // 每行 `$name = 字面量/函数`，由 knowdb 每次刷新按自身时钟求值并替换
-        // SQL 里的 `$name`；引擎只读透传。boot 与每次刷新同源渲染。
-        let code = table
-            .get("code")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
-        let boot_sql = if code.trim().is_empty() {
-            sql_template.clone()
-        } else {
-            crate::lifecycle::provider_refresh::render_supply_sql(&sql_template, &code).map_err(
-                |e| {
-                    RuntimeReason::Bootstrap
-                        .to_err()
-                        .with_detail(format!("PG supply code {}: {}", name, e))
-                },
-            )?
-        };
-        let native =
-            wp_knowledge::facade::query_for(ENGINE_PG_PROVIDER, &boot_sql).map_err(|e| {
-                RuntimeReason::Bootstrap
-                    .to_err()
-                    .with_detail(format!("PG query {}: {}", name, e))
-            })?;
-        // 空装载也注册（live 首窗未收盘时供给可为空）：ProviderWindow 先空挂，
-        // 随周期刷新（refresh spec 照常登记）在首个收盘后自动填充——否则空 boot
-        // 会跳过 spec，之后永远不刷新（fixed 保留期过滤下的冷启动路径）。
-        let rows = engine_rows_from_knowdb(native);
+        // 中转供给表（2026-09-08，见 pg/baseline_records.sql 说明）。query 模板
+        // 可含 `$name` 占位符（如 $cur/$next/$max_age），由表级 VEL code 每 tick
+        // 求值替换——引擎只读透传（见 parse_pg_table_supply）。
+        let supply = parse_pg_table_supply(name, table);
 
-        // 周期刷新（S2-M3c-PG）：knowdb [[tables]] `refresh` → NamedSql 规格，
-        // daemon 下由 RefreshService 周期重跑 SELECT 并搬入本 provider 窗。
-        let refresh = parse_knowledge_refresh(table);
+        // 周期刷新（S2-M3c-PG）：[[tables]] `refresh` → NamedSql 规格，daemon 下
+        // 由 RefreshService 周期重跑 SELECT 并换代共享 store。refresh=None 的静态
+        // 供给同样经此同步装载（interval 仅为占位，不登记周期任务）。
+        let refresh = supply.refresh;
+        let spec = wp_knowledge::refresh::RefreshSpec {
+            name: name.to_string(),
+            interval: refresh.unwrap_or_default(),
+            source: wp_knowledge::refresh::RefreshSource::NamedSql {
+                provider: ENGINE_PG_PROVIDER.to_string(),
+                sql: supply.sql.clone(),
+                code: supply.code,
+            },
+        };
+        // 启动装载 = 同步一次 load_rows（渲染/查询与 tick 同一实现）。
+        let native = wp_knowledge::refresh::load_rows(&spec).map_err(|e| {
+            RuntimeReason::Bootstrap
+                .to_err()
+                .with_detail(format!("PG supply load {}: {}", name, e))
+        })?;
+        // 空装载也注册（live 首窗未收盘时供给可为空）：ProviderWindow 先空挂，
+        // 随周期刷新在首个收盘后自动填充——否则空 boot 会跳过 spec，之后永远
+        // 不刷新（fixed 保留期过滤下的冷启动路径）。
+        let rows = engine_rows_from_knowdb(&native);
         let row_count = rows.len();
-        let mut pw =
-            wf_engine::window::ProviderWindow::new(name.to_string(), sql_template.clone(), refresh);
+        let mut pw = wf_engine::window::ProviderWindow::new(name.to_string(), supply.sql, refresh);
         pw.load(rows);
         registry
             .register_provider(name.to_string(), pw)
@@ -1021,19 +1044,17 @@ fn load_from_postgres(
             table = %name,
             rows = row_count,
             refresh = refresh.map(|d| d.as_secs()),
-            code = !code.is_empty(),
             "knowdb data loaded from PG"
         );
-        if let Some(interval) = refresh {
-            crate::lifecycle::provider_refresh::register_spec(wp_knowledge::refresh::RefreshSpec {
-                name: name.to_string(),
-                interval,
-                source: wp_knowledge::refresh::RefreshSource::NamedSql {
-                    provider: ENGINE_PG_PROVIDER.to_string(),
-                    sql: sql_template,
-                    code,
+        if refresh.is_some() {
+            // 启动 seed：同一代数据先入共享 store（daemon 刷新换代同库）。
+            crate::lifecycle::provider_refresh::seed_store(std::sync::Arc::new(
+                wp_knowledge::refresh::TableData {
+                    name: name.to_string(),
+                    rows: native,
                 },
-            });
+            ));
+            crate::lifecycle::provider_refresh::register_spec(spec);
         }
     }
     Ok(())
@@ -1204,25 +1225,34 @@ mod tests {
     }
 
     #[test]
-    fn pg_supply_code_rendering_is_passthrough_at_engine_side() {
-        // 引擎对供给 code 只做透传 + boot 渲染（值计算/替换在 wp_knowledge）。
-        // 这里验证引擎入口渲染函数与 knowdb 同源（固定时刻语义已在 wp_knowledge
-        // 单测锁定，此处只验证 code 原样进入渲染、非法 code 报错）。
-        let code = "$cur = cur_phase_bucket(240, 15)\n$next = next_phase_bucket(240, 15)";
-        let sql = "WHERE phase_bucket IN ('$cur','$next')";
-        let rendered =
-            crate::lifecycle::provider_refresh::render_supply_sql(sql, code).expect("render");
+    fn pg_supply_table_parse_is_pure_passthrough_with_defaults() {
+        // 引擎对 PG 供给 code/query 只做**透传**（渲染/求值在 knowdb load_rows）：
+        // $cur/$next 必须原样进入 RefreshSpec；缺省 = SELECT * + 空 code + 无周期。
+        // （取代旧 render_supply_sql 引擎侧渲染——引擎已不再渲染。）
+        let table: toml::Value = toml::from_str(
+            r#"
+query = "SELECT entity, phase_bucket FROM baseline_records WHERE phase_bucket IN ('$cur','$next')"
+code = """
+$cur  = phase_now(240, 15)
+$next = phase_next(240, 15)
+"""
+refresh = "2m"
+"#,
+        )
+        .expect("toml");
+        let supply = parse_pg_table_supply("baseline_ref", &table);
         assert!(
-            rendered.starts_with("WHERE phase_bucket IN ('p"),
-            "渲染含标签: {rendered}"
+            supply.sql.contains("$cur"),
+            "query 模板原样透传（引擎不渲染）"
         );
-        // 无 code = 原样
-        assert_eq!(
-            crate::lifecycle::provider_refresh::render_supply_sql(sql, "").unwrap(),
-            sql
-        );
-        // 非法 code → 报错（boot 期暴露）
-        assert!(crate::lifecycle::provider_refresh::render_supply_sql(sql, "$x = nope()").is_err());
+        assert!(supply.code.contains("phase_now"), "VEL code 原样透传");
+        assert_eq!(supply.refresh, Some(Duration::from_secs(120)), "2m → 120s");
+
+        // 全缺省表：默认查询、空 code、无周期。
+        let defaults = parse_pg_table_supply("t", &toml::Value::Table(Default::default()));
+        assert_eq!(defaults.sql, "SELECT * FROM t");
+        assert!(defaults.code.is_empty());
+        assert!(defaults.refresh.is_none());
     }
 }
 

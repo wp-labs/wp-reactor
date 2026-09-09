@@ -2,6 +2,19 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [2.1.0] -- latest
+
+### Changed
+
+- **外部供给刷新的一致性提升**：刷新过程中读取方不再可能看到新旧数据混用的中间状态；
+  刷新对查询性能的影响更小。**配置与使用方式不变**（`knowdb.toml` / `refresh` / VEL `code`
+  写法、日志锚点均不变）。
+- **供给 SQL 变量（VEL）配置错误改为启动即报错**，不再推迟到首次刷新时才失败。
+
+### Fixed
+
+- **修复刷新与动态 join 配置并发时的偶发 join 退化**（漏命中 / 降级为全表扫描）。
+
 ## [2.0.19] -- latest
 
 ### Fixed
