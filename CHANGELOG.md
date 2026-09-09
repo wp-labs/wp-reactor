@@ -4,6 +4,16 @@ All notable changes to wp-reactor will be documented in this file.
 
 ## [2.1.0] -- latest
 
+### Added
+
+- **支持在线行为基线检测（baseline）**：流式指标可与“自身历史基线”对比做离群判定，开箱可用：
+  - **实时判定（judge）**：与最近 K 个已收盘窗比，`|z|>3` 告警（单次尖峰/位移最敏感）；
+  - **周期检测（detect）**：与长留存周期画像比（同相位），`(v−μ)/μ>5` 告警（量级偏离）；
+  - **忙闲相位同窗**：只与“历史同期”（同相位桶）比较，`period/bucket` 可配；
+  - 基线由窗口收盘聚合为 `n/sum/sum_sq` 可加三元组（新增 `sumsq`），支持启动历史 warm
+    与半衰期加权；周期画像数据源支持 CSV 周期重载或外部事实库（PG）直聚合；
+  - 规则侧新增 `baseline_dev` / `sumsq` / `phase_bucket` 内建。
+
 ### Changed
 
 - **外部供给刷新的一致性提升**：刷新过程中读取方不再可能看到新旧数据混用的中间状态；
