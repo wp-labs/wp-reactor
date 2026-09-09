@@ -616,8 +616,10 @@ CSV 装载为**启动一次性**；定期推进 = 导出侧重建 CSV + reload�
   SQL/CSV 导出退化为按列 `GROUP BY`（常量 240/15/'p'/时间解析消失）；`phase_cfg.py` 收窄为仅事件
   打标 + CSV seed。⚠ wfl 字面量 = 周期/桶宽唯一引擎侧出处，改值须同步 phase_cfg.py 与
   conf/loop.phase.wfusion.toml（run_phase --constants 交叉校验只覆盖 conf↔gen；wfl 错位 →
-  detect join miss → run.sh 健康检查 A=0 报错）；A 供给与 B 桶定义的**等价性测试**仍待补
-  （A=列打标秒粒度 vs B=引擎纳秒 `bucket_of`，BASE 对齐时等价）。
+  detect join miss → run.sh 健康检查 A=0 报错）；**A 供给与 B 桶定义等价性已闭环**
+  （2026-09-09）：wf-cep `phase_bucket_ns_fold_equals_epoch_second_fold` 锁定 B 纳秒
+  `bucket_of` 与 A 秒口径标签在 period/bucket 为整秒时**严格等价**（含亚秒时刻/桶
+  边界/周期回绕；240/15 演示档 + 60/15 + 24h/1h 生产档）。
 - **供给刷新动态变量 = VEL（2026-09-08 落地 demo，PG）**：knowdb `RefreshSource::NamedSql`
   的表级 `code` 块是一小段 **VEL**（变量求值语言，`wp_knowledge::vel`）：每行 `$name =
   字面量/内建函数`，每次刷新按 knowdb 自身时钟求值后替换 SQL 的 `$name`。内建：

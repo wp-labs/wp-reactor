@@ -741,6 +741,64 @@ mod tests {
     }
 
     #[test]
+    fn phase_bucket_ns_fold_equals_epoch_second_fold() {
+        // A/B 桶等价对拍（§11.6 挂账闭环）：B=近端 B Phase::bucket_of（epoch 纳秒
+        // mod period div bucket）与 A=事件打标/供给标签（epoch 秒 % period div
+        // bucket，phase_cfg/phase_now 同口径）在 period/bucket 为整秒时**严格等价**
+        // ——含亚秒时刻：bucket 边界在整秒，floor 秒折桶与纳秒折桶一致
+        // （floor(floor(t/1e9)/b) == floor(t/(b*1e9))）。
+        let sec_fold = |ts_ns: i64, period_s: u64, bucket_s: u64| {
+            ((ts_ns as u64 / 1_000_000_000) % period_s) / bucket_s
+        };
+        let base = 1_767_225_600_000_000_000i64; // 2026-01-01T00:00:00Z（任意基座）
+        let ns = |s: i64, rem: i64| base + s * 1_000_000_000 + rem;
+
+        // 全量秒级扫描（跨 ≥2 周期 + 桶边界）：每整秒带三种亚秒余量（0/1ns/末ns）
+        for (period_s, bucket_s) in [(240u64, 15u64), (60, 15)] {
+            let p = Phase {
+                period_nanos: period_s * 1_000_000_000,
+                bucket_nanos: bucket_s * 1_000_000_000,
+            };
+            let cycles = 2usize;
+            let period_s_i = period_s as i64;
+            for s in 0..(period_s_i * cycles as i64) {
+                for rem in [0i64, 1, 999_999_999] {
+                    let ts = ns(s, rem);
+                    assert_eq!(
+                        p.bucket_of(ts),
+                        sec_fold(ts, period_s, bucket_s) as u32,
+                        "period={period_s} bucket={bucket_s} ts=base+{s}s+{rem}ns"
+                    );
+                }
+            }
+            // 周期回绕与跨周期复现点
+            for s in [period_s_i, 2 * period_s_i, 2 * period_s_i + bucket_s as i64] {
+                assert_eq!(
+                    p.bucket_of(ns(s, 0)),
+                    sec_fold(ns(s, 0), period_s, bucket_s) as u32
+                );
+            }
+        }
+
+        // 生产量级（24h/1h）：选点含桶边界/周期末/回绕
+        let (period_s, bucket_s) = (86_400u64, 3_600u64);
+        let p = Phase {
+            period_nanos: period_s * 1_000_000_000,
+            bucket_nanos: bucket_s * 1_000_000_000,
+        };
+        for s in [0i64, 3599, 3600, 86_399, 86_400, 86_400 + 1800] {
+            for rem in [0i64, 500_000_000] {
+                let ts = ns(s, rem);
+                assert_eq!(
+                    p.bucket_of(ts),
+                    sec_fold(ts, period_s, bucket_s) as u32,
+                    "24h 档 ts=base+{s}s+{rem}ns"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn phase_period_equals_bucket_is_single_slot_and_stable() {
         // period==bucket：合法（单格周期），折叠退化为全时域同一桶——行为稳定、
         // 不产生分裂键（相位最细粒度=周期本身，等价关闭的可用形态）。
