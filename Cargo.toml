@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "Elastic-2.0"
-version = "2.0.19" # @gxl:set(version)
+version = "2.1.0" # @gxl:set(version)
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -48,5 +48,3 @@ wp-knowledge = "0.17"
 
 # In-workspace override: build against the wfusion/wp-knowledge checkout so the
 # KnowDB refresh service can be developed & tested together with the reactor.
-[patch.crates-io]
-wp-knowledge = { path = "../wp-knowledge" }
