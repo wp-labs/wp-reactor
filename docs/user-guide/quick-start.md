@@ -189,6 +189,7 @@ selector 参数是静态符号，不加引号。详细规则见 [规则编写指
 - `evidence_start_time = @evidence_start_time` / `evidence_end_time = @evidence_end_time`：本次命中证据（命中依据事件）的范围起止时间
 - `rule_window_start = @window_start_time` / `rule_window_end = @window_end_time`：规则窗口边界
 - `latest_analysis_time = @emit_time`：本条输出记录的稳定产出时间
+- `first_match_time = @first_match_time`：实例首次满足条件的系统（处理）墙钟——重复输出保持首次值、迟到事件不覆盖、未命中不产生该字段；写毫秒数字用 `time_to_ms(...)`
 
 时间变量只允许在 `yield` 表达式中使用。详细规则见 [规则编写指南](./rule-writing.md#15-输出证据时间和窗口时间) 和 [语言参考](./language-reference.md#时间系统变量)。
 

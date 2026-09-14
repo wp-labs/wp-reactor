@@ -203,7 +203,7 @@ yield security_alerts (
 - 事件时间：窗口内该实体的候选事件（进入实例的被接受事件）首尾——`first_seen` / `last_seen` 用 `@event_first_time` / `@event_last_time`。
 - 证据时间：本次命中实际依据的事件跨度——用 `@evidence_start_time` / `@evidence_end_time`。
 - 窗口时间：规则窗口的开始和结束时间。
-- 分析时间：本次告警输出的时间（`@emit_time`）与首次命中处理时刻（`@first_match_time`）。
+- 分析时间：本次告警输出的时间（`@emit_time`）与首次命中处理时刻（`@first_match_time`）——后者是实例第一次满足条件的系统墙钟，重复输出保持首次值、迟到/乱序事件不覆盖、新实例重置、未命中无值；`on each` 即当前匹配事件的系统时间。
 
 建议把这些字段作为业务字段写入输出 window：
 
@@ -220,6 +220,7 @@ window security_alerts {
         rule_window_start: time
         rule_window_end: time
         latest_analysis_time: time
+        first_match_time: time
     }
 }
 ```
@@ -235,14 +236,15 @@ yield security_alerts (
     evidence_end_time = @evidence_end_time,
     rule_window_start = @window_start_time,
     rule_window_end = @window_end_time,
-    latest_analysis_time = @emit_time
+    latest_analysis_time = @emit_time,
+    first_match_time = @first_match_time
 )
 ```
 
 命名建议：
 
 - 对外字段使用 `first_seen` / `last_seen` 这类业务名时，右侧仍映射到明确语义的系统变量。
-- 时间系统变量在表达式里的数值表示为 epoch milliseconds；写入 `time` 字段时按时间类型输出。
+- 时间系统变量在表达式里的数值表示为 epoch milliseconds；写入 `time` 字段时按时间类型输出；需要毫秒数字字段时用 `time_to_ms(@first_match_time)`。
 - 不使用 `event_fst_time` / `event_lst_time` 这类缩写，避免用户误解。
 - 不依赖 `__wfu_emit_time` 等内部元数据作为业务输出；需要业务字段时在 `yield` 中显式赋值。
 

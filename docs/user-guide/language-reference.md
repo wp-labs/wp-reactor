@@ -642,7 +642,7 @@ rule alert_entity_rule {
 | `@event_last_time` | `time` | 候选事件跨度终点：进入该实例的最后一条被接受事件的时间 |
 | `@evidence_start_time` | `time` | 本次命中所用**证据**（被接受为命中依据的事件）跨度起点 |
 | `@evidence_end_time` | `time` | 证据跨度终点（例如阈值规则下触发命中那条事件的时间） |
-| `@first_match_time` | `time` | 实例首次完整命中（产生 match/close 结果）的引擎处理墙钟；accu 重复输出保持首次值 |
+| `@first_match_time` | `time` | 实例**首次完整命中**（产生 match/close 结果）的引擎处理墙钟；`on each` 即当前匹配事件的系统时间；重复输出/迟到事件保持首次值，新实例周期重置，未命中无值 |
 | `@window_start_time` | `time` | 规则窗口开始时间 |
 | `@window_end_time` | `time` | 规则窗口结束时间 |
 | `@emit_time` | `time` | 本次输出记录的稳定产出时间 |
@@ -654,6 +654,8 @@ rule alert_entity_rule {
 - `on event<accu>` 规则：分支证据状态跨 rearm 累积（`collect_set` 等证据逐条递增）→ 证据起点通常就是窗口首条证据事件，候选与证据随窗口共同推进。
 - 乱序到达（事件时间回退）：候选 `first` 取到达序首条事件、`last` 取事件时间最大；证据 `start/end` 取分支记录的事件时间 min/max。
 - **事件时间**来自输入事件字段，**处理墙钟**（`@first_match_time`）来自引擎处理时刻，不应混用。
+- **首次命中墙钟**（`@first_match_time`，issue #82/#98）：规则实例第一次完整命中条件的系统时间——不受输入事件时间（`occur_time`）影响，也不被窗口关闭/输出调度（`@emit_time`）覆盖；`on event<accu>` 重复输出、窗口内迟到/乱序事件均保持首次值；实例重置（非 accu 新周期、新窗口桶、新会话）后重新记录；从未命中的实例无值。与 `@emit_time` 是**两个不同时刻**：前者是“何时首次满足条件”，后者是“何时产出这条记录”。
+- 需要把首次命中墙钟写进毫秒数字字段时，用时间转换函数（issue #69）：`time_to_ms(@first_match_time)`（目标字段声明为 `digit`）。
 
 推荐在输出 window 中显式声明业务字段：
 
@@ -669,6 +671,7 @@ window security_alerts {
         rule_window_start: time
         rule_window_end: time
         latest_analysis_time: time
+        first_match_time: time
     }
 }
 ```
@@ -683,7 +686,16 @@ yield security_alerts (
     evidence_end_time = @evidence_end_time,
     rule_window_start = @window_start_time,
     rule_window_end = @window_end_time,
-    latest_analysis_time = @emit_time
+    latest_analysis_time = @emit_time,
+    first_match_time = @first_match_time
+)
+```
+
+毫秒数字字段用 `time_to_ms`：
+
+```wfl
+yield security_alerts (
+    first_match_ms = time_to_ms(@first_match_time)   // 目标字段声明为 `digit`
 )
 ```
 
@@ -693,6 +705,7 @@ yield security_alerts (
 - 这些变量在表达式里的数值表示为 epoch milliseconds；写入 `time` 字段时会按时间类型输出。
 - `@emit_time` 在同一条输出记录内必须保持稳定，多次引用取同一个值。
 - `@event_first_time` / `@event_last_time` 表达窗口内候选事件的首尾；`@evidence_start_time` / `@evidence_end_time` 表达本次命中的证据跨度；`@window_start_time` / `@window_end_time` 表达规则窗口边界，不应混用。
+- `@first_match_time` 表达实例首次满足条件的处理墙钟（重复输出保持首次值、未命中无值），不能与 `@emit_time`（本条输出产出时间）互相替代。
 
 #### 稳定统计上下文
 

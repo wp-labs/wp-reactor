@@ -26,7 +26,7 @@
 
 ## 当前重点能力
 
-- **yield 时间变量**：在输出窗口中声明普通 `time` 字段，并用 `@event_first_time`、`@event_last_time`、`@evidence_start_time`、`@evidence_end_time`、`@window_start_time`、`@window_end_time`、`@emit_time` 显式赋值。
+- **yield 时间变量**：在输出窗口中声明普通 `time` 字段，并用 `@event_first_time`、`@event_last_time`、`@evidence_start_time`、`@evidence_end_time`、`@window_start_time`、`@window_end_time`、`@emit_time`、`@first_match_time` 显式赋值。
 - **稳定统计上下文**：用 `stat.count(window_event(alias))`、`stat.count(match_event(label))`、`stat.count(match_distinct(label))`、`stat.value(trigger(label))`、`stat.value(final(label))` 输出可解释统计证据。
 - **结构化输出**：输出 window 可声明 `object`、`array`、`array/T`，规则中用 WFL 字面量构造，避免手写 JSON 字符串。
 - **中间 window / pipeline**：`yield` 目标可以作为下游规则输入，用于 enrichment、逐条评分和多阶段聚合。
