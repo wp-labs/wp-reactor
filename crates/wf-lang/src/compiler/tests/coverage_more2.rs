@@ -547,7 +547,7 @@ fn collect_bind_tracking_covers_composite_expr_shapes() {
         },
     ];
 
-    let tracking = collect_rule_bind_tracking(&score, &entity, &yield_fields);
+    let tracking = collect_rule_bind_tracking(&score, &entity, &yield_fields, &[]);
     assert!(tracking.aliases.contains("e"), "alias e from refs/paths");
     assert!(
         !tracking.aliases.contains("alias_x"),
@@ -821,4 +821,248 @@ rule r {
         }
         other => panic!("expected TopTies in chain1, got {other:?}"),
     }
+}
+
+#[test]
+fn tracking_and_history_include_l3_series_hidden_in_let() {
+    // issue #99：L3 序列函数（first/...）只出现在规则级 let 中、由 yield 间接
+    // 引用时，仍必须触发绑定追踪与字段历史物化——否则运行时 let 求值拿到空
+    // 序列，产出空值（entity 输出 alert_id 为空）。
+    let plans = compile_with(
+        r#"
+rule r {
+    events { e : auth_events }
+    let dk = join_by("|", e.user, first(e.event_time))
+    match<:5m> { on event { e | count >= 1; } } -> score(1.0)
+    entity(ip, e.sip)
+    yield out (y = dk)
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let plan = plans.iter().find(|p| p.name == "r").expect("rule");
+    assert!(
+        plan.match_plan.needs_field_history,
+        "let 中的 L3 序列函数必须触发字段历史物化（issue #99）"
+    );
+    assert!(
+        plan.match_plan.tracked_bind_aliases.contains("e"),
+        "let 引用的别名必须进入绑定追踪"
+    );
+    assert!(
+        plan.match_plan
+            .tracked_bind_fields
+            .get("e")
+            .is_some_and(|fields| fields.contains("event_time")),
+        "let 中 first(e.event_time) 的字段必须进入绑定追踪"
+    );
+
+    // 对照：无 L3、单绑定、无 join/close → 不物化历史（保持既有热路径开关）。
+    let plans = compile_with(
+        r#"
+rule plain {
+    events { e : auth_events }
+    let who = e.user
+    match<:5m> { on event { e | count >= 1; } } -> score(1.0)
+    entity(ip, e.sip)
+    yield out (y = who)
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let plan = plans.iter().find(|p| p.name == "plain").expect("rule");
+    assert!(
+        !plan.match_plan.needs_field_history,
+        "无 L3 的普通 let 规则不应开启字段历史（避免热路径退化）"
+    );
+}
+
+#[test]
+fn let_l3_nested_in_if_triggers_history() {
+    // L3 嵌套在 object/if 内、仅出现在 let 中 → 仍需历史物化与字段追踪。
+    let plans = compile_with(
+        r#"
+rule nested {
+    events { e : auth_events }
+    let dk = if len(e.user) > 0 then first(e.user) else "x"
+    match<:5m> { on event { e | count >= 1; } } -> score(1.0)
+    entity(ip, e.sip)
+    yield out (y = e.user)
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let plan = plans.iter().find(|p| p.name == "nested").expect("rule");
+    assert!(
+        plan.match_plan.needs_field_history,
+        "嵌套在 if 分支中的 let L3 必须触发历史物化"
+    );
+    let fields = plan
+        .match_plan
+        .tracked_bind_fields
+        .get("e")
+        .expect("alias e tracked");
+    assert!(fields.contains("user"));
+}
+
+#[test]
+fn let_collect_list_tracks_field_and_history() {
+    // collect_list 形态（同族 L3）同样必须入绑定追踪与历史开关。
+    let plans = compile_with(
+        r#"
+rule cl {
+    events { e : auth_events }
+    let who = collect_list(e.user)
+    match<:5m> { on event { e | count >= 1; } } -> score(1.0)
+    entity(ip, e.sip)
+    yield out (y = e.user)
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let plan = plans.iter().find(|p| p.name == "cl").expect("rule");
+    assert!(plan.match_plan.needs_field_history);
+    assert!(
+        plan.match_plan
+            .tracked_bind_fields
+            .get("e")
+            .is_some_and(|f| f.contains("user"))
+    );
+}
+
+#[test]
+fn let_l3_bracket_field_form_tracks_field() {
+    // bracket 形态字段（扁平点号字段名）在 let L3 中同样被追踪。
+    let plans = compile_with(
+        r#"
+rule br {
+    events { e : auth_events }
+    let dk = first(e["event_time"])
+    match<:5m> { on event { e | count >= 1; } } -> score(1.0)
+    entity(ip, e.sip)
+    yield out (y = e.user)
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let plan = plans.iter().find(|p| p.name == "br").expect("rule");
+    assert!(plan.match_plan.needs_field_history);
+    assert!(
+        plan.match_plan
+            .tracked_bind_fields
+            .get("e")
+            .is_some_and(|f| f.contains("event_time"))
+    );
+}
+
+#[test]
+fn close_rule_let_l3_triggers_history_via_close_path() {
+    // close 步路径：let 中的 L3 决定 close 输出取值 → 必须保留每事件历史。
+    let plans = compile_with(
+        r#"
+rule closelet {
+    events { d : auth_events }
+    let dk = first(d.event_time)
+    match<sip:5m> {
+        on event { ev_count: d | count >= 1; }
+        on close { close_count: d | count >= 1; }
+    } -> score(1.0)
+    entity(ip, d.sip)
+    yield out (y = dk)
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let plan = plans.iter().find(|p| p.name == "closelet").expect("rule");
+    assert!(
+        plan.match_plan.needs_field_history,
+        "close 路径的 let L3 必须触发历史物化"
+    );
+}
+
+#[test]
+fn close_rule_let_non_key_field_triggers_history() {
+    // close 路径：let 读取非 key 字段（event_time）→ 需要每事件历史，否则
+    // close 时 let 求值读到空字段。
+    let plans = compile_with(
+        r#"
+rule closenonkey {
+    events { d : auth_events }
+    let who = d.user
+    match<sip:5m> {
+        on event { ev_count: d | count >= 1; }
+        on close { close_count: d | count >= 1; }
+    } -> score(1.0)
+    entity(ip, d.sip)
+    yield out (y = who)
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let plan = plans
+        .iter()
+        .find(|p| p.name == "closenonkey")
+        .expect("rule");
+    assert!(
+        plan.match_plan.needs_field_history,
+        "close 路径 let 引用的非 key 字段必须触发历史物化"
+    );
+}
+
+#[test]
+fn close_rule_let_key_only_field_keeps_history_off() {
+    // 对照：let 只引用 match key 字段（ctx 由 scope_key 提供）且无 L3 →
+    // 不开启每事件历史（避免 close 热路径退化）。
+    let plans = compile_with(
+        r#"
+rule closekeyonly {
+    events { d : auth_events }
+    let who = d.sip
+    match<sip:5m> {
+        on event { ev_count: d | count >= 1; }
+        on close { close_count: d | count >= 1; }
+    } -> score(1.0)
+    entity(ip, d.sip)
+    yield out (y = d.sip)
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let plan = plans
+        .iter()
+        .find(|p| p.name == "closekeyonly")
+        .expect("rule");
+    assert!(
+        !plan.match_plan.needs_field_history,
+        "仅 key 字段的 let 不应开启历史（热路径开关不退化）"
+    );
+}
+
+#[test]
+fn pipeline_stage_let_l3_triggers_history() {
+    // pipeline 规则的绑定追踪调用点同样纳入 let（stage0 真实 binds）。
+    let plans = compile_with(
+        r#"
+rule pipelet {
+    events { d : fw_events }
+    let dk = first(d.dport)
+    match<sip,dport:5m> {
+        on event { ev_count: d | count >= 1; }
+        on close { close_count: d | count >= 3; }
+    }
+    |> match<sip:10m> {
+        on event { ev_count: _in | count >= 1; }
+        on close { close_count: _in | count >= 10; }
+    } -> score(80.0)
+    entity(ip, _in.sip)
+    yield out (x = _in.sip)
+}
+"#,
+        &[fw_events_window(), output_window()],
+    );
+    let stage0 = plans.first().expect("stage0");
+    assert!(
+        stage0.match_plan.needs_field_history,
+        "pipeline 规则 let 中的 L3 必须触发历史物化"
+    );
 }

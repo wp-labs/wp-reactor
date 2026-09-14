@@ -298,7 +298,7 @@ fn bind_tracking_stat_count_inner_selector_forms() {
         name: "n".into(),
         value: Expr::Field(FieldRef::Simple("lbl".into())),
     }];
-    let tracking = collect_rule_bind_tracking(&score_expr, &entity_expr, &yield_fields);
+    let tracking = collect_rule_bind_tracking(&score_expr, &entity_expr, &yield_fields, &[]);
     // match_event selector args are not window aliases → no alias tracked.
     assert!(tracking.aliases.is_empty());
     assert!(tracking.plain_fields.contains("lbl"));

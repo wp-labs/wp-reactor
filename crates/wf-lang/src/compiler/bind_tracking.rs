@@ -17,20 +17,29 @@ pub(crate) fn collect_rule_bind_tracking_aliases(
     score_expr: &Expr,
     entity_expr: &Expr,
     yield_fields: &[YieldField],
+    lets: &[LetDecl],
 ) -> HashSet<String> {
-    collect_rule_bind_tracking(score_expr, entity_expr, yield_fields).aliases
+    collect_rule_bind_tracking(score_expr, entity_expr, yield_fields, lets).aliases
 }
 
+/// 收集规则级表达式（score/entity/yield **以及 let 绑定**）对绑定别名与字段的
+/// 引用。let 必须纳入：L3 序列函数（`first`/`last`/`collect_*`）可能只写在
+/// `let` 中、由 yield 间接引用（warp-fusion#99）——遗漏会使引擎不物化对应
+/// 事件历史，let 求值得到空值。
 pub(crate) fn collect_rule_bind_tracking(
     score_expr: &Expr,
     entity_expr: &Expr,
     yield_fields: &[YieldField],
+    lets: &[LetDecl],
 ) -> BindTracking {
     let mut tracking = BindTracking::default();
     collect_bind_tracking(score_expr, &mut tracking);
     collect_bind_tracking(entity_expr, &mut tracking);
     for field in yield_fields {
         collect_bind_tracking(&field.value, &mut tracking);
+    }
+    for l in lets {
+        collect_bind_tracking(&l.expr, &mut tracking);
     }
     tracking
 }
@@ -261,6 +270,7 @@ pub(crate) fn compute_needs_field_history(
     score_expr: &Expr,
     entity_expr: &Expr,
     yield_fields: &[YieldField],
+    lets: &[LetDecl],
 ) -> bool {
     if !match_plan.close_steps.is_empty() {
         // Close steps accumulate per event, but the field *history* (the
@@ -270,7 +280,13 @@ pub(crate) fn compute_needs_field_history(
         // serves keys from `scope_key` with precedence over the history.
         // q12-style count rules whose yields read only the key (or literals /
         // system vars) skip the per-event `collect_alias_event` entirely.
-        return close_path_reads_non_key_fields(match_plan, score_expr, entity_expr, yield_fields);
+        return close_path_reads_non_key_fields(
+            match_plan,
+            score_expr,
+            entity_expr,
+            yield_fields,
+            lets,
+        );
     }
     if binds.len() > 1 || !joins.is_empty() {
         return true;
@@ -278,6 +294,7 @@ pub(crate) fn compute_needs_field_history(
     if expr_uses_l3_series(score_expr)
         || expr_uses_l3_series(entity_expr)
         || yield_fields.iter().any(|f| expr_uses_l3_series(&f.value))
+        || lets.iter().any(|l| expr_uses_l3_series(&l.expr))
     {
         return true;
     }
@@ -293,10 +310,12 @@ fn close_path_reads_non_key_fields(
     score_expr: &Expr,
     entity_expr: &Expr,
     yield_fields: &[YieldField],
+    lets: &[LetDecl],
 ) -> bool {
     if expr_uses_l3_series(score_expr)
         || expr_uses_l3_series(entity_expr)
         || yield_fields.iter().any(|f| expr_uses_l3_series(&f.value))
+        || lets.iter().any(|l| expr_uses_l3_series(&l.expr))
     {
         return true;
     }
@@ -310,6 +329,10 @@ fn close_path_reads_non_key_fields(
     crate::field_usage::collect_expr_fields(entity_expr, &mut refs);
     for f in yield_fields {
         crate::field_usage::collect_expr_fields(&f.value, &mut refs);
+    }
+    // let 绑定引用的字段同样算入（issue #99）：L3/非键字段可能只出现在 let 中。
+    for l in lets {
+        crate::field_usage::collect_expr_fields(&l.expr, &mut refs);
     }
     refs.into_iter()
         .any(|name| name.is_empty() || name.starts_with('_') || !key_names.contains(name.as_str()))

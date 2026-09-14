@@ -369,6 +369,7 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
         &score_plan.expr,
         &entity_plan.entity_id_expr,
         &yield_plan.fields,
+        &rule.lets,
     );
     match_plan.tracked_bind_aliases = bind_tracking.aliases;
     match_plan.tracked_bind_fields = bind_tracking.fields;
@@ -381,6 +382,7 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
         &score_plan.expr,
         &entity_plan.entity_id_expr,
         &yield_plan.fields,
+        &rule.lets,
     );
     match_plan.trigger_event_needed = compute_trigger_event_needed(
         &match_plan,
@@ -529,6 +531,7 @@ fn compile_pipeline_rule(
             &score_plan.expr,
             &entity_plan.entity_id_expr,
             &yield_plan.fields,
+            &rule.lets,
         );
         match_plan.tracked_bind_aliases = bind_tracking.aliases;
         match_plan.tracked_bind_fields = bind_tracking.fields;
@@ -541,6 +544,7 @@ fn compile_pipeline_rule(
             &score_plan.expr,
             &entity_plan.entity_id_expr,
             &yield_plan.fields,
+            &rule.lets,
         );
 
         plans.push(RulePlan {
