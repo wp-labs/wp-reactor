@@ -2,6 +2,26 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [2.0.23] -- latest
+
+### Fixed
+
+- **L3 序列函数只写在规则级 `let` 中时输出为空（warp-fusion#99）**：单绑定、无 join/close 的规则下，`first` / `last` / `collect_*` 等只出现在 `let` 里（yield 以 let 名间接引用）时结果为空（entity 输出 `alert_id` 为空）；现已修复，与直接写在 `yield` 中结果一致。
+
+### Tests
+
+- 补充 issue #99 回归用例（let 内 L3、close 路径、pipeline 与 `on each` 场景）；`wf-lang` 1182 / `wf-cep` 361 / `wf-engine` 1043 全绿。
+
+## [2.0.22] -- latest
+
+### Changed
+
+- **`@first_match_time` 语义文档补全（issue #98，行为不变）**：语言参考/规则编写/核心概念/快速开始补充——实例首次满足条件的处理墙钟：重复输出保持首次值、迟到/乱序事件不覆盖、新实例周期重置、未命中无值；`on each` 等于当前匹配事件的系统时间；与 `@emit_time` 不可互替；毫秒数字字段用 `time_to_ms(@first_match_time)`。
+
+### Tests
+
+- `@first_match_time` 覆盖补全：hop/滚动窗口与 session 窗口（wf-cep；含收口墙钟、同会话保持与新会话重置）；`on each` 引擎路径（首次满足=系统墙钟≠输入事件时间、`time_to_ms` 可写数字）；惰性墙钟注入与乱序迟到事件不覆盖；yield-only 静态门与列式门排除断言（`SystemVar`）——`wf-lang` 1174 / `wf-cep` 361 / `wf-engine` 1041 全绿。
+
 ## [2.0.20] -- latest
 
 ### Added
