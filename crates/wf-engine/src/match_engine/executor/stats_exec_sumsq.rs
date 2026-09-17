@@ -4,6 +4,7 @@
 //! - 路径 parity：行式(process_rows) vs 空键列式域归并 vs 键式列式逐行；
 //! - 跨路线 parity：同批 `{count,sum}`（SoA）与 `{count,sum,sumsq}`（Classic）
 //!   的 count/sum 输出必须逐值相同——加一列 sumsq 不许改变其它度量。
+//!
 //! 挂载：stats_exec_test.rs 的 `#[path]` 兄弟子模块（`use super::*` 共享 harness）。
 
 use super::*;
