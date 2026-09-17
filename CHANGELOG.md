@@ -7,12 +7,12 @@ All notable changes to wp-reactor will be documented in this file.
 ### Fixed
 
 - **`first(field)` 在窗口事件数超过 1024 后漂移（warp-fusion#100）**：实例内字段样本此前只保留最近 1024 个，超过上限后最早样本被丢弃，`first(field)` 由“最早事件的值”退化为“当前保留样本的首个值”，并随窗口继续增长而变化；用 `first(field)` 组成聚合唯一键或 `alert_id` 的规则，同一实例会输出多个唯一键，下游按唯一键 upsert 时形成多条逻辑记录。现已修复：最早样本始终保留，`first(field)` 在整个实例周期内稳定；`last(field)`、`count(alias)` 与 `stat.count(window_event(alias))` 语义不变。字段样本规模上界由 1024 变为 1025（首个样本 + 最近最多 1024 个），`collect_set` / `collect_list` / `stddev` / `percentile` 以及 `min` / `max` / `sum` / `avg(alias.field)` 会包含最早样本（语言参考与设计文档已同步说明）。
-- **阈值表达式必须是编译期常量（warp-fusion#101）**：匹配步骤的触发判定只做常量折叠，但语义检查此前只在 guard / key / `on each` 上拒绝状态依赖写法，阈值位置漏检——字段引用、规则级 `let` 引用、函数调用（`first` / `collect_set` / `stddev` / `now*` / `baseline` 等）以及“除零 / 模零”这类折叠不出结果的退化常量都能通过编译，而运行期该分支永不满足且没有任何报错（静默不触发）。现改为编译期报错并给出可读提示（阈值须为编译期常量：数字 / 字符串字面量，可取负或用括号做常量算术）；同时把规则级**常量** `let`（如 `let THRESHOLD = 3`，含常量算术）在编译期内联为字面量，使这种命名常量的自然写法可直接用作阈值（非常量 `let` 引用仍拒绝）。语言侧与运行期改为共用同一份常量折叠规则，避免判据再次漂移；guard / key / `on each` 的既有拒绝行为不变。
+- **阈值表达式必须是编译期常量（warp-fusion#101）**：匹配步骤的触发判定只做常量折叠，但语义检查此前只在 guard / key / `on each` 上拒绝状态依赖写法，阈值位置漏检——字段引用、规则级 `let` 引用、函数调用（`first` / `collect_set` / `stddev` / `now*` / `baseline` 等）以及“除零 / 模零”这类折叠不出结果的退化常量都能通过编译，而运行期该分支永不满足且没有任何报错（静默不触发）。现改为编译期报错并给出可读提示（阈值须为编译期常量：数字 / 字符串字面量，可取负或用括号做常量算术）；同时把规则级**常量** `let`（如 `let THRESHOLD = 3`，含常量算术）在编译期内联为字面量，使这种命名常量的自然写法可直接用作阈值（非常量 `let` 引用仍拒绝）。语言侧与运行期改为共用同一份常量折叠规则，避免判据再次漂移。另：**pipeline stage 内不可引用规则级 `let`**（与既有 stage scope 一致，编译期报错并已文档化）；规则级 `let` 名**重名报错**（内联取值与绑定顺序会不一致）；阈值 lint（W004 零阈值）改为按内联后的值判断，与编译产物一致。guard / key / `on each` 的既有拒绝行为不变。
 
 ### Tests
 
 - 新增 issue #100 回归用例：1024 / 1025 / 2000 条事件下 `alert_id` 与 `first_seen` 的稳定性（逐条核对漂移起点）、close 步骤路径、`on event<accu>` 事件步骤序列、实例周期重置后不残留、限定字段聚合包含最早样本、按字段独立保留与上限内序列不变。
-- 新增 issue #101 阈值用例：编译期拒绝（L3 函数、字段引用、非常量 `let` 引用、`now*` / `baseline`、`if…then…else`、除零 / 模零，含 pipeline stage 与 `on event seq` 位置、错误计数与表达式回显）、常量正例（字面量、取负、括号常量算术、字符串字面量、规则级常量 `let`），以及常量 `let` 内联的 plan 断言与“常量 `let` 阈值真实触发”端到端、语言侧↔运行期折叠规则一致性守卫与共享折叠单测。`wf-cep` 369 / `wf-engine` 1052 / `wf-lang` 1198 / `wf-runtime` 639 全绿。
+- 新增 issue #101 阈值用例：编译期拒绝（L3 函数、字段引用、非常量 `let` 引用、`now*` / `baseline`、`if…then…else`、除零 / 模零，含 pipeline stage 与 `on event seq` 位置、错误计数与表达式回显）、常量正例（字面量、取负、括号常量算术、字符串字面量、规则级常量 `let`），以及常量 `let` 内联的 plan 断言、“常量 `let` 阈值真实触发”与“内联版≡手写字面量”差异等价端到端、内联器自身单测（取值/链/自引用与互引用/深链/退化常量/遍历）、常量 `let` 在 close 与 seq 与 `on event<accu>` 位置可用、pipeline stage 与重名 `let` 拒绝、lint W004 穿透常量 `let`、语言侧↔运行期折叠规则一致性守卫与共享折叠单测。`wf-cep` 369 / `wf-engine` 1053 / `wf-lang` 1210 / `wf-runtime` 639 全绿。
 
 ## [2.0.23] -- latest
 
