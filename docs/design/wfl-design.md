@@ -1996,11 +1996,11 @@ rollback_to: "risk_scores@v1"
 
 ## 18. 测试数据生成工具方案（wfgen）
 
-本章节已从 WFL 主规范中拆分，迁移到独立文档：
-
-- 设计文档：`docs/design/wfg-design.md`
+本章节已从 WFL 主规范中拆分：
 
 说明：
 
 - WFG（场景 DSL）进入独立演进周期，与 WFL 主规范解耦维护。
-- 本文不再维护 WFG 详细语法与 EBNF；以 `wfg-design.md` 为唯一准入规范。
+- 本文不再维护 WFG 详细语法与 EBNF；`.wfg` 的解析器/AST 与生成器均位于
+  `warp-fusion` 仓库的 `wfgen` crate，主设计文档为
+  `warp-fusion/docs/design/wfg-design.md`。
