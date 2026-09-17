@@ -24,6 +24,14 @@ All notable changes to wp-reactor will be documented in this file.
 ### Fixed
 
 - **修复刷新与动态 join 配置并发时的偶发 join 退化**（漏命中 / 降级为全表扫描）。
+
+### Removed
+
+- **`wf-lang` 移除 `.wfg` 场景语法的公开 API（`wfg_ast` 模块、`wfg_parser` 模块、`parse_wfg` 函数）**：
+  `.wfg` 的 AST 与解析器在本仓库与 `wfgen`（warp-fusion）各存一份，本仓库这份已无使用者，且仍停留在
+  旧注入语法；为避免两份语法继续分叉，场景语法统一归口 `wfgen`。原先借它校验场景模板的 `wfadm`
+  已改用 `wfgen` 的解析器；引擎（wf-engine / wf-cep / wf-runtime）不受影响。
+
 ## [2.0.24] -- latest
 
 ### Fixed
