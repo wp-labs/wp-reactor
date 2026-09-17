@@ -10,12 +10,12 @@ use crate::ast::*;
 use crate::parse_utils::{ident, kw, ws_skip};
 use crate::schema::{BaseType, FieldType};
 
-use super::parse_expr;
+use super::parse_expr_nested;
 
 pub(super) fn paren_expr(input: &mut &str) -> ModalResult<Expr> {
     literal("(").parse_next(input)?;
     ws_skip.parse_next(input)?;
-    let inner = cut_err(parse_expr).parse_next(input)?;
+    let inner = cut_err(parse_expr_nested).parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal(")")).parse_next(input)?;
     Ok(inner)
@@ -53,7 +53,7 @@ fn object_item(input: &mut &str) -> ModalResult<ObjectItem> {
     ws_skip.parse_next(input)?;
     cut_err(literal("=")).parse_next(input)?;
     ws_skip.parse_next(input)?;
-    let value = cut_err(parse_expr).parse_next(input)?;
+    let value = cut_err(parse_expr_nested).parse_next(input)?;
     ws_skip.parse_next(input)?;
     let _ = opt(literal(";")).parse_next(input)?;
     Ok(ObjectItem {
@@ -124,8 +124,8 @@ fn array_items(input: &mut &str) -> ModalResult<Vec<Expr>> {
         return Ok(Vec::new());
     }
 
-    let items: Vec<Expr> =
-        separated(1.., (ws_skip, parse_expr).map(|(_, e)| e), comma_sep).parse_next(input)?;
+    let items: Vec<Expr> = separated(1.., (ws_skip, parse_expr_nested).map(|(_, e)| e), comma_sep)
+        .parse_next(input)?;
     ws_skip.parse_next(input)?;
     let _ = opt(literal(",")).parse_next(input)?;
     ws_skip.parse_next(input)?;

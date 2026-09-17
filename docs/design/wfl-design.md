@@ -404,6 +404,9 @@ close_mode    = "on"                                    (* OR 模式：事件路
 match_step    = step_branch , { "||" , step_branch } , ";" ;
 step_branch   = [ IDENT , ":" ] , source_ref , [ "." , IDENT | "[" , STRING , "]" ] , [ "&&" , expr ] , pipe_chain ;
 source_ref    = IDENT ;                (* events 别名 或 |> 后续 stage 的 _in *)
+(* 全局硬限制：表达式嵌套分组 <= 5 层、规则级 `let` 引用链 <= 5 层、
+   否则编译期报错——防深嵌套/深链把递归下降与按链展开的递归打爆栈
+   （栈溢出不可捕获）*)
 pipe_chain    = { "|" , transform } , "|" , measure , cmp_op , atomic_expr ;
                 (* atomic_expr 必须是编译期常量：数字/字符串字面量（可取负、可括号算术），
                    或规则级常量 let（编译期内联为字面量；warp-fusion#101）。

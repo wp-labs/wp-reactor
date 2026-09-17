@@ -7,7 +7,9 @@ mod cond;
 mod ident;
 mod values;
 
-use winnow::combinator::{alt, cut_err, opt, separated};
+use std::cell::Cell;
+
+use winnow::combinator::{alt, cut_err, fail, opt, separated};
 use winnow::error::{StrContext, StrContextValue};
 use winnow::prelude::*;
 use winnow::token::literal;
@@ -25,6 +27,57 @@ use self::values::{array_expr, object_expr, paren_expr};
 // ---------------------------------------------------------------------------
 
 pub(crate) fn parse_expr(input: &mut &str) -> ModalResult<Expr> {
+    or_expr.parse_next(input)
+}
+
+/// 表达式**嵌套分组**层数上限。
+///
+/// 递归下降里每层分组（`(...)` / 函数实参 / 数组·对象元素 / `in (...)` /
+/// `if`·`case` 分支）都要穿过整条优先级链再回到 `parse_expr`——深嵌套输入会把
+/// 线程栈耗尽，而**栈溢出不是 panic、catch 不住**，直接 abort 进程（且无位置
+/// 信息）。同一层的 `&&`/`+` 等算子链不递增（解析用循环，不递归），顶层表达式
+/// 本身也不计入——所以「5」= 最多 5 层分组嵌套。
+///
+/// 上限在 **parse 阶段**兜住全链路：树深有界 ⇒ 后续 checker/compiler/inliner 的
+/// 递归遍历同样有界。
+const MAX_EXPR_NESTING: usize = crate::ast::MAX_NESTING_LEVELS;
+
+thread_local! {
+    /// 当前解析线程的分组嵌套层数（parser 同步单线程使用；RAII 保证成对增减）。
+    static EXPR_NESTING: Cell<usize> = const { Cell::new(0) };
+}
+
+struct NestingGuard;
+
+impl NestingGuard {
+    fn enter() -> Option<Self> {
+        EXPR_NESTING.with(|depth| {
+            let next = depth.get() + 1;
+            if next > MAX_EXPR_NESTING {
+                return None;
+            }
+            depth.set(next);
+            Some(Self)
+        })
+    }
+}
+
+impl Drop for NestingGuard {
+    fn drop(&mut self) {
+        EXPR_NESTING.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// 嵌套位置入口：每进入一层分组计一层，超过 [`MAX_EXPR_NESTING`] 给带位置的
+/// 解析错误（而不是让递归继续吃掉栈）。
+pub(super) fn parse_expr_nested(input: &mut &str) -> ModalResult<Expr> {
+    let Some(_guard) = NestingGuard::enter() else {
+        return cut_err(fail)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "expression nesting of at most 5 levels",
+            )))
+            .parse_next(input);
+    };
     or_expr.parse_next(input)
 }
 
@@ -157,8 +210,12 @@ fn parse_in_rhs(input: &mut &str, left: Expr, negated: bool) -> ModalResult<Expr
 pub(crate) fn in_list(input: &mut &str) -> ModalResult<Vec<Expr>> {
     cut_err(literal("(")).parse_next(input)?;
     ws_skip.parse_next(input)?;
-    let list: Vec<Expr> =
-        separated(1.., (ws_skip, parse_expr).map(|(_, e)| e), literal(",")).parse_next(input)?;
+    let list: Vec<Expr> = separated(
+        1..,
+        (ws_skip, parse_expr_nested).map(|(_, e)| e),
+        literal(","),
+    )
+    .parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal(")")).parse_next(input)?;
     Ok(list)
@@ -470,5 +527,56 @@ mod tests {
             vec![Expr::StringLit("a".into()), Expr::StringLit("b".into())]
         );
         assert!(s.is_empty());
+    }
+
+    // ---- 嵌套深度上限（防深嵌套输入栈溢出） ----
+
+    #[test]
+    fn expr_nesting_limit_allows_five_levels() {
+        // 5 层括号：合法
+        let deep = format!("{}1{}", "(".repeat(5), ")".repeat(5));
+        let mut s = deep.as_str();
+        assert!(
+            parse_expr.parse_next(&mut s).is_ok(),
+            "5 层嵌套应当解析成功: {deep}"
+        );
+    }
+
+    #[test]
+    fn expr_nesting_limit_rejects_six_levels() {
+        // 6 层括号：必须给解析错误（而不是继续递归耗尽栈）
+        let deep = format!("{}1{}", "(".repeat(6), ")".repeat(6));
+        let mut s = deep.as_str();
+        let err = parse_expr.parse_next(&mut s).expect_err("6 层应当报错");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("nesting"),
+            "错误信息应说明嵌套层数上限，实际: {text}"
+        );
+    }
+
+    #[test]
+    fn threshold_position_shares_the_same_limit() {
+        // 阈值入口（parse_atomic_expr → 括号）与顶层入口共用同一层数口径：
+        // 5 层合法、6 层报错。
+        let five = format!("{}1{}", "(".repeat(5), ")".repeat(5));
+        let mut s = five.as_str();
+        assert!(parse_atomic_expr.parse_next(&mut s).is_ok(), "阈值 5 层");
+
+        let six = format!("{}1{}", "(".repeat(6), ")".repeat(6));
+        let mut s = six.as_str();
+        assert!(parse_atomic_expr.parse_next(&mut s).is_err(), "阈值 6 层");
+    }
+
+    #[test]
+    fn pathological_nesting_fails_fast_instead_of_overflowing() {
+        // 200 层括号（曾导致 `fatal runtime error: stack overflow` 的直接 abort）：
+        // 现在必须变成一个普通的解析错误。
+        let deep = format!("{}1{}", "(".repeat(200), ")".repeat(200));
+        let mut s = deep.as_str();
+        assert!(
+            parse_expr.parse_next(&mut s).is_err(),
+            "深层嵌套应当快速失败（带诊断），而不是耗尽线程栈"
+        );
     }
 }

@@ -234,7 +234,16 @@ fn inline_const_lets(
     mode: ConstLetMode,
 ) -> Expr {
     // 递归时统一带上 mode，避免两套遍历逻辑漂移。
-    let rec = |e: &Expr, visiting: &mut Vec<String>| inline_const_lets(e, lets, visiting, mode);
+    // `let a = b` 链的展开深度也是用户可控的（链长 = `visiting` 长度），与表达式
+    // 嵌套同属「递归吃栈」风险：超过同一上限即停止内联（保留原引用，由阈值常量性
+    // 检查报「无法求值」），而不是继续递归。见 wfl_parser/expr 的 MAX_EXPR_NESTING。
+    const MAX_INLINE_CHAIN: usize = crate::ast::MAX_NESTING_LEVELS;
+    let rec = |e: &Expr, visiting: &mut Vec<String>| {
+        if visiting.len() >= MAX_INLINE_CHAIN {
+            return e.clone();
+        }
+        inline_const_lets(e, lets, visiting, mode)
+    };
     match expr {
         Expr::Field(FieldRef::Simple(name)) => {
             if !visiting.iter().any(|v| v == name) && lets.iter().any(|l| &l.name == name) {
@@ -529,13 +538,28 @@ mod inline_const_lets_tests {
     }
 
     #[test]
-    fn deep_let_chain_does_not_overflow_stack() {
-        // 深链（50 层）必须能解析且不爆栈。
+    fn let_chain_within_limit_is_inlined() {
+        // 5 条声明的链（L0..L4）在链深上限内 → 解析为字面量。
+        let mut lets: Vec<LetDecl> = vec![leto("L0", num(7.0))];
+        for i in 1..5 {
+            lets.push(leto(&format!("L{i}"), field(&format!("L{}", i - 1))));
+        }
+        assert_eq!(inline_scalar(&field("L4"), &lets), num(7.0));
+    }
+
+    #[test]
+    fn let_chain_beyond_limit_is_left_uninlined_without_overflow() {
+        // 深链（50 层）曾把内联递归打进栈溢出：现在超过链深上限即停止内联、保留
+        // 原引用（由阈值常量性检查报「无法求值」），绝不继续递归吃栈。
         let mut lets: Vec<LetDecl> = vec![leto("L0", num(7.0))];
         for i in 1..50 {
             lets.push(leto(&format!("L{i}"), field(&format!("L{}", i - 1))));
         }
-        assert_eq!(inline_scalar(&field("L49"), &lets), num(7.0));
+        assert_eq!(
+            inline_scalar(&field("L49"), &lets),
+            field("L49"),
+            "超过链深上限不得继续展开"
+        );
     }
 
     #[test]

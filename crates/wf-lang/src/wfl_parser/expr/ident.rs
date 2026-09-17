@@ -9,7 +9,7 @@ use winnow::token::literal;
 use crate::ast::*;
 use crate::parse_utils::{duration_value, ident, quoted_string, ws_skip};
 
-use super::parse_expr;
+use super::parse_expr_nested;
 
 /// Parse an ident-based primary: function call or field reference.
 pub(super) fn ident_primary(input: &mut &str) -> ModalResult<Expr> {
@@ -160,7 +160,7 @@ fn func_arg_expr(input: &mut &str) -> ModalResult<Expr> {
     } else {
         *input = saved;
     }
-    parse_expr(input)
+    parse_expr_nested(input)
 }
 
 #[cfg(test)]

@@ -733,3 +733,95 @@ rule r {
 "#;
     assert_no_errors(input, &[auth_events_window(), output_window()]);
 }
+
+// =========================================================================
+// 规则级 let 引用链深度上限（与表达式嵌套同口径 5 层；防下游按链递归吃栈）
+// =========================================================================
+
+fn chain_rule(depth: usize, use_in_threshold: bool) -> String {
+    let mut lets = String::from("let L0 = 7\n");
+    for i in 1..depth {
+        lets.push_str(&format!("    let L{i} = L{}\n", i - 1));
+    }
+    let threshold = if use_in_threshold {
+        format!("e.action | distinct | count >= L{}", depth - 1)
+    } else {
+        "e.action | distinct | count >= 1".to_string()
+    };
+    let key = if use_in_threshold {
+        "sip".to_string()
+    } else {
+        format!("L{}", depth - 1)
+    };
+    format!(
+        r#"
+rule r {{
+    events {{ e : auth_events }}
+{lets}
+    match<{key}:5m> {{
+        on event {{ {threshold}; }}
+    }} -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}}
+"#
+    )
+}
+
+/// 5 层链（上限内）合法。
+#[test]
+fn let_chain_at_limit_accepted() {
+    let input = chain_rule(5, true);
+    assert_no_errors(&input, &[auth_events_window(), output_window()]);
+}
+
+/// 超过 5 层的链：编译期报错（而不是留给键展开/阈值内联去递归吃栈）。
+#[test]
+fn let_chain_beyond_limit_rejected() {
+    let input = chain_rule(6, true);
+    assert_has_error(
+        &input,
+        &[auth_events_window(), output_window()],
+        "reference chain through",
+    );
+}
+
+/// 深链（200 层）用**作为 match key**：checker 必须先报错（此前键展开会按链递归，
+/// 存在栈溢出 → 进程 abort 的风险），绝不能崩。
+#[test]
+fn deep_let_chain_key_fails_closed_without_crashing() {
+    let input = chain_rule(200, false);
+    let file = parse_wfl(&input).expect("parse should succeed");
+    let errs = check_wfl(&file, &[auth_events_window(), output_window()]);
+    assert!(
+        errs.iter().any(|e| e.severity == Severity::Error
+            && e.message.contains("reference chain through")),
+        "深链必须编译期报错，实际: {errs:?}"
+    );
+    assert!(
+        crate::compile_wfl(&file, &[auth_events_window(), output_window()]).is_err(),
+        "compile_wfl 也必须失败（不得崩溃）"
+    );
+}
+
+/// 链成环（a → b → a）：同样报错。
+#[test]
+fn cyclic_let_chain_rejected() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    let A = B
+    let B = A
+    match<sip:5m> {
+        on event { e.action | distinct | count >= A; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "reference chain",
+    );
+}
