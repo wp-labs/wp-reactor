@@ -2,6 +2,16 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [2.0.24] -- latest
+
+### Fixed
+
+- **`first(field)` 在窗口事件数超过 1024 后漂移（warp-fusion#100）**：实例内字段样本此前只保留最近 1024 个，超过上限后最早样本被丢弃，`first(field)` 由“最早事件的值”退化为“当前保留样本的首个值”，并随窗口继续增长而变化；用 `first(field)` 组成聚合唯一键或 `alert_id` 的规则，同一实例会输出多个唯一键，下游按唯一键 upsert 时形成多条逻辑记录。现已修复：最早样本始终保留，`first(field)` 在整个实例周期内稳定；`last(field)`、`count(alias)` 与 `stat.count(window_event(alias))` 语义不变。字段样本规模上界由 1024 变为 1025（首个样本 + 最近最多 1024 个），`collect_set` / `collect_list` / `stddev` / `percentile` 以及 `min` / `max` / `sum` / `avg(alias.field)` 会包含最早样本（语言参考与设计文档已同步说明）。
+
+### Tests
+
+- 新增 issue #100 回归用例：1024 / 1025 / 2000 条事件下 `alert_id` 与 `first_seen` 的稳定性（逐条核对漂移起点）、close 步骤路径、`on event<accu>` 事件步骤序列、实例周期重置后不残留、限定字段聚合包含最早样本、按字段独立保留与上限内序列不变；`wf-cep` 368 / `wf-engine` 1051 / `wf-lang` 1182 / `wf-runtime` 639 全绿。
+
 ## [2.0.23] -- latest
 
 ### Fixed
