@@ -2,6 +2,7 @@ mod close_tests;
 mod direct_tests;
 mod helpers;
 mod l3;
+mod l3_first_history;
 mod match_tests;
 mod misc;
 mod where_tests;

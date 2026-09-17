@@ -237,15 +237,17 @@ runtime: runtime/wfusion.toml
 **集合函数**（窗口内值收集）：
 - `collect_set(alias.field)` → array/T：去重值收集（用于行为模式提取：一个会话访问了哪些资源）。
 - `collect_list(alias.field)` → array/T：有序值收集（用于操作序列还原：按时间排列的操作链）。
-- `first(alias.field)` → T：保留的最近字段样本中的首个值。
-- `last(alias.field)` → T：保留的最近字段样本中的末个值。
+- `first(alias.field)` → T：实例内按到达序首个被接受事件的字段值（跨整个实例窗口稳定，可用于组成稳定的聚合唯一键）。
+- `last(alias.field)` → T：实例内按到达序最后被接受事件的字段值。
 
 `collect_set(alias.field)` 和 `stat.count(window_event(alias))` 使用同一个 rule instance
 内的 alias 事件集合；前者输出该集合中字段值的去重数组，后者输出该集合的事件数。
 如果某条事件缺少 `field`，它仍计入 `stat.count(window_event(alias))`，但不会进入
-`collect_set(alias.field)` 的数组。alias 字段集合保留最近最多 1024 个字段值；
-`collect_set` / `collect_list` / `first` / `last` 均基于这组最近样本；大窗口或重复字段值
-场景下，`collect_set(alias.field)` 的数组长度可能小于 `stat.count(window_event(alias))`。
+`collect_set(alias.field)` 的数组。alias 字段样本集合规模有界：首个样本始终保留，另保留
+最近最多 1024 个样本（合计至多 1025 个）；`collect_set` / `collect_list` / `first` / `last`
+均基于这组样本。因此 `first` 不受窗口规模影响（始终是最早事件的值），`last` 始终是最新事件
+的值；大窗口或重复字段值场景下，`collect_set(alias.field)` 的数组长度可能小于
+`stat.count(window_event(alias))`。
 
 **会话窗口**：`match<key:session(gap)>`
 - 按活动间隔自动分割会话：相邻事件时间差超过 `gap` 即切分新窗口。
@@ -581,14 +583,14 @@ ANY           = ? any unicode char ? ;
 | `abs`/`ceil`/`floor`/`round`/`sqrt`/`exp`/`sign`/`trunc`/`pow`/`log`/`clamp`/`is_finite` | 数学函数 | L2 | 数值表达式辅助函数 |
 | `strftime` / `strptime` | 时间格式化/解析 | L2 | time/chars 转换 |
 | `sha1_n` | `sha1_n(text, length)` → chars | L2 | SHA-1 小写十六进制前 N 位，N 为 1 到 40 的整数 |
-| `collect_set` | `collect_set(alias.field)` → array/T | L3 | 窗口内最近最多 1024 个字段值的去重收集；与 `stat.count(window_event(alias))` 基于同一 alias 事件集合 |
-| `collect_list` | `collect_list(alias.field)` → array/T | L3 | 窗口内最近最多 1024 个字段值的有序收集 |
+| `collect_set` | `collect_set(alias.field)` → array/T | L3 | 窗口内字段值样本（首个样本 + 最近最多 1024 个）的去重收集；与 `stat.count(window_event(alias))` 基于同一 alias 事件集合 |
+| `collect_list` | `collect_list(alias.field)` → array/T | L3 | 窗口内字段值样本（首个样本 + 最近最多 1024 个）的有序收集 |
 | `mvjoin` | `mvjoin(array_expr, separator)` → chars | L3 | 多值数组按分隔符拼接为字符串（SPL 对齐能力） |
 | `mvdedup` | `mvdedup(array_expr)` → array/T | L3 | 多值数组去重（保留首次出现顺序） |
 | `mvindex` | `mvindex(array_expr, index[, end])` → T/array | L3 | 多值数组取元素或切片 |
 | `mvsort` / `mvreverse` | `mvsort(array_expr)` / `mvreverse(array_expr)` → array/T | L3 | 多值数组排序/反转 |
-| `first` | `first(alias.field)` → T | L3 | 最近字段样本中的首个值 |
-| `last` | `last(alias.field)` → T | L3 | 最近字段样本中的末个值 |
+| `first` | `first(alias.field)` → T | L3 | 实例内按到达序首个被接受事件的字段值（跨整个实例窗口稳定） |
+| `last` | `last(alias.field)` → T | L3 | 实例内按到达序最后被接受事件的字段值 |
 | `stddev` | `stddev(alias.field)` → float | L3 | 标准差 |
 | `percentile` | `percentile(alias.field, p)` → float | L3 | 分位数（p 为 0~100） |
 | `mvcount` | `mvcount(array_expr)` → digit | L3 | 多值/集合元素个数（SPL 对齐能力） |

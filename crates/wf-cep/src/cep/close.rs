@@ -5,7 +5,7 @@ use super::eval::{eval_expr, eval_expr_ext};
 use super::state::{Instance, StepState, snapshot_bind_data};
 use super::step::{
     apply_transforms, check_threshold, collect_event_fields, compute_measure, extract_branch_field,
-    push_capped, record_evidence_time, update_measure,
+    record_evidence_time, update_measure,
 };
 use super::types::{
     CloseOutput, CloseReason, EngineHashMap, Event, FieldSource, RollingStats, StepData, Value,
@@ -100,7 +100,7 @@ pub fn accumulate_close_steps<E: FieldSource>(
             if plan.needs_field_history
                 && let Some(val) = &field_value
             {
-                push_capped(bs.collected_values_mut(), val.clone());
+                bs.push_collected(val.clone());
             }
         }
     }
@@ -137,29 +137,16 @@ fn evaluate_close_steps(
         match evaluate_close_step(step_plan, step_state, &synthetic_event) {
             Some((branch_idx, measure_value)) => {
                 let label = step_plan.branches[branch_idx].label.clone();
-                let collected_values = step_state.branch_states[branch_idx]
-                    .collected_values
-                    .as_deref()
-                    .map(|q| q.iter().cloned().collect())
-                    .unwrap_or_default();
+                let branch_state = &step_state.branch_states[branch_idx];
+                let collected_values = branch_state.collected_series();
                 close_step_data.push(StepData {
                     satisfied_branch_index: branch_idx,
                     label,
                     measure_value,
-                    event_first_time_nanos: step_state.branch_states[branch_idx]
-                        .event_first_time_nanos,
-                    event_last_time_nanos: step_state.branch_states[branch_idx]
-                        .event_last_time_nanos,
+                    event_first_time_nanos: branch_state.event_first_time_nanos,
+                    event_last_time_nanos: branch_state.event_last_time_nanos,
                     collected_values,
-                    field_values: step_state.branch_states[branch_idx]
-                        .field_values
-                        .as_deref()
-                        .map(|m| {
-                            m.iter()
-                                .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                    field_values: branch_state.field_series(),
                 });
             }
             None => {

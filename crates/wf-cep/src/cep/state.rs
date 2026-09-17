@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use wf_lang::plan::MatchPlan;
 
 use super::key::ValueKey;
+use super::step::push_capped;
 use super::types::{BindData, EngineHashMap, EngineHashSet, FieldSource, RollingStats, Value};
 
 // ---------------------------------------------------------------------------
@@ -43,6 +44,25 @@ pub(super) struct BranchState {
     /// 每 push 一次 memmove 整个数组（q15 88% CPU 的根因，见 push_capped 注释）。
     #[allow(clippy::box_collection)] // intentional per-instance memory saving (wp-reactor#19)
     pub(super) field_values: Option<Box<EngineHashMap<String, VecDeque<Value>>>>,
+    /// 被环形裁剪丢弃的最早值（warp-fusion#100）。Lazy, boxed — 只有事件数
+    /// 超过 `MAX_TRACKED_FIELD_VALUES` 的实例才分配。
+    pub(super) pinned_first: Option<Box<PinnedFirst>>,
+}
+
+/// 字段历史被有界队列裁剪掉的最早样本（warp-fusion#100）。
+///
+/// 历史只保留最近 `MAX_TRACKED_FIELD_VALUES` 个样本，但 `first(x)` 的语义是
+/// 「实例内最早事件的值」——裁剪不能改变它，否则用 `first(x)` 组成的聚合唯一键 /
+/// `alert_id` 会随窗口增长漂移（同一实例被下游识别为多条记录）。
+///
+/// 只在**首次**裁剪时写入：此后的裁剪丢弃的值都晚于已记录的首值，因此每个
+/// 序列最多 1 个额外值，内存仍为 O(MAX)。
+#[derive(Debug, Clone, Default)]
+pub(super) struct PinnedFirst {
+    /// branch `collected_values` 序列被丢弃的首值。
+    pub(super) collected: Option<Value>,
+    /// 各字段历史序列被丢弃的首值。
+    pub(super) fields: EngineHashMap<String, Value>,
 }
 
 impl BranchState {
@@ -61,20 +81,53 @@ impl BranchState {
             event_last_time_nanos: None,
             collected_values: None,
             field_values: None,
+            pinned_first: None,
         }
-    }
-
-    /// Mutable access to the field-value history, allocating lazily.
-    pub(super) fn field_values_mut(&mut self) -> &mut EngineHashMap<String, VecDeque<Value>> {
-        self.field_values
-            .get_or_insert_with(|| Box::new(EngineHashMap::default()))
     }
 
     /// Mutable access to the L3 collected-values list, allocating lazily.
     /// VecDeque 环形（push_back/pop_front O(1)，见 push_capped 注释）。
-    pub(super) fn collected_values_mut(&mut self) -> &mut VecDeque<Value> {
+    ///
+    /// 仅本模块内部使用：所有写入必须经 [`Self::push_collected`]，否则会绕过
+    /// 首值钉扎（warp-fusion#100）。
+    fn collected_values_mut(&mut self) -> &mut VecDeque<Value> {
         self.collected_values
             .get_or_insert_with(|| Box::new(VecDeque::new()))
+    }
+
+    /// 追加 branch 的 L3 收集值：维护 1024 上限，并钉扎首个被裁剪的值。
+    pub(super) fn push_collected(&mut self, value: Value) {
+        let dropped = push_capped(self.collected_values_mut(), value);
+        pin_dropped_collected(&mut self.pinned_first, dropped);
+    }
+
+    /// 追加某字段的历史值：维护 1024 上限，并钉扎该字段首个被裁剪的值。
+    pub(super) fn push_field_value(&mut self, field_name: &str, value: Value) {
+        push_capped_field(
+            &mut self.field_values,
+            &mut self.pinned_first,
+            field_name,
+            value,
+        );
+    }
+
+    /// L3 `collected_values` 的完整有界序列：`[首值] ++ 最近样本`。
+    pub(super) fn collected_series(&self) -> Vec<Value> {
+        series_with_pinned_first(self.collected_values.as_deref(), self.pinned_collected())
+    }
+
+    /// 各字段历史的完整有界序列（`[首值] ++ 最近样本`）。
+    pub(super) fn field_series(&self) -> EngineHashMap<String, Vec<Value>> {
+        field_series_with_first(
+            self.field_values.as_deref(),
+            self.pinned_first.as_deref().map(|p| &p.fields),
+        )
+    }
+
+    fn pinned_collected(&self) -> Option<&Value> {
+        self.pinned_first
+            .as_deref()
+            .and_then(|p| p.collected.as_ref())
     }
 }
 
@@ -84,6 +137,8 @@ pub(super) struct AliasState {
     pub(super) count: u64,
     /// Lazy, boxed — only aliases with tracked bind fields allocate.
     pub(super) field_values: Option<Box<EngineHashMap<String, VecDeque<Value>>>>,
+    /// 被环形裁剪丢弃的最早值（warp-fusion#100，见 [`PinnedFirst`]）。
+    pub(super) pinned_first: Option<Box<PinnedFirst>>,
 }
 
 impl AliasState {
@@ -91,12 +146,26 @@ impl AliasState {
         Self {
             count: 0,
             field_values: None,
+            pinned_first: None,
         }
     }
 
-    pub(super) fn field_values_mut(&mut self) -> &mut EngineHashMap<String, VecDeque<Value>> {
-        self.field_values
-            .get_or_insert_with(|| Box::new(EngineHashMap::default()))
+    /// 追加某字段的历史值：维护 1024 上限，并钉扎该字段首个被裁剪的值。
+    pub(super) fn push_field_value(&mut self, field_name: &str, value: Value) {
+        push_capped_field(
+            &mut self.field_values,
+            &mut self.pinned_first,
+            field_name,
+            value,
+        );
+    }
+
+    /// 各字段历史的完整有界序列（`[首值] ++ 最近样本`）。
+    pub(super) fn field_series(&self) -> EngineHashMap<String, Vec<Value>> {
+        field_series_with_first(
+            self.field_values.as_deref(),
+            self.pinned_first.as_deref().map(|p| &p.fields),
+        )
     }
 }
 
@@ -222,6 +291,11 @@ impl Instance {
                             .sum::<usize>()
                     })
                     .unwrap_or(0);
+                size += bs
+                    .pinned_first
+                    .as_deref()
+                    .map(pinned_first_bytes)
+                    .unwrap_or(0);
             }
         }
 
@@ -246,6 +320,11 @@ impl Instance {
                                 })
                                 .sum::<usize>()
                         })
+                        .unwrap_or(0)
+                    + state
+                        .pinned_first
+                        .as_deref()
+                        .map(pinned_first_bytes)
                         .unwrap_or(0);
             }
         }
@@ -380,18 +459,111 @@ pub(super) fn snapshot_bind_data(
             alias_states.get(&alias).map(|state| BindData {
                 alias,
                 count: state.count,
-                field_values: state
-                    .field_values
-                    .as_deref()
-                    .map(|m| {
-                        m.iter()
-                            .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                field_values: state.field_series(),
             })
         })
         .collect()
+}
+
+/// `[首值] ++ 最近样本`：把被裁剪掉的序列首值拼回序列头部（warp-fusion#100）。
+///
+/// 未发生裁剪（`pinned_first == None`）时序列与历史逐位一致；发生裁剪时序列
+/// 长度上界 1025（首值 + 最多 1024 个最近样本）。按消费者分类：
+///
+/// - **`first(x)` 稳定为最早样本**（本修复的目的，`x` 可为裸别名或限定字段）；
+/// - `last(x)` 与裸字段读取（`values.last()`）、`count(alias)` /
+///   `stat.count(window_event(alias))`（独立累加器）语义不变；
+/// - `collect_list` / `collect_set` / `stddev` / `percentile` 额外得到最早样本；
+/// - **限定字段聚合也看到这个额外样本**：`sum/avg/min/max(alias.field)` 走同一序列，
+///   因此 `min(alias.field)` 会取到首个样本（`count()` 不接受字段投影，不存在
+///   `count(alias.field)` 形态）。
+fn series_with_pinned_first(stored: Option<&VecDeque<Value>>, first: Option<&Value>) -> Vec<Value> {
+    let stored_len = stored.map_or(0, VecDeque::len);
+    // 预分配：避免 `insert(0, ..)` 在每条序列上重分配 + O(1024) memmove（暴露在
+    // per-fire 热路径上，见 push_capped 关于 O(1024) 搬运的注释）。
+    let mut out = Vec::with_capacity(stored_len + usize::from(first.is_some()));
+    if let Some(first) = first {
+        out.push(first.clone());
+    }
+    if let Some(stored) = stored {
+        out.extend(stored.iter().cloned());
+    }
+    out
+}
+
+fn field_series_with_first(
+    values: Option<&EngineHashMap<String, VecDeque<Value>>>,
+    first: Option<&EngineHashMap<String, Value>>,
+) -> EngineHashMap<String, Vec<Value>> {
+    let Some(values) = values else {
+        return EngineHashMap::default();
+    };
+    // 不变量：`pinned_first.fields` 的键集是 `values` 键集的子集（两者只在
+    // `push_capped_field` 里同步写入，无删除路径）——按名查找才不会漏拼。
+    debug_assert!(first.is_none_or(|pins| {
+        pins.keys()
+            .all(|field_name| values.contains_key(field_name))
+    }));
+    values
+        .iter()
+        .map(|(field_name, stored)| {
+            let series =
+                series_with_pinned_first(Some(stored), first.and_then(|f| f.get(field_name)));
+            (field_name.clone(), series)
+        })
+        .collect()
+}
+
+/// 追加某字段的历史值（`BranchState` / `AliasState` 同一语义）：维护 1024 上限，
+/// 并钉扎该字段首个被裁剪的值。
+///
+/// 字段名已存在时走 `contains_key` + `get_mut`，热路径无 `String` 分配
+/// （count 类规则每事件重复收集同一批字段）；钉扎槽已存在时直接返回，
+/// 只有**首次**裁剪才分配字段名。
+fn push_capped_field(
+    field_values: &mut Option<Box<EngineHashMap<String, VecDeque<Value>>>>,
+    pinned_first: &mut Option<Box<PinnedFirst>>,
+    field_name: &str,
+    value: Value,
+) {
+    let dropped = {
+        let fvm = field_values.get_or_insert_with(|| Box::new(EngineHashMap::default()));
+        if !fvm.contains_key(field_name) {
+            fvm.insert(field_name.to_string(), VecDeque::new());
+        }
+        push_capped(fvm.get_mut(field_name).expect("just inserted"), value)
+    };
+    let Some(dropped) = dropped else {
+        return;
+    };
+    let fields = &mut pinned_first.get_or_insert_with(Box::default).fields;
+    if !fields.contains_key(field_name) {
+        fields.insert(field_name.to_string(), dropped);
+    }
+}
+
+/// 钉扎 `collected_values` 首个被裁剪的值（首值一旦记录即不再覆盖）。
+fn pin_dropped_collected(pinned_first: &mut Option<Box<PinnedFirst>>, dropped: Option<Value>) {
+    if let Some(dropped) = dropped {
+        pinned_first
+            .get_or_insert_with(Box::default)
+            .collected
+            .get_or_insert(dropped);
+    }
+}
+
+/// [`PinnedFirst`] 的字节数（每序列至多 1 个值，仅 >1024 事件的实例分配）。
+fn pinned_first_bytes(pinned: &PinnedFirst) -> usize {
+    24 + pinned
+        .collected
+        .as_ref()
+        .map(val_estimated_bytes)
+        .unwrap_or(0)
+        + pinned
+            .fields
+            .iter()
+            .map(|(field, value)| field.len() + 24 + val_estimated_bytes(value))
+            .sum::<usize>()
 }
 
 fn val_estimated_bytes(v: &Value) -> usize {

@@ -574,7 +574,7 @@ WFL 在 `match` 条件和 `yield` 赋值中均可使用内置函数：
 | | `split(s, sep)` | 拆分为多值数组 |
 | **多值** | `mvindex(arr, i)`, `mvsort(arr)`, `mvreverse(arr)` | 数组操作 |
 | | `mvjoin(arr, sep)` | 数组拼接为字符串 |
-| | `collect_set(alias.field)`, `collect_list(alias.field)` | 窗口内最近字段样本收集 |
+| | `collect_set(alias.field)`, `collect_list(alias.field)` | 窗口内字段样本收集（首个样本 + 最近最多 1024 个） |
 | **空值/空白** | `coalesce(a, b, ...)`, `isnull`, `isnotnull` | 按顺序取第一个非 null 且非 blank 字符串的值 |
 | **Hash/ID** | `md5`, `sha1`, `sha1_n`, `sha256`, `hex`, `stable_id` | Hash、编码与稳定 ID |
 | **时间** | `strptime(s, fmt)`, `strftime(t, fmt)` | 时间解析与格式化 |

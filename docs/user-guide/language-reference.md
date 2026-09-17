@@ -651,7 +651,7 @@ rule alert_entity_rule {
 
 - **候选事件跨度**（`@event_first_time` / `@event_last_time`）：窗口内进入该实例的全部被接受事件的首尾——适合 `first_seen` / `last_seen` 一类“该实体在窗口内何时开始/最后出现”的字段。
 - **证据跨度**（`@evidence_start_time` / `@evidence_end_time`）：实际构成这次命中的事件跨度。对阈值规则，若窗口里还有更多事件尚未达到触发即到达（或 guard 拒绝），证据终点可能早于候选终点；两类规则一致时两组相等。
-- `on event<accu>` 规则：分支证据状态跨 rearm 累积（`collect_set` 等证据逐条递增）→ 证据起点通常就是窗口首条证据事件，候选与证据随窗口共同推进。
+- `on event<accu>` 规则：分支证据状态跨 rearm 累积（`collect_set` 等证据在采样上界内逐条递增，达到上界后集合不再增长——见下方 L3 集合函数的样本上限说明）→ 证据起点通常就是窗口首条证据事件，候选与证据随窗口共同推进。
 - 乱序到达（事件时间回退）：候选 `first` 取到达序首条事件、`last` 取事件时间最大；证据 `start/end` 取分支记录的事件时间 min/max。
 - **事件时间**来自输入事件字段，**处理墙钟**（`@first_match_time`）来自引擎处理时刻，不应混用。
 - **首次命中墙钟**（`@first_match_time`，issue #82/#98）：规则实例第一次完整命中条件的系统时间——不受输入事件时间（`occur_time`）影响，也不被窗口关闭/输出调度（`@emit_time`）覆盖；`on event<accu>` 重复输出、窗口内迟到/乱序事件均保持首次值；实例重置（非 accu 新周期、新窗口桶、新会话）后重新记录；从未命中的实例无值。与 `@emit_time` 是**两个不同时刻**：前者是“何时首次满足条件”，后者是“何时产出这条记录”。
@@ -1196,11 +1196,11 @@ yield security_alerts (
 
 | 函数 | 返回类型 | 说明 |
 |------|----------|------|
-| `collect_set(alias.field)` | `array/T` | 收集当前 rule instance 内 alias 事件集合最近最多 1024 个字段值，按首次出现顺序去重 |
-| `collect_list(alias.field)` | `array/T` | 收集当前 rule instance 内 alias 事件集合最近最多 1024 个字段值，保留出现顺序 |
-| `first(alias.field)` | `T` | 返回当前 rule instance 内 alias 最近字段样本中的首个字段值 |
-| `last(alias.field)` | `T` | 返回当前 rule instance 内 alias 最近字段样本中的末个字段值 |
-| `stddev(alias.field)` | `float` | 当前 rule instance 内 alias 最近字段样本的标准差（样本 <2 时返回 0） |
+| `collect_set(alias.field)` | `array/T` | 收集当前 rule instance 内 alias 事件集合的字段值样本（首个样本 + 最近最多 1024 个），按首次出现顺序去重 |
+| `collect_list(alias.field)` | `array/T` | 收集当前 rule instance 内 alias 事件集合的字段值样本（首个样本 + 最近最多 1024 个），保留出现顺序 |
+| `first(alias.field)` | `T` | 返回当前 rule instance 内 alias **按到达序首个被接受事件**的字段值；跨整个实例窗口保持稳定（适合组成聚合唯一键 / `alert_id`） |
+| `last(alias.field)` | `T` | 返回当前 rule instance 内 alias 按到达序**最后**被接受事件的字段值 |
+| `stddev(alias.field)` | `float` | 当前 rule instance 内 alias 字段值样本的标准差（样本 <2 时返回 0） |
 | `percentile(alias.field, p)` | `float` | 样本百分位；`p` 必须是 0-100 数字字面量（越界编译拒绝） |
 
 `collect_set(alias.field)` 和 `stat.count(window_event(alias))` 基于同一个 alias 事件集合。常见 evidence 输出写法：
@@ -1222,7 +1222,7 @@ yield security_alerts (
 )
 ```
 
-如果某条事件缺少 `event_id`，它仍计入 `event_count`，但不会进入 `evidences`。alias 字段集合保留最近最多 1024 个字段值；`collect_set` / `collect_list` / `first` / `last` / `stddev` / `percentile` 均基于这组最近样本。大窗口或重复 `event_id` 场景下，`evidences` 数组长度可能小于 `event_count`。
+如果某条事件缺少 `event_id`，它仍计入 `event_count`，但不会进入 `evidences`。alias 字段样本集合的规模有界：**首个样本**始终保留，另保留最近最多 1024 个样本（合计至多 1025 个）；`collect_set` / `collect_list` / `first` / `last` / `stddev` / `percentile` 均基于这组样本。`first` 因此不受窗口规模影响（同一个 rule instance 内始终返回按到达序首个被接受事件的值，可用于组成稳定的聚合唯一键 / `alert_id`），而 `last` 始终返回按到达序最后一个被接受事件的值。大窗口或重复 `event_id` 场景下，`evidences` 数组长度仍可能小于 `event_count`。`sum(alias.field)` / `avg(alias.field)` / `min(alias.field)` / `max(alias.field)` 这类**限定字段聚合**同样基于这组样本，因此裁剪发生后会额外包含最早样本（例如 `min(alias.field)` 会取到首个样本）；而 `count(alias)` 与 `stat.count(window_event(alias))` 使用独立累加器，始终等于该 alias 的事件总数（`count()` 不接受字段投影）。
 
 ## 规则测试
 
