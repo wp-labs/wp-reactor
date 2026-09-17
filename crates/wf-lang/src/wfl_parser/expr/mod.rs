@@ -27,6 +27,7 @@ use self::values::{array_expr, object_expr, paren_expr};
 // ---------------------------------------------------------------------------
 
 pub(crate) fn parse_expr(input: &mut &str) -> ModalResult<Expr> {
+    let _scope = ExprScopeGuard::enter();
     or_expr.parse_next(input)
 }
 
@@ -38,13 +39,80 @@ pub(crate) fn parse_expr(input: &mut &str) -> ModalResult<Expr> {
 /// 信息）。同一层的 `&&`/`+` 等算子链不递增（解析用循环，不递归），顶层表达式
 /// 本身也不计入——所以「5」= 最多 5 层分组嵌套。
 ///
-/// 上限在 **parse 阶段**兜住全链路：树深有界 ⇒ 后续 checker/compiler/inliner 的
-/// 递归遍历同样有界。
+/// 分组嵌套上限只兜住**解析器自身**的递归深度；它会构造出多深的 AST 由下面的
+/// [`MAX_SCOPE_CHAIN_DEPTH`] 单独兜（两者管的是不同的东西，见该常量的说明）。
 const MAX_EXPR_NESTING: usize = crate::ast::MAX_NESTING_LEVELS;
+
+/// 单个表达式作用域内可累计的链式层数：算子链每次迭代、`not` 每层各记 1。
+///
+/// 与 [`MAX_EXPR_NESTING`] 是两个不同的量，不能互相替代：
+///
+/// - **分组嵌套**（`(...)` / 函数实参 / `in (...)` 列表 / 数组·对象元素）在 AST 里是
+///   **扁平**的——括号不产生节点，列表与实参是 `Vec`，下游遍历是迭代而非递归。
+///   它们只威胁**解析器**的栈，所以由 5 层分组上限兜住，不存在「长列表」问题。
+/// - **算子链**（`a + b + c`、`a || b || c`、`not not x`）在解析器里是 `loop`、不吃
+///   解析栈，却会构造出**左深 AST**，深度等于项数；下游所有按 AST 结构递归的遍历
+///   （checker 类型检查、常量折叠、`let` 内联、键派生、代码生成）都会随项数吃栈。
+///   实测：`yield` 里 5000 项的 `1 + 1 + ...` 会让 checker 栈溢出 `abort`、20000 项在
+///   解析阶段就 `abort`（同样是「CI 只报 signal: 6」的形态）；纯链到 254 层仍安全，
+///   而「3 层分组 × 每层 128 项链」（路径深度 381）已经 `abort`——**子树的链深会沿
+///   分组叠加**，所以预算必须按作用域收紧、让路径深度有硬上界。
+///
+/// 计数在**每个表达式作用域**（顶层表达式、每层分组）重置，因此：
+/// 任一路径经过的作用域 ≤ `MAX_EXPR_NESTING + 1` = 6 个，路径上的 AST 深度
+/// ≤ 6 × 本值 = **96 层**（实测安全线 254 的 2.6 倍余量以内）。
+/// 重置同时保证兄弟节点互不累加——长 `in (...)` 列表、长实参列表完全不受影响。
+const MAX_SCOPE_CHAIN_DEPTH: usize = 16;
 
 thread_local! {
     /// 当前解析线程的分组嵌套层数（parser 同步单线程使用；RAII 保证成对增减）。
     static EXPR_NESTING: Cell<usize> = const { Cell::new(0) };
+    /// 当前表达式作用域内已累计的链式层数（进入分组时重置，见 [`ExprScopeGuard`]）。
+    static EXPR_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// 表达式作用域：进入时把链深清零，退出时恢复进入前的值。
+///
+/// 清零点很关键——分组位置的兄弟（`in (a, b, …)` 的各项、函数实参、数组·对象元素）
+/// 在 AST 里是并列的，深度取 **max** 而不是求和；不清零就会把兄弟的链长互相累加，
+/// 把长列表误判成深嵌套。
+struct ExprScopeGuard {
+    prev_depth: usize,
+}
+
+impl ExprScopeGuard {
+    fn enter() -> Self {
+        Self {
+            prev_depth: EXPR_DEPTH.with(|d| d.replace(0)),
+        }
+    }
+}
+
+impl Drop for ExprScopeGuard {
+    fn drop(&mut self) {
+        EXPR_DEPTH.with(|d| d.set(self.prev_depth));
+    }
+}
+
+/// 沿路径再深一层（一次链式算子迭代 / 一层 `not`）：超预算给带位置的解析错误。
+fn charge_expr_depth(input: &mut &str) -> ModalResult<()> {
+    let over_budget = EXPR_DEPTH.with(|d| {
+        let next = d.get() + 1;
+        if next > MAX_SCOPE_CHAIN_DEPTH {
+            true
+        } else {
+            d.set(next);
+            false
+        }
+    });
+    if over_budget {
+        return cut_err(fail)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "expression chain of at most 16 operator levels per group",
+            )))
+            .parse_next(input);
+    }
+    Ok(())
 }
 
 struct NestingGuard;
@@ -78,6 +146,7 @@ pub(super) fn parse_expr_nested(input: &mut &str) -> ModalResult<Expr> {
             )))
             .parse_next(input);
     };
+    let _scope = ExprScopeGuard::enter();
     or_expr.parse_next(input)
 }
 
@@ -86,6 +155,7 @@ pub(super) fn parse_expr_nested(input: &mut &str) -> ModalResult<Expr> {
 pub(crate) fn parse_atomic_expr(input: &mut &str) -> ModalResult<Expr> {
     // Only parse up to additive level (no comparisons or logic)
     // In practice, thresholds are simple values: numbers, field refs, func calls
+    let _scope = ExprScopeGuard::enter();
     unary_expr.parse_next(input)
 }
 
@@ -100,6 +170,7 @@ fn or_expr(input: &mut &str) -> ModalResult<Expr> {
         ws_skip.parse_next(input)?;
         if opt(literal("||")).parse_next(input)?.is_some() {
             ws_skip.parse_next(input)?;
+            charge_expr_depth(input)?;
             let right = cut_err(and_expr).parse_next(input)?;
             left = Expr::BinOp {
                 op: BinOp::Or,
@@ -120,6 +191,7 @@ fn and_expr(input: &mut &str) -> ModalResult<Expr> {
         ws_skip.parse_next(input)?;
         if opt(literal("&&")).parse_next(input)?.is_some() {
             ws_skip.parse_next(input)?;
+            charge_expr_depth(input)?;
             let right = cut_err(not_expr).parse_next(input)?;
             left = Expr::BinOp {
                 op: BinOp::And,
@@ -144,6 +216,7 @@ fn not_expr(input: &mut &str) -> ModalResult<Expr> {
         || opt(literal("!")).parse_next(input)?.is_some();
     if negated {
         ws_skip.parse_next(input)?;
+        charge_expr_depth(input)?;
         let inner = not_expr.parse_next(input)?;
         Ok(Expr::Not(Box::new(inner)))
     } else {
@@ -248,6 +321,7 @@ fn add_expr(input: &mut &str) -> ModalResult<Expr> {
         .parse_next(input)?;
         if let Some(op) = op {
             ws_skip.parse_next(input)?;
+            charge_expr_depth(input)?;
             let right = cut_err(mul_expr).parse_next(input)?;
             left = Expr::BinOp {
                 op,
@@ -274,6 +348,7 @@ fn mul_expr(input: &mut &str) -> ModalResult<Expr> {
         .parse_next(input)?;
         if let Some(op) = op {
             ws_skip.parse_next(input)?;
+            charge_expr_depth(input)?;
             let right = cut_err(unary_expr).parse_next(input)?;
             left = Expr::BinOp {
                 op,
@@ -566,6 +641,121 @@ mod tests {
         let six = format!("{}1{}", "(".repeat(6), ")".repeat(6));
         let mut s = six.as_str();
         assert!(parse_atomic_expr.parse_next(&mut s).is_err(), "阈值 6 层");
+    }
+
+    // ---- 表达式链深预算（算子链会构造左深 AST，下游按 AST 递归吃栈） ----
+
+    fn chain_of(term: &str, n: usize, op: &str) -> String {
+        std::iter::repeat_n(term, n).collect::<Vec<_>>().join(op)
+    }
+
+    /// 数出一条左深链的 `BinOp` 层数。
+    fn binop_depth(expr: &Expr) -> usize {
+        let mut n = 0;
+        let mut cur = expr;
+        while let Expr::BinOp { left, .. } = cur {
+            n += 1;
+            cur = left;
+        }
+        n
+    }
+
+    /// 预算内的链正常解析，并确实构造出与项数同阶的左深树。
+    #[test]
+    fn operator_chain_within_budget_accepted() {
+        // 16 项 = 16 次计费？不：首项不计，链长 n 记 n-1 层 ⇒ 16 项记 15
+        assert_eq!(binop_depth(&expr_of(&chain_of("1", 16, " + "))), 15);
+        // 边界：17 项记 16，正好用满预算
+        assert_eq!(binop_depth(&expr_of(&chain_of("1", 17, " + "))), 16);
+    }
+
+    /// 超预算的链：给可读的解析错误（而不是留给下游递归吃栈）。
+    #[test]
+    fn operator_chain_beyond_budget_rejected() {
+        let chain = chain_of("1", 18, " + ");
+        let mut s = chain.as_str();
+        let err = parse_expr.parse_next(&mut s).expect_err("18 项链应当报错");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("operator levels"),
+            "错误信息应说明链长上限，实际: {text}"
+        );
+    }
+
+    /// 回归：曾经 5000 项链会让 checker（乃至解析阶段）栈溢出 `abort`
+    /// （CI 只报 `signal: 6`、无位置信息）；现在必须是可读的解析错误。
+    #[test]
+    fn long_operator_chain_fails_fast_without_overflowing() {
+        let chain = chain_of("1", 5_000, " + ");
+        let mut s = chain.as_str();
+        assert!(
+            parse_expr.parse_next(&mut s).is_err(),
+            "深链必须快速失败，而不是耗尽线程栈"
+        );
+    }
+
+    /// `||` / `&&` / `*` / `not` 前缀共用同一预算（都是沿路径加深 AST 的链）。
+    #[test]
+    fn all_chain_kinds_share_the_budget() {
+        expr_err(&chain_of("a", 300, " || "));
+        expr_err(&chain_of("a", 300, " && "));
+        expr_err(&chain_of("1", 300, " * "));
+        expr_err(&format!("{}a", "not ".repeat(300)));
+    }
+
+    /// 预算按**作用域**重置：每层分组各有一条预算内的链，纵深叠加后仍合法
+    /// （路径深度 ≈ 15 + 5×16 = 95，仍在上限 96 内）。
+    #[test]
+    fn chain_budget_resets_per_group() {
+        let mut expr = chain_of("1", 16, " + ");
+        for _ in 0..4 {
+            expr = format!("({expr}) + {}", chain_of("1", 16, " + "));
+        }
+        let parsed = expr_of(&expr);
+        assert!(
+            binop_depth(&parsed) >= 79,
+            "5 层分组叠加后应有可观深度，实际 {}",
+            binop_depth(&parsed)
+        );
+    }
+
+    /// 同层分组之间不累加（各自独立作用域），所以「两个预算内的链」合起来也合法——
+    /// 否则多写一对括号就会莫名超限。实际深度 = 外层那一个 `+` + 内层链。
+    #[test]
+    fn sibling_groups_do_not_accumulate() {
+        let c = chain_of("1", 17, " + ");
+        assert_eq!(binop_depth(&expr_of(&format!("({c}) + ({c})"))), 17);
+    }
+
+    /// **扁平**列表不吃预算：列表项在 AST 里并列，深度取 max 而非求和——长列表是
+    /// 文档推荐的替代写法（`in (...)` 取代超长 `||` 链），不能被误伤。
+    #[test]
+    fn flat_list_items_are_not_charged() {
+        let items = chain_of("\"x\"", 400, ", ");
+        let Expr::InList { list, .. } = expr_of(&format!("a in ({items})")) else {
+            panic!("应为 InList");
+        };
+        assert_eq!(list.len(), 400);
+    }
+
+    /// 数组元素同样是扁平列表，不吃预算。
+    #[test]
+    fn array_items_are_not_charged() {
+        let items = chain_of("1", 400, ", ");
+        let Expr::Array(items) = expr_of(&format!("array [{items}]")) else {
+            panic!("应为 Array");
+        };
+        assert_eq!(items.len(), 400);
+    }
+
+    /// 函数实参同样是扁平列表，不吃预算。
+    #[test]
+    fn function_args_are_not_charged() {
+        let args = chain_of("1", 400, ", ");
+        let Expr::FuncCall { args, .. } = expr_of(&format!("concat({args})")) else {
+            panic!("应为 FuncCall");
+        };
+        assert_eq!(args.len(), 400);
     }
 
     #[test]
