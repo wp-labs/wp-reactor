@@ -57,12 +57,6 @@ module LangTest {
   responsible_for "WFL test contract — input/output assertions, evaluation modes, and permutation testing"
 }
 
-module LangScenario {
-  layer DataFusion
-  owns WfgFile, ScenarioDecl, TimeClause, SyntaxScenario, ScenarioAttr, AttrValue, TrafficBlock, SyntaxStreamDecl, RateExpr, WaveShape, TimelineSegment, SyntaxInjectionBlock, SyntaxInjectCase, InjectCaseMode, SeqBlock, FieldPredicate, ExpectBlock, ExpectCheck, ExpectMetric, CompareOp, ExpectValue, Rate, RateUnit, StreamBlock, FieldOverride, GenExpr, GenArg, InjectBlock, InjectLine, InjectUseStep, InjectMode, FaultsBlock, FaultType, FaultLine, OracleBlock, ParamAssign, ParamValue
-  responsible_for "WFG scenario grammar — traffic generation, injections, faults, and oracle expectations"
-}
-
 module LangChecker {
   layer DataFusion
   owns CheckError, Severity, LangReason, Scope, ValType, StatLabelInfo, StatLabelStage, JoinKeySource
@@ -108,7 +102,6 @@ dependency_rule LangDeps {
   LangStats -> LangExpr
   LangTest -> LangExpr
   LangTest -> LangMatch
-  LangScenario -> LangRule
   LangChecker -> LangMatch
   LangCompile -> LangExpr
   LangCompile -> LangMatch
