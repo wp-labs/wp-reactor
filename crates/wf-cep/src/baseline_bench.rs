@@ -32,7 +32,10 @@ fn win(start_ns: i64) -> BaselineWindow {
 }
 
 /// 时间预算测量：warmup 后跑到 ~budget，返回 ns/op。
-fn measure_ns<F: FnMut()>(mut op: F) -> f64 {
+///
+/// 闭包**返回被测操作的值**（而不是 `()`）：`black_box(op())` 既让优化器无法消除
+/// 这次调用，又不会触发 `clippy::unit_arg`。
+fn measure_ns<T, F: FnMut() -> T>(mut op: F) -> f64 {
     let budget = Duration::from_millis(250);
     // warmup（首调含 HashMap 分配/缓存预热）
     op();
@@ -104,21 +107,18 @@ fn baseline_store_append_vs_judge_heat_path() {
             if phase { "开" } else { "关" }
         );
         // 用空 store 预热 append；judge 用带历史 store
-        let mut st = store_for(entities, phase, decay);
-        let ats = populate(&mut st, entities, phase);
+        let st = store_for(entities, phase, decay);
+        let ats = populate(&st, entities, phase);
         let at = ats[0];
 
         let mut next_start = 9_000_000_000_000i64;
         let append_ns = measure_ns(|| {
             st.append("e0", "flow", win(next_start)); // 每 op 新窗 → 追加 + K 裁剪
             next_start += 15_000_000_000;
+            next_start // 作为被测操作的值返回，交给 measure_ns 的 black_box
         });
-        let summary_ns = measure_ns(|| {
-            std::hint::black_box(st.summary_at("e0", "flow", Some(at)));
-        });
-        let dev_ns = measure_ns(|| {
-            std::hint::black_box(st.deviation_at("e0", "flow", 1000.0, Some(at)));
-        });
+        let summary_ns = measure_ns(|| st.summary_at("e0", "flow", Some(at)));
+        let dev_ns = measure_ns(|| st.deviation_at("e0", "flow", 1000.0, Some(at)));
         let judge_s = 1e9 / dev_ns;
         // 键数（诊断）
         let note = if phase {
@@ -139,19 +139,17 @@ fn baseline_store_append_vs_judge_heat_path() {
     eprintln!("=== 缩放（deviation_at，相位关） ===");
     let mut prev: Option<f64> = None;
     for entities in [1usize, 100, 10_000] {
-        let mut st = store_for(entities, false, true);
-        let ats = populate(&mut st, entities, false);
+        let st = store_for(entities, false, true);
+        let ats = populate(&st, entities, false);
         let at = ats[0];
-        let ns = measure_ns(|| {
-            std::hint::black_box(st.deviation_at("e0", "flow", 1000.0, Some(at)));
-        });
+        let ns = measure_ns(|| st.deviation_at("e0", "flow", 1000.0, Some(at)));
         let ratio = prev.map(|p| ns / p);
         eprintln!(
             "{:<8} 实体: {:>8.0} ns/判定   {:>7.1}× vs 上一档{}",
             entities,
             ns,
             ratio.unwrap_or(1.0),
-            if ratio.map_or(false, |r| r > 50.0) {
+            if ratio.is_some_and(|r| r > 50.0) {
                 "  ⚠ 全表扫描主导：键数线性放大（windows_for 每事件扫全 store）"
             } else {
                 ""

@@ -58,18 +58,10 @@ type MetricMap = HashMap<String, BucketMap>;
 /// 共享大实体空间下每事件 O(store 键数)，改嵌套后 O(该键桶数)，查询零分配）。
 type EntityMap = HashMap<String, MetricMap>;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Entry {
     /// 按 win_start_nanos 升序；长度 ≤ K。
     windows: VecDeque<BaselineWindow>,
-}
-
-impl Default for Entry {
-    fn default() -> Self {
-        Entry {
-            windows: VecDeque::new(),
-        }
-    }
 }
 
 /// 规则级共享基线历史表（内部 Mutex，可经 `&'static` 跨规则/线程访问）。
@@ -244,10 +236,10 @@ impl BaselineStore {
         };
         let mut out = Vec::new();
         for (&b, entry) in buckets {
-            if let Some(p) = target_phase {
-                if b != p {
-                    continue;
-                }
+            if let Some(p) = target_phase
+                && b != p
+            {
+                continue;
             }
             out.extend(entry.windows.iter().copied());
         }
@@ -825,7 +817,7 @@ mod tests {
                 std::thread::spawn(move || {
                     for i in 0..200 {
                         let entity = format!("p{t}");
-                        let slot = (i % 4) as i64; // 相位格 0..3
+                        let slot = i % 4; // 相位格 0..3
                         let cycle = i / 4; // 周期序号
                         let ts = (cycle * 60 + slot * 15) * 1_000_000_000i64;
                         s.append(&entity, "m", win(ts, 2.0, 20.0, 210.0));
