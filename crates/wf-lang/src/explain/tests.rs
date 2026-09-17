@@ -667,3 +667,40 @@ rule r {
     assert!(limits.contains("disk_provider=Redb"), "got: {limits}");
     assert!(limits.contains("max_disk=8589934592B"), "got: {limits}");
 }
+
+/// 一致性：常量 `let` 阈值内联是纯编译期重写，`explain` 对「内联版」与「手写字面量版」
+/// 必须给出完全相同的说明（否则 ops 看到的解释与实际执行语义脱节）。
+#[test]
+fn explain_is_identical_for_const_let_and_literal_threshold() {
+    let schemas = vec![auth_events_window(), security_alerts_window()];
+    let compile = |src: &str| {
+        let file = parse_wfl(src).expect("parse");
+        compile_wfl(&file, &schemas).expect("compile")
+    };
+    let literal = explain_rules(&compile(LITERAL_SRC), &schemas);
+    let via_let = explain_rules(&compile(VIA_LET_SRC), &schemas);
+    assert_eq!(
+        format!("{literal:?}"),
+        format!("{via_let:?}"),
+        "explain 输出必须与手写字面量版逐字一致"
+    );
+}
+
+const LITERAL_SRC: &str = r#"
+rule literal_threshold {
+    events { e : auth_events }
+    match<sip:5m> { on event { e.action | distinct | count >= 3; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield security_alerts (sip = e.sip, fail_count = 1, message = "x")
+}
+"#;
+
+const VIA_LET_SRC: &str = r#"
+rule literal_threshold {
+    events { e : auth_events }
+    let THRESHOLD = 3
+    match<sip:5m> { on event { e.action | distinct | count >= THRESHOLD; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield security_alerts (sip = e.sip, fail_count = 1, message = "x")
+}
+"#;
