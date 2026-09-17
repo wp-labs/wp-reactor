@@ -183,6 +183,21 @@ rule r {
     assert_has_warning(input, &[auth_events_window(), output_window()], "W004");
 }
 
+/// 阈值 0 经由规则级常量 `let` 也必须是 W004（与编译产物一致：`>= 0`）。
+#[test]
+fn w004_threshold_zero_via_const_let() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    let ZERO = 0
+    match<sip:5m> { on event { e | count >= ZERO; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_has_warning(input, &[auth_events_window(), output_window()], "W004");
+}
+
 #[test]
 fn w004_threshold_nonzero_no_warning() {
     let input = r#"

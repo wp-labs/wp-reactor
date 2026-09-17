@@ -619,3 +619,117 @@ rule r {
         "not allowed in threshold expressions",
     );
 }
+
+/// 规则级 `let` 不适用于 pipeline stage（stage scope 无 let 绑定，checker 与
+/// compiler 两侧一致传空）→ 常量 let 阈值在这里仍被拒绝，且不会静默失效。
+#[test]
+fn pipeline_stage_const_let_threshold_rejected() {
+    let input = r#"
+rule r {
+    events { d: auth_events }
+    let THRESHOLD = 3
+    match<sip:5m> {
+        on event { ev: d | count >= 1; }
+        on close { d | count >= 1; }
+    }
+    |> match<sip:10m> {
+        on event { _in | count >= THRESHOLD; }
+        on close { _in | count >= 1; }
+    } -> score(80.0)
+    entity(ip, _in.sip)
+    yield out (x = _in.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "cannot be evaluated by the trigger check",
+    );
+}
+
+/// 重名规则级 `let`：编译期报错（否则「接受/拒绝」与绑定语义随声明顺序变化）。
+#[test]
+fn duplicate_rule_let_names_rejected() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    let T = "abc"
+    let T = 3
+    match<sip:5m> {
+        on event { e.action | distinct | count >= T; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "duplicate rule-level `let` name `T`",
+    );
+}
+
+/// 常量 `let` 在 close 步骤 / seq 链 / `on event<accu>` 位置同样可用（内联后与
+/// 手写字面量等价）。
+#[test]
+fn const_let_threshold_accepted_in_all_match_positions() {
+    let cases = [
+        // on close 步骤
+        r#"
+rule r {
+    events { e : auth_events }
+    let T = 2
+    match<sip:5m> {
+        on event { e.action | distinct | count >= 1; }
+        and close { e.action | distinct | count >= T; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#,
+        // seq 链步骤
+        r#"
+rule r {
+    events { e : auth_events }
+    let T = 2
+    match<sip:5m> {
+        on event seq { e.action | distinct | count >= T; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#,
+        // accu 事件步骤
+        r#"
+rule r {
+    events { e : auth_events }
+    let T = 1
+    match<sip:5m> {
+        on event<accu> { e.action | distinct | count >= T; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#,
+    ];
+    for input in cases {
+        assert_no_errors(input, &[auth_events_window(), output_window()]);
+    }
+}
+
+/// 字符串常量 `let` 可用于 min/max（Chars 字段）阈值——内联为字符串字面量。
+#[test]
+fn string_const_let_threshold_accepted() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    let BASELINE = "abc"
+    match<sip:5m> {
+        on event { e.action | min >= BASELINE; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
+}

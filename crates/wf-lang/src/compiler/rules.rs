@@ -507,7 +507,10 @@ fn compile_pipeline_rule(
         };
 
         let mut match_plan =
-            compile_match(match_clause, !is_final, &binds, joins, schemas, &rule.lets);
+            // 规则级 `let` 不适用于 pipeline stage（stage scope 手工构建、无 let
+            // 绑定，checker 侧同样传空——见 checker/rules/mod.rs 的 check_stage 调用）：
+            // 两侧必须一致，否则「checker 拒绝、compiler 内联」会留下不可达分支。
+            compile_match(match_clause, !is_final, &binds, joins, schemas, &[]);
         // `as label` 归约标签集（仅最终 stage 的 score/entity/yield 可引用；
         // 非最终 stage 的 yield/entity 为自动生成，无用户表达式）。
         let labels: HashSet<String> = if is_final {

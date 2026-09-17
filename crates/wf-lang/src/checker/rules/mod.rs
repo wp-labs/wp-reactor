@@ -28,6 +28,21 @@ const PIPE_IN_ALIAS: &str = "_in";
 pub(crate) fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<CheckError>) {
     let name = &rule.name;
 
+    // 规则级 `let` 名必须唯一：scope 的 let 类型表按声明顺序覆盖（后者胜），而
+    // 常量内联按声明顺序取首（前者胜）——重名会让「接受/拒绝」与绑定语义随行序
+    // 变化（warp-fusion#101 review）。
+    let mut let_names = HashSet::new();
+    for l in &rule.lets {
+        if !let_names.insert(l.name.as_str()) {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(name.to_string()),
+                test: None,
+                message: format!("duplicate rule-level `let` name `{}`", l.name),
+            });
+        }
+    }
+
     if rule.events.decls.iter().any(|d| d.alias == PIPE_IN_ALIAS) {
         errors.push(CheckError {
             severity: Severity::Error,

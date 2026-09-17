@@ -401,3 +401,155 @@ pub(crate) fn collect_rule_let_refs(expr: &Expr, lets: &[crate::ast::LetDecl]) -
     go(expr, lets, &mut out);
     out
 }
+
+#[cfg(test)]
+mod inline_const_lets_tests {
+    use super::*;
+    use crate::ast::{BinOp, Expr, FieldRef, LetDecl};
+
+    fn num(v: f64) -> Expr {
+        Expr::Number(v)
+    }
+    fn field(name: &str) -> Expr {
+        Expr::Field(FieldRef::Simple(name.into()))
+    }
+    fn binop(op: BinOp, l: Expr, r: Expr) -> Expr {
+        Expr::BinOp {
+            op,
+            left: Box::new(l),
+            right: Box::new(r),
+        }
+    }
+    fn leto(name: &str, expr: Expr) -> LetDecl {
+        LetDecl {
+            name: name.into(),
+            expr,
+        }
+    }
+
+    fn inline_string(e: &Expr, lets: &[LetDecl]) -> Expr {
+        inline_const_string_lets(e, lets, &mut Vec::new())
+    }
+    fn inline_scalar(e: &Expr, lets: &[LetDecl]) -> Expr {
+        inline_const_scalar_lets(e, lets, &mut Vec::new())
+    }
+
+    // ---- StringOnly：既有行为不得变化（events 条件正则复用，issue #90） ----
+
+    #[test]
+    fn string_mode_inlines_only_string_literals() {
+        let lets = vec![
+            leto("RE", Expr::StringLit("^a.*$".into())),
+            leto("N", num(5.0)),
+            leto("B", Expr::Bool(true)),
+            leto("CHAIN", field("RE")),
+        ];
+        assert_eq!(
+            inline_string(&field("RE"), &lets),
+            Expr::StringLit("^a.*$".into())
+        );
+        assert_eq!(
+            inline_string(&field("CHAIN"), &lets),
+            Expr::StringLit("^a.*$".into())
+        );
+        // 非字符串 let 与事件字段保持原引用（由 checker 报错）。
+        assert_eq!(inline_string(&field("N"), &lets), field("N"));
+        assert_eq!(inline_string(&field("B"), &lets), field("B"));
+        assert_eq!(inline_string(&field("sip"), &lets), field("sip"));
+    }
+
+    #[test]
+    fn string_mode_traverses_nested_expressions() {
+        let lets = vec![leto("RE", Expr::StringLit("^a$".into()))];
+        let call = Expr::FuncCall {
+            qualifier: None,
+            name: "regex_match".into(),
+            args: vec![field("sip"), field("RE")],
+        };
+        let Expr::FuncCall { args, .. } = inline_string(&call, &lets) else {
+            panic!("应是函数调用");
+        };
+        assert_eq!(args[1], Expr::StringLit("^a$".into()));
+    }
+
+    // ---- Scalar：阈值常量（issue #101） ----
+
+    #[test]
+    fn scalar_mode_inlines_literals_and_constant_arithmetic() {
+        let lets = vec![
+            leto("T", num(3.0)),
+            leto("S", Expr::StringLit("abc".into())),
+            leto("B", Expr::Bool(true)),
+            leto("ARITH", binop(BinOp::Add, num(2.0), num(1.0))),
+            leto("NEG", Expr::Neg(Box::new(num(4.0)))),
+            leto("CHAIN", field("ARITH")),
+        ];
+        assert_eq!(inline_scalar(&field("T"), &lets), num(3.0));
+        assert_eq!(
+            inline_scalar(&field("S"), &lets),
+            Expr::StringLit("abc".into())
+        );
+        assert_eq!(inline_scalar(&field("B"), &lets), Expr::Bool(true));
+        // 常量算术 / 取负折叠为单个数字字面量（触发判定只做常量折叠）。
+        assert_eq!(inline_scalar(&field("ARITH"), &lets), num(3.0));
+        assert_eq!(inline_scalar(&field("NEG"), &lets), num(-4.0));
+        assert_eq!(inline_scalar(&field("CHAIN"), &lets), num(3.0));
+    }
+
+    #[test]
+    fn scalar_mode_keeps_unfoldable_references() {
+        let lets = vec![
+            leto("DEP", field("e.count")),
+            leto(
+                "CALL",
+                Expr::FuncCall {
+                    qualifier: None,
+                    name: "abs".into(),
+                    args: vec![num(-3.0)],
+                },
+            ),
+            leto("DEGEN", binop(BinOp::Div, num(1.0), num(0.0))),
+        ];
+        // 依赖事件字段 / 函数调用 / 退化常量都不可折叠 → 保留原引用（由 checker 拒绝）。
+        assert_eq!(inline_scalar(&field("DEP"), &lets), field("DEP"));
+        assert_eq!(inline_scalar(&field("CALL"), &lets), field("CALL"));
+        assert_eq!(inline_scalar(&field("DEGEN"), &lets), field("DEGEN"));
+        assert_eq!(inline_scalar(&field("sip"), &lets), field("sip"));
+    }
+
+    #[test]
+    fn cycles_terminate_and_keep_original_reference() {
+        // 自引用与互引用都不得死循环；无法解析为常量时保留原引用。
+        let self_ref = vec![leto("A", field("A"))];
+        assert_eq!(inline_scalar(&field("A"), &self_ref), field("A"));
+
+        let mutual = vec![leto("A", field("B")), leto("B", field("A"))];
+        assert_eq!(inline_scalar(&field("A"), &mutual), field("A"));
+        assert_eq!(inline_scalar(&field("B"), &mutual), field("B"));
+    }
+
+    #[test]
+    fn deep_let_chain_does_not_overflow_stack() {
+        // 深链（50 层）必须能解析且不爆栈。
+        let mut lets: Vec<LetDecl> = vec![leto("L0", num(7.0))];
+        for i in 1..50 {
+            lets.push(leto(&format!("L{i}"), field(&format!("L{}", i - 1))));
+        }
+        assert_eq!(inline_scalar(&field("L49"), &lets), num(7.0));
+    }
+
+    #[test]
+    fn scalar_mode_traverses_binop_and_call_args() {
+        let lets = vec![leto("T", num(3.0))];
+        // `(T + 1)` 中的 let 引用被内联 → 常量算术进而可折叠为 4。
+        let expr = binop(BinOp::Add, field("T"), num(1.0));
+        assert_eq!(
+            inline_scalar(&expr, &lets),
+            binop(BinOp::Add, num(3.0), num(1.0))
+        );
+        assert_eq!(
+            crate::const_fold::try_eval_expr_to_f64(&inline_scalar(&expr, &lets)),
+            Some(4.0)
+        );
+    }
+}
