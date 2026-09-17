@@ -405,6 +405,9 @@ match_step    = step_branch , { "||" , step_branch } , ";" ;
 step_branch   = [ IDENT , ":" ] , source_ref , [ "." , IDENT | "[" , STRING , "]" ] , [ "&&" , expr ] , pipe_chain ;
 source_ref    = IDENT ;                (* events 别名 或 |> 后续 stage 的 _in *)
 pipe_chain    = { "|" , transform } , "|" , measure , cmp_op , atomic_expr ;
+                (* atomic_expr 必须是编译期常量：数字/字符串字面量（可取负、可括号算术）。
+                   字段引用 / 函数调用在触发判定中求值不出结果 → 分支永不触发，
+                   checker 直接拒绝（warp-fusion#101）。 *)
 transform     = "distinct" ;
 measure       = "count" | "sum" | "avg" | "min" | "max" ;
 

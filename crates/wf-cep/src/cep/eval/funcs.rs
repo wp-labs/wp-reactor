@@ -94,12 +94,15 @@ fn eval_handler(name: &str) -> Option<FuncHandler> {
         map.insert("time_diff", eval_func_time_diff);
         map.insert("time_bucket", eval_func_time_bucket);
         map.insert("bucket_end", eval_func_bucket_end);
-        map.insert("collect_set", eval_func_collect_set);
-        map.insert("collect_list", eval_func_collect_set);
-        map.insert("first", eval_func_collect_set);
-        map.insert("last", eval_func_collect_set);
-        map.insert("stddev", eval_func_stddev);
-        map.insert("percentile", eval_func_stddev);
+        // L3 集合/统计函数：CEP 侧逐事件求值**不可用**（需要 instance 收集序列，
+        // 只在执行器 yield/derive 上下文求值）——全部指向同一占位，checker 已在
+        // guard / `on each` / threshold 上拒绝这些位置（warp-fusion#101）。
+        map.insert("collect_set", eval_instance_series_unavailable);
+        map.insert("collect_list", eval_instance_series_unavailable);
+        map.insert("first", eval_instance_series_unavailable);
+        map.insert("last", eval_instance_series_unavailable);
+        map.insert("stddev", eval_instance_series_unavailable);
+        map.insert("percentile", eval_instance_series_unavailable);
         map.insert("external", eval_func_external);
         map
     });

@@ -11,6 +11,7 @@ mod checker;
 pub mod cidr;
 pub mod columnar;
 pub mod compiler;
+pub mod const_fold;
 pub mod diagnostics;
 pub mod error;
 pub mod explain;

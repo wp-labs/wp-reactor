@@ -481,6 +481,9 @@ pub(super) fn check_threshold(agg: &AggPlan, bs: &BranchState) -> bool {
             // count/sum/avg with a non-constant threshold (e.g. field ref):
             // cannot evaluate — treat as unsatisfied rather than silently
             // comparing against 0.0
+            //
+            // WFL 侧已由 checker 在编译期拒绝这类阈值（warp-fusion#101，判据与
+            // `wf_lang::const_fold` 共用）；这里是 hand-built `AggPlan` 的兜底语义。
             false
         }
     }
