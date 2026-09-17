@@ -115,6 +115,26 @@ rule r {
 }
 
 #[test]
+fn system_vars_are_yield_only_first_match_time() {
+    // issue #98：@first_match_time 与其他系统变量一致，仅允许出现在 `yield`；
+    // 出现在 score/events 等上下文时报错。
+    let out = make_output_window("out", vec![("x", bt(BaseType::Time))]);
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(@first_match_time)
+    entity(ip, e.sip)
+    yield out (x = @first_match_time)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), out],
+        "only allowed in `yield`",
+    );
+}
+
+#[test]
 fn yield_unknown_field() {
     let input = r#"
 rule r {

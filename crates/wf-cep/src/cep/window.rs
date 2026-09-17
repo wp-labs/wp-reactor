@@ -364,18 +364,8 @@ impl CepStateMachine {
                         (
                             bs.event_first_time_nanos,
                             bs.event_last_time_nanos,
-                            bs.collected_values
-                                .as_deref()
-                                .map(|q| q.iter().cloned().collect())
-                                .unwrap_or_default(),
-                            bs.field_values
-                                .as_deref()
-                                .map(|m| {
-                                    m.iter()
-                                        .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
+                            bs.collected_series(),
+                            bs.field_series(),
                         )
                     };
                     instance.completed_steps.push(StepData {
@@ -533,27 +523,15 @@ impl CepStateMachine {
             let label = step_plan.branches[branch_idx].label.clone();
             let step_state = &instance.step_states[step_idx];
             // Collect the values from the satisfied branch for L3 functions
-            let collected_values = step_state.branch_states[branch_idx]
-                .collected_values
-                .as_deref()
-                .map(|q| q.iter().cloned().collect())
-                .unwrap_or_default();
+            let branch_state = &step_state.branch_states[branch_idx];
             instance.completed_steps.push(StepData {
                 satisfied_branch_index: branch_idx,
                 label,
                 measure_value,
-                event_first_time_nanos: step_state.branch_states[branch_idx].event_first_time_nanos,
-                event_last_time_nanos: step_state.branch_states[branch_idx].event_last_time_nanos,
-                collected_values,
-                field_values: step_state.branch_states[branch_idx]
-                    .field_values
-                    .as_deref()
-                    .map(|m| {
-                        m.iter()
-                            .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                event_first_time_nanos: branch_state.event_first_time_nanos,
+                event_last_time_nanos: branch_state.event_last_time_nanos,
+                collected_values: branch_state.collected_series(),
+                field_values: branch_state.field_series(),
             });
 
             // Chain `within`: the completing step must land within its gap of the

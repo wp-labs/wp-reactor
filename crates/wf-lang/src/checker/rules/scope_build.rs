@@ -78,11 +78,34 @@ pub(crate) fn build_scope<'a>(
     // record its inferred type so later expressions can reference it by name.
     // Bindings are registered in order, so a later `let` may reference an
     // earlier one (no forward references).
+    let mut declared_lets: HashSet<String> = HashSet::new();
     for l in &rule.lets {
+        let first_new = errors.len();
         if let Some(t) = crate::checker::types::infer_type(&l.expr, &scope) {
             scope.let_types.insert(l.name.clone(), t);
         }
         crate::checker::types::check_expr_type(&l.expr, &scope, rule_name, errors);
+        // 前向引用（`let a = b` 而 `b` 声明在后）在表达式类型检查里表现为
+        // 「字段 `b` 不存在」——那只是名字没能解析成字段，指向的是 window schema，
+        // 会把用户带偏。若该名字确实是本规则中**声明在后**的 `let`，就把这条消息
+        // 改写为声明顺序问题。**只改文案**：报错与否、规则接受/拒绝的判定不变
+        // （名字同时是字段时本就不会产生该错误，也就不会被改写）。
+        let later: Vec<String> = crate::ast::collect_rule_let_refs(&l.expr, &rule.lets)
+            .into_iter()
+            .filter(|n| !declared_lets.contains(n))
+            .collect();
+        for name in later {
+            let noisy = format!("field `{name}` not found in any event source");
+            for e in errors[first_new..].iter_mut() {
+                if e.message == noisy {
+                    e.message = format!(
+                        "rule-level let `{name}` is referenced by `{}` before its declaration; rule-level lets resolve in declaration order (forward references are not supported)",
+                        l.name
+                    );
+                }
+            }
+        }
+        declared_lets.insert(l.name.clone());
     }
 
     // Register join target windows so yield expressions can reference join_window.field

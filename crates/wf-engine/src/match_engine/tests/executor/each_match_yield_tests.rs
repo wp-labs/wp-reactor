@@ -332,6 +332,69 @@ fn execute_each_yield_can_reference_time_system_vars() {
 }
 
 #[test]
+fn execute_each_yield_first_match_time_is_processing_wall_clock() {
+    // issue #98 验收：on each 的 @first_match_time = 当前匹配事件的系统（处理）
+    // 墙钟，而不是输入事件时间；time_to_ms 可写入数字字段。
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "first_match_time".to_string(),
+            value: Expr::SystemVar(SystemVar::FirstMatchTime),
+        },
+        YieldField {
+            name: "first_match_ms".to_string(),
+            value: Expr::FuncCall {
+                qualifier: None,
+                name: "time_to_ms".to_string(),
+                args: vec![Expr::SystemVar(SystemVar::FirstMatchTime)],
+            },
+        },
+    ];
+    let exec = RuleExecutor::new(plan);
+    let event_time_nanos = 1_234_000_000; // 1.234s（1970 年）——与当前墙钟无关
+
+    let alert = exec
+        .execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), event_time_nanos)
+        .unwrap()
+        .unwrap();
+
+    let field = |name: &str| {
+        alert
+            .yield_fields
+            .iter()
+            .find(|(field_name, _)| &**field_name == name)
+            .map(|(_, value)| value.clone())
+    };
+    let event_time_ms = event_time_nanos as f64 / 1_000_000.0;
+    let Some(Value::Number(first_match_ms)) = field("first_match_time") else {
+        panic!("missing first_match_time: {:?}", field("first_match_time"));
+    };
+    assert!(first_match_ms > 0.0, "必须记录处理墙钟");
+    assert!(
+        first_match_ms > event_time_ms * 1_000_000.0,
+        "on each 首次满足 = 系统墙钟（{first_match_ms}），不是输入事件时间（{event_time_ms}）"
+    );
+    let Some(Value::Number(to_ms)) = field("first_match_ms") else {
+        panic!("missing first_match_ms");
+    };
+    assert_eq!(
+        to_ms, first_match_ms,
+        "time_to_ms(@first_match_time) 写数字字段（ms 值恒等）"
+    );
+}
+
+#[test]
 fn execute_each_yield_evaluates_structured_object_and_array_literals() {
     let mut plan = simple_rule_plan(
         "r1",

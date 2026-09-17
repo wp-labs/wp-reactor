@@ -293,11 +293,11 @@ fn yield_expression_collects_aliases() {
         },
     ];
     let aliases =
-        super::collect_rule_bind_tracking_aliases(&score_expr, &entity_expr, &yield_fields);
+        super::collect_rule_bind_tracking_aliases(&score_expr, &entity_expr, &yield_fields, &[]);
     assert!(aliases.contains("e"), "alias 'e' should be collected");
     assert_eq!(aliases.len(), 1, "only 'e' should be collected");
 
-    let tracking = super::collect_rule_bind_tracking(&score_expr, &entity_expr, &yield_fields);
+    let tracking = super::collect_rule_bind_tracking(&score_expr, &entity_expr, &yield_fields, &[]);
     let fields = tracking
         .fields
         .get("e")

@@ -24,6 +24,42 @@ All notable changes to wp-reactor will be documented in this file.
 ### Fixed
 
 - **修复刷新与动态 join 配置并发时的偶发 join 退化**（漏命中 / 降级为全表扫描）。
+## [2.0.24] -- latest
+
+### Fixed
+
+- **`first(field)` 超过字段历史上限后漂移（warp-fusion#100）**：实例内字段样本此前只保留最近 1024 个，超过上限后最早样本被丢弃，`first(field)` 由“最早事件的值”退化为“当前保留样本的首个值”并随窗口继续变化；用它组成聚合唯一键或 `alert_id` 的规则，同一实例会输出多个唯一键，下游按唯一键 upsert 时形成多条逻辑记录。现已修复：最早样本始终保留，`first(field)` 在整个实例周期内稳定；`last(field)` / `count(alias)` / `stat.count(window_event(alias))` 语义不变。样本上界 1024→1025（首个样本 + 最近最多 1024 个），因此 `collect_set` / `collect_list` / `stddev` / `percentile` 与 `min` / `max` / `sum` / `avg(alias.field)` 会包含最早样本。
+- **阈值表达式必须是编译期常量（warp-fusion#101）**：阈值位置的语义检查此前漏检——字段引用、规则级 `let` 引用、函数调用（`first` / `collect_set` / `stddev` / `now*` / `baseline` 等）以及“除零 / 模零”这类折叠不出结果的退化常量都能通过编译，而运行期该分支永不满足且没有任何报错（静默不触发）；现编译期拒绝并给出可读提示。同时规则级**常量** `let`（如 `let THRESHOLD = 3`，含常量算术）在编译期内联为字面量，这种命名常量可直接用作阈值（非常量 `let` 引用仍拒绝）。
+
+### Changed
+
+- **规则级 `let` 前向引用改为明确报错（warp-fusion#101 审查）**：`let a = b` 而 `b` 声明在后时，此前报“字段 `b` 在任何事件源中都不存在”（方向指向 window schema，容易带偏）；现直接提示按声明顺序解析。仅改错误文案，判定结果与可接受的规则集不变。
+- **新增输入复杂度硬限制，取代此前的进程 abort**：表达式嵌套分组 ≤ 5 层、同一分组内算子链 ≤ 16 层（分组重置计数 ⇒ 长 `in (...)` 列表与长实参列表不受影响）、规则级 `let` 引用链 ≤ 5 层（成环一并报错）。此前约 200 层括号的规则、约 200 层 `let` 链或数千项算子链会让编译进程栈溢出直接 abort（CI 只报 `signal: 6`、无位置信息）。算子链需单独设限：它在解析器里不递归、不吃解析栈，却会构造出与项数同阶的**左深表达式树**，下游按结构递归的遍历同样打爆栈。
+
+### Tests
+
+- 覆盖 issue #100（1024 / 1025 / 2000 条事件下 `alert_id` 与 `first_seen` 逐条核对漂移起点、close 步骤、`on event<accu>`、周期重置不残留、限定字段聚合含最早样本）与 issue #101（阈值拒绝位置矩阵 + 常量正例 + 常量 `let` 内联一致性 + 语言侧↔运行期折叠规则守卫），以及嵌套 / 链深硬限制的正反用例（200 层括号、5000 与 20000 项链、200 层 `let` 链均快速失败不崩；长 `in (...)` 列表不受影响；最深合法形状能走完解析 / 语义检查 / 编译）。`wf-lang` 1240 / `wf-engine` 1053 / `wf-cep` 369 / `wf-runtime` 639 / `wf-config` 168 / `wf-data` 2 全绿。
+
+## [2.0.23] -- latest
+
+### Fixed
+
+- **L3 序列函数只写在规则级 `let` 中时输出为空（warp-fusion#99）**：单绑定、无 join/close 的规则下，`first` / `last` / `collect_*` 等只出现在 `let` 里（yield 以 let 名间接引用）时结果为空（entity 输出 `alert_id` 为空）；现已修复，与直接写在 `yield` 中结果一致。
+
+### Tests
+
+- 补充 issue #99 回归用例（let 内 L3、close 路径、pipeline 与 `on each` 场景）；`wf-lang` 1182 / `wf-cep` 361 / `wf-engine` 1043 全绿。
+
+## [2.0.22] -- latest
+
+### Changed
+
+- **`@first_match_time` 语义文档补全（issue #98，行为不变）**：语言参考/规则编写/核心概念/快速开始补充——实例首次满足条件的处理墙钟：重复输出保持首次值、迟到/乱序事件不覆盖、新实例周期重置、未命中无值；`on each` 等于当前匹配事件的系统时间；与 `@emit_time` 不可互替；毫秒数字字段用 `time_to_ms(@first_match_time)`。
+
+### Tests
+
+- `@first_match_time` 覆盖补全：hop/滚动窗口与 session 窗口（wf-cep；含收口墙钟、同会话保持与新会话重置）；`on each` 引擎路径（首次满足=系统墙钟≠输入事件时间、`time_to_ms` 可写数字）；惰性墙钟注入与乱序迟到事件不覆盖；yield-only 静态门与列式门排除断言（`SystemVar`）——`wf-lang` 1174 / `wf-cep` 361 / `wf-engine` 1041 全绿。
+
 ## [2.0.20] -- latest
 
 ### Added

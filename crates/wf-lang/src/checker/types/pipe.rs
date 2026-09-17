@@ -1,4 +1,5 @@
-use crate::ast::{FieldSelector, Measure, StepBranch, Transform};
+use crate::ast::{Expr, FieldSelector, Measure, StepBranch, Transform};
+use crate::explain::format_expr;
 use crate::schema::BaseType;
 
 use super::check_expr::{check_expr_type, check_guard_expr_type};
@@ -12,6 +13,7 @@ pub(crate) fn check_pipe_chain(
     branch: &StepBranch,
     scope: &Scope<'_>,
     rule_name: &str,
+    lets: &[crate::ast::LetDecl],
     errors: &mut Vec<CheckError>,
 ) {
     let has_field = branch.field.is_some();
@@ -120,12 +122,32 @@ pub(crate) fn check_pipe_chain(
         }
     }
 
+    // 阈值先内联规则级常量 `let`（与 events 条件同机制，issue #90）：阈值必须能被
+    // 触发判定折叠，`let THRESHOLD = 5` 这类命名常量属于常量，内联后与手写字面量
+    // 完全一致；不可折叠的引用保持原样，由下面的常量性检查拒绝。
+    let threshold = {
+        let mut visiting = Vec::new();
+        crate::ast::inline_const_scalar_lets(&branch.pipe.threshold, lets, &mut visiting)
+    };
+
     // Check threshold expression type
-    check_expr_type(&branch.pipe.threshold, scope, rule_name, errors);
+    check_expr_type(&threshold, scope, rule_name, errors);
+
+    // F1（warp-fusion#101）：阈值必须是触发判定可求值的编译期常量。判据与
+    // wf-cep `check_threshold` 共用 `wf_lang::const_fold`——折叠不出结果时该
+    // 分支恒判「不满足」，运行期没有任何信号。
+    if let Some(message) = threshold_constant_violation(&threshold) {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message,
+        });
+    }
 
     // T5: threshold type must be compatible with measure result type
     if let Some(result_type) = measure_result_type(branch.pipe.measure, &field_val_type)
-        && let Some(threshold_type) = infer_type(&branch.pipe.threshold, scope)
+        && let Some(threshold_type) = infer_type(&threshold, scope)
         && !compatible(&result_type, &threshold_type)
         && !(is_numeric(&result_type) && is_numeric(&threshold_type))
     {
@@ -151,6 +173,31 @@ pub(crate) fn check_pipe_chain(
 fn field_selector_name(fs: &FieldSelector) -> &str {
     match fs {
         FieldSelector::Dot(n) | FieldSelector::Bracket(n) => n.as_str(),
+    }
+}
+
+/// 阈值常量性检查（warp-fusion#101）：返回违规描述。
+///
+/// 判据就是「触发判定能否求值」：`wf_lang::const_fold` 折叠不出结果的阈值在
+/// `wf-cep` 的 `check_threshold` 里恒判「不满足」，分支永不触发且运行期无信号。
+/// 覆盖两类写法：非常量形态（字段引用、规则级 `let` 引用、函数调用——含 L3 集合
+/// 函数与 `now*` / `baseline`），以及折叠不出结果的字面量算术（除零 / 模零）。
+fn threshold_constant_violation(threshold: &Expr) -> Option<String> {
+    if crate::const_fold::is_foldable_threshold(threshold) {
+        return None;
+    }
+    match threshold {
+        Expr::FuncCall { name, .. } => Some(format!(
+            "{name}() is not allowed in threshold expressions; use it in score/entity/yield instead \
+             (thresholds must be compile-time constants)"
+        )),
+        // 字段引用与规则级 `let` 引用在此同形（都不参与逐事件求值），故不区分措辞。
+        _ => Some(format!(
+            "threshold `{}` cannot be evaluated by the trigger check; thresholds must be \
+             compile-time constants (number / string literal, optionally negated or in \
+             parentheses) — this branch would never trigger",
+            format_expr(threshold)
+        )),
     }
 }
 

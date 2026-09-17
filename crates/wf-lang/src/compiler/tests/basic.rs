@@ -678,3 +678,44 @@ rule or_rule {
     assert_eq!(step.branches[0].source, "a");
     assert_eq!(step.branches[1].source, "b");
 }
+
+/// 规则级常量 `let` 作为阈值：编译期必须内联为字面量（运行期触发判定只折叠常量）。
+#[test]
+fn rule_let_constant_is_inlined_into_threshold() {
+    let src = r#"
+rule let_thr {
+    events { e : auth_events }
+    let THRESHOLD = 3
+    match<sip:5m> {
+        on event { e.action | distinct | count >= THRESHOLD; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let plans = compile_with(src, &[auth_events_window(), output_window()]);
+    assert_eq!(
+        plans[0].match_plan.event_steps[0].branches[0].agg.threshold,
+        Expr::Number(3.0),
+        "常量 let 必须内联为字面量"
+    );
+
+    // 常量算术的 let 一并折叠为单个数字字面量。
+    let src_arith = r#"
+rule let_thr_arith {
+    events { e : auth_events }
+    let THRESHOLD = 2 + 1
+    match<sip:5m> {
+        on event { e.action | distinct | count >= THRESHOLD; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let plans = compile_with(src_arith, &[auth_events_window(), output_window()]);
+    assert_eq!(
+        plans[0].match_plan.event_steps[0].branches[0].agg.threshold,
+        Expr::Number(3.0),
+        "常量算术 let 应折叠为字面量"
+    );
+}

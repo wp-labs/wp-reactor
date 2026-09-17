@@ -43,9 +43,9 @@ pub fn lint_wfl(file: &WflFile, _schemas: &[WindowSchema]) -> Vec<CheckError> {
             lint_high_cardinality_key(rule, name, &mut warnings);
 
             // W004 + W005: threshold/score zero checks
-            lint_steps(&rule.match_clause.on_event, name, &mut warnings);
+            lint_steps(&rule.match_clause.on_event, &rule.lets, name, &mut warnings);
             if let Some(ref close_block) = rule.match_clause.on_close {
-                lint_steps(&close_block.steps, name, &mut warnings);
+                lint_steps(&close_block.steps, &rule.lets, name, &mut warnings);
             }
         }
 
@@ -222,11 +222,22 @@ fn lint_high_cardinality_key(
 // W004: threshold is 0 with >= or >
 // ---------------------------------------------------------------------------
 
-fn lint_steps(steps: &[MatchStep], rule_name: &str, warnings: &mut Vec<CheckError>) {
+fn lint_steps(
+    steps: &[MatchStep],
+    lets: &[crate::ast::LetDecl],
+    rule_name: &str,
+    warnings: &mut Vec<CheckError>,
+) {
     for step in steps {
         for branch in &step.branches {
+            // 与编译路径一致：先内联规则级常量 `let`，否则 `let ZERO = 0` +
+            // `count >= ZERO` 会绕过 W004（编译产物其实就是 `>= 0`）。
+            let threshold = {
+                let mut visiting = Vec::new();
+                crate::ast::inline_const_scalar_lets(&branch.pipe.threshold, lets, &mut visiting)
+            };
             // W004: threshold == 0 with >= or >
-            if is_zero(&branch.pipe.threshold) && matches!(branch.pipe.cmp, CmpOp::Ge | CmpOp::Gt) {
+            if is_zero(&threshold) && matches!(branch.pipe.cmp, CmpOp::Ge | CmpOp::Gt) {
                 warnings.push(CheckError {
                     severity: Severity::Warning,
                     rule: Some(rule_name.to_string()),

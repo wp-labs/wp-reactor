@@ -469,7 +469,7 @@ rule evidence_rule {
 }
 
 #[test]
-fn execute_match_yield_caps_window_event_ids_to_recent_sample() {
+fn execute_match_yield_caps_window_event_ids_keeping_first_and_recent() {
     use crate::match_engine::cep::CepStateMachine;
 
     let source = r#"
@@ -525,8 +525,11 @@ rule evidence_rule {
     let Some(Value::Array(evidences)) = field("evidences") else {
         panic!("evidences should be an array");
     };
-    assert_eq!(evidences.len(), 1024);
-    assert_eq!(evidences.first(), Some(&str_val("evt_1041")));
+    // 有界序列 = [首值] ++ 最近 1024 个（warp-fusion#100）：最早样本不再丢失，
+    // `first()` 因此稳定；采样上界仍为 1025（内存 O(1024)）。
+    assert_eq!(evidences.len(), 1025);
+    assert_eq!(evidences.first(), Some(&str_val("evt_0000")));
+    assert_eq!(evidences.get(1), Some(&str_val("evt_1041")));
     assert_eq!(evidences.last(), Some(&str_val("evt_2064")));
 }
 

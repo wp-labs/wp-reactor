@@ -28,21 +28,15 @@ use std::time::Duration;
 /// condvar 等待看门狗（2026-09 review）：worker 是 `std::thread`，系统过载时
 /// 可能长时间得不到调度——`flush`/背压等待若无线索会**无限挂起**（测试侧表现
 /// 为 runner 报 "running for over 60 seconds"）。超时后直接 panic 快速失败，
-/// 把静默挂起变成可诊断错误。阈值 60s > 最坏单批写（q18 实测 25s/批）×2；
-/// 测试态缩到 200ms 以便验证 watchdog 路径（见 `watchdog_timeout`）。
+/// 把静默挂起变成可诊断错误。
+///
+/// 阈值为**每实例可配**（[`AsyncPersister::new_with_watchdog`]）：生产默认 60s
+/// （> 最坏单批写 q18 实测 25s/批 ×2）；测试默认 10s（容忍并行跑测的调度延迟，
+/// 真死锁仍在有界时间内报错）；看门狗路径用例显式传 200ms 以便快速验证。
 #[cfg(not(test))]
-const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(60);
-
-fn watchdog_timeout() -> Duration {
-    #[cfg(test)]
-    {
-        Duration::from_millis(200)
-    }
-    #[cfg(not(test))]
-    {
-        WATCHDOG_TIMEOUT
-    }
-}
+const DEFAULT_WATCHDOG: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const DEFAULT_WATCHDOG: Duration = Duration::from_secs(10);
 
 /// 持久化提交错误。
 #[derive(Debug, ::jumo_derive::Jumo)]
@@ -96,6 +90,8 @@ pub struct AsyncPersister<T, B> {
     /// 队列空标志（Condvar 通知；全部 worker 写清后置 true）。
     idle: Arc<(Mutex<bool>, Condvar)>,
     workers: Vec<JoinHandle<()>>,
+    /// `flush`/背压等待的看门狗阈值（见模块注释；实例可配便于测试）。
+    watchdog: Duration,
     _backend: PhantomData<B>,
 }
 
@@ -113,6 +109,25 @@ impl<T: Send + 'static, B: BatchWriter<T> + Send + 'static> AsyncPersister<T, B>
         max_pending_batches: usize,
         max_batch_bytes: usize,
         error_cb: Option<ErrorCb>,
+    ) -> Self {
+        Self::new_with_watchdog(
+            backends,
+            byte_budget,
+            max_pending_batches,
+            max_batch_bytes,
+            error_cb,
+            DEFAULT_WATCHDOG,
+        )
+    }
+
+    /// 同 [`Self::new`]，但显式指定看门狗阈值（测试注入短阈值验证 watchdog 路径）。
+    pub(crate) fn new_with_watchdog(
+        backends: Vec<B>,
+        byte_budget: usize,
+        max_pending_batches: usize,
+        max_batch_bytes: usize,
+        error_cb: Option<ErrorCb>,
+        watchdog: Duration,
     ) -> Self {
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let idle = Arc::new((Mutex::new(true), Condvar::new()));
@@ -169,6 +184,7 @@ impl<T: Send + 'static, B: BatchWriter<T> + Send + 'static> AsyncPersister<T, B>
             queued_bytes,
             idle,
             workers,
+            watchdog,
             _backend: PhantomData,
         }
     }
@@ -214,27 +230,35 @@ impl<T: Send + 'static, B: BatchWriter<T> + Send + 'static> AsyncPersister<T, B>
                 break;
             }
             let (guard, timed_out) = cvar
-                .wait_timeout(idle_guard, watchdog_timeout())
+                .wait_timeout(idle_guard, self.watchdog)
                 .expect("async-persist budget wait");
             idle_guard = guard;
             if timed_out.timed_out() {
                 panic!(
                     "async-persist 背压等待超过 {:?}：worker 线程可能饿死或死锁（queued_bytes={}）",
-                    watchdog_timeout(),
+                    self.watchdog,
                     self.queued_bytes.load(Ordering::SeqCst)
                 );
             }
         }
+        // 先**预留**字节并清 idle，再投递（2026-09 竞态修）：worker 一旦收到
+        // 批次就会 `fetch_sub`；若记账发生在 send 之后，worker 可能在记账前
+        // 完成该批——`fetch_sub` 下溢、或 worker 先置 idle=true 又被这里改回
+        // false，使 flush 等不到唤醒而撞看门狗（现象：panic 报文 queued_bytes=0）。
+        // 预留后 worker 至少能看到非零在途字节，idle 语义与在途一致。
+        self.queued_bytes.fetch_add(est_bytes, Ordering::SeqCst);
+        let (lock, _) = &*self.idle;
+        *lock.lock().expect("async-persist idle lock") = false;
+
         // 路由到 worker（同一 route 恒同 worker）；通道满 → 阻塞（背压）。
         let idx = route as usize % self.txs.len();
         match self.txs[idx].send((items, est_bytes)) {
-            Ok(()) => {
-                let (lock, _) = &*self.idle;
-                *lock.lock().expect("async-persist idle lock") = false;
-                self.queued_bytes.fetch_add(est_bytes, Ordering::SeqCst);
-                Ok(())
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // 通道已关闭（shutdown）：回滚预留。
+                self.queued_bytes.fetch_sub(est_bytes, Ordering::SeqCst);
+                Err(PersistError::Closed)
             }
-            Err(_) => Err(PersistError::Closed),
         }
     }
 
@@ -245,13 +269,13 @@ impl<T: Send + 'static, B: BatchWriter<T> + Send + 'static> AsyncPersister<T, B>
         let mut idle_guard = lock.lock().expect("async-persist flush lock");
         while !*idle_guard {
             let (guard, timed_out) = cvar
-                .wait_timeout(idle_guard, watchdog_timeout())
+                .wait_timeout(idle_guard, self.watchdog)
                 .expect("async-persist flush wait");
             idle_guard = guard;
             if timed_out.timed_out() {
                 panic!(
                     "async-persist flush 等待超过 {:?}：worker 线程可能饿死或死锁（queued_bytes={}）",
-                    watchdog_timeout(),
+                    self.watchdog,
                     self.queued_bytes.load(Ordering::SeqCst)
                 );
             }
@@ -445,13 +469,22 @@ mod tests {
         }
     }
 
+    /// 看门狗路径用例：显式注入 200ms 阈值（默认阈值 10s 会拖慢套件）。
+    const WATCHDOG_TEST: Duration = Duration::from_millis(200);
+
     #[test]
     #[should_panic(expected = "flush 等待超过")]
     fn flush_watchdog_panics_when_worker_stalls() {
-        // worker 卡在写 → idle 恒 false → flush 看门狗（测试态 200ms）触发 panic，
-        // 不再让 runner 无限挂（"running for over 60 seconds" 场景）。
-        let p =
-            AsyncPersister::<u64, HangBackend>::new(vec![HangBackend], 1 << 20, 4, 1 << 16, None);
+        // worker 卡在写 → idle 恒 false → flush 看门狗触发 panic，不再让 runner
+        // 无限挂（"running for over 60 seconds" 场景）。
+        let p = AsyncPersister::<u64, HangBackend>::new_with_watchdog(
+            vec![HangBackend],
+            1 << 20,
+            4,
+            1 << 16,
+            None,
+            WATCHDOG_TEST,
+        );
         p.submit_batch(0, vec![1], 8).unwrap();
         p.flush().unwrap();
     }
@@ -461,8 +494,72 @@ mod tests {
     fn submit_backpressure_watchdog_panics_when_worker_stalls() {
         // budget = 8B：第一批占满后第二批进入背压等待；worker 卡写永不扣减
         // → submit 看门狗触发 panic。
-        let p = AsyncPersister::<u64, HangBackend>::new(vec![HangBackend], 8, 4, 1 << 16, None);
+        let p = AsyncPersister::<u64, HangBackend>::new_with_watchdog(
+            vec![HangBackend],
+            8,
+            4,
+            1 << 16,
+            None,
+            WATCHDOG_TEST,
+        );
         p.submit_batch(0, vec![1], 8).unwrap();
-        p.submit_batch(0, vec![2], 8).unwrap(); // 背压等待 → 200ms 后 panic
+        p.submit_batch(0, vec![2], 8).unwrap(); // 背压等待 → 看门狗 panic
+    }
+
+    #[test]
+    fn submit_then_flush_race_does_not_spuriously_timeout() {
+        // 2026-09 竞态回归：submit 记账先于投递（预留）——高频「提交后立即 flush」
+        // 不再出现 worker 抢在记账前消费完该批、flush 等不到 idle 唤醒而撞看门狗
+        // 的情形（旧实现偶发 panic，报文 queued_bytes=0）。默认阈值 10s 下本用例
+        // 只可能因真死锁失败。
+        let backend = SharedBackend::new();
+        let p = AsyncPersister::<u64, SharedBackend>::new(
+            vec![backend.clone()],
+            1 << 20,
+            16,
+            1 << 16,
+            None,
+        );
+        for i in 0..500u64 {
+            p.submit_batch(0, vec![i], est(1)).unwrap();
+            p.flush().unwrap();
+            assert!(p.is_idle(), "flush 返回即空闲（i={i}）");
+        }
+        assert_eq!(backend.all(), (0..500).collect::<Vec<_>>());
+        p.shutdown();
+    }
+
+    #[test]
+    fn concurrent_submits_flush_race_does_not_spuriously_timeout() {
+        // 多线程并发提交 + 中途 flush：记账预留保证在途字节与 idle 语义一致，
+        // flush 返回后所有已提交批次必须可见。
+        let backend = SharedBackend::new();
+        let p = Arc::new(AsyncPersister::<u64, SharedBackend>::new(
+            vec![backend.clone()],
+            1 << 20,
+            64,
+            1 << 16,
+            None,
+        ));
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let p = Arc::clone(&p);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..200u64 {
+                    p.submit_batch(0, vec![t * 1000 + i], est(1)).unwrap();
+                }
+            }));
+        }
+        for _ in 0..20 {
+            p.flush().unwrap();
+        }
+        for h in handles {
+            h.join().expect("submit thread");
+        }
+        p.flush().unwrap();
+        assert_eq!(backend.all().len(), 4 * 200, "并发提交全部落盘");
+        // Arc 共享期间不调用 shutdown(self)：drop 最后一个引用即关闭通道，
+        // worker 排空后退出（flush 已断言全部可见）。
+        drop(p);
     }
 }

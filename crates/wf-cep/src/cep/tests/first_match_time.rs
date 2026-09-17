@@ -13,7 +13,7 @@ use wf_lang::plan::{
     AggPlan, BranchPlan, ExceedAction, LimitsPlan, MatchPlan, RateSpec, WindowSpec,
 };
 
-use super::types::Value;
+use super::types::{CloseReason, Value};
 use super::{CepStateMachine, Event, MatchedContext, StepResult, close_is_qualified};
 
 /// 墙钟基准：固定值仅用于断言语义（记录的是处理墙钟，不是事件时间）。
@@ -388,5 +388,140 @@ fn first_match_throttled_accu_fire_keeps_prior_first_wall() {
         ctx3.first_match_time_nanos,
         Some(WALL_1),
         "被 throttle 抑制的 rearm 不得清空/改写首次命中墙钟"
+    );
+}
+
+#[test]
+fn first_match_hop_windows_record_wall_per_instance() {
+    // hop(size=10s, slide=2s)：事件扇入多个覆盖窗口实例；每个实例记录其首次
+    // 完整命中的处理墙钟。两批不同 key 事件在不同墙钟下命中 → 输出包含两组
+    // 墙钟，且没有被收口/输出时的墙钟（WALL_3）覆盖。
+    let mut plan = plan_with_close_mode(CloseMode::And);
+    plan.window_spec = WindowSpec::Hop {
+        size: Duration::from_secs(10),
+        slide: Duration::from_secs(2),
+    };
+    let mut sm = CepStateMachine::new("r".into(), plan, None);
+    let t = 1_700_000_000_000_000_000i64; // 2s/10s 整除
+
+    // 第一批（key 10.0.0.1）在 WALL_1 下命中；事件路径只置 event_ok（And）。
+    sm.set_processing_wall(WALL_1);
+    assert!(matches!(
+        sm.advance_at("req", &sip_ev(), t),
+        StepResult::Advance | StepResult::Accumulate
+    ));
+    sm.advance_at("c", &sip_ev(), t);
+
+    // 第二批（key 10.0.0.2）在 WALL_2 下命中（推高水位，供 flush 收口）。
+    sm.set_processing_wall(WALL_2);
+    let ev2 = event(vec![("sip", str_val("10.0.0.2"))]);
+    sm.advance_at("req", &ev2, t + 6_000_000_000);
+    sm.advance_at("c", &ev2, t + 6_000_000_000);
+
+    // 收口墙钟与命中墙钟不同：输出值不得被收口墙钟覆盖。
+    sm.set_processing_wall(WALL_3);
+    let outs = sm.close_all(CloseReason::Flush);
+    assert!(!outs.is_empty(), "hop 覆盖窗口应产生实例输出");
+    assert!(outs.iter().all(close_is_qualified), "实例均 qualified");
+    // close 路径：完整命中在收口时确定 → 各覆盖窗口实例记录收口处理墙钟。
+    assert!(
+        outs.iter()
+            .all(|o| o.first_match_time_nanos == Some(WALL_3)),
+        "hop 每个实例的 first_match_time = 首次完整命中（收口）墙钟：{:?}",
+        outs.iter()
+            .map(|o| o.first_match_time_nanos)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn first_match_session_window_keeps_first_wall_and_resets_per_session() {
+    // session(60s)：同一会话内重复命中保持首次墙钟；空闲超时收口后新会话重新记录。
+    let mut plan = simple_plan(MatchMode::Any, true);
+    plan.window_spec = WindowSpec::Session(Duration::from_secs(60));
+    let mut sm = CepStateMachine::new("r".into(), plan, None);
+
+    sm.set_processing_wall(WALL_1);
+    let ctx1 = expect_matched(&mut sm, "e", &sip_ev(), 1_000_000_000);
+    assert_eq!(ctx1.first_match_time_nanos, Some(WALL_1));
+
+    sm.set_processing_wall(WALL_2);
+    let ctx2 = expect_matched(&mut sm, "e", &sip_ev(), 2_000_000_000);
+    assert_eq!(
+        ctx2.first_match_time_nanos,
+        Some(WALL_1),
+        "同 session 重复命中保持首次墙钟"
+    );
+
+    // 超过 60s 会话间隔 → 旧会话收口（保持首次值），新事件开启新会话。
+    sm.set_processing_wall(WALL_3);
+    let outs = sm.scan_expired_at(90_000_000_000);
+    assert_eq!(outs.len(), 1, "旧 session 收口一条");
+    assert_eq!(
+        outs[0].first_match_time_nanos,
+        Some(WALL_1),
+        "旧 session 收口保持首次墙钟"
+    );
+
+    let ctx3 = expect_matched(&mut sm, "e", &sip_ev(), 100_000_000_000);
+    assert_eq!(
+        ctx3.first_match_time_nanos,
+        Some(WALL_3),
+        "新 session 实例重新记录首次墙钟"
+    );
+}
+
+#[test]
+fn first_match_records_wall_when_first_injected_then_keeps_it() {
+    // 驱动方首个批次未注入墙钟（None）→ 首次 fire 无值；后续批次注入墙钟后按
+    // 该墙钟惰性补记首次命中，并保持首次写入值不变（不追溯事件时间）。
+    let mut sm = CepStateMachine::new("r".into(), simple_plan(MatchMode::Any, true), None);
+    let ctx0 = expect_matched(&mut sm, "e", &sip_ev(), 1_000_000_000);
+    assert_eq!(
+        ctx0.first_match_time_nanos, None,
+        "未注入处理墙钟 → @first_match_time 无值"
+    );
+
+    sm.set_processing_wall(WALL_1);
+    let ctx1 = expect_matched(&mut sm, "e", &sip_ev(), 2_000_000_000);
+    assert_eq!(
+        ctx1.first_match_time_nanos,
+        Some(WALL_1),
+        "墙钟可用后惰性补记首次命中（不取事件时间）"
+    );
+
+    sm.set_processing_wall(WALL_2);
+    let ctx2 = expect_matched(&mut sm, "e", &sip_ev(), 3_000_000_000);
+    assert_eq!(
+        ctx2.first_match_time_nanos,
+        Some(WALL_1),
+        "首次写入后保持，不被后续批次墙钟改写"
+    );
+}
+
+#[test]
+fn first_match_not_overwritten_by_late_out_of_order_event() {
+    // 迟到/乱序事件（事件时间回退）不覆盖已记录的首次命中墙钟：fire 后喂更早
+    // event_time 的命中事件，其后 close 输出仍为首次值。
+    let mut sm = CepStateMachine::new("r".into(), simple_plan(MatchMode::Any, true), None);
+    sm.set_processing_wall(WALL_1);
+    let ctx1 = expect_matched(&mut sm, "e", &sip_ev(), 5_000_000_000);
+    assert_eq!(ctx1.first_match_time_nanos, Some(WALL_1));
+
+    sm.set_processing_wall(WALL_2);
+    let ctx2 = expect_matched(&mut sm, "e", &sip_ev(), 1_000_000_000);
+    assert_eq!(
+        ctx2.first_match_time_nanos,
+        Some(WALL_1),
+        "迟到（乱序更早）事件不得覆盖首次命中墙钟"
+    );
+
+    sm.set_processing_wall(WALL_3);
+    let outs = sm.scan_expired_at(70_000_000_000);
+    assert_eq!(outs.len(), 1);
+    assert_eq!(
+        outs[0].first_match_time_nanos,
+        Some(WALL_1),
+        "close 输出保持首次命中墙钟"
     );
 }

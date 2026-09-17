@@ -18,6 +18,7 @@ mod scope;
 mod seq;
 mod stats;
 mod t14_t51;
+mod t5_let_interactions;
 mod t5_threshold;
 mod type_check;
 mod yield_check;

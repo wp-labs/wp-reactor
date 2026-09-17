@@ -236,3 +236,85 @@ fn execute_match_entity_id_fallback() {
     let alert = exec.execute_match(&matched_with_values(vec![])).unwrap();
     assert_eq!(alert.entity_id, "");
 }
+
+#[test]
+fn execute_match_yield_let_derived_l3_value_is_not_empty() {
+    // issue #99：L3 序列函数只写在 let 中、yield 仅引用 let 名时，输出必须取到
+    // 真实值（而非空串）——let 求值须能看到匹配实例收集的序列数据。
+    let mut plan = simple_rule_plan(
+        "r_let_l3",
+        simple_plan(
+            vec![simple_key("sip")],
+            vec![step(vec![branch("fail", count_ge(1.0))])],
+        ),
+        Expr::Number(70.0),
+        "ip",
+        field("sip"),
+    );
+    plan.lets = vec![wf_lang::plan::LetPlan {
+        name: "dedup_key".into(),
+        expr: call(
+            "join_by",
+            vec![str_lit("|"), call("first", vec![field("fail")])],
+        ),
+    }];
+    plan.yield_plan.fields = vec![YieldField {
+        name: "alert_id".into(),
+        value: field("dedup_key"),
+    }];
+    let exec = RuleExecutor::new(plan);
+
+    let matched = matched_with_values(vec![
+        Value::Number(10.0),
+        Value::Number(20.0),
+        Value::Number(30.0),
+    ]);
+    let alert = exec.execute_match(&matched).unwrap();
+
+    assert_eq!(
+        yield_value(&alert, "alert_id"),
+        Some(&str_val("10")),
+        "let 中的 L3（first）必须产出真实值（issue #99 空值回归）"
+    );
+}
+
+#[test]
+fn execute_match_yield_let_derived_l3_list_value_is_not_empty() {
+    // issue #99 变体：let 中使用 collect_list 聚合并拼接 → yield 引用 let 名时
+    // 必须得到完整列表（而非空串）。
+    let mut plan = simple_rule_plan(
+        "r_let_l3_list",
+        simple_plan(
+            vec![simple_key("sip")],
+            vec![step(vec![branch("fail", count_ge(1.0))])],
+        ),
+        Expr::Number(70.0),
+        "ip",
+        field("sip"),
+    );
+    plan.lets = vec![wf_lang::plan::LetPlan {
+        name: "ids".into(),
+        expr: call(
+            "mvjoin",
+            vec![call("collect_list", vec![field("fail")]), str_lit(",")],
+        ),
+    }];
+    plan.yield_plan.fields = vec![YieldField {
+        name: "id_list".into(),
+        value: field("ids"),
+    }];
+    let exec = RuleExecutor::new(plan);
+
+    let matched = matched_with_values(vec![
+        Value::Number(10.0),
+        Value::Number(20.0),
+        Value::Number(30.0),
+    ]);
+    let alert = exec.execute_match(&matched).unwrap();
+
+    assert_eq!(
+        yield_value(&alert, "id_list"),
+        Some(&str_val("10,20,30")),
+        "let 中的 collect_list 聚合必须产出完整列表（issue #99）"
+    );
+}

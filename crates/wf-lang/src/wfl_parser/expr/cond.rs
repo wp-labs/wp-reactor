@@ -10,13 +10,13 @@ use winnow::token::literal;
 use crate::ast::*;
 use crate::parse_utils::{kw, ws_skip};
 
-use super::{and_expr, or_expr, parse_expr};
+use super::{and_expr, or_expr, parse_expr_nested};
 
 /// `if expr then expr else expr`
 pub(super) fn if_expr(input: &mut &str) -> ModalResult<Expr> {
     kw("if").parse_next(input)?;
     ws_skip.parse_next(input)?;
-    let cond = cut_err(parse_expr).parse_next(input)?;
+    let cond = cut_err(parse_expr_nested).parse_next(input)?;
 
     let then_e = parse_if_then_branch(input)?;
     let else_e = parse_if_else_branch(input)?;
@@ -125,7 +125,7 @@ fn parse_case_regular_arm(input: &mut &str) -> ModalResult<MatchArm> {
         )))
         .parse_next(input)?;
     ws_skip.parse_next(input)?;
-    let value = cut_err(parse_expr).parse_next(input)?;
+    let value = cut_err(parse_expr_nested).parse_next(input)?;
     Ok(MatchArm { patterns, value })
 }
 
@@ -138,7 +138,7 @@ fn parse_case_default_arm(input: &mut &str) -> ModalResult<Expr> {
         )))
         .parse_next(input)?;
     ws_skip.parse_next(input)?;
-    let value = cut_err(parse_expr).parse_next(input)?;
+    let value = cut_err(parse_expr_nested).parse_next(input)?;
     ws_skip.parse_next(input)?;
     opt(literal(",")).parse_next(input)?;
     Ok(value)

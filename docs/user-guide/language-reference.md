@@ -222,6 +222,7 @@ match<sip:5m> {
 - key 支持**多层嵌套路径**（root 必须是结构化 object/array 字段），例如 `match<s.extensions_obj.obj.id:1d:fixed>`——按路径叶值分组，等价于把该叶先提取为顶层字段再用其分组；嵌套路径可含数组索引段（`s.roles_obj.related[0].uid`）
 - key 可引用**`let` 派生字段**（issue #83）：事件先按 `let` 定义求值再参与分组；`let` 定义可以是任意可推断为标量 key 类型的表达式（字段/嵌套路径、函数与字面量派生如 `concat`/`coalesce`/`case` 均可，issue #80），float/object/array 除外，窗口/状态依赖函数除外
 - 多步是顺序关系，前一步命中后才进入后一步
+- **阈值必须是编译期常量**（数字 / 字符串字面量；可取负、可用括号做常量算术）：触发判定只做常量折叠，其中规则级**常量** `let`（如 `let THRESHOLD = 3`，含常量算术）在编译期内联为字面量，可直接用作阈值（`|>` pipeline 的 stage 内不支持规则级 `let`，见下）；字段引用、非常量 `let` 引用与函数调用（L3 集合函数、`now*`、`baseline` 等）无法求值 → 该分支永不触发，编译期报错（issue #101）
 
 派生 / 嵌套 key 示例：
 
@@ -519,6 +520,7 @@ rule r_pipe {
 - 中间 stage 不允许带 `-> score(...)`
 - 最终 stage 必须带 `-> score(...)`
 - 下游 stage 通过 `_in` 读取上一 stage 输出
+- **stage 内不可引用规则级 `let`**（stage 的 scope 只含 `_in`/join/reduce 标签，无 let 绑定）：阈值写成常量 `let` 也会被编译期拒绝；需要常量时把字面量直接写进 stage 的阈值
 
 ### `yield`
 
@@ -642,7 +644,7 @@ rule alert_entity_rule {
 | `@event_last_time` | `time` | 候选事件跨度终点：进入该实例的最后一条被接受事件的时间 |
 | `@evidence_start_time` | `time` | 本次命中所用**证据**（被接受为命中依据的事件）跨度起点 |
 | `@evidence_end_time` | `time` | 证据跨度终点（例如阈值规则下触发命中那条事件的时间） |
-| `@first_match_time` | `time` | 实例首次完整命中（产生 match/close 结果）的引擎处理墙钟；accu 重复输出保持首次值 |
+| `@first_match_time` | `time` | 实例**首次完整命中**（产生 match/close 结果）的引擎处理墙钟；`on each` 即当前匹配事件的系统时间；重复输出/迟到事件保持首次值，新实例周期重置，未命中无值 |
 | `@window_start_time` | `time` | 规则窗口开始时间 |
 | `@window_end_time` | `time` | 规则窗口结束时间 |
 | `@emit_time` | `time` | 本次输出记录的稳定产出时间 |
@@ -651,9 +653,11 @@ rule alert_entity_rule {
 
 - **候选事件跨度**（`@event_first_time` / `@event_last_time`）：窗口内进入该实例的全部被接受事件的首尾——适合 `first_seen` / `last_seen` 一类“该实体在窗口内何时开始/最后出现”的字段。
 - **证据跨度**（`@evidence_start_time` / `@evidence_end_time`）：实际构成这次命中的事件跨度。对阈值规则，若窗口里还有更多事件尚未达到触发即到达（或 guard 拒绝），证据终点可能早于候选终点；两类规则一致时两组相等。
-- `on event<accu>` 规则：分支证据状态跨 rearm 累积（`collect_set` 等证据逐条递增）→ 证据起点通常就是窗口首条证据事件，候选与证据随窗口共同推进。
+- `on event<accu>` 规则：分支证据状态跨 rearm 累积（`collect_set` 等证据在采样上界内逐条递增，达到上界后集合不再增长——见下方 L3 集合函数的样本上限说明）→ 证据起点通常就是窗口首条证据事件，候选与证据随窗口共同推进。
 - 乱序到达（事件时间回退）：候选 `first` 取到达序首条事件、`last` 取事件时间最大；证据 `start/end` 取分支记录的事件时间 min/max。
 - **事件时间**来自输入事件字段，**处理墙钟**（`@first_match_time`）来自引擎处理时刻，不应混用。
+- **首次命中墙钟**（`@first_match_time`，issue #82/#98）：规则实例第一次完整命中条件的系统时间——不受输入事件时间（`occur_time`）影响，也不被窗口关闭/输出调度（`@emit_time`）覆盖；`on event<accu>` 重复输出、窗口内迟到/乱序事件均保持首次值；实例重置（非 accu 新周期、新窗口桶、新会话）后重新记录；从未命中的实例无值。与 `@emit_time` 是**两个不同时刻**：前者是“何时首次满足条件”，后者是“何时产出这条记录”。
+- 需要把首次命中墙钟写进毫秒数字字段时，用时间转换函数（issue #69）：`time_to_ms(@first_match_time)`（目标字段声明为 `digit`）。
 
 推荐在输出 window 中显式声明业务字段：
 
@@ -669,6 +673,7 @@ window security_alerts {
         rule_window_start: time
         rule_window_end: time
         latest_analysis_time: time
+        first_match_time: time
     }
 }
 ```
@@ -683,7 +688,16 @@ yield security_alerts (
     evidence_end_time = @evidence_end_time,
     rule_window_start = @window_start_time,
     rule_window_end = @window_end_time,
-    latest_analysis_time = @emit_time
+    latest_analysis_time = @emit_time,
+    first_match_time = @first_match_time
+)
+```
+
+毫秒数字字段用 `time_to_ms`：
+
+```wfl
+yield security_alerts (
+    first_match_ms = time_to_ms(@first_match_time)   // 目标字段声明为 `digit`
 )
 ```
 
@@ -693,6 +707,7 @@ yield security_alerts (
 - 这些变量在表达式里的数值表示为 epoch milliseconds；写入 `time` 字段时会按时间类型输出。
 - `@emit_time` 在同一条输出记录内必须保持稳定，多次引用取同一个值。
 - `@event_first_time` / `@event_last_time` 表达窗口内候选事件的首尾；`@evidence_start_time` / `@evidence_end_time` 表达本次命中的证据跨度；`@window_start_time` / `@window_end_time` 表达规则窗口边界，不应混用。
+- `@first_match_time` 表达实例首次满足条件的处理墙钟（重复输出保持首次值、未命中无值），不能与 `@emit_time`（本条输出产出时间）互相替代。
 
 #### 稳定统计上下文
 
@@ -1183,11 +1198,11 @@ yield security_alerts (
 
 | 函数 | 返回类型 | 说明 |
 |------|----------|------|
-| `collect_set(alias.field)` | `array/T` | 收集当前 rule instance 内 alias 事件集合最近最多 1024 个字段值，按首次出现顺序去重 |
-| `collect_list(alias.field)` | `array/T` | 收集当前 rule instance 内 alias 事件集合最近最多 1024 个字段值，保留出现顺序 |
-| `first(alias.field)` | `T` | 返回当前 rule instance 内 alias 最近字段样本中的首个字段值 |
-| `last(alias.field)` | `T` | 返回当前 rule instance 内 alias 最近字段样本中的末个字段值 |
-| `stddev(alias.field)` | `float` | 当前 rule instance 内 alias 最近字段样本的标准差（样本 <2 时返回 0） |
+| `collect_set(alias.field)` | `array/T` | 收集当前 rule instance 内 alias 事件集合的字段值样本（首个样本 + 最近最多 1024 个），按首次出现顺序去重 |
+| `collect_list(alias.field)` | `array/T` | 收集当前 rule instance 内 alias 事件集合的字段值样本（首个样本 + 最近最多 1024 个），保留出现顺序 |
+| `first(alias.field)` | `T` | 返回当前 rule instance 内 alias **按到达序首个被接受事件**的字段值；跨整个实例窗口保持稳定（适合组成聚合唯一键 / `alert_id`） |
+| `last(alias.field)` | `T` | 返回当前 rule instance 内 alias 按到达序**最后**被接受事件的字段值 |
+| `stddev(alias.field)` | `float` | 当前 rule instance 内 alias 字段值样本的标准差（样本 <2 时返回 0） |
 | `percentile(alias.field, p)` | `float` | 样本百分位；`p` 必须是 0-100 数字字面量（越界编译拒绝） |
 
 `collect_set(alias.field)` 和 `stat.count(window_event(alias))` 基于同一个 alias 事件集合。常见 evidence 输出写法：
@@ -1209,7 +1224,7 @@ yield security_alerts (
 )
 ```
 
-如果某条事件缺少 `event_id`，它仍计入 `event_count`，但不会进入 `evidences`。alias 字段集合保留最近最多 1024 个字段值；`collect_set` / `collect_list` / `first` / `last` / `stddev` / `percentile` 均基于这组最近样本。大窗口或重复 `event_id` 场景下，`evidences` 数组长度可能小于 `event_count`。
+如果某条事件缺少 `event_id`，它仍计入 `event_count`，但不会进入 `evidences`。alias 字段样本集合的规模有界：**首个样本**始终保留，另保留最近最多 1024 个样本（合计至多 1025 个）；`collect_set` / `collect_list` / `first` / `last` / `stddev` / `percentile` 均基于这组样本。`first` 因此不受窗口规模影响（同一个 rule instance 内始终返回按到达序首个被接受事件的值，可用于组成稳定的聚合唯一键 / `alert_id`），而 `last` 始终返回按到达序最后一个被接受事件的值。大窗口或重复 `event_id` 场景下，`evidences` 数组长度仍可能小于 `event_count`。`sum(alias.field)` / `avg(alias.field)` / `min(alias.field)` / `max(alias.field)` 这类**限定字段聚合**同样基于这组样本，因此裁剪发生后会额外包含最早样本（例如 `min(alias.field)` 会取到首个样本）；而 `count(alias)` 与 `stat.count(window_event(alias))` 使用独立累加器，始终等于该 alias 的事件总数（`count()` 不接受字段投影）。
 
 ## 规则测试
 
@@ -1260,6 +1275,13 @@ test brute_test for brute_force {
 
 ## 语义约束速查
 
+表达式与 `let` 层次（硬限制）：
+
+- **表达式嵌套分组不超过 5 层**：括号、函数实参、数组/对象元素、`in (...)`、`if`/`case` 分支各算一层（同一层的 `&&`/`+` 等算子链不递增，链长由下一条限制单独约束；顶层表达式本身不计）；超过给编译期错误。目的：深嵌套输入会让递归下降耗尽线程栈（栈溢出不可捕获、直接 abort 进程且无位置信息）
+- **规则级 `let` 引用链不超过 5 层**（`let a = b` 这类链），成环同样报错；需要更深时把值直接内联到使用处
+- **同一分组内的算子链不超过 16 层**：`a + b + c`、`a || b || c`、`not not …` 每多一项/一层各记一层，括号等分组会重置计数（所以每层括号各自有独立预算）；超限编译期报错。需要更长时改用 `in (...)` 列表，或把中间结果放进规则级 `let`。与分组嵌套合计，任一表达式沿路径的链式深度上界为 96 层——算子链会构造出与项数同阶的**左深树**，下游按结构递归的遍历同样会耗尽线程栈（同样是直接 abort）
+- **规则级 `let` 按声明顺序解析**：只能引用**已声明**的 `let`，前向引用（`let a = b` 而 `b` 声明在后）编译期报错
+
 Events 约束：
 
 - 别名唯一
@@ -1271,6 +1293,9 @@ Match 约束：
 - step 必须显式声明 source
 - `match` 至少需要有效的事件/关闭路径才能通过后续语义检查
 - `close_reason` 仅可在 `on close` 中引用
+- 阈值必须是编译期常量（数字 / 字符串字面量，可取负）；规则级常量 `let` 编译期内联后可用（pipeline stage 内不可引用规则级 `let`），字段引用、非常量 `let` 引用、函数调用（L3 集合函数、`now*` / `baseline` 等）与除零/模零常量一并编译期拒绝（issue #101）
+- 规则级 `let` 名必须唯一（重名报错：绑定语义与内联取值的先后顺序会不一致）
+- 规则级 `let` 只能引用声明在**之前**的 `let`（前向引用报错；`match` 之后再声明 `let` 是语法错误）
 - `match` 与 `on each` 互斥
 - `conv` 仅允许与 fixed / hop 窗口搭配（sliding/session 拒绝）；`top_ties` 要求同 chain 前导 `sort`
 - `emit at`（deferred join）仅支持 `on each` 驱动形态

@@ -368,24 +368,21 @@ pub(super) fn eval_func_phase_bucket(
     };
     Some(Value::Number(idx as f64))
 }
-pub(super) fn eval_func_collect_set(
+/// L3 集合/统计函数（`collect_set` / `collect_list` / `first` / `last` / `stddev` /
+/// `percentile`）在 CEP 侧逐事件求值中的**占位**：这些函数需要 instance 的收集
+/// 序列，只有执行器的 yield/derive 上下文（wf-engine `eval_l3_func`，读
+/// `_step_*` / `_bind_*` 序列）才提供，本求值器恒返回 `None`。
+///
+/// 函数名仍登记在分派表中（`funcs.rs`）只为「按名解析成功、按缺席求值」，避免
+/// 把「名字未知」与「此处不可用」混为一谈——它们被写进 CEP 侧求值位置时必然
+/// 失效，因此 checker 在 guard / `on each` / threshold 上直接拒绝（后者见
+/// warp-fusion#101）。
+pub(super) fn eval_instance_series_unavailable(
     _args: &[Expr],
     _event: &dyn FieldSource,
     _windows: Option<&dyn WindowLookup>,
     _baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> Option<Value> {
-    // These functions need access to the instance's collected events
-    // They are supported in yield/derive context via StepEvalContext
-    None
-}
-pub(super) fn eval_func_stddev(
-    _args: &[Expr],
-    _event: &dyn FieldSource,
-    _windows: Option<&dyn WindowLookup>,
-    _baselines: &mut EngineHashMap<String, RollingStats>,
-) -> Option<Value> {
-    // These functions need access to the instance's numeric values
-    // They are supported in yield/derive context via StepEvalContext
     None
 }
 pub(super) fn eval_func_external(

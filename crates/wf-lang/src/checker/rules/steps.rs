@@ -10,6 +10,7 @@ pub(crate) fn check_match_steps<'a>(
     steps: &'a [MatchStep],
     scope: &Scope<'_>,
     rule_name: &str,
+    lets: &[crate::ast::LetDecl],
     errors: &mut Vec<CheckError>,
     labels_seen: &mut HashSet<&'a str>,
 ) {
@@ -61,7 +62,7 @@ pub(crate) fn check_match_steps<'a>(
             }
 
             // Type-check the pipe chain
-            check_pipe_chain(branch, scope, rule_name, errors);
+            check_pipe_chain(branch, scope, rule_name, lets, errors);
         }
     }
 }

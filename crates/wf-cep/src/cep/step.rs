@@ -95,7 +95,7 @@ pub(super) fn evaluate_step_with_progress<E: FieldSource>(
         if input.collect_step_values
             && let Some(val) = &field_value
         {
-            push_capped(bs.collected_values_mut(), val.clone());
+            bs.push_collected(val.clone());
         }
 
         // Check threshold
@@ -230,11 +230,7 @@ pub(super) fn collect_event_fields<E: FieldSource>(
         // matches the eager path (batch_to_events drops nulls from the map).
         for field_name in event.field_names() {
             if let Some(value) = event.field_value(field_name) {
-                let values = bs
-                    .field_values_mut()
-                    .entry(field_name.to_string())
-                    .or_default();
-                push_capped(values, value);
+                bs.push_field_value(field_name, value);
             }
         }
     }
@@ -242,11 +238,7 @@ pub(super) fn collect_event_fields<E: FieldSource>(
 
 fn push_event_field<E: FieldSource>(event: &E, bs: &mut BranchState, field_name: &str) {
     if let Some(value) = event.field_value(field_name) {
-        let values = bs
-            .field_values_mut()
-            .entry(field_name.to_string())
-            .or_default();
-        push_capped(values, value);
+        bs.push_field_value(field_name, value);
     }
 }
 
@@ -268,7 +260,9 @@ fn selected_field_name(field: Option<&FieldSelector>) -> Option<&str> {
 ///
 /// `stat.count(window_event(alias))` counts all accepted alias events. Collection
 /// functions over alias fields can therefore return fewer values than the count
-/// for large windows or duplicate field values. Close-step threshold evaluation
+/// for large windows or duplicate field values. 序列首值是窗内最早样本
+/// （被裁剪丢弃的首值由 `PinnedFirst` 钉扎，warp-fusion#100），序列长度上界
+/// 1025 = 首值 + 最多 1024 个最近样本。Close-step threshold evaluation
 /// (count/sum/min/max/distinct) uses separate accumulators and is not affected by
 /// this cap.
 const MAX_TRACKED_FIELD_VALUES: usize = 1024;
@@ -276,16 +270,23 @@ const MAX_TRACKED_FIELD_VALUES: usize = 1024;
 /// Push `value` onto `values`, trimming to the most recent
 /// `MAX_TRACKED_FIELD_VALUES` entries.
 ///
+/// Returns the value dropped by this call (`None` when no trim happened).
+/// 调用方必须把返回的首个被丢弃值交给 `PinnedFirst` 钉扎（warp-fusion#100），
+/// 否则 `first()` 会随窗口增长漂移——工程上应调 `BranchState::push_collected` /
+/// `push_field_value`（已封装钉扎），不要直接调本函数。
+///
 /// 环形维护（VecDeque push_back + pop_front 均 O(1)）：旧实现用 `Vec::drain(..1)`
 /// 每次把剩余元素整体 memmove 左移（drain 后 len=1024，下一次 push 又触发 drain）——
 /// 每 push 一次 O(1024) 搬运。q15 每事件 8 个 distinct branch 收集 → 每事件
 /// 8×32KB memmove，占 q15 CPU 的 88%（macOS sample 2026-08-22 实测，q15 10M
 /// EPS 37k 的主因）。
-pub(super) fn push_capped(values: &mut VecDeque<Value>, value: Value) {
+#[must_use = "被裁减掉的首值必须交给 PinnedFirst 钉扎（warp-fusion#100）"]
+pub(super) fn push_capped(values: &mut VecDeque<Value>, value: Value) -> Option<Value> {
     values.push_back(value);
     if values.len() > MAX_TRACKED_FIELD_VALUES {
-        values.pop_front(); // O(1)：保留最近 MAX 个（与旧 drain 语义一致）
+        return values.pop_front(); // O(1)：保留最近 MAX 个（与旧 drain 语义一致）
     }
+    None
 }
 
 pub(super) fn collect_alias_event<E: FieldSource>(
@@ -297,34 +298,16 @@ pub(super) fn collect_alias_event<E: FieldSource>(
     if let Some(fields) = tracked_fields {
         for field_name in fields {
             if let Some(value) = event.field_value(field_name.as_str()) {
-                let values = field_values_for(alias_state, field_name.as_str());
-                push_capped(values, value);
+                alias_state.push_field_value(field_name.as_str(), value);
             }
         }
     } else {
         for field_name in event.field_names() {
             if let Some(value) = event.field_value(field_name) {
-                let values = field_values_for(alias_state, field_name);
-                push_capped(values, value);
+                alias_state.push_field_value(field_name, value);
             }
         }
     }
-}
-
-/// `&mut Vec<Value>` for `field_name`, creating the map entry only on first
-/// use. Previously every event cloned the field-name `String` just to do the
-/// lookup (`entry(field_name.clone())`) — the dominant per-event allocation on
-/// count-only rules, which re-collect the same fields every event. Now the
-/// common path (key already present) is a lookup + `get_mut`, no allocation.
-fn field_values_for<'a>(
-    alias_state: &'a mut AliasState,
-    field_name: &str,
-) -> &'a mut VecDeque<Value> {
-    let fvm = alias_state.field_values_mut();
-    if !fvm.contains_key(field_name) {
-        fvm.insert(field_name.to_string(), VecDeque::new());
-    }
-    fvm.get_mut(field_name).expect("just inserted")
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +481,9 @@ pub(super) fn check_threshold(agg: &AggPlan, bs: &BranchState) -> bool {
             // count/sum/avg with a non-constant threshold (e.g. field ref):
             // cannot evaluate — treat as unsatisfied rather than silently
             // comparing against 0.0
+            //
+            // WFL 侧已由 checker 在编译期拒绝这类阈值（warp-fusion#101，判据与
+            // `wf_lang::const_fold` 共用）；这里是 hand-built `AggPlan` 的兜底语义。
             false
         }
     }
@@ -661,6 +647,106 @@ mod tests {
     }
 
     #[test]
+    fn collect_event_fields_pins_first_value_for_series() {
+        // warp-fusion#100：裁剪丢弃的最早样本必须钉扎，否则 `first()` 漂移。
+        let mut bs = BranchState::new();
+        let over = MAX_TRACKED_FIELD_VALUES * 2 + 3;
+        for i in 0..over as i64 {
+            collect_event_fields(
+                &event_with("dport", i),
+                &mut bs,
+                None,
+                &HashSet::new(),
+                None,
+            );
+        }
+
+        let series = bs.field_series();
+        let values = series.get("dport").expect("dport series");
+        // `[首值] ++ 最近 MAX 个`：长度上界 1025，首值 / 尾值均正确。
+        assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES + 1);
+        assert_eq!(values.first(), Some(&Value::Number(0.0)));
+        assert_eq!(values.last(), Some(&Value::Number((over - 1) as f64)));
+        // 原始环形队列仍只保留最近 MAX 个（内存上界不变）。
+        assert_eq!(
+            bs.field_values
+                .as_deref()
+                .and_then(|m| m.get("dport"))
+                .map(|v| v.len()),
+            Some(MAX_TRACKED_FIELD_VALUES)
+        );
+    }
+
+    #[test]
+    fn collect_alias_event_pins_first_value_for_series() {
+        let mut state = AliasState::new();
+        let over = MAX_TRACKED_FIELD_VALUES + 1;
+        for i in 0..over as i64 {
+            collect_alias_event(&event_with("event_id", i), &mut state, None);
+        }
+
+        let series = state.field_series();
+        let values = series.get("event_id").expect("event_id series");
+        assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES + 1);
+        assert_eq!(values.first(), Some(&Value::Number(0.0)));
+        assert_eq!(values.last(), Some(&Value::Number(over as f64 - 1.0)));
+        // count 不受钉扎影响。
+        assert_eq!(state.count, over as u64);
+    }
+
+    #[test]
+    fn series_without_trim_is_unchanged_by_pinning() {
+        // 未裁剪 → 无钉扎槽，序列与历史逐位一致（无额外首值 / 无重复）。
+        let mut bs = BranchState::new();
+        for i in 0..3i64 {
+            bs.push_field_value("dport", Value::Number(i as f64));
+            bs.push_collected(Value::Number(i as f64));
+        }
+
+        assert!(bs.pinned_first.is_none());
+        assert_eq!(
+            bs.field_series().get("dport").cloned(),
+            Some(vec![0.0, 1.0, 2.0].into_iter().map(Value::Number).collect())
+        );
+        assert_eq!(
+            bs.collected_series(),
+            vec![0.0, 1.0, 2.0]
+                .into_iter()
+                .map(Value::Number)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn push_collected_pins_first_dropped_value() {
+        let mut bs = BranchState::new();
+        let over = MAX_TRACKED_FIELD_VALUES + 1;
+        for i in 0..over as i64 {
+            bs.push_collected(Value::Number(i as f64));
+        }
+
+        let series = bs.collected_series();
+        assert_eq!(series.len(), MAX_TRACKED_FIELD_VALUES + 1);
+        assert_eq!(series.first(), Some(&Value::Number(0.0)));
+        assert_eq!(series.last(), Some(&Value::Number(over as f64 - 1.0)));
+    }
+
+    #[test]
+    fn pinned_first_value_is_not_replaced_by_later_trims() {
+        // 首次裁剪记录首值后，后续裁剪丢弃的值更晚，不得覆盖。
+        let mut bs = BranchState::new();
+        for i in 0..(MAX_TRACKED_FIELD_VALUES * 3) as i64 {
+            bs.push_collected(Value::Number(i as f64));
+        }
+
+        assert_eq!(
+            bs.collected_series().first(),
+            Some(&Value::Number(0.0)),
+            "首值必须始终是最早样本"
+        );
+    }
+
+    #[test]
     fn collect_alias_event_tracks_only_requested_fields() {
         let mut state = AliasState::new();
         let mut fields = EngineHashMap::default();
@@ -760,7 +846,8 @@ mod tests {
             update_measure(&Measure::Count, &Some(Value::Number(i as f64)), &mut bs);
             // F9：collected_values 收集移到调用方（gate = needs_field_history），
             // update_measure 自身不再收集——测试补 push 以保持对 cap 的断言。
-            push_capped(bs.collected_values_mut(), Value::Number(i as f64));
+            // 走 `push_collected`（而非裸 `push_capped`）以免演示绕过首值钉扎的写法。
+            bs.push_collected(Value::Number(i as f64));
         }
 
         assert_eq!(
@@ -773,6 +860,83 @@ mod tests {
         );
         // Threshold accumulators still see every event; only the raw value list is capped.
         assert_eq!(bs.count, over as u64);
+        // 裁剪丢弃的首值已被钉扎（同一序列的 first 语义来源）。
+        assert_eq!(
+            bs.collected_series().first(),
+            Some(&Value::Number(0.0)),
+            "collected_values 裁剪后的首项必须是钉扎的最早样本"
+        );
+    }
+
+    #[test]
+    fn push_capped_reports_dropped_head_and_keeps_bounded_tail() {
+        // `push_capped` 的返回值是整套钉扎机制的根基：必须是本次被丢弃的首值，
+        // 且只在真正发生裁剪时返回。
+        let mut values: VecDeque<Value> = VecDeque::new();
+        for i in 0..MAX_TRACKED_FIELD_VALUES as i64 {
+            assert_eq!(
+                push_capped(&mut values, Value::Number(i as f64)),
+                None,
+                "上限内不得报告丢弃（第 {i} 次）"
+            );
+        }
+        assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
+        assert_eq!(
+            push_capped(&mut values, Value::Number(MAX_TRACKED_FIELD_VALUES as f64)),
+            Some(Value::Number(0.0)),
+            "首次裁剪报告最早样本"
+        );
+        assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
+        assert_eq!(
+            values.back(),
+            Some(&Value::Number(MAX_TRACKED_FIELD_VALUES as f64))
+        );
+        assert_eq!(
+            push_capped(
+                &mut values,
+                Value::Number(MAX_TRACKED_FIELD_VALUES as f64 + 1.0)
+            ),
+            Some(Value::Number(1.0)),
+            "后续裁剪逐次报告当时的首项"
+        );
+    }
+
+    #[test]
+    fn field_pins_are_independent_per_field() {
+        // 参差不齐的字段到达节奏：被裁剪的字段有独立钉扎，样本稀少的字段既无钉扎
+        // 也不丢首值（`PinnedFirst.fields` 按字段名分槽，不是单一槽位）。
+        let mut state = AliasState::new();
+        let over = MAX_TRACKED_FIELD_VALUES * 2 + 7;
+        for i in 0..over as i64 {
+            state.push_field_value("event_id", Value::Number(i as f64));
+            if i < 3 {
+                state.push_field_value("rare", Value::Str(format!("rare-{i}").into()));
+            }
+        }
+
+        let series = state.field_series();
+        let dense = series.get("event_id").expect("event_id series");
+        assert_eq!(dense.len(), MAX_TRACKED_FIELD_VALUES + 1);
+        assert_eq!(dense.first(), Some(&Value::Number(0.0)));
+        assert_eq!(dense.last(), Some(&Value::Number((over - 1) as f64)));
+
+        let rare = series.get("rare").expect("rare series");
+        assert_eq!(
+            rare,
+            &vec![
+                Value::Str("rare-0".into()),
+                Value::Str("rare-1".into()),
+                Value::Str("rare-2".into()),
+            ],
+            "样本稀少的字段必须完整保留（无钉扎、无裁剪）"
+        );
+
+        let pins = state.pinned_first.as_deref().expect("稠密字段应产生钉扎槽");
+        assert!(pins.fields.contains_key("event_id"));
+        assert!(
+            !pins.fields.contains_key("rare"),
+            "未被裁剪的字段不得凭空产生钉扎值"
+        );
     }
 
     #[test]

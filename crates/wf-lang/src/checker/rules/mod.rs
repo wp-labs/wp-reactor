@@ -8,7 +8,7 @@ mod steps;
 mod yield_check;
 pub(crate) mod yield_version;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::ast::{
@@ -27,6 +27,23 @@ const PIPE_IN_ALIAS: &str = "_in";
 /// Check a single rule declaration against the provided schemas.
 pub(crate) fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<CheckError>) {
     let name = &rule.name;
+
+    // 规则级 `let` 名必须唯一：scope 的 let 类型表按声明顺序覆盖（后者胜），而
+    // 常量内联按声明顺序取首（前者胜）——重名会让「接受/拒绝」与绑定语义随行序
+    // 变化（warp-fusion#101 review）。
+    let mut let_names = HashSet::new();
+    for l in &rule.lets {
+        if !let_names.insert(l.name.as_str()) {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(name.to_string()),
+                test: None,
+                message: format!("duplicate rule-level `let` name `{}`", l.name),
+            });
+        }
+    }
+
+    check_let_chain_depth(rule, name, errors);
 
     if rule.events.decls.iter().any(|d| d.alias == PIPE_IN_ALIAS) {
         errors.push(CheckError {
@@ -468,6 +485,7 @@ fn check_stage(
         &match_clause.on_event,
         scope,
         rule_name,
+        lets,
         errors,
         &mut labels_seen,
     );
@@ -476,6 +494,7 @@ fn check_stage(
             &close_block.steps,
             scope,
             rule_name,
+            lets,
             errors,
             &mut labels_seen,
         );
@@ -530,7 +549,14 @@ fn check_stage(
             })
             .collect();
         let mut chain_labels = HashSet::new();
-        steps::check_match_steps(&chain_steps, scope, rule_name, errors, &mut chain_labels);
+        steps::check_match_steps(
+            &chain_steps,
+            scope,
+            rule_name,
+            lets,
+            errors,
+            &mut chain_labels,
+        );
         check_seq(chain, match_clause.duration, rule_name, errors);
     }
 
@@ -922,4 +948,68 @@ fn val_type_to_field_type(v: ValType) -> Option<FieldType> {
         ValType::Bool => Some(FieldType::Base(BaseType::Bool)),
         ValType::Numeric => Some(FieldType::Base(BaseType::Digit)),
     }
+}
+
+/// 规则级 `let` 引用链的层数上限。
+///
+/// 多个下游都按链**递归**展开 let 引用（键派生 `expand_let_expr`、列式 yield
+/// `inline_lets`、阈值常量内联），链长完全由用户输入决定——无上限时深链会耗尽
+/// 线程栈（栈溢出不可捕获 → 进程 abort）。与表达式嵌套同口径：**5 层**。
+/// 超出（或成环）在编译期报错，而不是留给下游去递归。
+const MAX_LET_CHAIN: usize = crate::ast::MAX_NESTING_LEVELS;
+
+/// 迭代式求解每条 let 的最长引用链深（不递归：否则检查本身就会栈溢出）。
+///
+/// 松弛 MAX+1 轮：仍在增长说明存在环（链无界），同样报错。
+fn check_let_chain_depth(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckError>) {
+    if rule.lets.is_empty() {
+        return;
+    }
+    let refs: Vec<(String, Vec<String>)> = rule
+        .lets
+        .iter()
+        .map(|l| {
+            (
+                l.name.clone(),
+                crate::ast::collect_rule_let_refs(&l.expr, &rule.lets),
+            )
+        })
+        .collect();
+    let mut depth: HashMap<String, usize> = refs.iter().map(|(n, _)| (n.clone(), 1)).collect();
+
+    for _ in 0..=MAX_LET_CHAIN {
+        let mut changed = false;
+        for (name, deps) in &refs {
+            let mut d = 1;
+            for dep in deps {
+                d = d.max(depth.get(dep).copied().unwrap_or(1) + 1);
+            }
+            if d > depth[name] {
+                depth.insert(name.clone(), d);
+                if d > MAX_LET_CHAIN {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "rule-level `let` reference chain through `{name}` is deeper than {MAX_LET_CHAIN} levels (or cyclic); inline the value instead"
+                        ),
+                    });
+                    return;
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+    }
+    errors.push(CheckError {
+        severity: Severity::Error,
+        rule: Some(rule_name.to_string()),
+        test: None,
+        message: format!(
+            "rule-level `let` reference chain is cyclic (deeper than {MAX_LET_CHAIN} levels)"
+        ),
+    });
 }

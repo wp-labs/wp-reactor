@@ -927,6 +927,11 @@ mod tests {
     fn system_and_meta_vars_fall_back() {
         use crate::ast::{SystemVar, WfuMetaField};
         assert!(!expr_is_columnar(&Expr::SystemVar(SystemVar::Score)));
+        // issue #98/@first_match_time 同属 SystemVar → 非列式；保证列式快路径
+        // 的 light meta（不携带处理墙钟）永远不会求值到该变量。
+        assert!(!expr_is_columnar(&Expr::SystemVar(
+            SystemVar::FirstMatchTime
+        )));
         assert!(!expr_is_columnar(&Expr::WfuMeta(WfuMetaField::RuleName)));
         assert!(!expr_is_columnar(&Expr::PresetParam("severity".into())));
     }

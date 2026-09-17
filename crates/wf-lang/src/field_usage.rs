@@ -1077,3 +1077,97 @@ mod tests {
         assert!(usage.needs_all.contains("auth_events"));
     }
 }
+
+#[cfg(test)]
+mod const_let_threshold_consistency_tests {
+    use super::*;
+    use crate::{BaseType, FieldDef, FieldType, WindowSchema, compile_wfl, parse_wfl};
+
+    fn bt(b: BaseType) -> FieldType {
+        FieldType::Base(b)
+    }
+
+    fn schemas() -> Vec<WindowSchema> {
+        vec![
+            WindowSchema {
+                name: "auth_events".into(),
+                streams: vec!["auth_stream".into()],
+                time_field: Some("event_time".into()),
+                over: std::time::Duration::from_secs(300),
+                fields: vec![
+                    FieldDef {
+                        name: "sip".into(),
+                        field_type: bt(BaseType::Ip),
+                    },
+                    FieldDef {
+                        name: "action".into(),
+                        field_type: bt(BaseType::Chars),
+                    },
+                    FieldDef {
+                        name: "event_time".into(),
+                        field_type: bt(BaseType::Time),
+                    },
+                ],
+            },
+            WindowSchema {
+                name: "out".into(),
+                streams: vec![],
+                time_field: None,
+                over: std::time::Duration::from_secs(300),
+                fields: vec![FieldDef {
+                    name: "x".into(),
+                    field_type: bt(BaseType::Chars),
+                }],
+            },
+        ]
+    }
+
+    /// 常量 `let` 阈值不得让字段用量分析产生「幽灵列」（以 let 名命名的列）——
+    /// 内联发生在编译期，分析必须与手写字面量版完全一致。
+    #[test]
+    fn const_let_threshold_does_not_add_phantom_columns() {
+        let literal_src = r#"
+rule literal_threshold {
+    events { e : auth_events }
+    match<sip:5m> { on event { e.action | distinct | count >= 3; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+        let via_let_src = r#"
+rule let_threshold {
+    events { e : auth_events }
+    let THRESHOLD = 3
+    match<sip:5m> { on event { e.action | distinct | count >= THRESHOLD; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+        let compile = |src: &str| {
+            let file = parse_wfl(src).expect("parse");
+            compile_wfl(&file, &schemas()).expect("compile")
+        };
+        let literal = compute_window_field_usage(&compile(literal_src));
+        let via_let = compute_window_field_usage(&compile(via_let_src));
+        // HashSet 无迭代序保证 → 统一排序后比较（否则断言会随哈希顺序闪烁）。
+        let sorted = |set: &std::collections::HashSet<String>| {
+            let mut v: Vec<String> = set.iter().cloned().collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            sorted(&literal.global_fields),
+            sorted(&via_let.global_fields),
+            "字段用量必须与手写字面量版一致（无 THRESHOLD 幽灵列）"
+        );
+        assert_eq!(sorted(&literal.needs_all), sorted(&via_let.needs_all));
+        assert_eq!(
+            sorted(&literal.defer_materialization),
+            sorted(&via_let.defer_materialization)
+        );
+        assert!(
+            !via_let.global_fields.contains("THRESHOLD"),
+            "let 名不得出现在字段用量里"
+        );
+    }
+}

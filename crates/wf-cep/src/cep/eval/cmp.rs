@@ -83,47 +83,18 @@ impl FromBinOp for CmpOp {
 /// numeric literals).  Returns `None` for expressions that cannot be
 /// statically resolved to a number (field refs, function calls, etc.)
 /// — callers must fall back to value-based comparison.
+///
+/// 折叠规则的定义在 `wf_lang::const_fold`（单一真源）：checker 的阈值常量性判定
+/// 与本函数共用同一份规则，避免两处漂移（warp-fusion#101）。
 pub fn try_eval_expr_to_f64(expr: &Expr) -> Option<f64> {
-    match expr {
-        Expr::Number(n) => Some(*n),
-        Expr::Neg(inner) => try_eval_expr_to_f64(inner).map(|v| -v),
-        Expr::BinOp { op, left, right } => {
-            let l = try_eval_expr_to_f64(left)?;
-            let r = try_eval_expr_to_f64(right)?;
-            fold_f64_binop(op, l, r)
-        }
-        _ => None,
-    }
-}
-
-/// 常量折叠的 f64 算术（除/模零 → None; 非算术算子 → None）。
-fn fold_f64_binop(op: &BinOp, l: f64, r: f64) -> Option<f64> {
-    match op {
-        BinOp::Add => Some(l + r),
-        BinOp::Sub => Some(l - r),
-        BinOp::Mul => Some(l * r),
-        BinOp::Div => {
-            if r == 0.0 {
-                None
-            } else {
-                Some(l / r)
-            }
-        }
-        BinOp::Mod => {
-            if r == 0.0 {
-                None
-            } else {
-                Some(l % r)
-            }
-        }
-        _ => None,
-    }
+    wf_lang::const_fold::try_eval_expr_to_f64(expr)
 }
 
 /// Try to evaluate a threshold expression to a [`Value`].
 /// Returns `Some` for literal constants (Number, String, Bool) and
 /// constant arithmetic (Neg, BinOp on numeric literals).
-/// Returns `None` for non-constant expressions (field refs, func calls, etc.).
+/// Returns `None` for non-constant expressions (field refs, func calls, etc.)
+/// — `check_threshold` 据此判为「不满足」（分支永不触发）。
 pub fn try_eval_expr_to_value(expr: &Expr) -> Option<Value> {
     match expr {
         Expr::Number(n) => Some(Value::Number(*n)),
@@ -366,6 +337,36 @@ mod tests {
             try_eval_expr_to_value(&Expr::Field(FieldRef::Simple("x".into()))),
             None
         );
+    }
+
+    /// 跨 crate 不变量：触发判定的可求值性必须与 checker 的阈值常量性判据一致
+    /// （共用 `wf_lang::const_fold`）。两处一旦漂移，就会出现「编译期放行、运行期
+    /// 永不触发」的静默失效（warp-fusion#101）。
+    #[test]
+    fn foldability_matches_checker_threshold_rule() {
+        let cases = vec![
+            en(5.0),
+            Expr::Neg(Box::new(en(1.0))),
+            bin(BinOp::Add, en(1.0), en(2.0)),
+            bin(BinOp::Div, en(1.0), en(2.0)),
+            bin(BinOp::Mul, bin(BinOp::Add, en(1.0), en(2.0)), en(3.0)),
+            // 退化常量：折叠不出结果 → 两侧都判不可用
+            bin(BinOp::Div, en(1.0), en(0.0)),
+            bin(BinOp::Mod, en(1.0), en(0.0)),
+            bin(BinOp::Eq, en(1.0), en(1.0)),
+            // 非常量形态
+            Expr::Field(FieldRef::Simple("x".into())),
+            Expr::Neg(Box::new(Expr::Bool(true))),
+            Expr::StringLit("s".into()),
+            Expr::Bool(false),
+        ];
+        for expr in cases {
+            assert_eq!(
+                try_eval_expr_to_value(&expr).is_some(),
+                wf_lang::const_fold::is_foldable_threshold(&expr),
+                "可求值性与 checker 判据漂移: {expr:?}"
+            );
+        }
     }
 
     #[test]

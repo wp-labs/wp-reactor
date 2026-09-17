@@ -237,15 +237,17 @@ runtime: runtime/wfusion.toml
 **集合函数**（窗口内值收集）：
 - `collect_set(alias.field)` → array/T：去重值收集（用于行为模式提取：一个会话访问了哪些资源）。
 - `collect_list(alias.field)` → array/T：有序值收集（用于操作序列还原：按时间排列的操作链）。
-- `first(alias.field)` → T：保留的最近字段样本中的首个值。
-- `last(alias.field)` → T：保留的最近字段样本中的末个值。
+- `first(alias.field)` → T：实例内按到达序首个被接受事件的字段值（跨整个实例窗口稳定，可用于组成稳定的聚合唯一键）。
+- `last(alias.field)` → T：实例内按到达序最后被接受事件的字段值。
 
 `collect_set(alias.field)` 和 `stat.count(window_event(alias))` 使用同一个 rule instance
 内的 alias 事件集合；前者输出该集合中字段值的去重数组，后者输出该集合的事件数。
 如果某条事件缺少 `field`，它仍计入 `stat.count(window_event(alias))`，但不会进入
-`collect_set(alias.field)` 的数组。alias 字段集合保留最近最多 1024 个字段值；
-`collect_set` / `collect_list` / `first` / `last` 均基于这组最近样本；大窗口或重复字段值
-场景下，`collect_set(alias.field)` 的数组长度可能小于 `stat.count(window_event(alias))`。
+`collect_set(alias.field)` 的数组。alias 字段样本集合规模有界：首个样本始终保留，另保留
+最近最多 1024 个样本（合计至多 1025 个）；`collect_set` / `collect_list` / `first` / `last`
+均基于这组样本。因此 `first` 不受窗口规模影响（始终是最早事件的值），`last` 始终是最新事件
+的值；大窗口或重复字段值场景下，`collect_set(alias.field)` 的数组长度可能小于
+`stat.count(window_event(alias))`。
 
 **会话窗口**：`match<key:session(gap)>`
 - 按活动间隔自动分割会话：相邻事件时间差超过 `gap` 即切分新窗口。
@@ -402,7 +404,20 @@ close_mode    = "on"                                    (* OR 模式：事件路
 match_step    = step_branch , { "||" , step_branch } , ";" ;
 step_branch   = [ IDENT , ":" ] , source_ref , [ "." , IDENT | "[" , STRING , "]" ] , [ "&&" , expr ] , pipe_chain ;
 source_ref    = IDENT ;                (* events 别名 或 |> 后续 stage 的 _in *)
+(* 全局硬限制（超限一律编译期报错）：
+   1) 表达式嵌套分组 <= 5 层——防深嵌套把递归下降打爆栈（栈溢出不可捕获）；
+   2) 同一分组内的算子链 <= 16 层（`a+b+c`、`a||b||c`、`not not …` 各算一层，
+      分组重置计数）——算子链在解析器里是 loop、不吃解析栈，却会构造出与项数
+      同阶的左深 AST，下游按 AST 递归的遍历（类型检查 / 常量折叠 / let 内联 /
+      键派生 / 代码生成）同样会打爆栈；两条限制合起来给出「任一表达式沿路径的
+      链式深度 <= (5+1) x 16 = 96 层」的硬上界（实测安全线 ~254 层）；
+   3) 规则级 `let` 引用链 <= 5 层；*)
 pipe_chain    = { "|" , transform } , "|" , measure , cmp_op , atomic_expr ;
+                (* atomic_expr 必须是编译期常量：数字/字符串字面量（可取负、可括号算术），
+                   或规则级常量 let（编译期内联为字面量；warp-fusion#101）。
+                   pipeline stage 内规则级 let 不可用（stage scope 无 let 绑定）。
+                   字段引用 / 函数调用在触发判定中求值不出结果 → 分支永不触发，
+                   checker 直接拒绝（warp-fusion#101）。 *)
 transform     = "distinct" ;
 measure       = "count" | "sum" | "avg" | "min" | "max" ;
 
@@ -581,14 +596,14 @@ ANY           = ? any unicode char ? ;
 | `abs`/`ceil`/`floor`/`round`/`sqrt`/`exp`/`sign`/`trunc`/`pow`/`log`/`clamp`/`is_finite` | 数学函数 | L2 | 数值表达式辅助函数 |
 | `strftime` / `strptime` | 时间格式化/解析 | L2 | time/chars 转换 |
 | `sha1_n` | `sha1_n(text, length)` → chars | L2 | SHA-1 小写十六进制前 N 位，N 为 1 到 40 的整数 |
-| `collect_set` | `collect_set(alias.field)` → array/T | L3 | 窗口内最近最多 1024 个字段值的去重收集；与 `stat.count(window_event(alias))` 基于同一 alias 事件集合 |
-| `collect_list` | `collect_list(alias.field)` → array/T | L3 | 窗口内最近最多 1024 个字段值的有序收集 |
+| `collect_set` | `collect_set(alias.field)` → array/T | L3 | 窗口内字段值样本（首个样本 + 最近最多 1024 个）的去重收集；与 `stat.count(window_event(alias))` 基于同一 alias 事件集合 |
+| `collect_list` | `collect_list(alias.field)` → array/T | L3 | 窗口内字段值样本（首个样本 + 最近最多 1024 个）的有序收集 |
 | `mvjoin` | `mvjoin(array_expr, separator)` → chars | L3 | 多值数组按分隔符拼接为字符串（SPL 对齐能力） |
 | `mvdedup` | `mvdedup(array_expr)` → array/T | L3 | 多值数组去重（保留首次出现顺序） |
 | `mvindex` | `mvindex(array_expr, index[, end])` → T/array | L3 | 多值数组取元素或切片 |
 | `mvsort` / `mvreverse` | `mvsort(array_expr)` / `mvreverse(array_expr)` → array/T | L3 | 多值数组排序/反转 |
-| `first` | `first(alias.field)` → T | L3 | 最近字段样本中的首个值 |
-| `last` | `last(alias.field)` → T | L3 | 最近字段样本中的末个值 |
+| `first` | `first(alias.field)` → T | L3 | 实例内按到达序首个被接受事件的字段值（跨整个实例窗口稳定） |
+| `last` | `last(alias.field)` → T | L3 | 实例内按到达序最后被接受事件的字段值 |
 | `stddev` | `stddev(alias.field)` → float | L3 | 标准差 |
 | `percentile` | `percentile(alias.field, p)` → float | L3 | 分位数（p 为 0~100） |
 | `mvcount` | `mvcount(array_expr)` → digit | L3 | 多值/集合元素个数（SPL 对齐能力） |
@@ -1981,11 +1996,11 @@ rollback_to: "risk_scores@v1"
 
 ## 18. 测试数据生成工具方案（wfgen）
 
-本章节已从 WFL 主规范中拆分，迁移到独立文档：
-
-- 设计文档：`docs/design/wfg-design.md`
+本章节已从 WFL 主规范中拆分：
 
 说明：
 
 - WFG（场景 DSL）进入独立演进周期，与 WFL 主规范解耦维护。
-- 本文不再维护 WFG 详细语法与 EBNF；以 `wfg-design.md` 为唯一准入规范。
+- 本文不再维护 WFG 详细语法与 EBNF；`.wfg` 的解析器/AST 与生成器均位于
+  `warp-fusion` 仓库的 `wfgen` crate，主设计文档为
+  `warp-fusion/docs/design/wfg-design.md`。

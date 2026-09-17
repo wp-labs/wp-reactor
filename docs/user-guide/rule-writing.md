@@ -98,6 +98,8 @@ match<attacker_ip:1d:fixed> {
 
 派生/嵌套 key 的缺失、为空或路径中途漏写段 → 该事件不进入任何实例（与普通 key 缺失行为一致）。v1 限制：仅单事件源规则；与 `rule_shards > 1`、`conv`、pipeline stage 组合暂不支持（详见语言参考）。
 
+阈值（`count >= 3` 里的 `3`）必须是**编译期常量**：数字 / 字符串字面量（可取负、可用括号做常量算术），或者引用规则级**常量** `let`（如 `let THRESHOLD = 3`——编译期内联为字面量后与手写等价；`|>` pipeline 的 stage 内不可引用规则级 `let`）。字段引用、非常量 `let` 引用与函数调用不能用在阈值位置——它们在触发判定时求值不出结果，该分支会永不触发，因此编译期直接报错（issue #101）。
+
 **`on event { failed_hits: fail | count >= 3; }`**
 
 事件触发条件。`failed_hits` 是 step label，用于在 `yield` 中稳定引用这一步的统计值；`fail` 引用 events 中绑定的别名，`|` 后是聚合条件：`fail` 事件的 `count`（累积计数）达到 3。
@@ -203,7 +205,7 @@ yield security_alerts (
 - 事件时间：窗口内该实体的候选事件（进入实例的被接受事件）首尾——`first_seen` / `last_seen` 用 `@event_first_time` / `@event_last_time`。
 - 证据时间：本次命中实际依据的事件跨度——用 `@evidence_start_time` / `@evidence_end_time`。
 - 窗口时间：规则窗口的开始和结束时间。
-- 分析时间：本次告警输出的时间（`@emit_time`）与首次命中处理时刻（`@first_match_time`）。
+- 分析时间：本次告警输出的时间（`@emit_time`）与首次命中处理时刻（`@first_match_time`）——后者是实例第一次满足条件的系统墙钟，重复输出保持首次值、迟到/乱序事件不覆盖、新实例重置、未命中无值；`on each` 即当前匹配事件的系统时间。
 
 建议把这些字段作为业务字段写入输出 window：
 
@@ -220,6 +222,7 @@ window security_alerts {
         rule_window_start: time
         rule_window_end: time
         latest_analysis_time: time
+        first_match_time: time
     }
 }
 ```
@@ -235,14 +238,15 @@ yield security_alerts (
     evidence_end_time = @evidence_end_time,
     rule_window_start = @window_start_time,
     rule_window_end = @window_end_time,
-    latest_analysis_time = @emit_time
+    latest_analysis_time = @emit_time,
+    first_match_time = @first_match_time
 )
 ```
 
 命名建议：
 
 - 对外字段使用 `first_seen` / `last_seen` 这类业务名时，右侧仍映射到明确语义的系统变量。
-- 时间系统变量在表达式里的数值表示为 epoch milliseconds；写入 `time` 字段时按时间类型输出。
+- 时间系统变量在表达式里的数值表示为 epoch milliseconds；写入 `time` 字段时按时间类型输出；需要毫秒数字字段时用 `time_to_ms(@first_match_time)`。
 - 不使用 `event_fst_time` / `event_lst_time` 这类缩写，避免用户误解。
 - 不依赖 `__wfu_emit_time` 等内部元数据作为业务输出；需要业务字段时在 `yield` 中显式赋值。
 
@@ -572,7 +576,7 @@ WFL 在 `match` 条件和 `yield` 赋值中均可使用内置函数：
 | | `split(s, sep)` | 拆分为多值数组 |
 | **多值** | `mvindex(arr, i)`, `mvsort(arr)`, `mvreverse(arr)` | 数组操作 |
 | | `mvjoin(arr, sep)` | 数组拼接为字符串 |
-| | `collect_set(alias.field)`, `collect_list(alias.field)` | 窗口内最近字段样本收集 |
+| | `collect_set(alias.field)`, `collect_list(alias.field)` | 窗口内字段样本收集（首个样本 + 最近最多 1024 个） |
 | **空值/空白** | `coalesce(a, b, ...)`, `isnull`, `isnotnull` | 按顺序取第一个非 null 且非 blank 字符串的值 |
 | **Hash/ID** | `md5`, `sha1`, `sha1_n`, `sha256`, `hex`, `stable_id` | Hash、编码与稳定 ID |
 | **时间** | `strptime(s, fmt)`, `strftime(t, fmt)` | 时间解析与格式化 |

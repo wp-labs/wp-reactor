@@ -195,54 +195,85 @@ pub enum Expr {
 // `regex_match(f, re)`，re 为 let 声明）。此类引用在 type-check 与 plan 编译前
 // 内联为字面量——行/列两条求值路径看到的与手写内联正则完全一致。
 // 非字面量 let 的引用保持原样（Simple(let 名)），由 checker 显式报错。
+/// 内联模式：只认字符串字面量（events 条件正则复用，issue #90），或任意可折叠
+/// 的常量标量（阈值常量，issue #101）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConstLetMode {
+    /// 仅 `StringLit`（其余形态保留原引用，由 checker 报错）。
+    StringOnly,
+    /// 常量标量：`Number` / `StringLit` / `Bool` 原样，常量算术折叠为数字字面量。
+    Scalar,
+}
 
-/// 递归展开引用：`FieldRef::Simple(let 名)` 且该 let 的 RHS（经 let 链递归）
-/// 解析为字符串字面量时，就地替换为 `StringLit`；否则（非字面量 let / 事件
-/// 字段 / Qualified / Path / 自引用）保留原引用。`visiting` 防 let 自引用死循环。
+/// 递归展开引用：`FieldRef::Simple(let 名)` 且该 let 的 RHS（经 let 链递归）解析为
+/// 字符串字面量时，就地替换为 `StringLit`；否则（非字面量 let / 事件字段 /
+/// Qualified / Path / 自引用）保留原引用。`visiting` 防 let 自引用死循环。
 pub(crate) fn inline_const_string_lets(
     expr: &Expr,
     lets: &[crate::ast::LetDecl],
     visiting: &mut Vec<String>,
 ) -> Expr {
+    inline_const_lets(expr, lets, visiting, ConstLetMode::StringOnly)
+}
+
+/// 同 [`inline_const_string_lets`]，但放宽到任何**可折叠的常量标量**（阈值位置用，
+/// issue #101）：`let THRESHOLD = 5` / `let RE = "..."` / 常量算术都能内联为字面量，
+/// 使阈值满足「触发判定可求值」的约束；不可折叠的引用保持原样，交给 checker 拒绝。
+pub(crate) fn inline_const_scalar_lets(
+    expr: &Expr,
+    lets: &[crate::ast::LetDecl],
+    visiting: &mut Vec<String>,
+) -> Expr {
+    inline_const_lets(expr, lets, visiting, ConstLetMode::Scalar)
+}
+
+fn inline_const_lets(
+    expr: &Expr,
+    lets: &[crate::ast::LetDecl],
+    visiting: &mut Vec<String>,
+    mode: ConstLetMode,
+) -> Expr {
+    // 递归时统一带上 mode，避免两套遍历逻辑漂移。
+    // `let a = b` 链的展开深度也是用户可控的（链长 = `visiting` 长度），与表达式
+    // 嵌套同属「递归吃栈」风险：超过同一上限即停止内联（保留原引用，由阈值常量性
+    // 检查报「无法求值」），而不是继续递归。见 wfl_parser/expr 的 MAX_EXPR_NESTING。
+    const MAX_INLINE_CHAIN: usize = crate::ast::MAX_NESTING_LEVELS;
+    let rec = |e: &Expr, visiting: &mut Vec<String>| {
+        if visiting.len() >= MAX_INLINE_CHAIN {
+            return e.clone();
+        }
+        inline_const_lets(e, lets, visiting, mode)
+    };
     match expr {
         Expr::Field(FieldRef::Simple(name)) => {
             if !visiting.iter().any(|v| v == name) && lets.iter().any(|l| &l.name == name) {
                 visiting.push(name.clone());
-                let expanded = inline_const_string_lets(
+                let expanded = rec(
                     &lets.iter().find(|l| &l.name == name).unwrap().expr,
-                    lets,
                     visiting,
                 );
                 visiting.pop();
-                if let Expr::StringLit(_) = expanded {
-                    return expanded;
+                if let Some(literal) = const_let_literal(&expanded, mode) {
+                    return literal;
                 }
             }
             expr.clone()
         }
         Expr::BinOp { op, left, right } => Expr::BinOp {
             op: *op,
-            left: Box::new(inline_const_string_lets(left, lets, visiting)),
-            right: Box::new(inline_const_string_lets(right, lets, visiting)),
+            left: Box::new(rec(left, visiting)),
+            right: Box::new(rec(right, visiting)),
         },
-        Expr::Neg(inner) => Expr::Neg(Box::new(inline_const_string_lets(inner, lets, visiting))),
-        Expr::Not(inner) => Expr::Not(Box::new(inline_const_string_lets(inner, lets, visiting))),
-        Expr::Array(items) => Expr::Array(
-            items
-                .iter()
-                .map(|i| inline_const_string_lets(i, lets, visiting))
-                .collect(),
-        ),
+        Expr::Neg(inner) => Expr::Neg(Box::new(rec(inner, visiting))),
+        Expr::Not(inner) => Expr::Not(Box::new(rec(inner, visiting))),
+        Expr::Array(items) => Expr::Array(items.iter().map(|i| rec(i, visiting)).collect()),
         Expr::InList {
             expr: target,
             list,
             negated,
         } => Expr::InList {
-            expr: Box::new(inline_const_string_lets(target, lets, visiting)),
-            list: list
-                .iter()
-                .map(|i| inline_const_string_lets(i, lets, visiting))
-                .collect(),
+            expr: Box::new(rec(target, visiting)),
+            list: list.iter().map(|i| rec(i, visiting)).collect(),
             negated: *negated,
         },
         Expr::IfThenElse {
@@ -250,30 +281,24 @@ pub(crate) fn inline_const_string_lets(
             then_expr,
             else_expr,
         } => Expr::IfThenElse {
-            cond: Box::new(inline_const_string_lets(cond, lets, visiting)),
-            then_expr: Box::new(inline_const_string_lets(then_expr, lets, visiting)),
-            else_expr: Box::new(inline_const_string_lets(else_expr, lets, visiting)),
+            cond: Box::new(rec(cond, visiting)),
+            then_expr: Box::new(rec(then_expr, visiting)),
+            else_expr: Box::new(rec(else_expr, visiting)),
         },
         Expr::Match {
             expr: subject,
             arms,
             default,
         } => Expr::Match {
-            expr: Box::new(inline_const_string_lets(subject, lets, visiting)),
+            expr: Box::new(rec(subject, visiting)),
             arms: arms
                 .iter()
                 .map(|arm| crate::ast::MatchArm {
-                    patterns: arm
-                        .patterns
-                        .iter()
-                        .map(|p| inline_const_string_lets(p, lets, visiting))
-                        .collect(),
-                    value: inline_const_string_lets(&arm.value, lets, visiting),
+                    patterns: arm.patterns.iter().map(|p| rec(p, visiting)).collect(),
+                    value: rec(&arm.value, visiting),
                 })
                 .collect(),
-            default: default
-                .as_ref()
-                .map(|d| Box::new(inline_const_string_lets(d, lets, visiting))),
+            default: default.as_ref().map(|d| Box::new(rec(d, visiting))),
         },
         Expr::Object(items) => Expr::Object(
             items
@@ -281,7 +306,7 @@ pub(crate) fn inline_const_string_lets(
                 .map(|it| crate::ast::ObjectItem {
                     targets: it.targets.clone(),
                     type_hint: it.type_hint.clone(),
-                    value: inline_const_string_lets(&it.value, lets, visiting),
+                    value: rec(&it.value, visiting),
                 })
                 .collect(),
         ),
@@ -292,10 +317,7 @@ pub(crate) fn inline_const_string_lets(
         } => Expr::FuncCall {
             qualifier: qualifier.clone(),
             name: name.clone(),
-            args: args
-                .iter()
-                .map(|a| inline_const_string_lets(a, lets, visiting))
-                .collect(),
+            args: args.iter().map(|a| rec(a, visiting)).collect(),
         },
         // 叶子：非 Simple 字段引用与字面量保持原样。
         Expr::Field(_)
@@ -306,6 +328,18 @@ pub(crate) fn inline_const_string_lets(
         | Expr::WfuMeta(_)
         | Expr::PresetParam(_)
         | Expr::ListRef(_) => expr.clone(),
+    }
+}
+
+/// 内联替换值：`mode` 允许的常量字面量；不可折叠 → `None`（调用方保留原引用）。
+fn const_let_literal(expanded: &Expr, mode: ConstLetMode) -> Option<Expr> {
+    match expanded {
+        Expr::StringLit(_) => Some(expanded.clone()),
+        Expr::Number(_) | Expr::Bool(_) if mode == ConstLetMode::Scalar => Some(expanded.clone()),
+        _ if mode == ConstLetMode::Scalar => {
+            crate::const_fold::try_eval_expr_to_f64(expanded).map(Expr::Number)
+        }
+        _ => None,
     }
 }
 
@@ -375,4 +409,171 @@ pub(crate) fn collect_rule_let_refs(expr: &Expr, lets: &[crate::ast::LetDecl]) -
     let mut out = Vec::new();
     go(expr, lets, &mut out);
     out
+}
+
+#[cfg(test)]
+mod inline_const_lets_tests {
+    use super::*;
+    use crate::ast::{BinOp, Expr, FieldRef, LetDecl};
+
+    fn num(v: f64) -> Expr {
+        Expr::Number(v)
+    }
+    fn field(name: &str) -> Expr {
+        Expr::Field(FieldRef::Simple(name.into()))
+    }
+    fn binop(op: BinOp, l: Expr, r: Expr) -> Expr {
+        Expr::BinOp {
+            op,
+            left: Box::new(l),
+            right: Box::new(r),
+        }
+    }
+    fn leto(name: &str, expr: Expr) -> LetDecl {
+        LetDecl {
+            name: name.into(),
+            expr,
+        }
+    }
+
+    fn inline_string(e: &Expr, lets: &[LetDecl]) -> Expr {
+        inline_const_string_lets(e, lets, &mut Vec::new())
+    }
+    fn inline_scalar(e: &Expr, lets: &[LetDecl]) -> Expr {
+        inline_const_scalar_lets(e, lets, &mut Vec::new())
+    }
+
+    // ---- StringOnly：既有行为不得变化（events 条件正则复用，issue #90） ----
+
+    #[test]
+    fn string_mode_inlines_only_string_literals() {
+        let lets = vec![
+            leto("RE", Expr::StringLit("^a.*$".into())),
+            leto("N", num(5.0)),
+            leto("B", Expr::Bool(true)),
+            leto("CHAIN", field("RE")),
+        ];
+        assert_eq!(
+            inline_string(&field("RE"), &lets),
+            Expr::StringLit("^a.*$".into())
+        );
+        assert_eq!(
+            inline_string(&field("CHAIN"), &lets),
+            Expr::StringLit("^a.*$".into())
+        );
+        // 非字符串 let 与事件字段保持原引用（由 checker 报错）。
+        assert_eq!(inline_string(&field("N"), &lets), field("N"));
+        assert_eq!(inline_string(&field("B"), &lets), field("B"));
+        assert_eq!(inline_string(&field("sip"), &lets), field("sip"));
+    }
+
+    #[test]
+    fn string_mode_traverses_nested_expressions() {
+        let lets = vec![leto("RE", Expr::StringLit("^a$".into()))];
+        let call = Expr::FuncCall {
+            qualifier: None,
+            name: "regex_match".into(),
+            args: vec![field("sip"), field("RE")],
+        };
+        let Expr::FuncCall { args, .. } = inline_string(&call, &lets) else {
+            panic!("应是函数调用");
+        };
+        assert_eq!(args[1], Expr::StringLit("^a$".into()));
+    }
+
+    // ---- Scalar：阈值常量（issue #101） ----
+
+    #[test]
+    fn scalar_mode_inlines_literals_and_constant_arithmetic() {
+        let lets = vec![
+            leto("T", num(3.0)),
+            leto("S", Expr::StringLit("abc".into())),
+            leto("B", Expr::Bool(true)),
+            leto("ARITH", binop(BinOp::Add, num(2.0), num(1.0))),
+            leto("NEG", Expr::Neg(Box::new(num(4.0)))),
+            leto("CHAIN", field("ARITH")),
+        ];
+        assert_eq!(inline_scalar(&field("T"), &lets), num(3.0));
+        assert_eq!(
+            inline_scalar(&field("S"), &lets),
+            Expr::StringLit("abc".into())
+        );
+        assert_eq!(inline_scalar(&field("B"), &lets), Expr::Bool(true));
+        // 常量算术 / 取负折叠为单个数字字面量（触发判定只做常量折叠）。
+        assert_eq!(inline_scalar(&field("ARITH"), &lets), num(3.0));
+        assert_eq!(inline_scalar(&field("NEG"), &lets), num(-4.0));
+        assert_eq!(inline_scalar(&field("CHAIN"), &lets), num(3.0));
+    }
+
+    #[test]
+    fn scalar_mode_keeps_unfoldable_references() {
+        let lets = vec![
+            leto("DEP", field("e.count")),
+            leto(
+                "CALL",
+                Expr::FuncCall {
+                    qualifier: None,
+                    name: "abs".into(),
+                    args: vec![num(-3.0)],
+                },
+            ),
+            leto("DEGEN", binop(BinOp::Div, num(1.0), num(0.0))),
+        ];
+        // 依赖事件字段 / 函数调用 / 退化常量都不可折叠 → 保留原引用（由 checker 拒绝）。
+        assert_eq!(inline_scalar(&field("DEP"), &lets), field("DEP"));
+        assert_eq!(inline_scalar(&field("CALL"), &lets), field("CALL"));
+        assert_eq!(inline_scalar(&field("DEGEN"), &lets), field("DEGEN"));
+        assert_eq!(inline_scalar(&field("sip"), &lets), field("sip"));
+    }
+
+    #[test]
+    fn cycles_terminate_and_keep_original_reference() {
+        // 自引用与互引用都不得死循环；无法解析为常量时保留原引用。
+        let self_ref = vec![leto("A", field("A"))];
+        assert_eq!(inline_scalar(&field("A"), &self_ref), field("A"));
+
+        let mutual = vec![leto("A", field("B")), leto("B", field("A"))];
+        assert_eq!(inline_scalar(&field("A"), &mutual), field("A"));
+        assert_eq!(inline_scalar(&field("B"), &mutual), field("B"));
+    }
+
+    #[test]
+    fn let_chain_within_limit_is_inlined() {
+        // 5 条声明的链（L0..L4）在链深上限内 → 解析为字面量。
+        let mut lets: Vec<LetDecl> = vec![leto("L0", num(7.0))];
+        for i in 1..5 {
+            lets.push(leto(&format!("L{i}"), field(&format!("L{}", i - 1))));
+        }
+        assert_eq!(inline_scalar(&field("L4"), &lets), num(7.0));
+    }
+
+    #[test]
+    fn let_chain_beyond_limit_is_left_uninlined_without_overflow() {
+        // 深链（50 层）曾把内联递归打进栈溢出：现在超过链深上限即停止内联、保留
+        // 原引用（由阈值常量性检查报「无法求值」），绝不继续递归吃栈。
+        let mut lets: Vec<LetDecl> = vec![leto("L0", num(7.0))];
+        for i in 1..50 {
+            lets.push(leto(&format!("L{i}"), field(&format!("L{}", i - 1))));
+        }
+        assert_eq!(
+            inline_scalar(&field("L49"), &lets),
+            field("L49"),
+            "超过链深上限不得继续展开"
+        );
+    }
+
+    #[test]
+    fn scalar_mode_traverses_binop_and_call_args() {
+        let lets = vec![leto("T", num(3.0))];
+        // `(T + 1)` 中的 let 引用被内联 → 常量算术进而可折叠为 4。
+        let expr = binop(BinOp::Add, field("T"), num(1.0));
+        assert_eq!(
+            inline_scalar(&expr, &lets),
+            binop(BinOp::Add, num(3.0), num(1.0))
+        );
+        assert_eq!(
+            crate::const_fold::try_eval_expr_to_f64(&inline_scalar(&expr, &lets)),
+            Some(4.0)
+        );
+    }
 }
