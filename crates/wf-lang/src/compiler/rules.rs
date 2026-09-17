@@ -306,7 +306,14 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
     let entity_plan = compile_entity(&rule.entity, &labels);
     let yield_plan = compile_yield(&rule.yield_clause, file, &labels);
     let binds = compile_binds(&rule.events, &rule.lets);
-    let mut match_plan = compile_match(&rule.match_clause, false, &binds, &rule.joins, schemas);
+    let mut match_plan = compile_match(
+        &rule.match_clause,
+        false,
+        &binds,
+        &rule.joins,
+        schemas,
+        &rule.lets,
+    );
     // issue #83/#80：派生 key（match key 引用 let 绑定）编译装配。
     // - 纯字段/嵌套路径 let（#83）：内联为等值 FieldRef（与直接写嵌套路径 key
     //   聚合结果一致），key_exprs 槽位为 None——引擎按普通字段/路径提取。
@@ -499,7 +506,8 @@ fn compile_pipeline_rule(
             }]
         };
 
-        let mut match_plan = compile_match(match_clause, !is_final, &binds, joins, schemas);
+        let mut match_plan =
+            compile_match(match_clause, !is_final, &binds, joins, schemas, &rule.lets);
         // `as label` 归约标签集（仅最终 stage 的 score/entity/yield 可引用；
         // 非最终 stage 的 yield/entity 为自动生成，无用户表达式）。
         let labels: HashSet<String> = if is_final {

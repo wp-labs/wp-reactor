@@ -17,6 +17,7 @@ pub(super) fn compile_match(
     binds: &[BindPlan],
     joins: &[crate::ast::JoinClause],
     schemas: &[WindowSchema],
+    lets: &[crate::ast::LetDecl],
 ) -> MatchPlan {
     let (keys, key_map) = if let Some(ref km) = mc.key_mapping {
         // When key mapping is present, use logical key names as keys
@@ -77,13 +78,17 @@ pub(super) fn compile_match(
                 .iter()
                 .filter(|s| !s.neg)
                 .map(|s| StepPlan {
-                    branches: vec![compile_branch(&s.branch, inject_implicit_stage_labels)],
+                    branches: vec![compile_branch(
+                        &s.branch,
+                        inject_implicit_stage_labels,
+                        lets,
+                    )],
                 })
                 .collect()
         } else {
             mc.on_event
                 .iter()
-                .map(|s| compile_step(s, inject_implicit_stage_labels))
+                .map(|s| compile_step(s, inject_implicit_stage_labels, lets))
                 .collect()
         },
         close_steps: mc
@@ -92,7 +97,7 @@ pub(super) fn compile_match(
             .map(|cb| {
                 cb.steps
                     .iter()
-                    .map(|s| compile_step(s, inject_implicit_stage_labels))
+                    .map(|s| compile_step(s, inject_implicit_stage_labels, lets))
                     .collect()
             })
             .unwrap_or_default(),
@@ -114,7 +119,7 @@ pub(super) fn compile_match(
                 .map(|s| SeqStepPlan {
                     neg: s.neg,
                     within: s.within,
-                    branch: compile_branch(&s.branch, inject_implicit_stage_labels),
+                    branch: compile_branch(&s.branch, inject_implicit_stage_labels, lets),
                 })
                 .collect(),
         }),
@@ -199,12 +204,16 @@ fn resolve_join_key(
     })
 }
 
-fn compile_step(step: &crate::ast::MatchStep, inject_implicit_stage_labels: bool) -> StepPlan {
+fn compile_step(
+    step: &crate::ast::MatchStep,
+    inject_implicit_stage_labels: bool,
+    lets: &[crate::ast::LetDecl],
+) -> StepPlan {
     StepPlan {
         branches: step
             .branches
             .iter()
-            .map(|b| compile_branch(b, inject_implicit_stage_labels))
+            .map(|b| compile_branch(b, inject_implicit_stage_labels, lets))
             .collect(),
     }
 }
@@ -212,6 +221,7 @@ fn compile_step(step: &crate::ast::MatchStep, inject_implicit_stage_labels: bool
 fn compile_branch(
     branch: &crate::ast::StepBranch,
     inject_implicit_stage_labels: bool,
+    lets: &[crate::ast::LetDecl],
 ) -> BranchPlan {
     BranchPlan {
         label: branch.label.clone().or_else(|| {
@@ -228,7 +238,12 @@ fn compile_branch(
             transforms: branch.pipe.transforms.clone(),
             measure: branch.pipe.measure,
             cmp: branch.pipe.cmp,
-            threshold: branch.pipe.threshold.clone(),
+            // 规则级常量 `let` 内联为字面量（issue #101，与 checker 同机制）：
+            // 触发判定只做常量折叠，未内联的 `let` 引用会永不满足。
+            threshold: {
+                let mut visiting = Vec::new();
+                crate::ast::inline_const_scalar_lets(&branch.pipe.threshold, lets, &mut visiting)
+            },
         },
     }
 }

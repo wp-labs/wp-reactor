@@ -5,5 +5,6 @@ mod l3;
 mod l3_first_history;
 mod match_tests;
 mod misc;
+mod threshold_const_let;
 mod where_tests;
 mod yield_tests;

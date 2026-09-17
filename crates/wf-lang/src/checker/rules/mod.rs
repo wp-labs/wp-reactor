@@ -468,6 +468,7 @@ fn check_stage(
         &match_clause.on_event,
         scope,
         rule_name,
+        lets,
         errors,
         &mut labels_seen,
     );
@@ -476,6 +477,7 @@ fn check_stage(
             &close_block.steps,
             scope,
             rule_name,
+            lets,
             errors,
             &mut labels_seen,
         );
@@ -530,7 +532,14 @@ fn check_stage(
             })
             .collect();
         let mut chain_labels = HashSet::new();
-        steps::check_match_steps(&chain_steps, scope, rule_name, errors, &mut chain_labels);
+        steps::check_match_steps(
+            &chain_steps,
+            scope,
+            rule_name,
+            lets,
+            errors,
+            &mut chain_labels,
+        );
         check_seq(chain, match_clause.duration, rule_name, errors);
     }
 

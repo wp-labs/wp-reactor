@@ -368,14 +368,37 @@ rule r {
     );
 }
 
-/// 规则级 `let` 常量在阈值位置不会被内联（编译产物仍是字段引用）→ 拒绝并给出
-/// 明确约束；workaround 是把字面量直接写进阈值。
+/// 规则级**常量** `let` 作为阈值：编译期内联为字面量，因此合法可用。
 #[test]
-fn rule_let_const_threshold_rejected() {
+fn rule_let_const_threshold_accepted() {
+    for branch in [
+        "e.action | distinct | count >= THRESHOLD",
+        "e.count | min >= THRESHOLD",
+    ] {
+        let input = format!(
+            r#"
+rule r {{
+    events {{ e : auth_events }}
+    let THRESHOLD = 5
+    match<sip:5m> {{
+        on event {{ {branch}; }}
+    }} -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}}
+"#
+        );
+        assert_no_errors(&input, &[auth_events_window(), output_window()]);
+    }
+}
+
+/// 非常量 `let`（RHS 依赖事件字段）在阈值位置仍被拒绝。
+#[test]
+fn rule_let_non_const_threshold_rejected() {
     let input = r#"
 rule r {
     events { e : auth_events }
-    let thr = 5
+    let thr = e.count
     match<sip:5m> {
         on event { e.action | distinct | count >= thr; }
     } -> score(50.0)
@@ -394,11 +417,6 @@ rule r {
     assert!(
         msgs[0].contains("cannot be evaluated by the trigger check"),
         "错误应说明触发判定无法求值: {}",
-        msgs[0]
-    );
-    assert!(
-        msgs[0].contains("`thr`"),
-        "错误应回显 let 名（不臆断「逐事件求值」）: {}",
         msgs[0]
     );
 }

@@ -13,6 +13,7 @@ pub(crate) fn check_pipe_chain(
     branch: &StepBranch,
     scope: &Scope<'_>,
     rule_name: &str,
+    lets: &[crate::ast::LetDecl],
     errors: &mut Vec<CheckError>,
 ) {
     let has_field = branch.field.is_some();
@@ -121,13 +122,21 @@ pub(crate) fn check_pipe_chain(
         }
     }
 
+    // 阈值先内联规则级常量 `let`（与 events 条件同机制，issue #90）：阈值必须能被
+    // 触发判定折叠，`let THRESHOLD = 5` 这类命名常量属于常量，内联后与手写字面量
+    // 完全一致；不可折叠的引用保持原样，由下面的常量性检查拒绝。
+    let threshold = {
+        let mut visiting = Vec::new();
+        crate::ast::inline_const_scalar_lets(&branch.pipe.threshold, lets, &mut visiting)
+    };
+
     // Check threshold expression type
-    check_expr_type(&branch.pipe.threshold, scope, rule_name, errors);
+    check_expr_type(&threshold, scope, rule_name, errors);
 
     // F1（warp-fusion#101）：阈值必须是触发判定可求值的编译期常量。判据与
     // wf-cep `check_threshold` 共用 `wf_lang::const_fold`——折叠不出结果时该
     // 分支恒判「不满足」，运行期没有任何信号。
-    if let Some(message) = threshold_constant_violation(&branch.pipe.threshold) {
+    if let Some(message) = threshold_constant_violation(&threshold) {
         errors.push(CheckError {
             severity: Severity::Error,
             rule: Some(rule_name.to_string()),
@@ -138,7 +147,7 @@ pub(crate) fn check_pipe_chain(
 
     // T5: threshold type must be compatible with measure result type
     if let Some(result_type) = measure_result_type(branch.pipe.measure, &field_val_type)
-        && let Some(threshold_type) = infer_type(&branch.pipe.threshold, scope)
+        && let Some(threshold_type) = infer_type(&threshold, scope)
         && !compatible(&result_type, &threshold_type)
         && !(is_numeric(&result_type) && is_numeric(&threshold_type))
     {

@@ -222,7 +222,7 @@ match<sip:5m> {
 - key 支持**多层嵌套路径**（root 必须是结构化 object/array 字段），例如 `match<s.extensions_obj.obj.id:1d:fixed>`——按路径叶值分组，等价于把该叶先提取为顶层字段再用其分组；嵌套路径可含数组索引段（`s.roles_obj.related[0].uid`）
 - key 可引用**`let` 派生字段**（issue #83）：事件先按 `let` 定义求值再参与分组；`let` 定义可以是任意可推断为标量 key 类型的表达式（字段/嵌套路径、函数与字面量派生如 `concat`/`coalesce`/`case` 均可，issue #80），float/object/array 除外，窗口/状态依赖函数除外
 - 多步是顺序关系，前一步命中后才进入后一步
-- **阈值必须是编译期常量**（数字 / 字符串字面量；可取负、可用括号做常量算术）：触发判定只做常量折叠，字段引用、规则级 `let` 引用与函数调用（L3 集合函数、`now*`、`baseline` 等）无法求值 → 该分支永不触发；此类写法在编译期报错（issue #101）
+- **阈值必须是编译期常量**（数字 / 字符串字面量；可取负、可用括号做常量算术）：触发判定只做常量折叠，其中规则级**常量** `let`（如 `let THRESHOLD = 3`，含常量算术）在编译期内联为字面量，可直接用作阈值；字段引用、非常量 `let` 引用与函数调用（L3 集合函数、`now*`、`baseline` 等）无法求值 → 该分支永不触发，编译期报错（issue #101）
 
 派生 / 嵌套 key 示例：
 
@@ -1285,7 +1285,7 @@ Match 约束：
 - step 必须显式声明 source
 - `match` 至少需要有效的事件/关闭路径才能通过后续语义检查
 - `close_reason` 仅可在 `on close` 中引用
-- 阈值必须是编译期常量（数字 / 字符串字面量，可取负）；字段引用、`let` 引用与函数调用（L3 集合函数、`now*` / `baseline` 等）与除零/模零常量一并编译期拒绝（issue #101）
+- 阈值必须是编译期常量（数字 / 字符串字面量，可取负）；规则级常量 `let` 编译期内联后可用，字段引用、非常量 `let` 引用、函数调用（L3 集合函数、`now*` / `baseline` 等）与除零/模零常量一并编译期拒绝（issue #101）
 - `match` 与 `on each` 互斥
 - `conv` 仅允许与 fixed / hop 窗口搭配（sliding/session 拒绝）；`top_ties` 要求同 chain 前导 `sort`
 - `emit at`（deferred join）仅支持 `on each` 驱动形态
