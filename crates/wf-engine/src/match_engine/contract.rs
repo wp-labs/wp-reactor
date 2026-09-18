@@ -8,6 +8,7 @@ use crate::alert::OutputRecord;
 use crate::error::CoreResult;
 use crate::match_engine::cep::EngineHashMap;
 use crate::match_engine::cep::eval_expr;
+use crate::match_engine::cep::numeric_cmp;
 use crate::match_engine::{
     CepStateMachine, CloseReason, Event, RuleExecutor, StepResult, Value, WindowLookup,
 };
@@ -386,7 +387,7 @@ fn validate_hit_assert(
     failures: &mut Vec<String>,
 ) {
     match assert {
-        HitAssert::Score { cmp, value } if !compare_f64(*cmp, output.score, *value) => {
+        HitAssert::Score { cmp, value } if !numeric_cmp(*cmp, output.score, *value) => {
             failures.push(format!(
                 "hit[{}].score: expected {} {}, got {}",
                 index,
@@ -485,19 +486,6 @@ fn expr_to_value(expr: &Expr) -> Option<Value> {
         fields: EngineHashMap::default(),
     };
     eval_expr(expr, &empty_event)
-}
-
-fn compare_f64(cmp: CmpOp, actual: f64, expected: f64) -> bool {
-    match cmp {
-        CmpOp::Eq => (actual - expected).abs() < f64::EPSILON,
-        CmpOp::Ne => (actual - expected).abs() >= f64::EPSILON,
-        CmpOp::Lt => actual < expected,
-        CmpOp::Gt => actual > expected,
-        CmpOp::Le => actual <= expected,
-        CmpOp::Ge => actual >= expected,
-        #[allow(unreachable_patterns)]
-        _ => false,
-    }
 }
 
 fn compare_usize(cmp: CmpOp, actual: usize, expected: usize) -> bool {

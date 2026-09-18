@@ -6,7 +6,7 @@
 //!   Neg / 算术 BinOp / 除零 / 非算术操作分支（经 `CepStateMachine` 阈值求值）；
 //! - `executor/eval`（L3 路径）：经 `RuleExecutor::execute_match` 驱动 score 钳位与错误、
 //!   entity_id 回退、yield 表达式中的系统变量 / L3 聚合 / 时间函数路由。
-use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, Measure};
+use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, Measure, ObjectItem};
 use wf_lang::plan::{AggPlan, BranchPlan};
 
 use crate::cep::{CepStateMachine, EngineHashMap, Event, StepResult, Value, eval_expr};
@@ -288,14 +288,18 @@ fn cmp_number_boundaries() {
         eval_expr(&binop(BinOp::Lt, n(-3.0), n(-2.0)), &e),
         Some(Value::Bool(true))
     );
-    // NaN：所有比较为 false（含 Ne——`(NaN - x).abs() >= EPSILON` 为 false）
+    // NaN：`Eq` 为 false（不声称相等），`Ne` 取其逻辑补 → true；顺序比较仍全部 false。
     assert_eq!(
         eval_expr(&binop(BinOp::Eq, n(f64::NAN), n(f64::NAN)), &e),
         Some(Value::Bool(false))
     );
     assert_eq!(
         eval_expr(&binop(BinOp::Ne, n(f64::NAN), n(1.0)), &e),
-        Some(Value::Bool(false))
+        Some(Value::Bool(true))
+    );
+    assert_eq!(
+        eval_expr(&binop(BinOp::Ne, n(f64::NAN), n(f64::NAN)), &e),
+        Some(Value::Bool(true))
     );
     assert_eq!(
         eval_expr(&binop(BinOp::Lt, n(f64::NAN), n(1.0)), &e),
@@ -305,6 +309,156 @@ fn cmp_number_boundaries() {
         eval_expr(&binop(BinOp::Gt, n(f64::NAN), n(1.0)), &e),
         Some(Value::Bool(false))
     );
+    // inf：IEEE 精确相等（`inf == inf` 为 true——旧式 `(a-b).abs() < EPSILON` 因
+    // `inf - inf = NaN` 返回 false）
+    assert_eq!(
+        eval_expr(&binop(BinOp::Eq, n(f64::INFINITY), n(f64::INFINITY)), &e),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(
+        eval_expr(&binop(BinOp::Ne, n(f64::INFINITY), n(f64::INFINITY)), &e),
+        Some(Value::Bool(false))
+    );
+    assert_eq!(
+        eval_expr(
+            &binop(BinOp::Ne, n(f64::INFINITY), n(f64::NEG_INFINITY)),
+            &e
+        ),
+        Some(Value::Bool(true))
+    );
+}
+
+/// 结构化值**递归结构相等**（回归 2026-09-18）。
+///
+/// 回归前 `values_equal` / `compare_values` 对 `Array`/`Object` 落进 `_ => false`
+/// → **内容完全相同的两个结构化值也判不等**：`==` 恒 false、`!=` 恒 true、`in` 恒
+/// 不命中、去重不合并。检查器 `compatible` 允许 `Object == Object` / `Array == Array`，
+/// 所以这是一条可达且静默的语义错误。
+#[test]
+fn cmp_structured_values_use_recursive_equality() {
+    let e = event(vec![]);
+    let obj = |pairs: &[(&str, f64)]| {
+        Expr::Object(
+            pairs
+                .iter()
+                .map(|(k, v)| ObjectItem {
+                    targets: vec![(*k).to_string()],
+                    type_hint: None,
+                    value: n(*v),
+                })
+                .collect(),
+        )
+    };
+    let arr = |vals: Vec<Expr>| Expr::Array(vals);
+
+    // 内容相同、键序不同 → 相等（对象按集合比较，与插入序无关）
+    let a = obj(&[("ip", 1.0), ("port", 2.0)]);
+    let b = obj(&[("port", 2.0), ("ip", 1.0)]);
+    assert_eq!(
+        eval_expr(&binop(BinOp::Eq, a.clone(), b.clone()), &e),
+        Some(Value::Bool(true)),
+        "同内容对象必须相等（列式/行式同口径）"
+    );
+    assert_eq!(
+        eval_expr(&binop(BinOp::Ne, a.clone(), b.clone()), &e),
+        Some(Value::Bool(false))
+    );
+
+    // 叶子值不同 / 键数不同 → 不等，`Ne` 为逻辑补
+    let c = obj(&[("ip", 1.0), ("port", 3.0)]);
+    let d = obj(&[("ip", 1.0)]);
+    for other in [c, d] {
+        assert_eq!(
+            eval_expr(&binop(BinOp::Eq, a.clone(), other.clone()), &e),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(
+            eval_expr(&binop(BinOp::Ne, a.clone(), other), &e),
+            Some(Value::Bool(true))
+        );
+    }
+
+    // 数组：逐元素递归（含嵌套），长度不同 → 不等
+    let a1 = arr(vec![n(1.0), arr(vec![n(2.0), n(3.0)])]);
+    let a2 = arr(vec![n(1.0), arr(vec![n(2.0), n(3.0)])]);
+    let a3 = arr(vec![n(1.0), arr(vec![n(2.0), n(4.0)])]);
+    let a4 = arr(vec![n(1.0)]);
+    assert_eq!(
+        eval_expr(&binop(BinOp::Eq, a1.clone(), a2), &e),
+        Some(Value::Bool(true))
+    );
+    for other in [a3, a4] {
+        assert_eq!(
+            eval_expr(&binop(BinOp::Eq, a1.clone(), other), &e),
+            Some(Value::Bool(false))
+        );
+    }
+
+    // 结构化但不同构（Object vs Array）→ 不等；`Ne` 取补
+    assert_eq!(
+        eval_expr(&binop(BinOp::Eq, a.clone(), a1.clone()), &e),
+        Some(Value::Bool(false))
+    );
+    assert_eq!(
+        eval_expr(&binop(BinOp::Ne, a.clone(), a1.clone()), &e),
+        Some(Value::Bool(true))
+    );
+
+    // 标量 vs 结构化：不可比较 → `Eq` false / `Ne` true（不声称相等）
+    assert_eq!(
+        eval_expr(&binop(BinOp::Eq, n(1.0), a.clone()), &e),
+        Some(Value::Bool(false))
+    );
+    assert_eq!(
+        eval_expr(&binop(BinOp::Ne, n(1.0), a), &e),
+        Some(Value::Bool(true))
+    );
+
+    // 顺序比较在语言层被检查器拒绝（T8 要求数值）→ 直接构造 AST 时为 false
+    assert_eq!(
+        eval_expr(
+            &binop(BinOp::Lt, obj(&[("k", 1.0)]), obj(&[("k", 2.0)])),
+            &e
+        ),
+        Some(Value::Bool(false))
+    );
+}
+
+/// 同义写法必须同结果：`x != y` ≡ `!(x == y)`。
+///
+/// 回归：此前 `Ne` 用 `(a - b).abs() >= EPSILON`，对 NaN 与 `inf == inf` 会和 `Eq`
+/// **同时为假** → `x != y` 得 false 而 `!(x == y)` 得 true（`eval_not` 取反），
+/// 同一命题两种答案；`not in (...)` 也走 `values_equal` 取反，同属这一族。
+#[test]
+fn cmp_ne_is_logical_complement_of_eq() {
+    let e = event(vec![]);
+    let cases = [
+        (1.0, 1.0),
+        (1.0, 2.0),
+        (0.1 + 0.2, 0.3),
+        (f64::NAN, f64::NAN),
+        (f64::NAN, 1.0),
+        (f64::INFINITY, f64::INFINITY),
+        (f64::INFINITY, f64::NEG_INFINITY),
+        (-0.0, 0.0),
+    ];
+    for (lhs, rhs) in cases {
+        let eq = binop(BinOp::Eq, n(lhs), n(rhs));
+        let ne = binop(BinOp::Ne, n(lhs), n(rhs));
+        let not_eq = Expr::Not(Box::new(eq.clone()));
+        let eq_val = eval_expr(&eq, &e);
+        let is_eq = matches!(eq_val, Some(Value::Bool(true)));
+        assert_eq!(
+            eval_expr(&ne, &e),
+            eval_expr(&not_eq, &e),
+            "`x != y` 必须等于 `!(x == y)`（lhs={lhs} rhs={rhs}）"
+        );
+        assert_eq!(
+            eval_expr(&ne, &e),
+            Some(Value::Bool(!is_eq)),
+            "`Ne` 必须是 `Eq` 的逻辑补（lhs={lhs} rhs={rhs}）"
+        );
+    }
 }
 
 #[test]
@@ -344,14 +498,15 @@ fn cmp_string_and_bool_boundaries() {
         eval_expr(&binop(BinOp::Lt, Expr::Bool(false), Expr::Bool(true)), &e),
         Some(Value::Bool(false))
     );
-    // 类型不匹配：顺序比较 false，Eq/Ne 均 false（cmp.rs 顶层 `_ => false`）
+    // 类型不匹配（不可比较）：不声称相等 → `Eq` false，`Ne` 取其补 → true，
+    // 与列式路径同口径（结构化值同理，见 `compare_values` 的 `_` 分支）。
     assert_eq!(
         eval_expr(&binop(BinOp::Eq, n(1.0), str_lit("1")), &e),
         Some(Value::Bool(false))
     );
     assert_eq!(
         eval_expr(&binop(BinOp::Ne, n(1.0), str_lit("1")), &e),
-        Some(Value::Bool(false))
+        Some(Value::Bool(true))
     );
     assert_eq!(
         eval_expr(&binop(BinOp::Lt, n(1.0), str_lit("a")), &e),

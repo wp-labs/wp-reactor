@@ -110,7 +110,10 @@ impl RuleExecutor {
             .each_plan
             .as_ref()
             .and_then(|ep| ep.filter.as_ref())
-            .filter(|f| !crate::match_engine::columnar::arg_reads_structured(&view, f))
+            .filter(|f| {
+                !crate::match_engine::columnar::arg_reads_structured(&view, f)
+                    && !crate::match_engine::columnar::compares_structured_values(f, batch)
+            })
             .and_then(|f| compile_guard(f, &view))
             .map(|plan| plan.eval_vec(&view, n));
         // post-join `where`（P4 gap-3，2026-09-02）：无 join 时仅驱动列，与
@@ -121,7 +124,10 @@ impl RuleExecutor {
             .plan
             .r#where
             .as_ref()
-            .filter(|w| !crate::match_engine::columnar::arg_reads_structured(&view, w))
+            .filter(|w| {
+                !crate::match_engine::columnar::arg_reads_structured(&view, w)
+                    && !crate::match_engine::columnar::compares_structured_values(w, batch)
+            })
             .and_then(|w| compile_guard(w, &view))
             .map(|plan| plan.eval_vec(&view, n));
         // 一般 score / entity（P4 gap-6/7，2026-09-02）：非快通道形状
@@ -131,19 +137,21 @@ impl RuleExecutor {
         // 解析成 Object/Array 可分叉）→ 逐行 eval_score / eval_entity_id 回退。
         let score_cvec = if score_is_general(&self.plan.score_plan.expr) {
             let expr = &self.plan.score_plan.expr;
-            (!crate::match_engine::columnar::arg_reads_structured(&view, expr))
-                .then(|| compile_guard(expr, &view))
-                .flatten()
-                .map(|plan| plan.eval_vec(&view, n))
+            (!crate::match_engine::columnar::arg_reads_structured(&view, expr)
+                && !crate::match_engine::columnar::compares_structured_values(expr, batch))
+            .then(|| compile_guard(expr, &view))
+            .flatten()
+            .map(|plan| plan.eval_vec(&view, n))
         } else {
             None
         };
         let entity_expr = &self.plan.entity_plan.entity_id_expr;
         let entity_cvec = if entity_is_general(entity_expr) {
-            (!crate::match_engine::columnar::arg_reads_structured(&view, entity_expr))
-                .then(|| compile_guard(entity_expr, &view))
-                .flatten()
-                .map(|plan| plan.eval_vec(&view, n))
+            (!crate::match_engine::columnar::arg_reads_structured(&view, entity_expr)
+                && !crate::match_engine::columnar::compares_structured_values(entity_expr, batch))
+            .then(|| compile_guard(entity_expr, &view))
+            .flatten()
+            .map(|plan| plan.eval_vec(&view, n))
         } else {
             None
         };

@@ -414,12 +414,33 @@ fn eval_arithmetic(op: BinOp, lv: f64, rv: f64) -> Option<Value> {
     Some(Value::Number(result))
 }
 
-/// Equality check for InList membership.
+/// `Value` 等值判定 —— `==` / `!=` / `in` / 去重共用的**单一语义**。
+///
+/// 标量叶子沿用 epsilon 契约（[`cmp::numeric_eq`]）；**结构化值递归比较**：
+/// 数组等长且逐元素相等，对象按键集合同长度逐键比较（与插入顺序无关，因为
+/// `EngineHashMap` 迭代序不稳定）。类型不匹配（标量 vs 结构化、不同标量类型）
+/// → `false`（不声称相等，故 `!=` 为真，见 `cmp::compare_values`）。
+///
+/// 回归（2026-09-18）：此前 Array/Object 落进 `_ => false`，导致**内容完全相同的
+/// 两个结构化值也判不等** —— `where(a.detail == b.detail)` 恒不成立、`!=` 恒成立、
+/// `in` 恒不命中、去重不合并。检查器 `compatible` 允许比较 Object/Object 与
+/// Array/Array，所以这是一条可达且静默的语义错误。
+///
+/// 递归深度由输入约束：JSON 列经 `serde_json` 解析（默认递归上限 128），
+/// arrow 嵌套列由 schema 深度决定。
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => (x - y).abs() < f64::EPSILON,
+        (Value::Number(x), Value::Number(y)) => cmp::numeric_eq(*x, *y),
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| values_equal(v, w)))
+        }
         _ => false,
     }
 }

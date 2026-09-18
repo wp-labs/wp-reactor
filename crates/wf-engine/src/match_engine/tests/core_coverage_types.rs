@@ -153,7 +153,7 @@ fn window_lookup_default_asof_and_fast_path_fallbacks() {
 }
 
 #[test]
-fn values_equal_matches_scalars_and_rejects_structured() {
+fn values_equal_matches_scalars_and_structures() {
     assert!(values_equal(&Value::Number(1.0), &Value::Number(1.0)));
     assert!(values_equal(
         &Value::Number(1.0),
@@ -170,16 +170,51 @@ fn values_equal_matches_scalars_and_rejects_structured() {
     ));
     assert!(values_equal(&Value::Bool(true), &Value::Bool(true)));
     assert!(!values_equal(&Value::Bool(true), &Value::Bool(false)));
-    // Cross-type and structured comparisons are never equal.
+    // 类型不匹配 → 不等（不声称相等）
     assert!(!values_equal(&Value::Number(1.0), &Value::Str("1".into())));
-    assert!(!values_equal(
+    // 结构化值 → **递归结构相等**（回归 2026-09-18：此前恒不等，`obj == obj` 为 false）
+    assert!(values_equal(
         &Value::Array(vec![num(1.0)]),
         &Value::Array(vec![num(1.0)])
     ));
     assert!(!values_equal(
+        &Value::Array(vec![num(1.0)]),
+        &Value::Array(vec![num(2.0)])
+    ));
+    assert!(!values_equal(
+        &Value::Array(vec![num(1.0)]),
+        &Value::Array(vec![num(1.0), num(2.0)])
+    ));
+    assert!(values_equal(
         &Value::Object(EngineHashMap::default()),
         &Value::Object(EngineHashMap::default())
     ));
+    // 嵌套：对象含数组/对象同样递归；键序不影响结果
+    let obj = |pairs: Vec<(&str, Value)>| {
+        let mut m = EngineHashMap::default();
+        for (k, v) in pairs {
+            m.insert(k.into(), v);
+        }
+        Value::Object(m)
+    };
+    let a = obj(vec![
+        ("ip", Value::Str("1.2.3.4".into())),
+        ("ports", Value::Array(vec![num(80.0), num(443.0)])),
+    ]);
+    let b = obj(vec![
+        ("ports", Value::Array(vec![num(80.0), num(443.0)])),
+        ("ip", Value::Str("1.2.3.4".into())),
+    ]);
+    assert!(values_equal(&a, &b), "键序不同但内容相同 → 相等");
+    let c = obj(vec![
+        ("ip", Value::Str("1.2.3.4".into())),
+        ("ports", Value::Array(vec![num(80.0)])),
+    ]);
+    assert!(!values_equal(&a, &c), "嵌套数组长度不同 → 不等");
+    assert!(
+        !values_equal(&a, &Value::Array(vec![num(80.0), num(443.0)])),
+        "Object vs Array → 不等"
+    );
 }
 
 // ===========================================================================

@@ -29,6 +29,7 @@ use super::plan_analysis::{
     compute_live_joins, compute_match_ctx_free, plan_close_ctx_fields, plan_reduce_label_reads,
 };
 use super::{OutputStatic, RuleExecutor, RuleExecutorOptions, YieldKind};
+use crate::match_engine::columnar::compares_structured_values;
 
 use crate::alert::AlertOrigin;
 use crate::error::{CoreReason, CoreResult};
@@ -378,6 +379,11 @@ impl RuleExecutor {
         if !wf_lang::columnar::expr_is_columnar(filter) {
             return None;
         }
+        // 两侧都是结构化来源的比较：列式内核无载荷（`CScalar::Structured`），会把
+        // 「内容相同」判 false → 返回 None 交给逐行解释（递归结构相等）。
+        if compares_structured_values(filter, batch) {
+            return None;
+        }
         let view = ColumnarBatch::from_all_fields(batch);
         Some(self.guard_mask(&format!("bind:{alias}"), filter, &view, batch))
     }
@@ -440,6 +446,10 @@ impl RuleExecutor {
         if !wf_lang::columnar::expr_is_columnar(filter) {
             return None;
         }
+        // 同 `bind_filter_columnar_mask`：结构化×结构化比较回退逐行解释。
+        if compares_structured_values(filter, batch) {
+            return None;
+        }
         let view = ColumnarBatch::from_all_fields(batch);
         Some(self.guard_mask("each", filter, &view, batch))
     }
@@ -466,6 +476,7 @@ impl RuleExecutor {
             for (branch_idx, branch) in step.branches.iter().enumerate() {
                 if let Some(guard) = &branch.guard
                     && wf_lang::columnar::expr_is_columnar(guard)
+                    && !compares_structured_values(guard, batch)
                 {
                     let site = format!("event:{step_idx}:{branch_idx}");
                     masks.insert_event(
@@ -480,6 +491,7 @@ impl RuleExecutor {
             for (branch_idx, branch) in step.branches.iter().enumerate() {
                 if let Some(guard) = &branch.guard
                     && wf_lang::columnar::expr_is_columnar(guard)
+                    && !compares_structured_values(guard, batch)
                 {
                     let site = format!("close:{step_idx}:{branch_idx}");
                     masks.insert_close(
@@ -498,6 +510,7 @@ impl RuleExecutor {
                 if step.neg {
                     if let Some(guard) = &step.branch.guard
                         && wf_lang::columnar::expr_is_columnar(guard)
+                        && !compares_structured_values(guard, batch)
                     {
                         let site = format!("neg:{neg_idx}");
                         masks.insert_neg(neg_idx, 0, self.guard_mask(&site, guard, &view, batch));

@@ -58,8 +58,8 @@ mod columnar_compile;
 mod columnar_eval;
 
 pub(crate) use columnar_compile::{
-    arg_reads_structured, compile_guard, compile_yield_cvec, eval_compiled_guard, inline_lets,
-    materialize_fields,
+    arg_reads_structured, compares_structured_values, compile_guard, compile_yield_cvec,
+    eval_compiled_guard, inline_lets, materialize_fields,
 };
 pub(crate) use columnar_eval::CVec;
 

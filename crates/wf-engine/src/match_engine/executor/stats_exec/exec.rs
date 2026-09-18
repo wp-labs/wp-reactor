@@ -656,6 +656,12 @@ impl StatsExecutor {
             if !wf_lang::columnar::expr_is_columnar(e) {
                 return None;
             }
+            // 结构化×结构化比较：列式内核无载荷（`CScalar::Structured`）会把
+            // 「内容相同」判 false，而解释路径做递归结构相等 → 回退行式
+            // （preflight 返回 None 时调用方回退 `process_rows`，无累加副作用）。
+            if crate::match_engine::columnar::compares_structured_values(e, batch) {
+                return None;
+            }
         }
         if !distinct_fields_columnar_safe(batch, &self.plan) {
             return None;

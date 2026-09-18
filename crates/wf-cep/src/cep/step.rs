@@ -3,7 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use wf_lang::ast::{BinOp, CmpOp, Expr, FieldSelector, Measure, Transform};
 use wf_lang::plan::{AggPlan, StepPlan};
 
-use super::eval::{eval_expr_ext, try_eval_expr_to_f64, try_eval_expr_to_value};
+use super::eval::{cmp::numeric_cmp, eval_expr_ext, try_eval_expr_to_f64, try_eval_expr_to_value};
 use super::key::ValueKey;
 use super::state::{AliasState, BranchState, StepState};
 use super::types::{EngineHashMap, FieldSource, RollingStats, StepProgress, Value, WindowLookup};
@@ -451,7 +451,7 @@ pub(super) fn check_threshold(agg: &AggPlan, bs: &BranchState) -> bool {
                 // Numeric accumulator is ±INF → non-numeric field, fall through
                 // to value-based path below
             }
-            _ => return compare(agg.cmp, measure_f64, threshold_f64),
+            _ => return numeric_cmp(agg.cmp, measure_f64, threshold_f64),
         }
     }
 
@@ -493,18 +493,6 @@ pub(super) fn check_threshold(agg: &AggPlan, bs: &BranchState) -> bool {
 // ---------------------------------------------------------------------------
 // Comparison
 // ---------------------------------------------------------------------------
-
-fn compare(cmp: CmpOp, lhs: f64, rhs: f64) -> bool {
-    match cmp {
-        CmpOp::Eq => (lhs - rhs).abs() < f64::EPSILON,
-        CmpOp::Ne => (lhs - rhs).abs() >= f64::EPSILON,
-        CmpOp::Lt => lhs < rhs,
-        CmpOp::Gt => lhs > rhs,
-        CmpOp::Le => lhs <= rhs,
-        CmpOp::Ge => lhs >= rhs,
-        _ => false,
-    }
-}
 
 /// Ordering for Value (used by min/max on orderable fields).
 /// Number < Str < Bool < Array < Object for cross-type (shouldn't happen in practice).

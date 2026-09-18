@@ -6,7 +6,7 @@ use std::cell::Cell;
 
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::cep::{
-    EngineHashMap, FieldSource, Value, WindowLookup, eval_expr, eval_expr_ext,
+    EngineHashMap, FieldSource, Value, WindowLookup, compare_values, eval_expr, eval_expr_ext,
     eval_field_value_src, value_to_string, values_equal,
 };
 use wf_cep::value_extract::value_to_f64;
@@ -507,39 +507,6 @@ fn eval_logic_or_with_l3(
         (Some(Value::Bool(true)), _) | (_, Some(Value::Bool(true))) => Some(Value::Bool(true)),
         (Some(Value::Bool(false)), Some(Value::Bool(false))) => Some(Value::Bool(false)),
         _ => None,
-    }
-}
-
-fn compare_values(op: wf_lang::ast::BinOp, lv: &Value, rv: &Value) -> bool {
-    use wf_lang::ast::BinOp;
-    match op {
-        BinOp::Eq => values_equal(lv, rv),
-        BinOp::Ne => !values_equal(lv, rv),
-        BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => match (lv, rv) {
-            (Value::Number(a), Value::Number(b)) => match op {
-                BinOp::Lt => a < b,
-                BinOp::Gt => a > b,
-                BinOp::Le => a <= b,
-                BinOp::Ge => a >= b,
-                _ => false,
-            },
-            (Value::Str(a), Value::Str(b)) => match op {
-                BinOp::Lt => a < b,
-                BinOp::Gt => a > b,
-                BinOp::Le => a <= b,
-                BinOp::Ge => a >= b,
-                _ => false,
-            },
-            (Value::Bool(a), Value::Bool(b)) => match op {
-                BinOp::Lt => a < b,
-                BinOp::Gt => a > b,
-                BinOp::Le => a <= b,
-                BinOp::Ge => a >= b,
-                _ => false,
-            },
-            _ => false,
-        },
-        _ => false,
     }
 }
 

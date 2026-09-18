@@ -8,15 +8,72 @@ use super::super::key::value_to_string;
 use super::super::types::{EngineHashMap, FieldSource, RollingStats, Value, WindowLookup};
 use super::eval_expr_ext;
 
-pub(super) fn compare_values(op: BinOp, lv: &Value, rv: &Value) -> bool {
-    match (lv, rv) {
-        (Value::Number(a), Value::Number(b)) => {
-            let cmp = CmpOp::from_binop(op);
-            compare_cmp(cmp, *a, *b)
+/// 数值相等：**epsilon 容差**（既有契约：`0.1 + 0.2 == 0.3` 为真，见
+/// `sem_tests::eval_coverage::cmp_number_boundaries` 与
+/// `columnar_tests_guard::epsilon_equality_matches_interpreted_on_floats`）
+/// 叠加 IEEE 精确相等（`a == b` 保证 `inf == inf` 为真；`NaN` 两项皆假）。
+pub fn numeric_eq(a: f64, b: f64) -> bool {
+    a == b || (a - b).abs() < f64::EPSILON
+}
+
+/// 数值不等：恒为 `!numeric_eq`（`Ne ≡ !Eq`）。
+///
+/// 此前多处写成 `(a - b).abs() >= f64::EPSILON`：对 `NaN` 与 `inf == inf` 会和 `Eq`
+/// **同时为假**，于是 `a != b` 与 `!(a == b)` 得出相反结果（`Not` 走 `eval_not`，
+/// 比较式是合法 Bool 操作数 —— 两种同义写法必须同结果）。`NaN != x → true` 也与
+/// IEEE 754 及主流语言一致。
+pub fn numeric_ne(a: f64, b: f64) -> bool {
+    !numeric_eq(a, b)
+}
+
+/// 数值比较的**唯一实现**：行式（`cep`）/ 统计阈值（`step`）/ 列式
+/// （`columnar_eval`）/ 契约断言（`contract`）四处共用。
+///
+/// `Lt/Gt/Le/Ge` 保持 IEEE 精确序 —— 容差只作用于 `Eq`/`Ne`，因此亚 epsilon 带内可能
+/// 出现 `Eq` 真而 `Ge` 假（例：`0.3` vs `0.1 + 0.2`）。这是既有语义，未在此扩展
+/// （扩展会改变所有 `where(agg >= thr)` 的阈值行为）。
+pub fn numeric_cmp(cmp: CmpOp, a: f64, b: f64) -> bool {
+    match cmp {
+        CmpOp::Eq => numeric_eq(a, b),
+        CmpOp::Ne => numeric_ne(a, b),
+        CmpOp::Lt => a < b,
+        CmpOp::Gt => a > b,
+        CmpOp::Le => a <= b,
+        CmpOp::Ge => a >= b,
+        _ => false,
+    }
+}
+
+/// [`numeric_cmp`] 的 `BinOp` 入口。非比较算子一律 `false`（不再沿用
+/// `CmpOp::from_binop` 对非比较算子回退 `CmpOp::Eq` 的旧行为）。
+pub fn numeric_cmp_binop(op: BinOp, a: f64, b: f64) -> bool {
+    match op {
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+            numeric_cmp(CmpOp::from_binop(op), a, b)
         }
+        _ => false,
+    }
+}
+
+/// `Value` 层面的比较（行式解释器；列式路径复用本函数，见 `columnar` 的
+/// `compare_scalars`）。数值走 [`numeric_cmp_binop`]（epsilon），字符串按字典序，
+/// 布尔仅支持等/不等。
+///
+/// **结构化值递归结构相等**（`Array`/`Object`，见 [`super::values_equal`]）：
+/// `Eq`/`Ne` 有真实语义，顺序比较在语言层被检查器拒绝（T8 要求数值）→ `false`。
+/// 类型不匹配（标量 vs 结构化、不同标量类型）不声称相等，`Ne` 取其补（`Ne ≡ !Eq`）。
+pub fn compare_values(op: BinOp, lv: &Value, rv: &Value) -> bool {
+    match (lv, rv) {
+        (Value::Number(a), Value::Number(b)) => numeric_cmp_binop(op, *a, *b),
         (Value::Str(a), Value::Str(b)) => compare_strs(op, a, b),
         (Value::Bool(a), Value::Bool(b)) => compare_bools(op, *a, *b),
-        _ => false, // type mismatch
+        (Value::Array(_) | Value::Object(_), Value::Array(_) | Value::Object(_)) => match op {
+            BinOp::Eq => super::values_equal(lv, rv),
+            BinOp::Ne => !super::values_equal(lv, rv),
+            _ => false,
+        },
+        // 不可比较（标量 vs 结构化 / 不同标量类型）：不声称相等，故 `Ne` 为真。
+        _ => op == BinOp::Ne,
     }
 }
 
@@ -39,18 +96,6 @@ fn compare_bools(op: BinOp, a: bool, b: bool) -> bool {
     match op {
         BinOp::Eq => a == b,
         BinOp::Ne => a != b,
-        _ => false,
-    }
-}
-
-fn compare_cmp(cmp: CmpOp, lhs: f64, rhs: f64) -> bool {
-    match cmp {
-        CmpOp::Eq => (lhs - rhs).abs() < f64::EPSILON,
-        CmpOp::Ne => (lhs - rhs).abs() >= f64::EPSILON,
-        CmpOp::Lt => lhs < rhs,
-        CmpOp::Gt => lhs > rhs,
-        CmpOp::Le => lhs <= rhs,
-        CmpOp::Ge => lhs >= rhs,
         _ => false,
     }
 }

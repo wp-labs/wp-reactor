@@ -453,6 +453,75 @@ fn compile_guard_func(
     }
 }
 
+/// 该列是否结构化存储：`array/...` / `object/...` 的 JSON 文本列（元数据标记），
+/// 或原生 Arrow `List` / `LargeList` / `FixedSizeList` / `Struct` 列。
+fn column_is_structured(field: &arrow::datatypes::Field) -> bool {
+    matches!(
+        field.data_type(),
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+    ) || (matches!(field.data_type(), DataType::Utf8) && wfl_structured_field_kind(field).is_some())
+}
+
+/// 比较算子的两侧**都可能读到结构化值**？（回归 2026-09-18）
+///
+/// 结构化来源：结构化列的裸读（`c.detail`），或列表元素读（`c.tags[0]`——元素可能
+/// 是对象/数组，静态不可知 → 保守计入）。
+///
+/// 为什么必须拒绝列式化：列式内核把结构化行读成**无载荷**的
+/// `CScalar::Structured`（与标量恒不等），而解释路径按 `values_equal` 做**递归结构
+/// 相等** —— `a.detail == b.detail` 两个内容相同的对象，列式判 false（丢行/丢匹配）、
+/// 解释判 true。调用方据此回退逐行解释（返回 `None` / 跳过该 guard mask）。
+pub(crate) fn compares_structured_values(expr: &Expr, batch: &RecordBatch) -> bool {
+    fn operand_may_be_structured(e: &Expr, batch: &RecordBatch) -> bool {
+        match e {
+            Expr::Field(fr) => match fr {
+                // 列表元素读：元素可能是对象/数组（静态不可知）→ 保守命中。
+                FieldRef::Path { .. } => true,
+                _ => batch
+                    .schema()
+                    .index_of(field_ref_name(fr))
+                    .ok()
+                    .is_some_and(|i| column_is_structured(batch.schema().field(i))),
+            },
+            _ => false,
+        }
+    }
+    let recurse = |e: &Expr| compares_structured_values(e, batch);
+    match expr {
+        Expr::BinOp {
+            op: BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge,
+            left,
+            right,
+        } => {
+            (operand_may_be_structured(left, batch) && operand_may_be_structured(right, batch))
+                || recurse(left)
+                || recurse(right)
+        }
+        Expr::BinOp { left, right, .. } => recurse(left) || recurse(right),
+        Expr::Neg(inner) | Expr::Not(inner) => recurse(inner),
+        Expr::FuncCall { args, .. } => args.iter().any(recurse),
+        Expr::InList { expr, list, .. } => recurse(expr) || list.iter().any(recurse),
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => recurse(cond) || recurse(then_expr) || recurse(else_expr),
+        Expr::Match {
+            expr,
+            arms,
+            default,
+        } => {
+            recurse(expr)
+                || arms.iter().any(|arm| recurse(&arm.value))
+                || default.as_ref().is_some_and(|d| recurse(d))
+        }
+        _ => false,
+    }
+}
+
 /// 输出函数参数（**递归**）是否读取结构化列（`wf.wfl.field_type` = array/object
 /// 元数据）。结构化列在解释路径解析成 `Value::Array`/`Value::Object`（fmt 渲染
 /// `[array]`/`[object]`、count_char 对非 Str → None），列式读原始 JSON 文本

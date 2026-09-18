@@ -355,22 +355,27 @@ fn compare_and_arithmetic_l3_arms() {
         )
     };
 
-    // Bool ordering.
+    // Bool：canonical 仅支持 Eq/Ne（排序算子被检查器 T8 拒绝 → 不可达路径，
+    // 此处按参考实现 `compare_bools` 返回 false）。
+    assert_eq!(
+        cmp(BinOp::Eq, Expr::Bool(false), Expr::Bool(false)),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(
+        cmp(BinOp::Ne, Expr::Bool(false), Expr::Bool(true)),
+        Some(Value::Bool(true))
+    );
     assert_eq!(
         cmp(BinOp::Lt, Expr::Bool(false), Expr::Bool(true)),
-        Some(Value::Bool(true))
+        Some(Value::Bool(false))
     );
     assert_eq!(
         cmp(BinOp::Gt, Expr::Bool(true), Expr::Bool(false)),
-        Some(Value::Bool(true))
+        Some(Value::Bool(false))
     );
     assert_eq!(
         cmp(BinOp::Le, Expr::Bool(true), Expr::Bool(true)),
-        Some(Value::Bool(true))
-    );
-    assert_eq!(
-        cmp(BinOp::Ge, Expr::Bool(false), Expr::Bool(false)),
-        Some(Value::Bool(true))
+        Some(Value::Bool(false))
     );
     // Cross-type ordering → false.
     assert_eq!(

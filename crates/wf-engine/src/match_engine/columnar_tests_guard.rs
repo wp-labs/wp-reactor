@@ -265,6 +265,39 @@ fn epsilon_equality_matches_interpreted_on_floats() {
     assert_equiv(&expr, &batch);
 }
 
+/// NaN / ±inf 上的 `Eq`/`Ne`/顺序比较：列式与解释路径必须逐行同结果。
+///
+/// 回归：`Ne` 曾写成 `(a - b).abs() >= EPSILON`，在 NaN 与 `inf == inf` 上与 `Eq`
+/// 同时为假（`x != y` ≠ `!(x == y)`）。两轨各有实现（`columnar_eval::compare_numeric`
+/// 与 `cep::eval::cmp::compare_cmp`），现已收敛到 `numeric_eq` / `numeric_ne`；
+/// 本用例锁住"不再漂移"。
+#[test]
+fn nan_and_infinity_comparison_matches_interpreted() {
+    let batch = make_batch(
+        vec![Some(1), Some(2), Some(3), Some(4)],
+        vec![
+            Some(0.1 + 0.2),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+        ],
+        vec![Some("x"), Some("x"), Some("x"), Some("x")],
+        vec![Some(true), Some(true), Some(true), Some(true)],
+    );
+    for expr in [
+        bin(BinOp::Eq, field("price"), num(0.3)),
+        bin(BinOp::Ne, field("price"), num(0.3)),
+        bin(BinOp::Eq, field("price"), num(f64::INFINITY)),
+        bin(BinOp::Ne, field("price"), num(f64::INFINITY)),
+        bin(BinOp::Eq, field("price"), num(f64::NEG_INFINITY)),
+        bin(BinOp::Ne, field("price"), num(f64::NAN)),
+        bin(BinOp::Lt, field("price"), num(1.0)),
+        bin(BinOp::Ge, field("price"), num(1.0)),
+    ] {
+        assert_equiv(&expr, &batch);
+    }
+}
+
 #[test]
 fn non_boolean_top_level_is_not_matched() {
     let batch = make_batch(

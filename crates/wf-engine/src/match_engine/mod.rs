@@ -21,11 +21,12 @@ pub(crate) mod cep {
         AsofLookup, BindData, CepStateMachine, CloseOutput, CloseReason, EngineHashMap,
         EngineHashSet, Event, FieldSource, JoinKey, MACHINE_ID, MatchedContext, RollingStats,
         ScopeKey, SharedLimits, StepData, StepOutcome, StepProgress, StepResult, StepState, Value,
-        ValueKey, WindowLookup, accumulate_close_steps, apply_conv, close_is_qualified, eval_expr,
-        eval_expr_ext, eval_field_value, eval_field_value_src, extract_key_simple,
-        extract_scope_key_from_row, extract_scope_key_mixed, field_ref_name,
-        precompute_join_then_keys, push_i64_exact_decimal, scope_key_from_values,
-        scope_key_shard_index, value_to_string, values_equal,
+        ValueKey, WindowLookup, accumulate_close_steps, apply_conv, close_is_qualified,
+        compare_values, eval_expr, eval_expr_ext, eval_field_value, eval_field_value_src,
+        extract_key_simple, extract_scope_key_from_row, extract_scope_key_mixed, field_ref_name,
+        numeric_cmp, numeric_cmp_binop, numeric_eq, numeric_ne, precompute_join_then_keys,
+        push_i64_exact_decimal, scope_key_from_values, scope_key_shard_index, value_to_string,
+        values_equal,
     };
     pub(crate) mod eval {
         #[allow(unused_imports)]
@@ -78,7 +79,8 @@ pub use wf_cep::cep::close_is_qualified;
 pub use wf_cep::cep::{
     AsofLookup, BindData, CepStateMachine, CloseOutput, CloseReason, Event, FieldSource, JoinKey,
     MACHINE_ID, MatchedContext, ScopeKey, SharedLimits, StepData, StepOutcome, StepProgress,
-    StepResult, Value, WindowLookup, field_ref_name, precompute_join_then_keys, values_equal,
+    StepResult, Value, WindowLookup, compare_values, field_ref_name, numeric_cmp,
+    numeric_cmp_binop, numeric_eq, numeric_ne, precompute_join_then_keys, values_equal,
 };
 pub use wf_cep::cep::{EngineHashMap, EngineHashSet};
 pub(crate) use wf_cep::cep::{

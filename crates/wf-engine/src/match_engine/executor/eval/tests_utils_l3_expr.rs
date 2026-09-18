@@ -482,10 +482,21 @@ fn l3_expression_arith_and_compare() {
         l3_ctx(&binop(BinOp::Gt, lit("b"), lit("a")), &ctx),
         Some(Value::Bool(true))
     );
-    // bool comparison
+    // bool：canonical 仅支持 Eq/Ne（排序被检查器 T8 拒绝 → 不可达路径）
+    assert_eq!(
+        l3_ctx(
+            &binop(BinOp::Eq, Expr::Bool(false), Expr::Bool(false)),
+            &ctx
+        ),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(
+        l3_ctx(&binop(BinOp::Ne, Expr::Bool(false), Expr::Bool(true)), &ctx),
+        Some(Value::Bool(true))
+    );
     assert_eq!(
         l3_ctx(&binop(BinOp::Lt, Expr::Bool(false), Expr::Bool(true)), &ctx),
-        Some(Value::Bool(true))
+        Some(Value::Bool(false))
     );
     // mismatch: order comparisons → false, Ne → true (values_equal mismatch)
     assert_eq!(

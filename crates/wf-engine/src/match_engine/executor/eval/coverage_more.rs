@@ -61,7 +61,8 @@ fn compare_values_string_and_bool_ordering_ops() {
     assert_eq!(cmp(BinOp::Lt, "b", "a"), Some(Value::Bool(false)));
     assert_eq!(cmp(BinOp::Gt, "a", "b"), Some(Value::Bool(false)));
 
-    // Bool ordering: false < true.
+    // Bool: canonical 语义仅支持 Eq/Ne（排序算子被检查器 T8 拒绝——"ordering requires
+    // numeric operands"，故此处为不可达路径；仍按参考实现 `compare_bools` 返回 false）。
     let bcmp = |op: BinOp, l: bool, r: bool| {
         l3(
             &Expr::BinOp {
@@ -72,9 +73,11 @@ fn compare_values_string_and_bool_ordering_ops() {
             &ctx_with(vec![]),
         )
     };
-    assert_eq!(bcmp(BinOp::Lt, false, true), Some(Value::Bool(true)));
-    assert_eq!(bcmp(BinOp::Gt, true, false), Some(Value::Bool(true)));
-    assert_eq!(bcmp(BinOp::Le, true, true), Some(Value::Bool(true)));
+    assert_eq!(bcmp(BinOp::Eq, false, false), Some(Value::Bool(true)));
+    assert_eq!(bcmp(BinOp::Ne, false, true), Some(Value::Bool(true)));
+    assert_eq!(bcmp(BinOp::Lt, false, true), Some(Value::Bool(false)));
+    assert_eq!(bcmp(BinOp::Gt, true, false), Some(Value::Bool(false)));
+    assert_eq!(bcmp(BinOp::Le, true, true), Some(Value::Bool(false)));
 
     // Cross-type ordering (Str vs Number, Bool vs Str) → false.
     let cross = |op: BinOp| {

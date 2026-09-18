@@ -12,7 +12,7 @@ use wf_lang::ast::BinOp;
 
 use super::*;
 use crate::match_engine::cep::eval::cmp::{apply_fmt_template, timestamp_nanos_to_utc};
-use crate::match_engine::cep::{Value, value_to_string, values_equal};
+use crate::match_engine::cep::{Value, numeric_cmp_binop, value_to_string, values_equal};
 use crate::time::normalize_epoch_timestamp_float_nanos;
 
 /// A materialized whole-column output of a vectorized expression node (P3).
@@ -967,13 +967,14 @@ fn compare_scalars(op: BinOp, lv: &CScalar, rv: &CScalar) -> bool {
         (CScalar::Int(a), CScalar::Int(b)) => compare_int(op, *a, *b),
         (CScalar::Str(a), CScalar::Str(b)) => compare_str(op, a, b),
         (CScalar::Bool(a), CScalar::Bool(b)) => compare_bool(op, *a, *b),
-        // A structured operand is a definite type mismatch → false (the
-        // interpreted `compare_values` catch-all for non-scalar `Value`s).
-        (CScalar::Structured, _) | (_, CScalar::Structured) => false,
+        // 不可比较（结构化 / 类型不匹配）：**不声称相等**，故 `Eq` 为 false 而 `Ne`
+        // 取其逻辑补（`Ne ≡ !Eq`）——与解释路径 `compare_values` 的 `_` 分支同口径
+        // （结构化值不实现结构相等；`c.tags != "prod"` 为 true 是既定契约）。
+        (CScalar::Structured, _) | (_, CScalar::Structured) => op == BinOp::Ne,
         // Mixed i64/f64 (and any other numeric pairing) → f64 (epsilon) semantics.
         (a, b) => match (to_f64(a), to_f64(b)) {
-            (Some(x), Some(y)) => compare_numeric(op, x, y),
-            _ => false,
+            (Some(x), Some(y)) => numeric_cmp_binop(op, x, y),
+            _ => op == BinOp::Ne,
         },
     }
 }
@@ -1007,19 +1008,6 @@ fn compare_int(op: BinOp, a: i64, b: i64) -> bool {
     match op {
         BinOp::Eq => a == b,
         BinOp::Ne => a != b,
-        BinOp::Lt => a < b,
-        BinOp::Gt => a > b,
-        BinOp::Le => a <= b,
-        BinOp::Ge => a >= b,
-        _ => false,
-    }
-}
-
-/// Numeric comparison with the interpreted evaluator's epsilon `==` / `!=`.
-fn compare_numeric(op: BinOp, a: f64, b: f64) -> bool {
-    match op {
-        BinOp::Eq => (a - b).abs() < f64::EPSILON,
-        BinOp::Ne => (a - b).abs() >= f64::EPSILON,
         BinOp::Lt => a < b,
         BinOp::Gt => a > b,
         BinOp::Le => a <= b,
@@ -1165,13 +1153,18 @@ mod tests {
             &CScalar::Int(1),
             &CScalar::Float(1.0)
         ));
-        // Structured 与任何值比较 → false。
+        // 结构化与任何值比较：`Eq` → false（不实现结构相等），`Ne` 取其逻辑补 → true。
         assert!(!compare_scalars(
             BinOp::Eq,
             &CScalar::Structured,
             &CScalar::Int(1)
         ));
-        assert!(!compare_scalars(
+        assert!(compare_scalars(
+            BinOp::Ne,
+            &CScalar::Structured,
+            &CScalar::Int(1)
+        ));
+        assert!(compare_scalars(
             BinOp::Ne,
             &CScalar::Str("x".into()),
             &CScalar::Structured

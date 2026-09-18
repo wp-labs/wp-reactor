@@ -488,6 +488,95 @@ fn string_batch(rows: &[(&str, Option<&str>)]) -> RecordBatch {
     .unwrap()
 }
 
+/// 结构化×结构化比较**必须拒绝列式化**（回归 2026-09-18）。
+///
+/// 列式内核把结构化行读成无载荷的 `CScalar::Structured`（与标量恒不等），解释路径
+/// 按 `values_equal` 递归结构相等 —— 内容相同的两个对象列式判 false、解释判 true。
+/// 因此 bind filter 门控必须返回 `None`（逐行解释回退），否则静默丢匹配/丢行。
+#[test]
+fn structured_vs_structured_filter_is_refused_columnarly() {
+    use crate::match_engine::{WFL_FIELD_TYPE_METADATA_KEY, WFL_FIELD_TYPE_OBJECT};
+    use arrow::array::{ArrayRef, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let meta = || {
+        HashMap::from([(
+            WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+            WFL_FIELD_TYPE_OBJECT.to_string(),
+        )])
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("d1", DataType::Utf8, true).with_metadata(meta()),
+        Field::new("d2", DataType::Utf8, true).with_metadata(meta()),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            // 内容相同、键序不同 → 结构相等
+            Arc::new(StringArray::from(vec![Some(r#"{"a":1,"b":2}"#)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some(r#"{"b":2,"a":1}"#)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let cmp = Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Simple("d1".into()))),
+        right: Box::new(Expr::Field(FieldRef::Simple("d2".into()))),
+    };
+
+    // 解释路径：结构相等 → true
+    let events = crate::match_engine::batch_to_events(&batch);
+    assert_eq!(
+        eval_expr(&cmp, &events[0]),
+        Some(Value::Bool(true)),
+        "解释路径必须做递归结构相等"
+    );
+    // 列式内核：无载荷 → false（这正是必须回退的原因，非"两轨应当一致"）
+    let view = crate::match_engine::columnar::ColumnarBatch::from_all_fields(&batch);
+    assert!(
+        !crate::match_engine::columnar::eval_guard_columnar(&cmp, &view).value(0),
+        "列式内核无法判定结构化相等"
+    );
+
+    // 门控：bind filter mask 拒绝 → None → 逐行解释
+    let mut plan = simple_rule_plan(
+        "r_struct",
+        simple_plan(vec![], vec![]),
+        Expr::Number(1.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("ip".to_string())),
+    );
+    let alias = plan.binds[0].alias.clone();
+    plan.binds[0].filter = Some(cmp.clone());
+    let exec = RuleExecutor::new(plan);
+    assert!(
+        exec.bind_filter_columnar_mask(&alias, &batch).is_none(),
+        "结构化×结构化 bind filter 必须回退逐行解释"
+    );
+    // 对照：读单个结构化列（对比标量）仍可列式（内核语义 = 与标量恒不等，两轨一致）
+    let scalar_cmp = Expr::BinOp {
+        op: BinOp::Ne,
+        left: Box::new(Expr::Field(FieldRef::Simple("d1".into()))),
+        right: Box::new(Expr::StringLit("x".into())),
+    };
+    let mut plan2 = simple_rule_plan(
+        "r_struct2",
+        simple_plan(vec![], vec![]),
+        Expr::Number(1.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("ip".to_string())),
+    );
+    let alias2 = plan2.binds[0].alias.clone();
+    plan2.binds[0].filter = Some(scalar_cmp);
+    let exec2 = RuleExecutor::new(plan2);
+    assert!(
+        exec2.bind_filter_columnar_mask(&alias2, &batch).is_some(),
+        "结构化 vs 标量仍走列式（两侧都为结构化才拒绝）"
+    );
+}
+
 #[test]
 fn bind_filter_columnar_mask_and_safety_gates() {
     let mut plan = simple_rule_plan(

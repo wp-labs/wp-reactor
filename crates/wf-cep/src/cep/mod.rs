@@ -28,6 +28,8 @@ pub use types::{EngineHashMap, EngineHashSet};
 // Re-export pub(crate) items
 pub use eval::eval_expr;
 pub use eval::values_equal;
+// 数值比较/相等基元：跨 crate 唯一实现（step / columnar_eval / contract 复用）。
+pub use eval::cmp::{compare_values, numeric_cmp, numeric_cmp_binop, numeric_eq, numeric_ne};
 pub use key::{ScopeKey, field_ref_name};
 #[allow(unused_imports)] // key.rs 内部用全限定路径；重导出由 executor::eval 等模块消费
 pub use key::{
