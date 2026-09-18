@@ -239,15 +239,15 @@ impl InstanceKey {
 }
 
 /// Flatten a possibly-`Pair`ed [`ScopeKey`] into its leaf [`Value`]s, preserving
-/// the **original Value types** (`Int`/`Float` → `Number`, `Str` → `Str`) so the
-/// close path's `scope_key` is byte-identical to the event path's (`extract_key`
-/// returns the raw field Values). Previously Int keys flattened to `Str`, which
+/// the **original Value types** (`Int`/`Float` → `Number`/`Int`, `Str` → `Str`) so
+/// the close path's `scope_key` is byte-identical to the event path's
+/// (`extract_key` returns the raw field Values). Previously Int keys flattened to `Str`, which
 /// broke digit-typed yield/entity fields on `on close` rules (`id = b.auction`
 /// got a string and failed digit coercion).
 pub(super) fn flatten_scope_values(key: &ScopeKey) -> Vec<Value> {
     match key {
         ScopeKey::Empty => vec![],
-        ScopeKey::Int(v) => vec![Value::Number(*v as f64)],
+        ScopeKey::Int(v) => vec![Value::Int(*v)],
         ScopeKey::Float(bits) => vec![Value::Number(f64::from_bits(*bits))],
         ScopeKey::Str(s) => vec![Value::Str(s.clone())],
         ScopeKey::Pair(a, b) => {
@@ -1086,7 +1086,7 @@ mod tests {
         // every close alert was dropped with `data format error`.
         assert_eq!(
             flatten_scope_values(&ScopeKey::Int(421_762)),
-            vec![Value::Number(421_762.0)]
+            vec![Value::Int(421_762)]
         );
         assert_eq!(
             flatten_scope_values(&ScopeKey::Float(f64::to_bits(7.5))),
@@ -1102,13 +1102,13 @@ mod tests {
                 Box::new(ScopeKey::Int(42)),
                 Box::new(ScopeKey::Str("k".into())),
             )),
-            vec![Value::Number(42.0), Value::Str("k".into())]
+            vec![Value::Int(42), Value::Str("k".into())]
         );
         // `InstanceKey::fixed` (the close/conv window path) round-trips the
-        // Int key as `Number`, byte-identical to the event path.
+        // Int key as `Int`, byte-identical to the (now `Value::Int`) event path.
         assert_eq!(
             InstanceKey::fixed(&ScopeKey::Int(99), 1_000).scope_key_values(),
-            vec![Value::Number(99.0)]
+            vec![Value::Int(99)]
         );
     }
 

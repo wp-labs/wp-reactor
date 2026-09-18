@@ -382,9 +382,9 @@ mod tests {
             rows[0].1.field_value("ip"),
             Some(Value::Str("10.0.0.1".into()))
         );
-        assert_eq!(rows[0].1.field_value("score"), Some(Value::Number(80.0)));
+        assert_eq!(rows[0].1.field_value("score"), Some(Value::Int(80)));
         // Time column should also be present as a field
-        assert_eq!(rows[0].1.field_value("ts"), Some(Value::Number(ts1 as f64)));
+        assert_eq!(rows[0].1.field_value("ts"), Some(Value::Int(ts1)));
 
         // Row 1: ts=2s
         assert_eq!(rows[1].0, ts2);
@@ -392,7 +392,7 @@ mod tests {
             rows[1].1.field_value("ip"),
             Some(Value::Str("10.0.0.2".into()))
         );
-        assert_eq!(rows[1].1.field_value("score"), Some(Value::Number(95.0)));
+        assert_eq!(rows[1].1.field_value("score"), Some(Value::Int(95)));
     }
 
     #[tokio::test]
@@ -430,7 +430,7 @@ mod tests {
             rows[0].field_value("ip"),
             Some(Value::Str("10.0.0.1".into()))
         );
-        assert_eq!(rows[0].field_value("score"), Some(Value::Number(80.0)));
+        assert_eq!(rows[0].field_value("score"), Some(Value::Int(80)));
 
         // No match → empty (not None — the window IS indexed).
         let none = lookup
@@ -662,7 +662,7 @@ mod tests {
             Some(&Duration::from_secs(3)),
         ) {
             AsofLookup::Hit(row) => {
-                assert_eq!(row.field_value("score"), Some(Value::Number(95.0)));
+                assert_eq!(row.field_value("score"), Some(Value::Int(95)));
                 assert_eq!(row.field_value("ip"), Some(Value::Str("10.0.0.1".into())));
             }
             AsofLookup::Miss => panic!("expected Hit, got Miss"),
@@ -685,7 +685,7 @@ mod tests {
         // latest row ≤ 2s (ts=1s, score 80) — no caller-side fallback.
         match lookup.asof_lookup_max("threat_intel", "ip", &key, 2_000_000_000, None) {
             AsofLookup::Hit(row) => {
-                assert_eq!(row.field_value("score"), Some(Value::Number(80.0)));
+                assert_eq!(row.field_value("score"), Some(Value::Int(80)));
             }
             AsofLookup::Miss => panic!("expected Hit for max_ts > event_time, got Miss"),
             AsofLookup::Fallback => panic!("expected Hit for max_ts > event_time, got Fallback"),
@@ -706,7 +706,7 @@ mod tests {
         // within=None (no lower bound): max_ts=3s <= event_time=3s → Hit.
         match lookup.asof_lookup_max("threat_intel", "ip", &key, 3_000_000_000, None) {
             AsofLookup::Hit(row) => {
-                assert_eq!(row.field_value("score"), Some(Value::Number(95.0)));
+                assert_eq!(row.field_value("score"), Some(Value::Int(95)));
             }
             AsofLookup::Miss => panic!("expected Hit with within=None, got Miss"),
             AsofLookup::Fallback => panic!("expected Hit with within=None, got Fallback"),

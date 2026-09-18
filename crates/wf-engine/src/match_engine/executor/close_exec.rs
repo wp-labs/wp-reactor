@@ -1207,7 +1207,7 @@ fn stats_bucket_rows(buckets: &[StatsCloseBucket]) -> usize {
 fn stats_scope_key_to_values(key: &crate::match_engine::cep::ScopeKey) -> Vec<Value> {
     match key {
         crate::match_engine::cep::ScopeKey::Empty => vec![],
-        crate::match_engine::cep::ScopeKey::Int(i) => vec![Value::Number(*i as f64)],
+        crate::match_engine::cep::ScopeKey::Int(i) => vec![Value::Int(*i)],
         crate::match_engine::cep::ScopeKey::Float(b) => {
             vec![Value::Number(f64::from_bits(*b))]
         }

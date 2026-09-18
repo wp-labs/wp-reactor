@@ -481,6 +481,7 @@ impl RuleExecutor {
                     Some(cvec) => match cvec.scalar_at(event.row()) {
                         Some(s) => match cscalar_to_value(&s) {
                             Value::Number(n) => Some(n.clamp(0.0, 100.0)),
+                            Value::Int(i) => Some((i as f64).clamp(0.0, 100.0)),
                             _ => None,
                         },
                         None => None,
@@ -511,7 +512,7 @@ impl RuleExecutor {
                             Some(v) => {
                                 let mut es = String::with_capacity(20);
                                 write_int64_value(&mut es, v);
-                                (es, Some(Value::Number(v as f64)), Some(v as f64))
+                                (es, Some(Value::Int(v)), Some(v as f64))
                             }
                             None => {
                                 let (eid, eval) = empty_entity_pair();

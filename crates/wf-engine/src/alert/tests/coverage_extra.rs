@@ -89,10 +89,10 @@ fn export_yield_f64_fast_lanes_and_fallbacks() {
     let (meta, value) = export_yield_f64(1.5, Some(&FieldType::Base(BaseType::Chars))).unwrap();
     assert_eq!(meta, DataType::Chars);
     assert_eq!(value, ModelValue::from("1.5"));
-    // Untyped: finite → float.
+    // Untyped: integer-valued finite → i64 digit.
     let (meta, value) = export_yield_f64(2.0, None).unwrap();
-    assert_eq!(meta, DataType::Float);
-    assert_eq!(value, ModelValue::from(2.0));
+    assert_eq!(meta, DataType::Digit);
+    assert_eq!(value, ModelValue::from(2_i64));
     // Fractional digit → falls back to the Value path → error.
     assert!(export_yield_f64(1.5, Some(&FieldType::Base(BaseType::Digit))).is_err());
     // Non-finite float → falls back → error.
@@ -636,7 +636,6 @@ fn staged_row_with_const_column_matches_append_path() {
     // identical row views to the record path where the field is constant.
     use crate::alert::types::export_yield_value;
     let target = Arc::from("alerts");
-    let ft_float = FieldType::Base(BaseType::Float);
     let ft_chars = FieldType::Base(BaseType::Chars);
     let rule_name = Arc::from("r");
     let entity_type = Arc::from("ip");
@@ -679,8 +678,10 @@ fn staged_row_with_const_column_matches_append_path() {
     let v_name = Arc::from("v");
     for i in 0..2 {
         via_staged.begin_row();
+        // 与 record 路径同口径：`v` 未声明类型（未声明整值 → Digit，两条路径
+        // 必须产出一致的 DataType/ModelValue）。
         via_staged
-            .stage_yield_cell(&v_name, Some(&ft_float), &Value::Number((10 + i) as f64))
+            .stage_yield_cell(&v_name, None, &Value::Number((10 + i) as f64))
             .unwrap();
         via_staged.commit_each_row(EachRowCells {
             wfx_id: format!("id{i}").into(),

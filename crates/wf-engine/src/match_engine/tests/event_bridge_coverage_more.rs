@@ -51,15 +51,15 @@ fn batch_to_events_drops_unsupported_column_types() {
     let events = batch_to_events(&batch);
     assert_eq!(events.len(), 2);
     // Int64 survives; Int16/Float32/Date32 have no conversion → omitted.
-    assert_eq!(events[0].fields["id"], Value::Number(1.0));
+    assert_eq!(events[0].fields["id"], Value::Int(1));
     assert!(!events[0].fields.contains_key("i16"));
     assert!(!events[0].fields.contains_key("f32"));
     assert!(!events[0].fields.contains_key("d32"));
-    assert_eq!(events[1].fields["id"], Value::Number(2.0));
+    assert_eq!(events[1].fields["id"], Value::Int(2));
 }
 
 #[test]
-fn batch_to_events_timestamp_with_timezone_uses_millis_f64_value() {
+fn batch_to_events_timestamp_with_timezone_uses_nanos_int_value() {
     // `extract_value` matches `Timestamp(Ns, _)` — the timezone-aware variant
     // must convert the same as the bare one.
     let schema = make_schema(vec![Field::new(
@@ -72,7 +72,7 @@ fn batch_to_events_timestamp_with_timezone_uses_millis_f64_value() {
     let batch = RecordBatch::try_new(schema, vec![Arc::new(tz_array) as ArrayRef]).unwrap();
 
     let events = batch_to_events(&batch);
-    assert_eq!(events[0].fields["ts"], Value::Number(nanos as f64));
+    assert_eq!(events[0].fields["ts"], Value::Int(nanos));
 }
 
 // ---------------------------------------------------------------------------
@@ -98,7 +98,7 @@ fn materialize_rows_filtered_projects_and_skips_out_of_range() {
     // Index 5 is out of range → skipped; row 1 is materialized with only "id".
     let events = materialize_rows_filtered(&batch, &[1, 5], &only_id);
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].fields["id"], Value::Number(2.0));
+    assert_eq!(events[0].fields["id"], Value::Int(2));
     assert!(!events[0].fields.contains_key("name"));
 
     // Same indices with no filter → both fields materialized for row 0 and 2.
@@ -136,11 +136,11 @@ fn columnar_join_rows_across_batches_with_null_cells() {
 
     let rows = columnar_join_rows(vec![b1, b2], None);
     assert_eq!(rows.len(), 3, "rows across both batches");
-    assert_eq!(rows[0].field_value("id"), Some(Value::Number(1.0)));
+    assert_eq!(rows[0].field_value("id"), Some(Value::Int(1)));
     // Null cell in batch 1 row 1 → None (matches the eager null-drop).
     assert_eq!(rows[1].field_value("id"), None);
     assert_eq!(rows[1].field_value("name"), Some(Value::Str("b".into())));
-    assert_eq!(rows[2].field_value("id"), Some(Value::Number(3.0)));
+    assert_eq!(rows[2].field_value("id"), Some(Value::Int(3)));
 
     // A batch of zero rows contributes nothing.
     let empty = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(

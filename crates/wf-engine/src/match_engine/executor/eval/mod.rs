@@ -278,6 +278,10 @@ fn eval_neg_with_l3(
 ) -> Option<Value> {
     match eval_expr_with_l3(inner, ctx, score)? {
         Value::Number(n) => Some(Value::Number(-n)),
+        Value::Int(i) => Some(match i.checked_neg() {
+            Some(neg) => Value::Int(neg),
+            None => Value::Number(-(i as f64)),
+        }),
         _ => None,
     }
 }
@@ -516,6 +520,7 @@ pub(super) fn eval_score(expr: &wf_lang::ast::Expr, ctx: &dyn FieldSource) -> Co
     let val = eval_yield_expr(expr, ctx);
     let raw = match val {
         Some(Value::Number(n)) => n,
+        Some(Value::Int(i)) => i as f64,
         Some(other) => {
             return orion_error::prelude::StructError::from(CoreReason::RuleExec)
                 .with_detail(format!(

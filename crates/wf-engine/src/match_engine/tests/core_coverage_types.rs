@@ -561,13 +561,13 @@ fn batch_to_events_filtered_materializes_only_requested_fields() {
     );
     assert_eq!(filtered.len(), 3);
     let e0 = &filtered[0];
-    assert_eq!(e0.fields["id"], Value::Number(1.0));
+    assert_eq!(e0.fields["id"], Value::Int(1));
     assert_eq!(e0.fields["name"], Value::Str("a".into()));
     assert!(!e0.fields.contains_key("active"));
     assert!(!e0.fields.contains_key("ts"));
     assert!(!e0.fields.contains_key("solo"));
     // Row 1: null name dropped, active=false still materialized via full path.
-    assert_eq!(filtered[1].fields["id"], Value::Number(2.0));
+    assert_eq!(filtered[1].fields["id"], Value::Int(2));
     assert!(!filtered[1].fields.contains_key("name"));
 
     // Filtering to fields absent from the schema yields empty events.
@@ -582,8 +582,8 @@ fn materialize_rows_skips_out_of_range_and_filters_fields() {
     // Row 99 is out of range → skipped.
     let rows = materialize_rows(&batch, &[0, 1, 99]);
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].fields["id"], Value::Number(1.0));
-    assert_eq!(rows[1].fields["id"], Value::Number(2.0));
+    assert_eq!(rows[0].fields["id"], Value::Int(1));
+    assert_eq!(rows[1].fields["id"], Value::Int(2));
 
     let filtered = materialize_rows_filtered(
         &batch,
@@ -591,7 +591,7 @@ fn materialize_rows_skips_out_of_range_and_filters_fields() {
         &HashSet::from(["id".to_string(), "ts".to_string()]),
     );
     assert_eq!(filtered.len(), 2);
-    assert_eq!(filtered[0].fields["ts"], Value::Number(1_000.0));
+    assert_eq!(filtered[0].fields["ts"], Value::Int(1_000));
     assert!(!filtered[0].fields.contains_key("name"));
 }
 
@@ -625,9 +625,9 @@ fn batch_to_timestamped_rows_requires_timestamp_column_and_skips_nulls() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].0, 1_000);
     assert_eq!(rows[1].0, 2_000);
-    assert_eq!(rows[0].1["ts"], Value::Number(1_000.0));
-    assert_eq!(rows[0].1["id"], Value::Number(1.0));
-    assert_eq!(rows[1].1["id"], Value::Number(2.0));
+    assert_eq!(rows[0].1["ts"], Value::Int(1_000));
+    assert_eq!(rows[0].1["id"], Value::Int(1));
+    assert_eq!(rows[1].1["id"], Value::Int(2));
 }
 
 #[test]
@@ -666,19 +666,15 @@ fn batch_to_events_covers_list_large_list_and_fixed_size_list() {
     assert_eq!(events.len(), 1);
     assert_eq!(
         events[0].fields["tags"],
-        Value::Array(vec![Value::Number(10.0), Value::Number(20.0)])
+        Value::Array(vec![Value::Int(10), Value::Int(20)])
     );
     assert_eq!(
         events[0].fields["big"],
-        Value::Array(vec![
-            Value::Number(1.0),
-            Value::Number(2.0),
-            Value::Number(3.0)
-        ])
+        Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
     );
     assert_eq!(
         events[0].fields["pair"],
-        Value::Array(vec![Value::Number(7.0), Value::Number(8.0)])
+        Value::Array(vec![Value::Int(7), Value::Int(8)])
     );
 }
 
@@ -805,21 +801,21 @@ fn columnar_event_constructors_and_join_row_variants() {
 
     // `new` (no index) resolves through schema().index_of.
     let ce = ColumnarEvent::new(&batch, 0);
-    assert_eq!(ce.field_value("id"), Some(Value::Number(1.0)));
+    assert_eq!(ce.field_value("id"), Some(Value::Int(1)));
     assert_eq!(ce.field_value("name"), Some(Value::Str("a".into())));
     assert_eq!(ce.field_value_str("name"), "a");
     assert_eq!(ce.field_value_str("id"), "");
     assert_eq!(ce.field_value("ghost"), None);
-    assert_eq!(ce.to_event().fields["id"], Value::Number(1.0));
+    assert_eq!(ce.to_event().fields["id"], Value::Int(1));
 
     // `with_index` + projected to_event reproduces the filtered materialization.
     let ce_idx = ColumnarEvent::with_index(&batch, 0, Arc::clone(&index));
-    assert_eq!(ce_idx.field_value("solo"), Some(Value::Number(9.0)));
+    assert_eq!(ce_idx.field_value("solo"), Some(Value::Int(9)));
     let proj: Arc<HashSet<String>> =
         Arc::new(HashSet::from(["id".to_string(), "name".to_string()]));
     let projected = ColumnarEvent::with_index_projected(&batch, 0, Arc::clone(&index), Some(proj));
     let ev = projected.to_event();
-    assert_eq!(ev.fields["id"], Value::Number(1.0));
+    assert_eq!(ev.fields["id"], Value::Int(1));
     assert_eq!(ev.fields["name"], Value::Str("a".into()));
     assert!(!ev.fields.contains_key("ts"));
 
@@ -838,7 +834,7 @@ fn columnar_join_rows_and_timestamped_rows_share_batch_state() {
     let mut names = rows[0].field_names();
     names.sort_unstable();
     assert_eq!(names, vec!["active", "id", "name", "solo", "ts"]);
-    assert_eq!(rows[0].field_value("id"), Some(Value::Number(1.0)));
+    assert_eq!(rows[0].field_value("id"), Some(Value::Int(1)));
     // Null cell reads None on the columnar view.
     assert_eq!(rows[1].field_value("name"), None);
     assert_eq!(rows[2].field_value("name"), Some(Value::Str("c".into())));

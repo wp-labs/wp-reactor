@@ -19,7 +19,7 @@ use crate::match_engine::cep::{
     EngineHashMap, Event, Value, WindowLookup, eval_expr, field_ref_name,
 };
 use crate::match_engine::{FieldSource, JoinRow};
-use crate::time::normalize_epoch_timestamp_float_nanos;
+use crate::time::{normalize_epoch_timestamp_float_nanos, normalize_epoch_timestamp_int_nanos};
 
 use super::RuleExecutor;
 use super::context::{enrich_join_row_bare, eval_interval_bound, in_interval, row_matches_conds};
@@ -162,6 +162,7 @@ impl RuleExecutor {
         let hi_ns = eval_interval_bound(&wspec.hi, &left, event_time_nanos)?;
         let expiry_nanos = eval_expr(emit_at, &left).and_then(|v| match v {
             Value::Number(n) => normalize_epoch_timestamp_float_nanos(n),
+            Value::Int(i) => normalize_epoch_timestamp_int_nanos(i),
             _ => None,
         })?;
         Some(DeferredPending {
@@ -402,6 +403,7 @@ fn cmp_row_num(
 fn row_num(row: &crate::match_engine::JoinRow, field: &str) -> Option<f64> {
     match row.field_value(field)? {
         Value::Number(n) => Some(n),
+        Value::Int(i) => Some(i as f64),
         _ => None,
     }
 }

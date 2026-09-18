@@ -14,6 +14,7 @@ use super::cmp::timestamp_nanos_to_utc;
 use super::cmp::update_stable_id_hash;
 use super::eval_expr_ext;
 use crate::time::normalize_epoch_timestamp_float_nanos;
+use crate::time::normalize_epoch_timestamp_int_nanos;
 use crate::time::positive_interval_seconds_to_nanos;
 use md5::Digest as Md5Digest;
 use md5::Md5;
@@ -57,8 +58,10 @@ pub(super) fn eval_func_sha1_n(
         Value::Str(s) => s,
         _ => return None,
     };
+    // 数值内置函数是 f64 域：`Value::Int` 经 `i as f64` 归一，走与 `Number` 相同路径。
     let len = match eval_expr_ext(&args[1], event, windows, baselines)? {
         Value::Number(n) if n.is_finite() && n.fract() == 0.0 => n as usize,
+        Value::Int(i) => i as usize,
         _ => return None,
     };
     if !(1..=40).contains(&len) {
@@ -197,6 +200,7 @@ pub(super) fn eval_func_strftime(
     }
     let ts_nanos = match eval_expr_ext(&args[0], event, windows, baselines)? {
         Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let fmt = if let Some(fmt_expr) = args.get(1) {
@@ -281,10 +285,12 @@ pub(super) fn eval_func_time_diff(
     }
     let t1 = match eval_expr_ext(&args[0], event, windows, baselines)? {
         Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let t2 = match eval_expr_ext(&args[1], event, windows, baselines)? {
         Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     Some(Value::Number((t1 - t2).abs() as f64 / 1_000_000_000.0))
@@ -300,10 +306,12 @@ pub(super) fn eval_func_time_bucket(
     }
     let t = match eval_expr_ext(&args[0], event, windows, baselines)? {
         Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let interval = match eval_expr_ext(&args[1], event, windows, baselines)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
     let interval_nanos = positive_interval_seconds_to_nanos(interval)?;
@@ -323,10 +331,12 @@ pub(super) fn eval_func_bucket_end(
     }
     let t = match eval_expr_ext(&args[0], event, windows, baselines)? {
         Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let interval = match eval_expr_ext(&args[1], event, windows, baselines)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
     let interval_nanos = positive_interval_seconds_to_nanos(interval)?;
@@ -348,14 +358,17 @@ pub(super) fn eval_func_phase_bucket(
     }
     let t = match eval_expr_ext(&args[0], event, windows, baselines)? {
         Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let period = match eval_expr_ext(&args[1], event, windows, baselines)? {
         Value::Number(n) => positive_interval_seconds_to_nanos(n)?,
+        Value::Int(i) => positive_interval_seconds_to_nanos(i as f64)?,
         _ => return None,
     };
     let bucket = match eval_expr_ext(&args[2], event, windows, baselines)? {
         Value::Number(n) => positive_interval_seconds_to_nanos(n)?,
+        Value::Int(i) => positive_interval_seconds_to_nanos(i as f64)?,
         _ => return None,
     };
     if bucket <= 0 || period < bucket {

@@ -5,7 +5,7 @@ use std::time::Duration;
 use wf_lang::ast::{CmpOp, Expr, FieldSelector, Measure};
 use wf_lang::plan::{AggPlan, BranchPlan};
 
-use crate::cep::{CepStateMachine, CloseReason, StepResult};
+use crate::cep::{CepStateMachine, CloseReason, StepResult, Value};
 
 use super::helpers::*;
 
@@ -78,13 +78,14 @@ fn close_missing_detection() {
 }
 
 #[test]
-fn int_key_close_preserves_number_scope_key() {
+fn int_key_close_preserves_int_scope_key() {
     // Regression: the close path's scope_key used to flatten Int keys to
     // `Value::Str`, so digit-typed yield/entity fields referencing the key
     // (e.g. `id = b.auction` on `on close` / conv rules) received a string and
     // failed digit coercion — every close alert was dropped with `data format
-    // error` (Q12/Q14 hit this). A close over an Int key must produce a
-    // `Number` scope_key, byte-identical to the event path.
+    // error` (Q12/Q14 hit this). A close over an Int key must produce the
+    // canonical typed-key 展开 —— 第 2 步起整数键为 `Value::Int`（精确、仍是数值，
+    // 不走字符串），与 `ScopeKey` 的规范化口径一致。
     let plan = plan_with_close(
         vec![simple_key("auction")],
         vec![step(vec![branch("b", count_ge(1.0))])],
@@ -99,7 +100,7 @@ fn int_key_close_preserves_number_scope_key() {
 
     let expired = sm.scan_expired_at(base + 61 * NANOS_PER_SEC);
     assert_eq!(expired.len(), 1);
-    assert_eq!(expired[0].scope_key, vec![num(421_762.0)]);
+    assert_eq!(expired[0].scope_key, vec![Value::Int(421_762)]);
 }
 
 #[test]

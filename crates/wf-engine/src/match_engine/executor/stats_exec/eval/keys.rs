@@ -249,6 +249,7 @@ pub(crate) fn scope_key_from_comps(comps: &[ScopeKey]) -> ScopeKey {
 pub(crate) fn value_to_i128(v: &Value) -> Option<i128> {
     match v {
         Value::Number(n) => Some(*n as i128),
+        Value::Int(i) => Some(*i as i128),
         _ => None,
     }
 }

@@ -425,7 +425,7 @@ fn machine_capture_trigger_columnar_skips_fire_materialization() {
         trigger.field_value("action"),
         Some(Value::Str("login".into()))
     );
-    assert_eq!(trigger.field_value("dport"), Some(Value::Number(443.0)));
+    assert_eq!(trigger.field_value("dport"), Some(Value::Int(443)));
     assert_eq!(trigger.to_event(), events[0]);
 
     // Fallback path (capture = None): the machine materializes the row — the

@@ -114,12 +114,12 @@ fn staged_batch_coercion_matrix() {
 
     // Row 0 — every field present, happy path.
     let f = &staged[0].fields;
-    assert_eq!(f.get(PIPE_EVENT_TIME_FIELD), Some(&Value::Number(1_000.0)));
+    assert_eq!(f.get(PIPE_EVENT_TIME_FIELD), Some(&Value::Int(1_000)));
     assert_eq!(
         f.get("event_time"),
-        Some(&Value::Number(1_700_000_000_000_000_000.0))
+        Some(&Value::Int(1_700_000_000_000_000_000))
     );
-    assert_eq!(f.get("n_i"), Some(&Value::Number(7.0)));
+    assert_eq!(f.get("n_i"), Some(&Value::Int(7)));
     assert_eq!(f.get("n_f"), Some(&Value::Number(1.5)));
     assert_eq!(f.get("flag"), Some(&Value::Bool(true)));
     assert_eq!(f.get("label"), Some(&Value::Str("x".into())));
@@ -129,10 +129,10 @@ fn staged_batch_coercion_matrix() {
     // Row 1 — missing scalars -> null (field absent); Utf8 coercion of
     // Number; the time column falls back to the record event time.
     let f = &staged[1].fields;
-    assert_eq!(f.get(PIPE_EVENT_TIME_FIELD), Some(&Value::Number(2_000.0)));
+    assert_eq!(f.get(PIPE_EVENT_TIME_FIELD), Some(&Value::Int(2_000)));
     assert_eq!(
         f.get("event_time"),
-        Some(&Value::Number(2_000.0)),
+        Some(&Value::Int(2_000)),
         "missing time-col value must fall back to event_time_nanos"
     );
     assert_eq!(f.get("n_i"), None);
@@ -144,8 +144,8 @@ fn staged_batch_coercion_matrix() {
     // Row 2 — type mismatches -> null; Utf8 coercion of Bool; a row
     // without any time value gets its own event_time_nanos.
     let f = &staged[2].fields;
-    assert_eq!(f.get(PIPE_EVENT_TIME_FIELD), Some(&Value::Number(3_000.0)));
-    assert_eq!(f.get("event_time"), Some(&Value::Number(3_000.0)));
+    assert_eq!(f.get(PIPE_EVENT_TIME_FIELD), Some(&Value::Int(3_000)));
+    assert_eq!(f.get("event_time"), Some(&Value::Int(3_000)));
     assert_eq!(f.get("n_i"), None, "Str into Int64 stages as null");
     assert_eq!(f.get("flag"), None, "Number into Bool stages as null");
     assert_eq!(f.get("label"), Some(&Value::Str("true".into())));
@@ -194,8 +194,8 @@ fn staged_timestamp_preserves_time_yield_as_epoch_nanos() {
     let (_, staged, _) = stager.take_events().unwrap().expect("rows staged");
     assert_eq!(
         staged[0].fields.get("event_time"),
-        Some(&Value::Number(ts as f64)),
-        "float epoch yield must normalize to exact epoch nanos"
+        Some(&Value::Int(ts)),
+        "epoch yield must normalize to exact epoch nanos (Int)"
     );
 }
 
@@ -274,7 +274,7 @@ fn stager_column_alignment_holds_over_many_rows() {
     let (_, events, _) = stager.take_events().unwrap().expect("rows staged");
     assert_eq!(events.len(), rows);
     for (i, event) in events.iter().enumerate() {
-        assert_eq!(event.fields.get("n_i"), Some(&Value::Number(i as f64)));
+        assert_eq!(event.fields.get("n_i"), Some(&Value::Int(i as i64)));
         assert_eq!(
             event.fields.get("label"),
             Some(&Value::Str(format!("row-{i}").into()))

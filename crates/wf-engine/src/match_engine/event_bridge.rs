@@ -98,11 +98,11 @@ pub fn batch_event_time_nanos(batch: &RecordBatch, time_field: Option<&str>, row
 ///
 /// | Arrow Type           | → | CEP Value               |
 /// |----------------------|---|-------------------------|
-/// | Int64                | → | Value::Number(i as f64) |
+/// | Int64                | → | Value::Int(i)           |
 /// | Float64              | → | Value::Number(f)        |
 /// | Utf8                 | → | Value::Str(s)           |
 /// | Boolean              | → | Value::Bool(b)          |
-/// | Timestamp(Ns, _)     | → | Value::Number(ns as f64)|
+/// | Timestamp(Ns, _)     | → | Value::Int(ns)          |
 /// | Struct               | → | Value::Object           |
 /// | List/LargeList       | → | Value::Array            |
 pub fn batch_to_events(batch: &RecordBatch) -> Vec<Event> {

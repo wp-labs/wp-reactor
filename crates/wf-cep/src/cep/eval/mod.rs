@@ -160,6 +160,11 @@ fn eval_neg(
     let v = eval_expr_ext(inner, event, windows, baselines)?;
     match v {
         Value::Number(n) => Some(Value::Number(-n)),
+        // 精确整数取反；`i64::MIN` 取反溢出 i64 → 退回 f64（2^63 可精确表示）。
+        Value::Int(i) => Some(match i.checked_neg() {
+            Some(neg) => Value::Int(neg),
+            None => Value::Number(-(i as f64)),
+        }),
         _ => None,
     }
 }
@@ -302,6 +307,7 @@ fn eval_baseline(
 ) -> Option<Value> {
     let current_val = match eval_expr(&args[0], event)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
 

@@ -598,7 +598,7 @@ fn failed_staging_then_successful_row_is_consistent() {
     assert_eq!(batch.len(), 1);
     let row = batch.iter_data_records().next().unwrap().unwrap();
     match row.field("x").unwrap().get_value() {
-        ModelValue::Float(n) => assert_eq!(*n, 3.0),
+        ModelValue::Digit(n) => assert_eq!(*n, 3),
         other => panic!("unexpected value for x: {other:?}"),
     }
 }

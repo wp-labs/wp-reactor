@@ -305,11 +305,11 @@ async fn pipeline_stage_output_writes_internal_window_instead_of_alert_channel()
     );
     assert_eq!(
         rows[0].fields.get("ev_count"),
-        Some(&wf_engine::match_engine::Value::Number(1.0))
+        Some(&wf_engine::match_engine::Value::Int(1))
     );
     assert_eq!(
         rows[0].fields.get("__wf_pipe_ts"),
-        Some(&wf_engine::match_engine::Value::Number(ts as f64))
+        Some(&wf_engine::match_engine::Value::Int(ts))
     );
 }
 
@@ -364,7 +364,7 @@ async fn intermediate_target_writes_window_instead_of_alert_channel() {
     );
     assert_eq!(
         rows[0].fields.get("event_time"),
-        Some(&wf_engine::match_engine::Value::Number(ts as f64))
+        Some(&wf_engine::match_engine::Value::Int(ts))
     );
     assert_eq!(
         rows[0].fields.get("risk_context"),
@@ -414,9 +414,7 @@ async fn intermediate_target_preserves_explicit_time_field() {
     let event = &push.events.as_ref().unwrap()[0];
     assert_eq!(
         event.fields.get("event_time"),
-        Some(&wf_engine::match_engine::Value::Number(
-            10_000_000_000_000_000.0
-        ))
+        Some(&wf_engine::match_engine::Value::Int(10_000_000_000_000_000))
     );
 }
 

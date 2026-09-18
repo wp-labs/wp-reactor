@@ -1067,14 +1067,13 @@ fn eval_interval_bound_is_exact_on_columnar_epoch_nanos() {
         "列式源的区间界必须精确（整数通道）"
     );
 
-    // 对照：eager（物化 Event）的字段已经过 `Value::Number(f64)`，界被量化——
-    // 这是 f64 表示纳秒时间戳的固有损失，需靠精确通道（或 Value 的整数表示）解决。
+    // eager（物化 Event）同样精确：第 2 步起 `Value::Int` 承载原始 i64，
+    // `value_to_int` 不经 f64 —— 旧「物化即量化到 ~256ns」的损失已消除。
     let eager = DeferredLeft::Event(batch_to_events(&batch).into_iter().next().unwrap());
-    let via_eager = eval_interval_bound(&bound, &eager, ns).unwrap();
-    assert_ne!(via_eager, ns, "eager 路径仍丢精度（对照）");
-    assert!(
-        (via_eager - ns).abs() <= 256,
-        "量化误差应在 f64 步长内：{via_eager} vs {ns}"
+    assert_eq!(
+        eval_interval_bound(&bound, &eager, ns),
+        Some(ns),
+        "eager 路径也已精确（Value::Int + 整数通道）"
     );
 }
 

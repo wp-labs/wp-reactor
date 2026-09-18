@@ -443,6 +443,7 @@ pub(crate) fn eval_interval_bound(
             let value = eval_expr(e, ctx)?;
             match value {
                 Value::Number(n) => normalize_epoch_timestamp_float_nanos(n),
+                Value::Int(i) => normalize_epoch_timestamp_int_nanos(i),
                 _ => None,
             }
         }
@@ -806,7 +807,7 @@ mod tests {
             matched_col.field_value("ip"),
             Some(Value::Str("10.0.0.2".into()))
         );
-        assert_eq!(matched_col.field_value("score"), Some(Value::Number(100.0)));
+        assert_eq!(matched_col.field_value("score"), Some(Value::Int(100)));
     }
 
     // -------------------------------------------------------------------

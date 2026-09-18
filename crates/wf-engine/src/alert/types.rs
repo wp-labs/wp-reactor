@@ -17,7 +17,7 @@ use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::CloseReason;
 use crate::match_engine::EngineHashMap;
 use crate::match_engine::Value;
-use crate::time::normalize_epoch_timestamp_float_nanos;
+use crate::time::{normalize_epoch_timestamp_float_nanos, normalize_epoch_timestamp_int_nanos};
 
 pub use wf_lang::wfu_meta::WFU_PREFIX;
 // 其余 WFU_* 为 crate 内契约（本文件构造元数据列 + alert 测试导入）；
@@ -296,6 +296,11 @@ pub(crate) fn export_yield_f64(
         Some(FieldType::Base(BaseType::Chars)) => {
             Ok((DataType::Chars, ModelValue::from(n.to_string().as_str())))
         }
+        // 未声明类型：整值与 `export_untyped_value` 同口径导出 `Digit`（两条
+        // 执行路径必须一致），非整值仍为 `Float`。
+        None if n.is_finite() && n.fract() == 0.0 && n.abs() <= i64::MAX as f64 => {
+            Ok((DataType::Digit, ModelValue::from(n as i64)))
+        }
         None if n.is_finite() => Ok((DataType::Float, ModelValue::from(n))),
         // Any other target (Time / Ip / Hex / non-finite / array / object) —
         // fall back to the Value path for byte-identical handling.
@@ -309,6 +314,8 @@ fn export_typed_value(base_type: &BaseType, value: &Value) -> CoreResult<(DataTy
             Value::Number(n) if n.is_finite() && n.fract() == 0.0 => {
                 Ok((DataType::Digit, ModelValue::from(*n as i64)))
             }
+            // 精确整数：不经 f64（>2^53 保持精确 Digit）。
+            Value::Int(i) => Ok((DataType::Digit, ModelValue::from(*i))),
             _ => CoreReason::DataFormat
                 .to_err()
                 .with_detail("digit field requires an integer-compatible number")
@@ -316,6 +323,7 @@ fn export_typed_value(base_type: &BaseType, value: &Value) -> CoreResult<(DataTy
         },
         BaseType::Float => match value {
             Value::Number(n) if n.is_finite() => Ok((DataType::Float, ModelValue::from(*n))),
+            Value::Int(i) => Ok((DataType::Float, ModelValue::from(*i as f64))),
             _ => CoreReason::DataFormat
                 .to_err()
                 .with_detail("float field requires a finite number")
@@ -355,6 +363,11 @@ fn export_typed_value(base_type: &BaseType, value: &Value) -> CoreResult<(DataTy
 
 fn export_untyped_value(value: &Value) -> CoreResult<(DataType, ModelValue)> {
     match value {
+        // 整值 `Number` 与 `Int` 同口径导出 `Digit`：未声明类型的整数在行式
+        // （`Value::Int`）/列式（f64 快车道）两条路径上必须产出**同一**模型类型。
+        Value::Number(n) if n.is_finite() && n.fract() == 0.0 && n.abs() <= i64::MAX as f64 => {
+            Ok((DataType::Digit, ModelValue::from(*n as i64)))
+        }
         Value::Number(n) if n.is_finite() => Ok((DataType::Float, ModelValue::from(*n))),
         // 精确整数输出为 `Digit`（而非不精确的 Float）—— 见 `Value::Int` 语义。
         Value::Int(i) => Ok((DataType::Digit, ModelValue::from(*i))),
@@ -606,6 +619,14 @@ fn parse_time_value(value: &Value) -> CoreResult<DateTimeValue> {
             })?;
             Ok(DateTime::from_timestamp_nanos(nanos).naive_utc())
         }
+        // 精确整数 epoch：整数通道归一化（无 f64 量化）。
+        Value::Int(i) => {
+            let nanos = normalize_epoch_timestamp_int_nanos(*i).ok_or_else(|| {
+                orion_error::StructError::from(CoreReason::DataFormat)
+                    .with_detail("time field requires a valid epoch timestamp")
+            })?;
+            Ok(DateTime::from_timestamp_nanos(nanos).naive_utc())
+        }
         Value::Str(text) => parse_time_text(text),
         _ => CoreReason::DataFormat
             .to_err()
@@ -652,6 +673,7 @@ fn parse_ip_value(value: &Value) -> CoreResult<IpAddr> {
 fn parse_hex_value(value: &Value) -> CoreResult<HexT> {
     match value {
         Value::Number(n) if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 => Ok(HexT(*n as u128)),
+        Value::Int(i) if *i >= 0 => Ok(HexT(*i as u128)),
         Value::Str(text) => {
             let normalized = text
                 .strip_prefix("0x")

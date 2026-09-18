@@ -171,8 +171,8 @@ fn batch_to_timestamped_rows_non_timestamp_column_returns_empty() {
     let rows = batch_to_timestamped_rows(&batch, 0);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, 10);
-    assert_eq!(rows[0].1.get("v"), Some(&Value::Number(7.0)));
-    assert_eq!(rows[0].1.get("ts"), Some(&Value::Number(10.0)));
+    assert_eq!(rows[0].1.get("v"), Some(&Value::Int(7)));
+    assert_eq!(rows[0].1.get("ts"), Some(&Value::Int(10)));
 }
 
 #[test]
@@ -271,20 +271,15 @@ fn scalar_extract_value_arms_and_list_nulls() {
 
     // extract_field_value for each column (list null elements dropped).
     let l = extract_field_value(batch.schema_ref().field(0), batch.column(0), 0).unwrap();
-    assert_eq!(l, Value::Array(vec![Value::Number(1.0)]));
+    assert_eq!(l, Value::Array(vec![Value::Int(1)]));
     let ll = extract_field_value(batch.schema_ref().field(1), batch.column(1), 0).unwrap();
-    assert_eq!(
-        ll,
-        Value::Array(vec![Value::Number(5.0), Value::Number(6.0)])
-    );
+    assert_eq!(ll, Value::Array(vec![Value::Int(5), Value::Int(6)]));
     let fl = extract_field_value(batch.schema_ref().field(2), batch.column(2), 0).unwrap();
-    assert_eq!(fl, Value::Array(vec![Value::Number(4.0)]));
+    assert_eq!(fl, Value::Array(vec![Value::Int(4)]));
     let s = extract_field_value(batch.schema_ref().field(3), batch.column(3), 0).unwrap();
     assert_eq!(
         s,
-        Value::Object(EngineHashMap::from_iter([
-            ("x".into(), Value::Number(9.0),)
-        ]))
+        Value::Object(EngineHashMap::from_iter([("x".into(), Value::Int(9),)]))
     );
 }
 
@@ -322,7 +317,7 @@ fn columnar_event_projected_fields_and_schema_fallback() {
 
     // Schema-fallback lane (no index): field_value via schema().index_of.
     let ce = ColumnarEvent::new(&batch, 0);
-    assert_eq!(ce.field_value("id"), Some(Value::Number(1.0)));
+    assert_eq!(ce.field_value("id"), Some(Value::Int(1)));
     assert_eq!(ce.field_value("missing"), None);
     // to_event via the field_names fallback loop.
     let ev = ce.to_event();
@@ -350,7 +345,7 @@ fn join_row_event_variant_and_columnar_null_reads() {
     let batch = batch();
     let rows = columnar_join_rows(vec![batch], None);
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0].field_value("id"), Some(Value::Number(1.0)));
+    assert_eq!(rows[0].field_value("id"), Some(Value::Int(1)));
     assert_eq!(rows[1].field_value("id"), None);
 }
 

@@ -37,7 +37,7 @@ use crate::match_engine::cep::{Event, FieldSource, Value, WindowLookup, field_re
 use crate::match_engine::columnar::{
     CVec, ColumnarBatch, GuardMasks, compile_guard, compile_yield_cvec, eval_compiled_guard,
 };
-use crate::time::normalize_epoch_timestamp_float_nanos;
+use crate::time::{normalize_epoch_timestamp_float_nanos, normalize_epoch_timestamp_int_nanos};
 
 /// Schema fingerprint for the compiled-guard cache: field name + data type +
 /// metadata (the metadata marks structured JSON-array columns, which change
@@ -780,6 +780,8 @@ fn coerce_yield_base_value(name: &str, base_type: &BaseType, value: Value) -> Co
         },
         BaseType::Digit => match value {
             Value::Number(n) if n.is_finite() && n.fract() == 0.0 => Ok(Value::Number(n)),
+            // 精确整数：原样保留（导出层 Digit 走 `i64`，无 f64 往返）。
+            Value::Int(i) => Ok(Value::Int(i)),
             _ => CoreReason::DataFormat
                 .to_err()
                 .with_detail(format!(
@@ -789,6 +791,8 @@ fn coerce_yield_base_value(name: &str, base_type: &BaseType, value: Value) -> Co
         },
         BaseType::Float => match value {
             Value::Number(n) if n.is_finite() => Ok(Value::Number(n)),
+            // 目标虽为 Float，但保留 `Int`（导出层再定 Float/Digit），避免精度丢失。
+            Value::Int(i) => Ok(Value::Int(i)),
             _ => CoreReason::DataFormat
                 .to_err()
                 .with_detail(format!("yield field {name:?} expects a finite number"))
@@ -819,6 +823,7 @@ fn coerce_yield_base_value(name: &str, base_type: &BaseType, value: Value) -> Co
             Value::Number(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => {
                 Ok(Value::Number(n))
             }
+            Value::Int(i) if i >= 0 => Ok(Value::Int(i)),
             Value::Str(text) => {
                 let normalized = text
                     .strip_prefix("0x")
@@ -842,6 +847,15 @@ fn coerce_yield_base_value(name: &str, base_type: &BaseType, value: Value) -> Co
 
 fn coerce_yield_time_value(name: &str, value: Value) -> CoreResult<Value> {
     match value {
+        // 精确整数：走整数时间戳归一化（epoch-ns 不经 f64 量化）。
+        Value::Int(i) => {
+            normalize_epoch_timestamp_int_nanos(i).ok_or_else(|| {
+                orion_error::StructError::from(CoreReason::DataFormat).with_detail(format!(
+                    "yield field {name:?} expects a valid epoch timestamp"
+                ))
+            })?;
+            Ok(Value::Int(i))
+        }
         Value::Number(n) => {
             normalize_epoch_timestamp_float_nanos(n).ok_or_else(|| {
                 orion_error::StructError::from(CoreReason::DataFormat).with_detail(format!(

@@ -1139,7 +1139,7 @@ fn instance_key_sliding_fixed_and_scope_matching() {
     assert_eq!(sliding.scope_key, skey);
     assert!(sliding.matches_scope(&ScopeKey::Int(7)));
     assert!(!sliding.matches_scope(&ScopeKey::Int(8)));
-    assert_eq!(sliding.scope_key_values(), vec![num(7.0)]);
+    assert_eq!(sliding.scope_key_values(), vec![Value::Int(7)]);
 
     let fixed = InstanceKey::fixed(&skey, 100);
     assert_eq!(fixed.bucket_start, Some(100));

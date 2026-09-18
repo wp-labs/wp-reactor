@@ -21,6 +21,14 @@ pub(super) fn compare_sortable_values(a: &Value, b: &Value) -> std::cmp::Orderin
         (Value::Number(x), Value::Number(y)) => {
             x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
         }
+        // 数值域统一：`Int` 与 `Number` 同序（与 wf-cep `compare_sortable_values` 同口径）。
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Int(x), Value::Number(y)) => (*x as f64)
+            .partial_cmp(y)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Number(x), Value::Int(y)) => x
+            .partial_cmp(&(*y as f64))
+            .unwrap_or(std::cmp::Ordering::Equal),
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         _ => value_to_string(a).cmp(&value_to_string(b)),

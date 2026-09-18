@@ -425,7 +425,7 @@ pub fn eval_guard_columnar(expr: &Expr, view: &ColumnarBatch<'_>) -> BooleanArra
 /// and fall back to the interpreted per-row path).
 pub(crate) fn cscalar_to_value(s: &CScalar) -> Value {
     match s {
-        CScalar::Int(i) => Value::Number(*i as f64),
+        CScalar::Int(i) => Value::Int(*i),
         CScalar::Float(f) => Value::Number(*f),
         CScalar::Str(s) => Value::Str(s.clone()),
         CScalar::Bool(b) => Value::Bool(*b),

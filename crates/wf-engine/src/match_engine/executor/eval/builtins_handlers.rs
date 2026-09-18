@@ -1,6 +1,7 @@
 //! eval_builtin_func_with_l3 的 per-name handler（issue: builtins.rs 拆分，
 //! 2026-09-06 code.split_reduce_complexity 机械搬运；行为与源 arm 一致）。
 use super::*;
+use wf_cep::time::normalize_epoch_timestamp_int_nanos;
 pub(super) fn builtin_contains(
     _name: &str,
     args: &[wf_lang::ast::Expr],
@@ -93,6 +94,8 @@ pub(super) fn builtin_substr(
     };
     let start = match eval_expr_with_l3(&args[1], ctx, score)? {
         Value::Number(n) => n.trunc() as i64,
+        // 数值内置函数是 f64 域：`Int` 经 `i as f64` 归一，与 `Number` 同路径。
+        Value::Int(i) => i,
         _ => return None,
     };
     let chars: Vec<char> = text.chars().collect();
@@ -114,6 +117,7 @@ pub(super) fn builtin_substr(
     if args.len() == 3 {
         let length = match eval_expr_with_l3(&args[2], ctx, score)? {
             Value::Number(n) => n.trunc() as i64,
+            Value::Int(i) => i,
             _ => return None,
         };
         if length <= 0 {
@@ -264,6 +268,7 @@ pub(super) fn builtin_mvindex(
     if args.len() == 2 {
         let idx = match eval_expr_with_l3(&args[1], ctx, score)? {
             Value::Number(n) => utils::normalize_index(n.trunc() as i64, arr.len()),
+            Value::Int(i) => utils::normalize_index(i, arr.len()),
             _ => return None,
         }?;
         return arr.get(idx).cloned();
@@ -273,10 +278,12 @@ pub(super) fn builtin_mvindex(
     }
     let start = match eval_expr_with_l3(&args[1], ctx, score)? {
         Value::Number(n) => n.trunc() as i64,
+        Value::Int(i) => i,
         _ => return None,
     };
     let end = match eval_expr_with_l3(&args[2], ctx, score)? {
         Value::Number(n) => n.trunc() as i64,
+        Value::Int(i) => i,
         _ => return None,
     };
     let len = arr.len() as i64;
@@ -375,6 +382,7 @@ pub(super) fn builtin_abs(
     }
     match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => Some(Value::Number(n.abs())),
+        Value::Int(i) => Some(Value::Number((i as f64).abs())),
         _ => None,
     }
 }
@@ -389,11 +397,13 @@ pub(super) fn builtin_round(
     }
     let value = match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
     let precision = if args.len() == 2 {
         match eval_expr_with_l3(&args[1], ctx, score)? {
             Value::Number(n) => utils::f64_to_i64_trunc(n)?,
+            Value::Int(i) => i,
             _ => return None,
         }
     } else {
@@ -413,6 +423,7 @@ pub(super) fn builtin_ceil(
     }
     match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => Some(Value::Number(n.ceil())),
+        Value::Int(i) => Some(Value::Number((i as f64).ceil())),
         _ => None,
     }
 }
@@ -427,6 +438,7 @@ pub(super) fn builtin_floor(
     }
     match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => Some(Value::Number(n.floor())),
+        Value::Int(i) => Some(Value::Number((i as f64).floor())),
         _ => None,
     }
 }
@@ -441,6 +453,7 @@ pub(super) fn builtin_sqrt(
     }
     match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) if n >= 0.0 => Some(Value::Number(n.sqrt())),
+        Value::Int(i) if i >= 0 => Some(Value::Number((i as f64).sqrt())),
         _ => None,
     }
 }
@@ -455,10 +468,12 @@ pub(super) fn builtin_pow(
     }
     let x = match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
     let y = match eval_expr_with_l3(&args[1], ctx, score)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
     let out = x.powf(y);
@@ -479,6 +494,7 @@ pub(super) fn builtin_log(
     }
     let x = match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
     if x <= 0.0 {
@@ -487,6 +503,7 @@ pub(super) fn builtin_log(
     let out = if args.len() == 2 {
         let base = match eval_expr_with_l3(&args[1], ctx, score)? {
             Value::Number(n) => n,
+            Value::Int(i) => i as f64,
             _ => return None,
         };
         if base <= 0.0 || (base - 1.0).abs() < f64::EPSILON {
@@ -513,6 +530,7 @@ pub(super) fn builtin_exp(
     }
     let x = match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
     let out = x.exp();
@@ -533,14 +551,17 @@ pub(super) fn builtin_clamp(
     }
     let x = match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
     let min = match eval_expr_with_l3(&args[1], ctx, score)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
     let max = match eval_expr_with_l3(&args[2], ctx, score)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
     if min > max {
@@ -559,6 +580,7 @@ pub(super) fn builtin_sign(
     }
     match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) if n.is_finite() => Some(Value::Number(n.signum())),
+        Value::Int(i) => Some(Value::Number((i as f64).signum())),
         _ => None,
     }
 }
@@ -573,6 +595,7 @@ pub(super) fn builtin_trunc(
     }
     match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => Some(Value::Number(n.trunc())),
+        Value::Int(i) => Some(Value::Number((i as f64).trunc())),
         _ => None,
     }
 }
@@ -587,6 +610,7 @@ pub(super) fn builtin_is_finite(
     }
     match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => Some(Value::Bool(n.is_finite())),
+        Value::Int(_) => Some(Value::Bool(true)),
         _ => None,
     }
 }
@@ -910,6 +934,7 @@ pub(super) fn builtin_sha1_n(
     };
     let len = match eval_expr_with_l3(&args[1], ctx, score)? {
         Value::Number(n) if n.is_finite() && n.fract() == 0.0 => n as usize,
+        Value::Int(i) if i >= 0 => i as usize,
         _ => return None,
     };
     if !(1..=40).contains(&len) {
@@ -1050,6 +1075,7 @@ pub(super) fn builtin_time_to_s(
     }
     let ts_nanos = match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let divisor = if name == "time_to_s" {
@@ -1070,6 +1096,7 @@ pub(super) fn builtin_strftime(
     }
     let ts_nanos = match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let fmt = if let Some(fmt_expr) = args.get(1) {
@@ -1157,10 +1184,12 @@ pub(super) fn builtin_time_diff(
     }
     let t1 = match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let t2 = match eval_expr_with_l3(&args[1], ctx, score)? {
         Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     Some(Value::Number((t1 - t2).abs() as f64 / 1_000_000_000.0))
@@ -1176,10 +1205,12 @@ pub(super) fn builtin_time_bucket(
     }
     let t = match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let interval = match eval_expr_with_l3(&args[1], ctx, score)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
     let interval_nanos = positive_interval_seconds_to_nanos(interval)?;
@@ -1198,10 +1229,12 @@ pub(super) fn builtin_bucket_end(
     }
     let t = match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let interval = match eval_expr_with_l3(&args[1], ctx, score)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
     let interval_nanos = positive_interval_seconds_to_nanos(interval)?;
@@ -1226,14 +1259,17 @@ pub(super) fn builtin_phase_bucket(
     }
     let t = match eval_expr_with_l3(&args[0], ctx, score)? {
         Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let period = match eval_expr_with_l3(&args[1], ctx, score)? {
         Value::Number(n) => positive_interval_seconds_to_nanos(n)?,
+        Value::Int(i) => positive_interval_seconds_to_nanos(i as f64)?,
         _ => return None,
     };
     let bucket = match eval_expr_with_l3(&args[2], ctx, score)? {
         Value::Number(n) => positive_interval_seconds_to_nanos(n)?,
+        Value::Int(i) => positive_interval_seconds_to_nanos(i as f64)?,
         _ => return None,
     };
     if bucket <= 0 || period < bucket {

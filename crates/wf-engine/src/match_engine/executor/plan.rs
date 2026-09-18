@@ -73,6 +73,7 @@ impl ScorePlan {
                 let v = event.value_at(idx)?;
                 match v {
                     Value::Number(n) => Some((n * const_v).clamp(0.0, 100.0)),
+                    Value::Int(i) => Some((i as f64 * const_v).clamp(0.0, 100.0)),
                     _ => None,
                 }
             }

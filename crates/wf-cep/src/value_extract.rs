@@ -117,7 +117,8 @@ fn extract_value(col: &dyn Array, row: usize) -> Option<Value> {
     match col.data_type() {
         DataType::Int64 => {
             let arr = col.as_any().downcast_ref::<Int64Array>()?;
-            Some(Value::Number(arr.value(row) as f64))
+            // 精确整数（>2^53 不经 f64 量化）—— 见 `Value::Int` 文档。
+            Some(Value::Int(arr.value(row)))
         }
         DataType::Float64 => {
             let arr = col.as_any().downcast_ref::<Float64Array>()?;
@@ -133,7 +134,8 @@ fn extract_value(col: &dyn Array, row: usize) -> Option<Value> {
         }
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
             let arr = col.as_any().downcast_ref::<TimestampNanosecondArray>()?;
-            Some(Value::Number(arr.value(row) as f64))
+            // epoch-ns（≈1.77e18 > 2^53）必须走精确整数，否则量化到 ~256ns。
+            Some(Value::Int(arr.value(row)))
         }
         DataType::Struct(_) => {
             let arr = col.as_any().downcast_ref::<StructArray>()?;
@@ -234,11 +236,12 @@ mod int_channel_tests {
             "null → None"
         );
 
+        // 2026-09-18（第 2 步）：Value 路径已改走精确整数通道，不再丢精度。
         let via_value = match extract_field_value(&field, &ints, 0) {
-            Some(Value::Number(n)) => n as i64,
-            other => panic!("expected number, got {other:?}"),
+            Some(Value::Int(v)) => v,
+            other => panic!("expected exact int, got {other:?}"),
         };
-        assert_ne!(via_value, ns, "Value 路径（f64）在这个量级必丢精度");
+        assert_eq!(via_value, ns, "Value 路径也必须精确（Int 变体）");
 
         let ts = TimestampNanosecondArray::from(vec![Some(ns)]);
         let ts_field = Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true);

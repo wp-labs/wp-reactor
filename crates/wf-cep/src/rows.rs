@@ -163,6 +163,12 @@ impl RowFields {
                 self.numeric[idx] = n;
                 self.mask_bit(i, false);
             }
+            // `Int` 落同一 f64 数值槽（槽宽 8B 的设计使然；`|i| < 2^53` 精确，
+            // 更大整数在此紧凑缓存里仍是既有 f64 边界——与 step 2 前同口径）。
+            (RowFieldSlot::Numeric(idx), Some(Value::Int(v))) => {
+                self.numeric[idx] = v as f64;
+                self.mask_bit(i, false);
+            }
             (RowFieldSlot::Str(idx), Some(Value::Str(s))) => {
                 self.strings[idx] = s;
                 self.mask_bit(i, false);

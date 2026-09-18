@@ -22,8 +22,10 @@ pub(super) fn eval_func_baseline_dev(
     }
     let entity = value_to_string(&eval_expr_ext(&args[0], event, windows, baselines)?);
     let metric = value_to_string(&eval_expr_ext(&args[1], event, windows, baselines)?);
+    // 数值内置函数是 f64 域：`Value::Int` 经 `i as f64` 归一，走与 `Number` 相同路径。
     let value = match eval_expr_ext(&args[2], event, windows, baselines)? {
         Value::Number(n) => n,
+        Value::Int(i) => i as f64,
         _ => return None,
     };
     // 相位同窗：按事件时间（event_time 字段，epoch 纳秒）折叠相位桶——只与历史
@@ -31,6 +33,7 @@ pub(super) fn eval_func_baseline_dev(
     // 全桶并集（保守：仅无时间来源的诊断场景）。
     let at = match event.field_value("event_time") {
         Some(Value::Number(n)) if n.is_finite() => Some(n as i64),
+        Some(Value::Int(i)) => Some(i),
         _ => None,
     };
     crate::baseline::store()

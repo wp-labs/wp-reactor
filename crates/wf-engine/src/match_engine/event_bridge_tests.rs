@@ -34,11 +34,11 @@ fn test_batch_to_events_basic() {
     let events = batch_to_events(&batch);
     assert_eq!(events.len(), 2);
 
-    assert_eq!(events[0].fields["id"], Value::Number(42.0));
+    assert_eq!(events[0].fields["id"], Value::Int(42));
     assert_eq!(events[0].fields["name"], Value::Str("alice".into()));
     assert_eq!(events[0].fields["active"], Value::Bool(true));
 
-    assert_eq!(events[1].fields["id"], Value::Number(99.0));
+    assert_eq!(events[1].fields["id"], Value::Int(99));
     assert_eq!(events[1].fields["name"], Value::Str("bob".into()));
     assert_eq!(events[1].fields["active"], Value::Bool(false));
 }
@@ -59,7 +59,7 @@ fn test_batch_to_events_timestamp() {
 
     let events = batch_to_events(&batch);
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].fields["ts"], Value::Number(nanos as f64));
+    assert_eq!(events[0].fields["ts"], Value::Int(nanos));
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn test_batch_to_events_nulls() {
     assert_eq!(events.len(), 2);
 
     // Row 0: id=1, name is null (skipped)
-    assert_eq!(events[0].fields["id"], Value::Number(1.0));
+    assert_eq!(events[0].fields["id"], Value::Int(1));
     assert!(!events[0].fields.contains_key("name"));
 
     // Row 1: id is null (skipped), name="bob"
@@ -206,13 +206,10 @@ fn test_batch_to_events_struct_and_list() {
     let Some(Value::Object(detection)) = extension.get("detection") else {
         panic!("expected nested detection object, got {extension:?}");
     };
-    assert_eq!(detection.get("severity"), Some(&Value::Number(10.0)));
+    assert_eq!(detection.get("severity"), Some(&Value::Int(10)));
     assert_eq!(
         extension.get("tags"),
-        Some(&Value::Array(vec![
-            Value::Number(10.0),
-            Value::Number(20.0)
-        ]))
+        Some(&Value::Array(vec![Value::Int(10), Value::Int(20)]))
     );
     assert!(!extension.contains_key("ignored"));
 }
@@ -339,7 +336,7 @@ fn test_columnar_join_rows_projection() {
         rows[0].field_value("name"),
         Some(Value::Str("alice".into()))
     );
-    assert_eq!(rows[0].field_value("id"), Some(Value::Number(42.0)));
+    assert_eq!(rows[0].field_value("id"), Some(Value::Int(42)));
 }
 
 #[test]
@@ -373,8 +370,8 @@ fn test_columnar_timestamped_join_rows_projection() {
     // `field_names` is projected to only "ts".
     assert_eq!(rows[0].1.field_names(), vec!["ts"]);
     // `field_value` still reads non-projected "id" (join conditions).
-    assert_eq!(rows[0].1.field_value("id"), Some(Value::Number(42.0)));
-    assert_eq!(rows[1].1.field_value("id"), Some(Value::Number(7.0)));
+    assert_eq!(rows[0].1.field_value("id"), Some(Value::Int(42)));
+    assert_eq!(rows[1].1.field_value("id"), Some(Value::Int(7)));
 }
 
 #[test]
@@ -509,11 +506,10 @@ fn columnar_extract_scope_key_fallbacks() {
 
 #[test]
 fn columnar_extract_scope_key_type_lanes() {
-    // 类型车道锁定（2026-08-31 review 补）：
+    // 类型车道锁定（2026-08-31 review 补，2026-09-18 第 2 步更新）：
     // - Timestamp(Ns) / >2^53 Int64：列式直读 = ScopeKey::Int（精确 i64），
-    //   行式 = Float（f64 舍入）——**已知分歧**（fanout 分片
-    //   `scope_key_columnar_matches_row_based` 同款：>2^53 行式丢精度），
-    //   列式与分片路由一致（本优化的正确方向）；
+    //   行式（`Value::Int` 起）= **同样精确** —— 两条路径不再分歧
+    //   （fanout 分片 `scope_key_columnar_matches_row_based` 同款）；
     // - Struct / List 列：双路径一致 → Str("[object]") / Str("[array]")
     //   （结构化键走 from_value 规范化）；
     // - 空 key 列表 → ScopeKey::Empty（shared instance）。
@@ -541,14 +537,14 @@ fn columnar_extract_scope_key_type_lanes() {
     let col = ColumnarEvent::with_index(&batch, 0, Arc::clone(&index));
     let col_key = col.extract_scope_key(&keys, None, "c").unwrap();
     assert_eq!(col_key, ScopeKey::Int(1_700_000_000_000_000_000));
-    // 行式（旧路径）在 >2^53 处发散为 Float——分歧被锁定（fanout 同款）。
+    // 行式同样精确（`Value::Int`）——与列式逐位一致（fanout 同款）。
     let row_key = extract_key_simple(&col, &keys)
         .map(|v| scope_key_from_values(&v))
         .unwrap();
-    assert_ne!(col_key, row_key);
-    assert!(matches!(row_key, ScopeKey::Float(_)));
+    assert_eq!(col_key, row_key);
+    assert!(matches!(row_key, ScopeKey::Int(_)));
 
-    // --- >2^53 Int64 key（同款分歧）---
+    // --- >2^53 Int64 key（双路径一致）---
     let schema = make_schema(vec![
         Field::new("big", DataType::Int64, false),
         Field::new("sip", DataType::Utf8, false),
@@ -569,7 +565,10 @@ fn columnar_extract_scope_key_type_lanes() {
     let row_key = extract_key_simple(&col, &keys)
         .map(|v| scope_key_from_values(&v))
         .unwrap();
-    assert_ne!(col_key, row_key, ">2^53 Int64 列式精确 vs 行式 f64 舍入");
+    assert_eq!(
+        col_key, row_key,
+        ">2^53 Int64 列式与行式都精确（Value::Int）"
+    );
 
     // --- Struct 列 → 双路径均 Str("[object]") ---
     let inner_field = Field::new("geo", DataType::Utf8, false);

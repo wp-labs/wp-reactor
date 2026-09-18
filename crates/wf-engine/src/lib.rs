@@ -34,4 +34,4 @@ pub(crate) mod time {
 }
 pub mod window;
 
-pub use time::normalize_epoch_timestamp_float_nanos;
+pub use time::{normalize_epoch_timestamp_float_nanos, normalize_epoch_timestamp_int_nanos};

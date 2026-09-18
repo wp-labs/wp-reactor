@@ -97,6 +97,8 @@ pub(crate) fn insert_top(entries: &mut Vec<TopEntry>, key: f64, row: RowFields, 
 pub(crate) fn value_to_distinct_key(v: &Value) -> DistinctKey {
     match v {
         Value::Number(n) => DistinctKey::from_f64(*n),
+        // 精确整数：不经 f64（>2^53 不丢精度）。
+        Value::Int(i) => DistinctKey::from_i64(*i),
         Value::Str(s) => DistinctKey::from_str(s),
         Value::Bool(b) => DistinctKey::Int(if *b { 1 } else { 0 }),
         _ => DistinctKey::Str(format!("{:?}", v).into()),

@@ -282,7 +282,7 @@ fn join_index_stays_columnar_without_materializing_parsed_events() {
         .join_lookup("value", &JoinKey::Int(42), None)
         .expect("indexed window should return rows");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].field_value("value"), Some(Value::Number(42.0)));
+    assert_eq!(rows[0].field_value("value"), Some(Value::Int(42)));
 
     // And the batch's `parsed_events` stayed uninitialized.
     assert!(
@@ -311,7 +311,7 @@ fn join_lookup_asof_max_fast_path() {
         None,
     ) {
         AsofLookup::Hit(row) => {
-            assert_eq!(row.field_value("ts"), Some(Value::Number(3_000_000_000.0)));
+            assert_eq!(row.field_value("ts"), Some(Value::Int(3_000_000_000)));
         }
         AsofLookup::Miss => panic!("expected Hit, got Miss"),
         AsofLookup::Fallback => panic!("expected Hit, got Fallback"),
@@ -342,7 +342,7 @@ fn join_lookup_asof_max_fast_path() {
     // the index scans and returns it directly — no caller-side fallback scan.
     match win.join_lookup_asof("value", &JoinKey::Int(42), 2_000_000_000, 0, None) {
         AsofLookup::Hit(row) => {
-            assert_eq!(row.field_value("ts"), Some(Value::Number(1_000_000_000.0)));
+            assert_eq!(row.field_value("ts"), Some(Value::Int(1_000_000_000)));
         }
         AsofLookup::Miss => panic!("expected Hit for max_ts > event_time, got Miss"),
         AsofLookup::Fallback => panic!("expected Hit for max_ts > event_time, got Fallback"),
@@ -363,7 +363,7 @@ fn join_lookup_asof_max_fast_path() {
         None,
     ) {
         AsofLookup::Hit(row) => {
-            assert_eq!(row.field_value("ts"), Some(Value::Number(3_000_000_000.0)));
+            assert_eq!(row.field_value("ts"), Some(Value::Int(3_000_000_000)));
         }
         AsofLookup::Miss => panic!("expected Hit at inclusive lower bound, got Miss"),
         AsofLookup::Fallback => panic!("expected Hit at inclusive lower bound, got Fallback"),
@@ -378,7 +378,7 @@ fn join_lookup_asof_max_fast_path() {
         None,
     ) {
         AsofLookup::Hit(row) => {
-            assert_eq!(row.field_value("ts"), Some(Value::Number(3_000_000_000.0)));
+            assert_eq!(row.field_value("ts"), Some(Value::Int(3_000_000_000)));
         }
         AsofLookup::Miss => panic!("expected Hit at inclusive upper bound, got Miss"),
         AsofLookup::Fallback => panic!("expected Hit at inclusive upper bound, got Fallback"),
@@ -409,7 +409,7 @@ fn join_lookup_asof_max_scans_when_max_is_future() {
     // event_time=7s, min_ts=0: max_ts(9s) > 7s → scan picks 5s (greatest ≤ 7s).
     match win.join_lookup_asof("value", &JoinKey::Int(42), 7_000_000_000, 0, None) {
         AsofLookup::Hit(row) => {
-            assert_eq!(row.field_value("ts"), Some(Value::Number(5_000_000_000.0)));
+            assert_eq!(row.field_value("ts"), Some(Value::Int(5_000_000_000)));
         }
         AsofLookup::Miss => panic!("expected Hit, got Miss"),
         AsofLookup::Fallback => panic!("expected Hit, got Fallback"),
@@ -424,7 +424,7 @@ fn join_lookup_asof_max_scans_when_max_is_future() {
         None,
     ) {
         AsofLookup::Hit(row) => {
-            assert_eq!(row.field_value("ts"), Some(Value::Number(5_000_000_000.0)));
+            assert_eq!(row.field_value("ts"), Some(Value::Int(5_000_000_000)));
         }
         AsofLookup::Miss => panic!("expected Hit, got Miss"),
         AsofLookup::Fallback => panic!("expected Hit, got Fallback"),
@@ -440,7 +440,7 @@ fn join_lookup_asof_max_scans_when_max_is_future() {
         None,
     ) {
         AsofLookup::Hit(row) => {
-            assert_eq!(row.field_value("ts"), Some(Value::Number(9_000_000_000.0)));
+            assert_eq!(row.field_value("ts"), Some(Value::Int(9_000_000_000)));
         }
         AsofLookup::Miss => panic!("expected Hit, got Miss"),
         AsofLookup::Fallback => panic!("expected Hit, got Fallback"),
@@ -574,7 +574,7 @@ fn join_index_sharded_lookup_evict_and_asof_span_all_shards() {
         // asof：两行都在 [ts, ts+50]，event_time 取后行 → 命中后行。
         match win.join_lookup_asof("value", &JoinKey::Int(*key), i64::MAX, i64::MIN, None) {
             AsofLookup::Hit(row) => {
-                assert_eq!(row.field_value("value"), Some(Value::Number(*key as f64)));
+                assert_eq!(row.field_value("value"), Some(Value::Int(*key)));
             }
             AsofLookup::Miss => panic!("expected asof Hit for key {key}, got Miss"),
             AsofLookup::Fallback => panic!("expected asof Hit for key {key}, got Fallback"),
@@ -682,7 +682,7 @@ fn join_index_incremental_remove_recomputes_max_ts() {
     match win.join_lookup_asof("value", &JoinKey::Int(42), 9_000_000_000, 0, None) {
         AsofLookup::Hit(row) => assert_eq!(
             row.field_value("ts"),
-            Some(Value::Number(5_000_000_000.0)),
+            Some(Value::Int(5_000_000_000)),
             "max_ts = 5s before eviction"
         ),
         AsofLookup::Miss => panic!("expected Hit, got Miss"),
@@ -694,7 +694,7 @@ fn join_index_incremental_remove_recomputes_max_ts() {
     match win.join_lookup_asof("value", &JoinKey::Int(42), 9_000_000_000, 0, None) {
         AsofLookup::Hit(row) => assert_eq!(
             row.field_value("ts"),
-            Some(Value::Number(1_000_000_000.0)),
+            Some(Value::Int(1_000_000_000)),
             "max_ts must drop to the surviving row after the max row is evicted"
         ),
         AsofLookup::Miss => panic!("expected Hit, got Miss"),

@@ -291,7 +291,7 @@ fn close_direct_batch_columnar_literal_bool_and_string_columns() {
     );
     assert_eq!(
         record.get_value("n"),
-        Some(&wp_model_core::model::Value::from(9.0_f64))
+        Some(&wp_model_core::model::Value::from(9_i64))
     );
 }
 

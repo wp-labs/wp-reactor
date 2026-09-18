@@ -132,6 +132,7 @@ fn materialize_wfu_meta(
     use wf_lang::ast::Expr;
     match score.resolve_wfu_meta(field)? {
         Value::Number(n) => Some(Expr::Number(n)),
+        Value::Int(i) => Some(Expr::Number(i as f64)),
         Value::Str(s) => Some(Expr::StringLit(s.to_string())),
         Value::Bool(b) => Some(Expr::Bool(b)),
         _ => None,
@@ -487,6 +488,7 @@ pub(super) fn eval_l3_func(
             }
             let p = match eval_expr_with_l3(&args[1], ctx, score)? {
                 Value::Number(n) => n.clamp(0.0, 100.0) / 100.0,
+                Value::Int(i) => (i as f64).clamp(0.0, 100.0) / 100.0,
                 _ => return None,
             };
             Some(percentile_value(&values, p))

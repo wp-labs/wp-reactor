@@ -292,6 +292,31 @@ fn spill_value_roundtrip_with_layout_mismatch_rejected() {
     ));
 }
 
+/// 第 2 步（精确整数）后的关键回归：**行式路径的 `all_other` layout** 会把
+/// Int64/Timestamp 列的值放进 `others` 槽（不是 `numeric`）——`Value::Int` 必须
+/// 能落盘（tag 5）且逐位还原，否则 stats 行式 spill 会在遇到 nanosecond 时间戳
+/// 时直接 `Unsupported` 失败。>2^53 的值同时锁定「不经 f64 量化」。
+#[test]
+fn row_fields_others_roundtrip_int_is_exact() {
+    let layout = std::sync::Arc::new(RowFieldLayout::all_other(&["ts".to_string()]));
+    let epoch_ns: i64 = 1_767_225_600_000_000_001;
+    // 前提：`all_other` 下该字段确实落 `others`（而非 numeric 槽）。
+    let mut rf = RowFields::empty(std::sync::Arc::clone(&layout));
+    rf.set(0, Some(crate::match_engine::Value::Int(epoch_ns)));
+
+    let accs = vec![StatsAccum::Last(Some(std::sync::Arc::new(rf)))];
+    let bytes = serialize_accs(&accs).expect("Int 必须可 spill（tag 5）");
+    let back = deserialize_accs(&bytes, &layout).expect("deserialize");
+    let StatsAccum::Last(Some(row)) = &back[0] else {
+        panic!("expected Last(Some)");
+    };
+    assert_eq!(
+        row.value_at(0),
+        Some(crate::match_engine::Value::Int(epoch_ns)),
+        "spill 往返必须逐位精确（f64 会量化到 ~256ns）"
+    );
+}
+
 #[test]
 fn noop_spill_is_empty() {
     let mut s = NoopSpillStore;

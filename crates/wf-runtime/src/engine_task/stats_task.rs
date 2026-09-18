@@ -522,6 +522,7 @@ impl StatsTask {
         let to_str = |v: &wf_engine::match_engine::Value| match v {
             wf_engine::match_engine::Value::Str(s) => s.to_string(),
             wf_engine::match_engine::Value::Number(x) => x.to_string(),
+            wf_engine::match_engine::Value::Int(i) => i.to_string(),
             wf_engine::match_engine::Value::Bool(b) => b.to_string(),
             _ => String::new(),
         };
@@ -1279,7 +1280,7 @@ fn build_stats_close_output(
 fn scope_key_to_values(key: &ScopeKey) -> Vec<wf_engine::match_engine::Value> {
     match key {
         ScopeKey::Empty => vec![],
-        ScopeKey::Int(i) => vec![wf_engine::match_engine::Value::Number(*i as f64)],
+        ScopeKey::Int(i) => vec![wf_engine::match_engine::Value::Int(*i)],
         ScopeKey::Float(b) => vec![wf_engine::match_engine::Value::Number(f64::from_bits(*b))],
         ScopeKey::Str(s) => vec![wf_engine::match_engine::Value::Str(s.clone())],
         ScopeKey::Pair(a, b) => {

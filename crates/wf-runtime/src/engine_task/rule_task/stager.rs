@@ -11,8 +11,8 @@ use arrow::record_batch::RecordBatch;
 use orion_error::conversion::{SourceRawErr, ToStructError};
 use wf_engine::alert::OutputRecord;
 use wf_engine::match_engine::{Event, PipeRowSink, batch_to_events};
-use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::Router;
+use wf_engine::{normalize_epoch_timestamp_float_nanos, normalize_epoch_timestamp_int_nanos};
 
 use crate::error::{RuntimeReason, RuntimeResult};
 
@@ -445,10 +445,12 @@ fn push_pipe_col(
     match col {
         PipeCol::Int64(b) => b.append_option(match value {
             Some(wf_engine::match_engine::Value::Number(n)) => Some(*n as i64),
+            Some(wf_engine::match_engine::Value::Int(i)) => Some(*i),
             _ => None,
         }),
         PipeCol::Float64(b) => b.append_option(match value {
             Some(wf_engine::match_engine::Value::Number(n)) => Some(*n),
+            Some(wf_engine::match_engine::Value::Int(i)) => Some(*i as f64),
             _ => None,
         }),
         PipeCol::Bool(b) => b.append_option(match value {
@@ -466,6 +468,11 @@ fn push_pipe_col(
                 Some(wf_engine::match_engine::Value::Number(n)) => {
                     use std::fmt::Write as _;
                     write!(b, "{n}").ok();
+                    b.append_value("");
+                }
+                Some(wf_engine::match_engine::Value::Int(i)) => {
+                    use std::fmt::Write as _;
+                    write!(b, "{i}").ok();
                     b.append_value("");
                 }
                 Some(wf_engine::match_engine::Value::Bool(v)) => {
@@ -487,6 +494,9 @@ fn push_pipe_col(
                 b.append_option(match value {
                     Some(wf_engine::match_engine::Value::Number(n)) => {
                         normalize_epoch_timestamp_float_nanos(*n)
+                    }
+                    Some(wf_engine::match_engine::Value::Int(i)) => {
+                        normalize_epoch_timestamp_int_nanos(*i)
                     }
                     // The schema's time column falls back to the row's event
                     // time when the yield did not provide one.

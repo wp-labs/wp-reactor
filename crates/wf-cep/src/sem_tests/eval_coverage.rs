@@ -98,6 +98,64 @@ fn str_lit(s: &str) -> Expr {
 }
 
 // ===========================================================================
+// 第 2 步（精确整数 `Value::Int`）：数值域内置函数必须接受 `Int` 输入
+// ===========================================================================
+
+/// 构造侧接入 `Value::Int` 后，所有**消费数值**的内置函数必须能接受 `Int`：
+/// 数值函数按 `i as f64` 归一（返回值仍 `Value::Number`，导出层整值归一为 Digit），
+/// 而**整数索引/长度**走精确 `i64`（不经 f64）。
+#[test]
+fn numeric_builtins_accept_int_inputs() {
+    let mut fields = EngineHashMap::default();
+    fields.insert("n".into(), Value::Int(7));
+    fields.insert("neg".into(), Value::Int(-3));
+    fields.insert("s".into(), Value::Str("abcdef".into()));
+    fields.insert("start".into(), Value::Int(3));
+    fields.insert("idx".into(), Value::Int(2));
+    fields.insert(
+        "arr".into(),
+        Value::Array(vec![
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str("c".into()),
+        ]),
+    );
+    let e = Event { fields };
+    let ev = |expr: &Expr| eval_expr(expr, &e);
+
+    // 一元数值函数：`Int` → f64 域计算
+    assert_eq!(ev(&call("abs", vec![field("neg")])), Some(num(3.0)));
+    assert_eq!(ev(&call("floor", vec![field("n")])), Some(num(7.0)));
+    assert_eq!(ev(&call("ceil", vec![field("n")])), Some(num(7.0)));
+    assert_eq!(ev(&call("round", vec![field("n")])), Some(num(7.0)));
+    assert_eq!(ev(&call("trunc", vec![field("n")])), Some(num(7.0)));
+    assert_eq!(ev(&call("sign", vec![field("neg")])), Some(num(-1.0)));
+    assert_eq!(
+        ev(&call("is_finite", vec![field("n")])),
+        Some(Value::Bool(true))
+    );
+    // 二元数值函数：`Int` 与 `Number` 混合
+    assert_eq!(ev(&call("pow", vec![field("n"), n(2.0)])), Some(num(49.0)));
+    assert_eq!(
+        ev(&call("clamp", vec![field("n"), n(0.0), n(5.0)])),
+        Some(num(5.0))
+    );
+
+    // 整数索引/长度：走精确整数（`Int` 不经 f64 截断）
+    assert_eq!(
+        ev(&call(
+            "substr",
+            vec![field("s"), field("start"), field("idx")]
+        )),
+        Some(Value::Str("cd".into()))
+    );
+    assert_eq!(
+        ev(&call("mvindex", vec![field("arr"), field("idx")])),
+        Some(Value::Str("c".into()))
+    );
+}
+
+// ===========================================================================
 // funcs.rs — 纯 eval 路径的常规错误分支（参数个数 / 类型错误 → None）
 // ===========================================================================
 

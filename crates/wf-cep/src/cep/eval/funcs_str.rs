@@ -107,8 +107,10 @@ pub(super) fn eval_func_substr(
         Value::Str(s) => s,
         _ => return None,
     };
+    // 数值内置函数是 f64 域：`Value::Int` 经 `i as f64` 归一，走与 `Number` 相同路径。
     let start = match eval_expr_ext(&args[1], event, windows, baselines)? {
         Value::Number(n) => n.trunc() as i64,
+        Value::Int(i) => i,
         _ => return None,
     };
     let chars: Vec<char> = text.chars().collect();
@@ -130,6 +132,7 @@ pub(super) fn eval_func_substr(
     if args.len() == 3 {
         let length = match eval_expr_ext(&args[2], event, windows, baselines)? {
             Value::Number(n) => n.trunc() as i64,
+            Value::Int(i) => i,
             _ => return None,
         };
         if length <= 0 {
@@ -280,6 +283,7 @@ pub(super) fn eval_func_mvindex(
     if args.len() == 2 {
         let idx = match eval_expr_ext(&args[1], event, windows, baselines)? {
             Value::Number(n) => normalize_index(n.trunc() as i64, arr.len()),
+            Value::Int(i) => normalize_index(i, arr.len()),
             _ => return None,
         }?;
         return arr.get(idx).cloned();
@@ -289,10 +293,12 @@ pub(super) fn eval_func_mvindex(
     }
     let start = match eval_expr_ext(&args[1], event, windows, baselines)? {
         Value::Number(n) => n.trunc() as i64,
+        Value::Int(i) => i,
         _ => return None,
     };
     let end = match eval_expr_ext(&args[2], event, windows, baselines)? {
         Value::Number(n) => n.trunc() as i64,
+        Value::Int(i) => i,
         _ => return None,
     };
     let len = arr.len() as i64;

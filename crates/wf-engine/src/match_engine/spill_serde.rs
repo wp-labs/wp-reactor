@@ -230,6 +230,11 @@ fn write_row_fields(w: &mut Writer, rf: &RowFields) -> Result<(), SpillError> {
 
 /// Value 序列化（RowFields.others 的 `Option<Value>` 用）。
 /// Array/Object 结构化值拒绝 spill（否则读回空值 = 静默丢数据）。
+///
+/// tag：`0=Number(f64)`、`1=Str`、`2=Bool`、`5=Int(i64)`。
+/// `5` 为 2026-09-18「值层精确整数」新增——**整数不再降级为 f64**（epoch-ns
+/// 量级经 f64 往返会被量化到 ~256ns）。旧读端遇 tag 5 会明确 `Corrupt` 报错
+/// （可接受的降级方向：绝不静默改写精度）。
 fn write_value(w: &mut Writer, v: &crate::match_engine::Value) -> Result<(), SpillError> {
     match v {
         crate::match_engine::Value::Number(n) => {
@@ -247,11 +252,11 @@ fn write_value(w: &mut Writer, v: &crate::match_engine::Value) -> Result<(), Spi
             w.u8(*b as u8);
             Ok(())
         }
-        // TODO(step 3): 新增 tag 5 落盘 `i64`。现在没有生产者产出 `Int`，
-        // 这里必须**显式失败**——用 tag 0 塞回 f64 等于把精度 bug 放回落盘边界。
-        crate::match_engine::Value::Int(_) => Err(SpillError::Unsupported(
-            "RowFields others 含 Int 值（spill tag 5 尚未启用）".into(),
-        )),
+        crate::match_engine::Value::Int(i) => {
+            w.u8(5);
+            w.i64(*i);
+            Ok(())
+        }
         crate::match_engine::Value::Array(_) => Err(SpillError::Unsupported(
             "RowFields others 含 Array 值".into(),
         )),
@@ -279,6 +284,7 @@ fn read_value(r: &mut Reader<'_>) -> Result<crate::match_engine::Value, SpillErr
         2 => crate::match_engine::Value::Bool(r.u8()? != 0),
         3 => crate::match_engine::Value::Array(Vec::new()),
         4 => crate::match_engine::Value::Object(Default::default()),
+        5 => crate::match_engine::Value::Int(r.i64()?),
         other => return Err(SpillError::Corrupt(format!("Value 未知 tag {other}"))),
     })
 }
@@ -639,17 +645,8 @@ pub fn spill_hash(key: &ScopeKey) -> u64 {
 mod value_int_tests {
     use super::*;
 
-    /// 第 1 步（尚未启用 tag 5）：`Value::Int` 落盘必须**显式失败** ——
-    /// 用 tag 0 塞回 f64 等于把精度 bug 放回落盘边界（静默丢精度）。
-    #[test]
-    fn write_value_rejects_int_loudly() {
-        let mut w = Writer::new();
-        let err = write_value(&mut w, &crate::match_engine::Value::Int(42))
-            .expect_err("Int 尚无 spill tag，必须显式失败");
-        assert!(matches!(err, SpillError::Unsupported(_)), "got {err:?}");
-    }
-
-    /// 对照：标量 `Number` / `Str` / `Bool` 的 round-trip 保持不变。
+    /// 标量 round-trip：`Number` / `Str` / `Bool` 不变；`Int(i64)` 走 tag 5，
+    /// **>2^53 也逐位精确**（epoch-ns 量级经 f64 会量化到 ~256ns）。
     #[test]
     fn write_read_value_round_trips_scalars() {
         let cases = [
@@ -657,6 +654,12 @@ mod value_int_tests {
             crate::match_engine::Value::Number(-0.0),
             crate::match_engine::Value::Str("x".into()),
             crate::match_engine::Value::Bool(true),
+            crate::match_engine::Value::Int(42),
+            crate::match_engine::Value::Int(-7),
+            crate::match_engine::Value::Int(i64::MIN),
+            crate::match_engine::Value::Int(i64::MAX),
+            // epoch-ns：f64 无法精确表示的整数，必须逐位还原。
+            crate::match_engine::Value::Int(1_767_225_600_000_000_001),
         ];
         for v in cases {
             let mut w = Writer::new();

@@ -427,14 +427,14 @@ fn composite_key_isolation() {
 
     // Third event to key1 → matched
     if let StepResult::Matched(ctx) = sm.advance("fail", &e1) {
-        assert_eq!(ctx.scope_key, vec![str_val("10.0.0.1"), num(22.0)]);
+        assert_eq!(ctx.scope_key, vec![str_val("10.0.0.1"), Value::Int(22)]);
     } else {
         panic!("expected Matched for key1");
     }
 
     // key2 still needs one more
     if let StepResult::Matched(ctx) = sm.advance("fail", &e2) {
-        assert_eq!(ctx.scope_key, vec![str_val("10.0.0.1"), num(80.0)]);
+        assert_eq!(ctx.scope_key, vec![str_val("10.0.0.1"), Value::Int(80)]);
     } else {
         panic!("expected Matched for key2");
     }
@@ -639,7 +639,8 @@ fn instance_resets_after_match() {
 #[test]
 fn numeric_key_type_preserved_through_pipeline() {
     // dport is a numeric key (443.0). After advance + match, scope_key
-    // should contain Value::Number(443.0), not Value::Str("443").
+    // carries the canonical typed key (`Value::Int(443)`，第 2 步起为精确整数
+    // 变体), not Value::Str("443").
     let plan = simple_plan(
         vec![simple_key("sip"), simple_key("dport")],
         vec![step(vec![branch("conn", count_ge(1.0))])],
@@ -650,7 +651,7 @@ fn numeric_key_type_preserved_through_pipeline() {
     if let StepResult::Matched(ctx) = sm.advance("conn", &e) {
         assert_eq!(ctx.scope_key.len(), 2);
         assert_eq!(ctx.scope_key[0], str_val("10.0.0.1"));
-        assert_eq!(ctx.scope_key[1], num(443.0));
+        assert_eq!(ctx.scope_key[1], Value::Int(443));
     } else {
         panic!("expected Matched");
     }

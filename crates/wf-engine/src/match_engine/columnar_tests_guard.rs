@@ -206,7 +206,7 @@ fn native_int_matches_interpreted_below_2_53() {
 }
 
 #[test]
-fn native_int_comparison_diverges_above_2_53() {
+fn native_int_comparison_matches_interpreted_above_2_53() {
     const TWO_POW_53: i64 = 9_007_199_254_740_992;
     let schema = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Int64, false),
@@ -221,8 +221,9 @@ fn native_int_comparison_diverges_above_2_53() {
     )
     .unwrap();
 
-    // a == b with a=2^53, b=2^53+1. Native i64 sees them distinct; the
-    // interpreted f64 path rounds b down to 2^53 and reports equal.
+    // a == b with a=2^53, b=2^53+1. Both lanes now see them distinct: the
+    // columnar native i64 lane, and the interpreted lane (2026-09-18 第 2 步起
+    // `batch_to_events` 产出 `Value::Int`，不再经 f64 舍入)。
     let expr = bin(BinOp::Eq, field("a"), field("b"));
     assert!(wf_lang::columnar::expr_is_columnar(&expr));
     let view = ColumnarBatch::from_all_fields(&batch);
@@ -234,8 +235,11 @@ fn native_int_comparison_diverges_above_2_53() {
 
     let events = batch_to_events(&batch);
     let interpreted = interpreted_bool(&expr, &events[0]);
-    assert!(interpreted, "interpreted f64 rounds 2^53+1 to 2^53");
-    assert_ne!(mask.value(0), interpreted);
+    assert!(
+        !interpreted,
+        "interpreted 路径同样精确（Value::Int）：2^53 与 2^53+1 不相等"
+    );
+    assert_eq!(mask.value(0), interpreted, "两条路径必须一致");
 }
 
 #[test]

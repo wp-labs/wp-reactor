@@ -86,7 +86,7 @@ fn join_key_hit_routes_to_joined_key_instance() {
     };
     // The instance key is the *joined* field value (category=7), not the driver
     // auction id.
-    assert_eq!(ctx.scope_key, vec![num(7.0)]);
+    assert_eq!(ctx.scope_key, vec![Value::Int(7)]);
     assert_eq!(sm.instance_count(), 1);
 }
 
@@ -222,7 +222,7 @@ fn join_key_fractional_left_value_does_not_false_match() {
     let StepResult::Matched(ctx) = sm.advance_at_with("b", &e, 2_000, Some(&lookup)) else {
         panic!("exact integer driver value should join");
     };
-    assert_eq!(ctx.scope_key, vec![num(7.0)]);
+    assert_eq!(ctx.scope_key, vec![Value::Int(7)]);
 }
 
 #[test]

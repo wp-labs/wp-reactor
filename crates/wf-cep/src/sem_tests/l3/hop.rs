@@ -234,7 +234,7 @@ fn fixed_match_context_scope_key_matches_input_key() {
     let e = event(vec![("auction", num(42.0))]);
     match sm.advance_at("fail", &e, 5_000_000_000) {
         StepResult::Matched(ctx) => {
-            assert_eq!(ctx.scope_key, vec![Value::Number(42.0)]);
+            assert_eq!(ctx.scope_key, vec![Value::Int(42)]);
         }
         other => panic!("fixed 每事件命中应返回 Matched，实际 {other:?}"),
     }

@@ -535,9 +535,8 @@ fn scope_key_columnar_matches_row_based() {
     // `scope_key_from_values(extract_key_simple)` 逐行构造出 **同一个**
     // `ScopeKey`（相等）——覆盖 Utf8、null（→ 缺失 → shard 0）、Int64
     // <2^53、多列 key。
-    // 注：>2^53 的 Int64 行式走 f64 丢精度（`Value::Number(v as f64)`），
-    // 与列式精确 i64 是已知语义分歧（既有 extract_field_value 行为），此
-    // 测试锁 <2^53 一致 + 断言 >2^53 分歧方向。
+    // 注：2026-09-18 第 2 步起行式也走 `Value::Int`（`extract_field_value` 的
+    // Int64/Timestamp 不再经 f64），>2^53 的 2^53+1 行不再分歧——全行逐位相等。
     use crate::match_engine::batch_to_events;
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -576,18 +575,10 @@ fn scope_key_columnar_matches_row_based() {
     let events = batch_to_events(&batch);
 
     assert_eq!(batch.num_rows(), 4);
-    // 2^53+1 是唯一的分歧 lane（行式 f64 丢精度），其余必须逐行相等。
+    // 所有行（含 >2^53 的 2^53+1）必须逐行相等 —— 两条路径都精确。
     for (row, event) in events.iter().enumerate() {
         let col = scope_key_columnar(&batch, &col_idx, row);
         let rw = extract_key_simple(event, &keys).map(|sk| scope_key_from_values(&sk));
-        if row == 1 {
-            // >2^53：列式 Int(2^53+1) vs 行式 f64 舍入 → 分歧（已知语义）。
-            assert!(
-                col != rw,
-                "row {row} 2^53+1 columnar vs row-based should differ (f64 loss)"
-            );
-            continue;
-        }
         assert_eq!(
             col, rw,
             "row {row}: columnar ScopeKey {:?} != row-based ScopeKey {:?}",

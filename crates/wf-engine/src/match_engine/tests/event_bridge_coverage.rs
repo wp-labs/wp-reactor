@@ -55,7 +55,7 @@ fn columnar_event_value_at_and_batch_row_accessors() {
     let ce = ColumnarEvent::with_index(&batch, 0, Arc::clone(&index));
 
     // Pre-resolved index lane: identical to field_value for the same column.
-    assert_eq!(ce.value_at(0), Some(Value::Number(1.0)));
+    assert_eq!(ce.value_at(0), Some(Value::Int(1)));
     assert_eq!(ce.value_at(1), Some(Value::Str("a".into())));
     // Null cell → None.
     assert_eq!(
@@ -128,16 +128,13 @@ fn list_cells_with_null_elements_are_skipped() {
     let events = batch_to_events(&batch);
     assert_eq!(
         events[0].fields["tags"],
-        Value::Array(vec![Value::Number(1.0), Value::Number(3.0)])
+        Value::Array(vec![Value::Int(1), Value::Int(3)])
     );
     assert_eq!(
         events[0].fields["big"],
-        Value::Array(vec![Value::Number(7.0), Value::Number(9.0)])
+        Value::Array(vec![Value::Int(7), Value::Int(9)])
     );
-    assert_eq!(
-        events[0].fields["pair"],
-        Value::Array(vec![Value::Number(4.0)])
-    );
+    assert_eq!(events[0].fields["pair"], Value::Array(vec![Value::Int(4)]));
 }
 
 #[test]

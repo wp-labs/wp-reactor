@@ -1046,6 +1046,34 @@ fn join_cmp(op: BinOp, lv: &Value, rv: &Value) -> bool {
                 BinOp::Ge => a >= b,
                 _ => false,
             },
+            // 数值域统一：`Int` 与 `Number` 同序（混合时升 f64）。
+            (Value::Int(a), Value::Int(b)) => match op {
+                BinOp::Lt => a < b,
+                BinOp::Gt => a > b,
+                BinOp::Le => a <= b,
+                BinOp::Ge => a >= b,
+                _ => false,
+            },
+            (Value::Int(a), Value::Number(b)) => {
+                let a = *a as f64;
+                match op {
+                    BinOp::Lt => a < *b,
+                    BinOp::Gt => a > *b,
+                    BinOp::Le => a <= *b,
+                    BinOp::Ge => a >= *b,
+                    _ => false,
+                }
+            }
+            (Value::Number(a), Value::Int(b)) => {
+                let b = *b as f64;
+                match op {
+                    BinOp::Lt => *a < b,
+                    BinOp::Gt => *a > b,
+                    BinOp::Le => *a <= b,
+                    BinOp::Ge => *a >= b,
+                    _ => false,
+                }
+            }
             (Value::Str(a), Value::Str(b)) => match op {
                 BinOp::Lt => a < b,
                 BinOp::Gt => a > b,

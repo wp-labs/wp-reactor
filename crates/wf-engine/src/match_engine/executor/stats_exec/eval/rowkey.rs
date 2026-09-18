@@ -62,6 +62,7 @@ pub(crate) fn field_value_of(expr: &Expr, row: &HashMap<String, Value>) -> Optio
     match expr {
         Expr::Field(fr) => match row.get(field_name(fr)) {
             Some(Value::Number(n)) => Some(*n),
+            Some(Value::Int(i)) => Some(*i as f64),
             _ => None,
         },
         Expr::Number(n) => Some(*n),

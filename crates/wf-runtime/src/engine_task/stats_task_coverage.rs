@@ -75,10 +75,7 @@ fn batch_max_time_scans_max() {
 fn scope_key_to_values_all_variants() {
     assert!(scope_key_to_values(&ScopeKey::Empty).is_empty());
 
-    assert_eq!(
-        scope_key_to_values(&ScopeKey::Int(7)),
-        vec![Value::Number(7.0)]
-    );
+    assert_eq!(scope_key_to_values(&ScopeKey::Int(7)), vec![Value::Int(7)]);
 
     let bits = 1.25f64.to_bits();
     assert_eq!(
@@ -101,11 +98,7 @@ fn scope_key_to_values_all_variants() {
     );
     assert_eq!(
         scope_key_to_values(&pair),
-        vec![
-            Value::Number(1.0),
-            Value::Str("x".into()),
-            Value::Number(2.0)
-        ]
+        vec![Value::Int(1), Value::Str("x".into()), Value::Int(2)]
     );
 }
 
@@ -133,8 +126,8 @@ fn build_stats_close_output_injects_key_fields() {
     assert_eq!(close.close_step_data.len(), 2);
     // Key fields land in the first StepData's field_values.
     let first = &close.close_step_data[0].field_values;
-    assert_eq!(first.get("bidder"), Some(&vec![Value::Number(7.0)]));
-    assert_eq!(first.get("auction"), Some(&vec![Value::Number(8.0)]));
+    assert_eq!(first.get("bidder"), Some(&vec![Value::Int(7)]));
+    assert_eq!(first.get("auction"), Some(&vec![Value::Int(8)]));
     // Second StepData carries no key injection.
     assert!(close.close_step_data[1].field_values.is_empty());
     assert_eq!(close.close_step_data[0].measure_value, 10.0);

@@ -214,6 +214,7 @@ fn str_field<'a>(row: &'a HashMap<String, Value>, key: &str) -> Option<&'a str> 
 fn number_field(row: &HashMap<String, Value>, key: &str) -> Option<f64> {
     match row.get(key) {
         Some(Value::Number(value)) => Some(*value),
+        Some(Value::Int(value)) => Some(*value as f64),
         _ => None,
     }
 }

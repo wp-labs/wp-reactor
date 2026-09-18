@@ -199,7 +199,7 @@ where
         let mut kind: Option<ColKind> = None;
         for row in 0..n {
             match resolve(row, fname) {
-                Some(Value::Number(_)) => {
+                Some(Value::Number(_) | Value::Int(_)) => {
                     kind = Some(ColKind::Num);
                     break;
                 }
@@ -225,6 +225,8 @@ where
                 for row in 0..n {
                     match resolve(row, fname) {
                         Some(Value::Number(f)) => b.append_value(f),
+                        // 该桥构建 Float64 列，`Int` 按数值写入（列型即 f64 域）。
+                        Some(Value::Int(i)) => b.append_value(i as f64),
                         Some(_) => return None,
                         None => b.append_null(),
                     }

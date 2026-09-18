@@ -1182,6 +1182,7 @@ pub(super) fn event_time_nanos(event: &dyn FieldSource, time_field: Option<&str>
         .and_then(|field| event.field_value(field))
         .and_then(|value| match value {
             wf_engine::match_engine::Value::Number(n) => Some(n as i64),
+            wf_engine::match_engine::Value::Int(i) => Some(i),
             _ => None,
         })
         .unwrap_or(0)

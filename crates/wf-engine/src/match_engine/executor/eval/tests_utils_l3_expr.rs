@@ -168,6 +168,45 @@ fn utils_stable_id_hash_and_time() {
 // executor/eval/mod.rs — eval_score / eval_entity_id / eval_bool_expr / fallback
 // ===========================================================================
 
+/// 第 2 步（精确整数）：`Int64` 列经 `batch_to_events`/列式桥产出 `Value::Int`，
+/// score / entity / 内置函数读到它必须照常求值（此前只认 `Value::Number` →
+/// 整行 failed，是真实回归）。
+#[test]
+fn eval_score_and_builtins_accept_int_values() {
+    let ctx = ctx_with(vec![("v", Value::Int(42)), ("s", Value::Str("x".into()))]);
+
+    // 裸字段 score：`Int` 不经 f64 → 42.0
+    assert_eq!(eval_score(&field("v"), &ctx).unwrap(), 42.0);
+    // 算术：`Int` 与字面量混合
+    assert_eq!(
+        eval_score(
+            &Expr::BinOp {
+                op: BinOp::Add,
+                left: Box::new(field("v")),
+                right: Box::new(Expr::Number(0.5)),
+            },
+            &ctx
+        )
+        .unwrap(),
+        42.5
+    );
+    // f64 域内置函数接受 `Int`
+    assert_eq!(
+        eval_score(
+            &Expr::FuncCall {
+                qualifier: None,
+                name: "abs".into(),
+                args: vec![field("v")],
+            },
+            &ctx
+        )
+        .unwrap(),
+        42.0
+    );
+    // 非数值（Str）仍然拒绝
+    assert!(eval_score(&field("s"), &ctx).is_err());
+}
+
 #[test]
 fn eval_score_clamps_and_rejects() {
     let ctx = ctx_with(vec![]);

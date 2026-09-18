@@ -14,6 +14,7 @@ use super::*;
 use crate::match_engine::cep::eval::cmp::{apply_fmt_template, timestamp_nanos_to_utc};
 use crate::match_engine::cep::{Value, numeric_cmp_binop, value_to_string, values_equal};
 use crate::time::normalize_epoch_timestamp_float_nanos;
+use crate::time::normalize_epoch_timestamp_int_nanos;
 
 /// A materialized whole-column output of a vectorized expression node (P3).
 ///
@@ -540,6 +541,7 @@ fn strftime_vec(ts: CVec, fmt: &SmolStr, n: usize) -> CVec {
         };
         let nanos = match cscalar_to_value(&cell) {
             Value::Number(v) => normalize_epoch_timestamp_float_nanos(v),
+            Value::Int(i) => normalize_epoch_timestamp_int_nanos(i),
             _ => None,
         };
         out.push(
