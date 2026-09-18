@@ -240,6 +240,23 @@ pub(crate) fn check_match_keys_clause(
                             alias, field, field
                         ),
                     });
+                } else if scope
+                    .aliases
+                    .get(alias.as_str())
+                    .and_then(|s| s.fields.iter().find(|f| f.name == *field))
+                    .is_some_and(|fd| is_structured_key_type(&fd.field_type))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "match key `{}.{}`: field is an object/array; match keys must be \
+                             scalar (a structured key collapses every value into one bucket) — \
+                             use a nested path to a scalar leaf or a `let` over a scalar expression",
+                            alias, field
+                        ),
+                    });
                 }
             }
             FieldRef::Bracketed(alias, key) => {
@@ -272,6 +289,22 @@ pub(crate) fn check_match_keys_clause(
                         message: format!(
                             "match key `{}[\"{}\"]`: field `{}` not found in window",
                             alias, key, key
+                        ),
+                    });
+                } else if scope
+                    .aliases
+                    .get(alias.as_str())
+                    .and_then(|s| s.fields.iter().find(|f| f.name == *key))
+                    .is_some_and(|fd| is_structured_key_type(&fd.field_type))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "match key `{}[\"{}\"]`: field is an object/array; match keys must be \
+                             scalar (a structured key collapses every value into one bucket)",
+                            alias, key
                         ),
                     });
                 }
@@ -600,6 +633,22 @@ fn resolve_join_key_source<'a>(
 /// Whether a field type can serve as a window key (scalar base types only —
 /// same rule as join index keys; float excluded: f64 truncation would
 /// false-match).
+/// 结构化字段类型（object / array）——**不可作 match 键**。
+///
+/// 结构化值经 `ScopeKey::from_value` 归一成固定的 `"[object]"` / `"[array]"`
+/// 字面量（`cep/key.rs`），于是**所有**该类实体落进同一个键：`match<>` 计数
+/// 跨实体聚合、分片塌成单桶 —— 静默错聚合且无任何告警。故检查期拒绝（与 join 键
+/// 要求标量同款先例，见 `joins.rs`）。嵌套路径的**叶**类型动态不可知，仍由运行时
+/// `extract_key_*` 按"key 缺失跳过"处理（`cep/key.rs`）。
+pub(super) fn is_structured_key_type(ft: &crate::schema::FieldType) -> bool {
+    matches!(
+        ft,
+        crate::schema::FieldType::Object
+            | crate::schema::FieldType::ArrayAny
+            | crate::schema::FieldType::Array(_)
+    )
+}
+
 pub(super) fn is_scalar_key_type(ft: &crate::schema::FieldType) -> bool {
     matches!(
         ft,
@@ -642,6 +691,20 @@ fn check_key_type_consistency(
             continue;
         }
         if let Some(fd) = schema.fields.iter().find(|f| f.name == field) {
+            if is_structured_key_type(&fd.field_type) {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "match key `{}`: field `{}` in `{}` is an object/array; match keys must be \
+                         scalar (a structured key collapses every value into one bucket) — use a \
+                         nested path to a scalar leaf or a `let` over a scalar expression",
+                        field, field, alias
+                    ),
+                });
+                return;
+            }
             let vt = scope::field_type_to_val(&fd.field_type);
             if let Some((ref prev_type, ref prev_alias)) = found_type {
                 if !compatible(prev_type, &vt) {

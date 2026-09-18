@@ -38,6 +38,94 @@ fn out_id_window() -> WindowSchema {
 // issue #83 — 派生（let）/嵌套路径 match key
 // ===========================================================================
 
+/// 结构化字段（object/array）作 match 键必须被拒绝（回归 2026-09-18）。
+///
+/// 结构化值经 `ScopeKey::from_value` 归一成固定字面量 `"[object]"` / `"[array]"`
+/// → **所有**该类实体落进同一个键：`match<>` 计数跨实体聚合、分片塌成单桶 ——
+/// 静默错聚合。与 join 键要求标量同款先例（`joins.rs`）。
+mod structured_match_key_rejected {
+    use super::*;
+
+    /// `ext_obj: object` + `ext_arr: array` 的事件窗（结构化字段作键的两个来源）。
+    fn structured_window() -> WindowSchema {
+        make_window(
+            "sx_events",
+            vec!["sx_stream"],
+            vec![
+                ("sip", bt(BaseType::Ip)),
+                ("conn_info", crate::schema::FieldType::Object),
+                ("tags", crate::schema::FieldType::Array(BaseType::Chars)),
+                ("event_time", bt(BaseType::Time)),
+            ],
+        )
+    }
+
+    fn out_window() -> WindowSchema {
+        make_output_window("out", vec![("x", bt(BaseType::Chars))])
+    }
+
+    fn rule_with_key(key: &str) -> String {
+        format!(
+            r#"
+rule r {{
+    events {{ e : sx_events }}
+    match<{key}:10m> {{
+        on event {{ e | count >= 1; }}
+    }} -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}}
+"#
+        )
+    }
+
+    #[test]
+    fn unqualified_object_key_is_rejected() {
+        assert_has_error(
+            &rule_with_key("conn_info"),
+            &[structured_window(), out_window()],
+            "match keys must be scalar",
+        );
+    }
+
+    #[test]
+    fn qualified_object_key_is_rejected() {
+        assert_has_error(
+            &rule_with_key("e.conn_info"),
+            &[structured_window(), out_window()],
+            "match keys must be scalar",
+        );
+    }
+
+    /// 方括号形态（`e["dotted.name"]`）同样拒绝。
+    #[test]
+    fn bracketed_object_key_is_rejected() {
+        assert_has_error(
+            &rule_with_key(r#"e["conn_info"]"#),
+            &[structured_window(), out_window()],
+            "match keys must be scalar",
+        );
+    }
+
+    #[test]
+    fn array_key_is_rejected() {
+        assert_has_error(
+            &rule_with_key("tags"),
+            &[structured_window(), out_window()],
+            "match keys must be scalar",
+        );
+    }
+
+    /// 对照：结构化字段的**嵌套路径到标量叶**仍合法（root 是结构化 ≠ key 是结构化）。
+    #[test]
+    fn nested_scalar_leaf_under_structured_root_is_still_accepted() {
+        assert_no_errors(
+            &rule_with_key("e.conn_info.geo.country"),
+            &[structured_window(), out_window()],
+        );
+    }
+}
+
 /// auth_events with a structured `roles_obj` object field（嵌套 key 的 root）。
 fn derived_auth_window() -> WindowSchema {
     make_window(
