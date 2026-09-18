@@ -51,7 +51,11 @@ impl ValueKey {
     }
 }
 
-fn canonical_f64_bits(value: f64) -> u64 {
+/// 规范化 f64 位（`0.0 → +0.0`、NaN → canonical NaN）。
+///
+/// `ValueKey` / `ScopeKey` 共用的哈希口径，也是 `wf-engine` 行式路径的复用点：
+/// 任一处改漏都会让「同一逻辑键」在不同路径上哈希不等（静默分片错配）。
+pub fn canonical_f64_bits(value: f64) -> u64 {
     if value == 0.0 {
         0.0f64.to_bits()
     } else if value.is_nan() {
@@ -94,18 +98,6 @@ pub enum ScopeKey {
 /// existing native-int columnar dispatch / `number_literal`).
 const TWO_POW_53: f64 = 9_007_199_254_740_992.0;
 
-/// Canonical f64 bits (0.0 → +0.0, NaN → canonical NaN), matching
-/// [`canonical_f64_bits`](super::super::cep::ValueKey) semantics.
-fn canonical_bits(n: f64) -> u64 {
-    if n == 0.0 {
-        0.0f64.to_bits()
-    } else if n.is_nan() {
-        f64::NAN.to_bits()
-    } else {
-        n.to_bits()
-    }
-}
-
 impl ScopeKey {
     /// Build a [`ScopeKey`] from a [`Value`] (row-based path). Integer-valued
     /// numbers (and full-precision integers) → `Int`; fractional / huge floats
@@ -117,7 +109,7 @@ impl ScopeKey {
                 if n.fract() == 0.0 && n.abs() < TWO_POW_53 {
                     ScopeKey::Int(*n as i64)
                 } else {
-                    ScopeKey::Float(canonical_bits(*n))
+                    ScopeKey::Float(canonical_f64_bits(*n))
                 }
             }
             Value::Str(s) => ScopeKey::Str(s.clone()),

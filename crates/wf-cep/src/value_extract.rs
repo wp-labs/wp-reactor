@@ -55,6 +55,60 @@ pub fn extract_field_value(field: &Field, col: &dyn Array, row: usize) -> Option
     extract_value(col, row)
 }
 
+/// 列值的**精确整数**读取（Int64 / Timestamp(Ns) 列）。
+///
+/// [`extract_value`] 把这两类列都转成 `Value::Number(f64)`：纳秒时间戳（≈1.77e18）
+/// 超出 f64 精确整数范围（2^53≈9.0e15），会被量化到 ~256ns，使"真值相等/相差 <128ns"
+/// 的区间界比较随机翻转（同刻跨流配对丢约一半）。区间界求值因此优先走本函数。
+/// 其它列类型（含 structured Utf8）返回 `None`，调用方回落到 `Value` 路径，语义不变。
+/// `Value` → 精确 `i64`（**只接受整值**）。
+///
+/// 物化 `Event` 的字段已经过 `Value::Number(f64)`（纳秒精度已丢），这里只能尽力还原；
+/// 真正精确的路径是列式源的 [`extract_field_value_int`]。
+pub fn value_to_int(v: Option<&Value>) -> Option<i64> {
+    match v? {
+        Value::Number(n)
+            if n.is_finite()
+                && n.fract() == 0.0
+                && *n >= i64::MIN as f64
+                && *n <= i64::MAX as f64 =>
+        {
+            Some(*n as i64)
+        }
+        _ => None,
+    }
+}
+
+pub fn extract_field_value_int(field: &Field, col: &dyn Array, row: usize) -> Option<i64> {
+    if col.is_null(row) {
+        return None;
+    }
+    if matches!(col.data_type(), DataType::Utf8) && wfl_structured_field_kind(field).is_some() {
+        return None;
+    }
+    match col.data_type() {
+        DataType::Int64 => Some(col.as_any().downcast_ref::<Int64Array>()?.value(row)),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Some(
+            col.as_any()
+                .downcast_ref::<TimestampNanosecondArray>()?
+                .value(row),
+        ),
+        _ => None,
+    }
+}
+
+/// `Value` → `f64`（仅 [`Value::Number`]；其余变体 `None`）。
+///
+/// 行式路径数值漏斗的**单一实现**：此前 `rows.rs` / `cep/step.rs` /
+/// `wf-engine …/stats_exec/eval/keys.rs` 各有一份同体副本，任一处改漏即口径漂移
+/// （列式与行式结果不一致会是静默错配）。
+pub fn value_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => Some(*n),
+        _ => None,
+    }
+}
+
 fn extract_value(col: &dyn Array, row: usize) -> Option<Value> {
     match col.data_type() {
         DataType::Int64 => {
@@ -147,4 +201,76 @@ fn extract_list_values(values: &dyn Array) -> Vec<Value> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod int_channel_tests {
+    use super::*;
+    use arrow::array::TimestampNanosecondArray;
+
+    /// Int64 / Timestamp(Ns) 列走精确通道；`Value` 路径（f64）在同一值上丢精度。
+    #[test]
+    fn extract_field_value_int_is_exact_for_epoch_nanos() {
+        let ns: i64 = 1_767_225_600_000_000_001;
+        let ints = Int64Array::from(vec![Some(ns), None, Some(7)]);
+        let field = Field::new("t", DataType::Int64, true);
+        assert_eq!(
+            extract_field_value_int(&field, &ints, 0),
+            Some(ns),
+            "精确通道"
+        );
+        assert_eq!(
+            extract_field_value_int(&field, &ints, 1),
+            None,
+            "null → None"
+        );
+
+        let via_value = match extract_field_value(&field, &ints, 0) {
+            Some(Value::Number(n)) => n as i64,
+            other => panic!("expected number, got {other:?}"),
+        };
+        assert_ne!(via_value, ns, "Value 路径（f64）在这个量级必丢精度");
+
+        let ts = TimestampNanosecondArray::from(vec![Some(ns)]);
+        let ts_field = Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true);
+        assert_eq!(
+            extract_field_value_int(&ts_field, &ts, 0),
+            Some(ns),
+            "Timestamp(Ns) 列同样是精确通道"
+        );
+    }
+
+    /// 非整数列 / structured Utf8 不参与精确通道（调用方回落 `Value` 路径）。
+    #[test]
+    fn extract_field_value_int_declines_non_integral_columns() {
+        let floats = arrow::array::Float64Array::from(vec![1.5]);
+        let field = Field::new("f", DataType::Float64, false);
+        assert_eq!(extract_field_value_int(&field, &floats, 0), None);
+
+        let strings = StringArray::from(vec!["x"]);
+        let field = Field::new("s", DataType::Utf8, false);
+        assert_eq!(extract_field_value_int(&field, &strings, 0), None);
+    }
+
+    /// `Value` → i64 只接受整值。
+    #[test]
+    fn value_to_int_accepts_only_integrals() {
+        assert_eq!(value_to_int(Some(&Value::Number(7.0))), Some(7));
+        assert_eq!(value_to_int(Some(&Value::Number(7.5))), None);
+        assert_eq!(value_to_int(Some(&Value::Str("7".into()))), None);
+        assert_eq!(value_to_int(None), None);
+    }
+
+    /// 数值漏斗契约：只有 `Number` 产出 `f64`，其它变体（含结构化）一律 `None`——
+    /// 列式与行式路径都走本函数，契约漂移会是静默错配。
+    #[test]
+    fn value_to_f64_only_accepts_numbers() {
+        assert_eq!(value_to_f64(&Value::Number(-0.5)), Some(-0.5));
+        // 整值也走同一入口（精度由调用方按需走 `extract_field_value_int`）。
+        assert_eq!(value_to_f64(&Value::Number(3.0)), Some(3.0));
+        assert_eq!(value_to_f64(&Value::Str("1".into())), None);
+        assert_eq!(value_to_f64(&Value::Bool(true)), None);
+        assert_eq!(value_to_f64(&Value::Array(Vec::new())), None);
+        assert_eq!(value_to_f64(&Value::Object(Default::default())), None);
+    }
 }

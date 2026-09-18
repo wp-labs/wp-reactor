@@ -159,7 +159,7 @@ fn logic_combinators_with_partial_none_operands() {
 fn arithmetic_rejects_non_numeric_operands_and_zero_divisor() {
     let ctx = ctx_with(vec![("s", Value::Str("x".into()))]);
 
-    // coerce_to_f64 fails on a Str operand → the whole expression is None.
+    // value_to_f64 fails on a Str operand → the whole expression is None.
     let add_str = Expr::BinOp {
         op: BinOp::Add,
         left: Box::new(field("s")),

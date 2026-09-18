@@ -8,6 +8,7 @@ use super::key::ValueKey;
 use super::state::{AliasState, BranchState, StepState};
 use super::types::{EngineHashMap, FieldSource, RollingStats, StepProgress, Value, WindowLookup};
 use crate::masks::GuardMasks;
+use crate::value_extract::value_to_f64;
 
 // ---------------------------------------------------------------------------
 // Step evaluation
@@ -554,13 +555,6 @@ fn compare_value_threshold(cmp: CmpOp, val: &Value, threshold: &Value) -> bool {
         CmpOp::Le => ord.is_le(),
         CmpOp::Ge => ord.is_ge(),
         _ => false,
-    }
-}
-
-fn value_to_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Number(n) => Some(*n),
-        _ => None,
     }
 }
 

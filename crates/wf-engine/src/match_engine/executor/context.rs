@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use wf_lang::ast::{BoundVal, FieldRef, JoinMode};
+use wf_lang::ast::{BoundVal, Expr, FieldRef, JoinMode};
 use wf_lang::plan::{JoinCondPlan, JoinPlan, StepPlan};
 
 use crate::match_engine::JoinRow;
@@ -9,7 +9,7 @@ use crate::match_engine::cep::{
     eval_expr, field_ref_name, values_equal,
 };
 use crate::match_engine::event_bridge::TriggerEvent;
-use crate::time::normalize_epoch_timestamp_float_nanos;
+use crate::time::{normalize_epoch_timestamp_float_nanos, normalize_epoch_timestamp_int_nanos};
 
 /// Which context fields the close/match alert builders need materialized.
 ///
@@ -428,6 +428,18 @@ pub(crate) fn eval_interval_bound(
             Some(event_time_nanos.saturating_add(offset))
         }
         BoundVal::Expr(e) => {
+            // 精确整数通道：裸字段引用（`p.timestamp` / `a.expires`）直接读列的原始 i64，
+            // 绕过 `Value::Number(f64)`。纳秒时间戳 ≈1.77e18 超出 f64 精确整数范围
+            // （2^53≈9.0e15），往返会把界量化到 ~256ns——"真值相等/相差 <128ns"的
+            // `>=`/`<` 因此随机翻转（同刻跨流配对实测丢约一半）。`Path`（嵌套访问）不是
+            // 扁平列读，排除在精确通道外。
+            if let Expr::Field(fr) = e
+                && !matches!(fr, FieldRef::Path { .. })
+                && let Some(raw) = ctx.field_value_int(field_ref_name(fr))
+                && let Some(ns) = normalize_epoch_timestamp_int_nanos(raw)
+            {
+                return Some(ns);
+            }
             let value = eval_expr(e, ctx)?;
             match value {
                 Value::Number(n) => normalize_epoch_timestamp_float_nanos(n),

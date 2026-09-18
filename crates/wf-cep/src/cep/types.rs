@@ -58,6 +58,16 @@ pub trait FieldSource {
         }
     }
 
+    /// **精确整数**字段值（Int64 / Timestamp(Ns) 列的原始 i64），区间界求值专用。
+    ///
+    /// `field_value` 会把这两类列转成 `Value::Number(f64)`，而纳秒时间戳（≈1.77e18）
+    /// 超出 f64 精确整数范围（2^53≈9.0e15）→ 量化到 ~256ns，使"真值相等或相差 <128ns"
+    /// 的区间界比较（`>=` / `<`）随机翻转（实测同刻跨流配对丢约一半）。
+    /// 默认 `None` = 调用方回落 `field_value`（列式源覆盖本方法以走精确通道）。
+    fn field_value_int(&self, _name: &str) -> Option<i64> {
+        None
+    }
+
     /// Build the rule's typed match scope key for this row, or `None` when a
     /// key field is missing / null (the event is skipped). Default: extract the
     /// key fields as owned [`Value`]s and convert (row-based path). Columnar
@@ -85,6 +95,11 @@ impl FieldSource for Event {
 
     fn to_event(&self) -> Event {
         self.clone()
+    }
+
+    fn field_value_int(&self, name: &str) -> Option<i64> {
+        // 物化 Event 的字段已经过 `Value::Number(f64)`（精度已丢）——只能尽力还原。
+        crate::value_extract::value_to_int(self.fields.get(name))
     }
 }
 

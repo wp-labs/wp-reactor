@@ -107,16 +107,10 @@ pub(crate) fn scope_key_from_f64(n: f64) -> ScopeKey {
     }
 }
 
-/// 规范化 f64 位（0.0 → +0.0, NaN → canonical NaN; 与 key.rs 同口径）。
-pub(crate) fn canonical_f64_bits(n: f64) -> u64 {
-    if n == 0.0 {
-        0.0f64.to_bits()
-    } else if n.is_nan() {
-        f64::NAN.to_bits()
-    } else {
-        n.to_bits()
-    }
-}
+// 值层漏斗：单一实现（`wf-cep`）——本文件此前各有一份同体副本，
+// 改漏即与 `ValueKey`/`ScopeKey` 口径漂移。
+pub(crate) use wf_cep::cep::key::canonical_f64_bits;
+pub(crate) use wf_cep::value_extract::value_to_f64;
 
 /// <2^53 的整数可被 f64 精确表示（与 `ScopeKey::from_value` 一致）。
 pub(crate) const TWO_POW_53: f64 = 9_007_199_254_740_992.0;
@@ -255,13 +249,6 @@ pub(crate) fn scope_key_from_comps(comps: &[ScopeKey]) -> ScopeKey {
 pub(crate) fn value_to_i128(v: &Value) -> Option<i128> {
     match v {
         Value::Number(n) => Some(*n as i128),
-        _ => None,
-    }
-}
-
-pub(crate) fn value_to_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Number(n) => Some(*n),
         _ => None,
     }
 }

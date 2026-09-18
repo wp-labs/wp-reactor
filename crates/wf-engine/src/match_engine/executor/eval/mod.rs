@@ -9,6 +9,7 @@ use crate::match_engine::cep::{
     EngineHashMap, FieldSource, Value, WindowLookup, eval_expr, eval_expr_ext,
     eval_field_value_src, value_to_string, values_equal,
 };
+use wf_cep::value_extract::value_to_f64;
 
 #[cfg(test)]
 pub(super) use crate::match_engine::cep::Event;
@@ -339,8 +340,8 @@ fn eval_arith_binop(
     use wf_lang::ast::BinOp;
     let lv = eval_expr_with_l3(left, ctx, score)?;
     let rv = eval_expr_with_l3(right, ctx, score)?;
-    let ln = coerce_to_f64(&lv)?;
-    let rn = coerce_to_f64(&rv)?;
+    let ln = value_to_f64(&lv)?;
+    let rn = value_to_f64(&rv)?;
     let out = match op {
         BinOp::Add => ln + rn,
         BinOp::Sub => ln - rn,
@@ -539,13 +540,6 @@ fn compare_values(op: wf_lang::ast::BinOp, lv: &Value, rv: &Value) -> bool {
             _ => false,
         },
         _ => false,
-    }
-}
-
-fn coerce_to_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Number(n) => Some(*n),
-        _ => None,
     }
 }
 

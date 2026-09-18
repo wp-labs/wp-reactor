@@ -4,6 +4,7 @@
 //! `from_schema` 需 arrow 纯数据类型（墙内允许）；不触 IO/async。
 
 use crate::value::Value;
+use crate::value_extract::value_to_f64;
 
 /// 行字段槽型（2026-08-26 q18/q19：stats last/top 行字段紧凑化）。
 /// 每字段一个槽位：数字→`numeric`（f64 8B）、字符串→`strings`（SmolStr 24B
@@ -248,12 +249,5 @@ impl RowFields {
             others,
             null_mask,
         }
-    }
-}
-
-fn value_to_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Number(n) => Some(*n),
-        _ => None,
     }
 }

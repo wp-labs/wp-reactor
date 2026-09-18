@@ -7,6 +7,7 @@ use sha2::Sha256;
 use super::{Value, YieldMeta, eval_expr_with_l3, step_data, utils};
 use crate::match_engine::cep::{EngineHashMap, FieldSource, value_to_string, values_equal};
 use crate::time::{normalize_epoch_timestamp_float_nanos, positive_interval_seconds_to_nanos};
+use wf_cep::value_extract::value_to_f64;
 
 pub(super) fn contains_system_var(expr: &wf_lang::ast::Expr) -> bool {
     use wf_lang::ast::Expr;
@@ -519,13 +520,7 @@ fn dedup_values(values: Vec<Value>) -> Vec<Value> {
 
 /// 样本标准差；不足 2 个数值 → 0.0（与原实现一致）。
 fn series_stddev(values: &[Value]) -> f64 {
-    let nums: Vec<f64> = values
-        .iter()
-        .filter_map(|v| match v {
-            Value::Number(n) => Some(*n),
-            _ => None,
-        })
-        .collect();
+    let nums: Vec<f64> = numeric_values(values);
     if nums.len() < 2 {
         return 0.0;
     }
@@ -536,13 +531,7 @@ fn series_stddev(values: &[Value]) -> f64 {
 
 /// p 分位（最近秩取整）；空序列 → 0.0（与原实现一致）。
 fn percentile_value(values: &[Value], p: f64) -> Value {
-    let mut nums: Vec<f64> = values
-        .iter()
-        .filter_map(|v| match v {
-            Value::Number(n) => Some(*n),
-            _ => None,
-        })
-        .collect();
+    let mut nums: Vec<f64> = numeric_values(values);
     if nums.is_empty() {
         return Value::Number(0.0);
     }
@@ -671,13 +660,7 @@ pub(super) fn eval_aggregate_over_values(name: &str, values: &[Value]) -> Option
 }
 
 pub(super) fn numeric_values(values: &[Value]) -> Vec<f64> {
-    values
-        .iter()
-        .filter_map(|value| match value {
-            Value::Number(n) => Some(*n),
-            _ => None,
-        })
-        .collect()
+    values.iter().filter_map(value_to_f64).collect()
 }
 
 pub(super) fn sum_numeric_values(values: &[Value]) -> f64 {

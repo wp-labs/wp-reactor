@@ -1029,6 +1029,108 @@ fn execute_deferred_join_empty_and_missing_paths() {
 
 /// 构造 2 行 auction 驱动批：id / dateTime / expires / category（均 i64）。
 /// 经 `extract_field_value` → Value::Number(f64)，与 `batch_to_events` 同转换。
+/// 区间界（裸时间字段引用）在**列式**源上必须精确：epoch-ns 超出 f64 精确整数范围
+/// （2^53≈9.0e15），经 `Value::Number(f64)` 往返会把界量化到 ~256ns，使"真值相等或相差
+/// <128ns"的 `>=`/`<` 随机翻转（同刻跨流配对实测丢约一半，症状是静默的"规则偶尔不触发"）。
+/// 回归：用**非 256 对齐**的纳秒值（对齐值恰好可精确表示，测不出差异）。
+#[test]
+fn eval_interval_bound_is_exact_on_columnar_epoch_nanos() {
+    use crate::match_engine::executor::context::eval_interval_bound;
+    use arrow::array::Int64Array;
+
+    let ns: i64 = 1_767_225_600_000_000_001; // ulp=256 → 非对齐，f64 往返必变
+    let schema = Arc::new(Schema::new(vec![ArrowField::new(
+        "dateTime",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![ns]))],
+    )
+    .unwrap();
+    let index = build_field_index(&batch);
+    let bound = Bound {
+        open: false,
+        val: BoundVal::Expr(Expr::Field(FieldRef::Simple("dateTime".into()))),
+    };
+
+    let left = DeferredLeft::Columnar(JoinRow::Columnar {
+        batch: Arc::new(batch.clone()),
+        row: 0,
+        index: Arc::clone(&index),
+        projection: None,
+    });
+    assert_eq!(
+        eval_interval_bound(&bound, &left, ns),
+        Some(ns),
+        "列式源的区间界必须精确（整数通道）"
+    );
+
+    // 对照：eager（物化 Event）的字段已经过 `Value::Number(f64)`，界被量化——
+    // 这是 f64 表示纳秒时间戳的固有损失，需靠精确通道（或 Value 的整数表示）解决。
+    let eager = DeferredLeft::Event(batch_to_events(&batch).into_iter().next().unwrap());
+    let via_eager = eval_interval_bound(&bound, &eager, ns).unwrap();
+    assert_ne!(via_eager, ns, "eager 路径仍丢精度（对照）");
+    assert!(
+        (via_eager - ns).abs() <= 256,
+        "量化误差应在 f64 步长内：{via_eager} vs {ns}"
+    );
+}
+
+/// 回归（同刻配对）：右行 ts **等于**区间下界时，deferred 求值必须命中。
+///
+/// 下界来自裸时间字段（`a.dateTime`，列式源）——修复前它经 `Value::Number(f64)` 被量化到
+/// ~256ns（epoch-ns ≈1.77e18 超出 f64 精确整数范围 2^53），约一半时间戳会让 `row_ts >= lo`
+/// 不成立而丢掉配对，症状是**静默**的"规则偶尔不触发"（实测 wfgen 侧 200 对同刻丢 98 对）。
+#[test]
+fn deferred_same_instant_right_row_matches_with_exact_bound() {
+    use arrow::array::Int64Array;
+
+    let ns: i64 = 1_767_225_600_000_000_001; // ulp=256 → 非对齐，f64 往返必变
+    let exec = RuleExecutor::new(deferred_join_plan(None));
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("dateTime", DataType::Int64, false),
+        ArrowField::new("expires", DataType::Int64, false),
+        ArrowField::new("category", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![5])),
+            Arc::new(Int64Array::from(vec![ns])),
+            Arc::new(Int64Array::from(vec![ns + 60_000_000_000])),
+            Arc::new(Int64Array::from(vec![10])),
+        ],
+    )
+    .unwrap();
+    let index = build_field_index(&batch);
+    let left = DeferredLeft::Columnar(JoinRow::Columnar {
+        batch: Arc::new(batch),
+        row: 0,
+        index,
+        projection: None,
+    });
+
+    let pending = exec.deferred_pending_for(0, &left, ns).expect("挂起成功");
+    assert_eq!(
+        pending.lo_ns, ns,
+        "下界必须精确（f64 往返会把它量化到 ~256ns）"
+    );
+    assert_eq!(pending.hi_ns, ns + 60_000_000_000);
+    assert!(!pending.lo_open);
+
+    // 右行 ts 与下界**同刻**：闭区间下界必须包含它。
+    let lookup = RowsLookup::with_ts(vec![bid(ns, 5.0, 1.0, 100.0)]);
+    assert!(
+        exec.evaluate_deferred_join(0, &pending, &lookup)
+            .unwrap()
+            .is_some(),
+        "同刻右行必须命中（修复前下界被 f64 量化，约一半时间戳会丢配对）"
+    );
+}
+
 fn deferred_auction_batch() -> RecordBatch {
     use arrow::array::Int64Array;
     let schema = Arc::new(Schema::new(vec![
