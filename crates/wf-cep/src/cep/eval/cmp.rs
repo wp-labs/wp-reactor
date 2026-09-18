@@ -104,13 +104,6 @@ pub fn try_eval_expr_to_value(expr: &Expr) -> Option<Value> {
     }
 }
 
-pub(super) fn coerce_to_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Number(n) => Some(*n),
-        _ => None,
-    }
-}
-
 pub(super) fn normalize_index(index: i64, len: usize) -> Option<usize> {
     let len = len as i64;
     let normalized = if index < 0 { len + index } else { index };
@@ -212,7 +205,7 @@ pub(super) fn eval_single_string_arg(
     }
 }
 
-pub(super) fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Option<()> {
+pub fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Option<()> {
     let (tag, text) = match value {
         Value::Number(_) => ("n", value_to_string(value)),
         Value::Str(s) => ("s", s.to_string()),
@@ -249,6 +242,7 @@ pub fn apply_fmt_template(template: &str, values: &[Value]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::cep::types::Event;
+    use crate::value_extract::value_to_f64;
     use std::cmp::Ordering;
     use wf_lang::ast::FieldRef;
 
@@ -388,8 +382,8 @@ mod tests {
         assert_eq!(f64_to_i64_trunc(-2.9), Some(-2));
         assert_eq!(f64_to_i64_trunc(f64::INFINITY), None);
         assert_eq!(f64_to_i64_trunc(1e300), None);
-        assert_eq!(coerce_to_f64(&num(1.5)), Some(1.5));
-        assert_eq!(coerce_to_f64(&strv("1.5")), None);
+        assert_eq!(value_to_f64(&num(1.5)), Some(1.5));
+        assert_eq!(value_to_f64(&strv("1.5")), None);
     }
 
     #[test]

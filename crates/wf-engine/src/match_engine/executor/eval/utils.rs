@@ -1,4 +1,5 @@
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 use super::{Value, YieldMeta, eval_expr_with_l3, get_or_init_eval_time_nanos};
@@ -119,21 +120,9 @@ pub(super) fn eval_single_string_arg_with_l3(
     }
 }
 
-pub(super) fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Option<()> {
-    let (tag, text) = match value {
-        Value::Number(_) => ("n", value_to_string(value)),
-        Value::Str(s) => ("s", s.to_string()),
-        Value::Bool(_) => ("b", value_to_string(value)),
-        Value::Array(_) | Value::Object(_) => return None,
-    };
-    hasher.update(tag.as_bytes());
-    hasher.update(b":");
-    hasher.update(text.len().to_string().as_bytes());
-    hasher.update(b":");
-    hasher.update(text.as_bytes());
-    hasher.update(b";");
-    Some(())
-}
+// 共享值层漏斗（单一实现，见 `wf_cep::cep::eval::cmp::update_stable_id_hash`）：
+// 本文件此前另有一份同体副本，改漏即稳定 ID 哈希口径漂移。
+pub(super) use wf_cep::cep::eval::cmp::update_stable_id_hash;
 
 #[cfg(test)]
 mod tests {

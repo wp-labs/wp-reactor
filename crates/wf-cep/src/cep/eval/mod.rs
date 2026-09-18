@@ -21,7 +21,8 @@ mod funcs_num;
 mod funcs_str;
 mod funcs_time;
 
-use cmp::{coerce_to_f64, compare_values};
+use crate::value_extract::value_to_f64;
+use cmp::compare_values;
 use funcs::eval_func_call;
 
 // Re-export items from sub-modules that sibling modules (step, close) need.
@@ -343,8 +344,8 @@ fn eval_binop(
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
             let lv = eval_expr_ext(left, event, windows, baselines)?;
             let rv = eval_expr_ext(right, event, windows, baselines)?;
-            let ln = coerce_to_f64(&lv)?;
-            let rn = coerce_to_f64(&rv)?;
+            let ln = value_to_f64(&lv)?;
+            let rn = value_to_f64(&rv)?;
             eval_arithmetic(op, ln, rn)
         }
         _ => None,
