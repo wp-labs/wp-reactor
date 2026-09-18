@@ -428,6 +428,23 @@ fn eval_arithmetic(op: BinOp, lv: f64, rv: f64) -> Option<Value> {
 ///
 /// 递归深度由输入约束：JSON 列经 `serde_json` 解析（默认递归上限 128），
 /// arrow 嵌套列由 schema 深度决定。
+///
+/// # 与「键同一」的刻意区分（2026-09-18 显式化）
+///
+/// 本函数是**比较语义**（epsilon）：`0.1 + 0.2 == 0.3` 为真。键层
+/// （[`ValueKey`](crate::cep::ValueKey) / [`ScopeKey`](crate::cep::ScopeKey) /
+/// stats 的 `DistinctKey`）用的是**精确 canonical 位**，两者刻意不同：
+/// epsilon 不是等价关系 —— **非传递**。具体例（EPS 在 0.3 处约合 4 ulp）：
+///
+/// ```text
+/// 0.3 ~ 0.30000000000000004 ~ 0.3000000000000002   （相邻差 1 ulp < EPS）
+/// 但 0.3 ≁ 0.3000000000000002                       （差 2.2e-16 ≥ EPS）
+/// ```
+///
+/// 非传递关系无法定义哈希/分桶的同一性（同一元素按插入顺序落不同桶），因此
+/// `distinct` 计数、join 索引、作用域分片一律用精确位 —— 它们需要**等价关系**。
+/// 副作用是使用者可见的：`where(x == 0.3)` 命中 `0.1 + 0.2`，而
+/// `count(distinct x)` 仍把两者算作两个值。
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => cmp::numeric_eq(*x, *y),

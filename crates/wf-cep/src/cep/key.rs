@@ -19,6 +19,11 @@ pub enum ValueKey {
 }
 
 impl ValueKey {
+    /// 值的**同一性**键（精确 canonical 位；`0.0 == -0.0`、NaN 归一）。
+    ///
+    /// 与 [`values_equal`](crate::cep::values_equal) 的 epsilon **比较**语义刻意
+    /// 不同：epsilon 非传递（见其文档），不能作哈希同一性。因此 `distinct`
+    /// 计数按**位**判同一 —— `0.1 + 0.2` 与 `0.3` 计两个值（而 `==` 认为相等）。
     pub fn from_value(value: &Value) -> Self {
         match value {
             Value::Number(n) => Self::Number(canonical_f64_bits(*n)),

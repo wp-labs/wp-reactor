@@ -217,6 +217,62 @@ fn values_equal_matches_scalars_and_structures() {
     );
 }
 
+/// 「值相等（epsilon，比较语义）」与「键同一（精确 canonical 位）」是**刻意不同**
+/// 的两个概念（2026-09-18 显式化）—— 本用例同时钉住两侧，防止后续"顺手统一"。
+///
+/// 使用者可见后果：`where(x == 0.3)` 命中 `0.1 + 0.2`，而 `count(distinct x)`
+/// 仍把两者算作两个值。
+#[test]
+fn epsilon_equality_and_key_identity_are_deliberately_different() {
+    let computed = Value::Number(0.1 + 0.2);
+    let literal = Value::Number(0.3);
+    assert!(
+        values_equal(&computed, &literal),
+        "比较语义：epsilon 认为二者相等（既有契约）"
+    );
+    assert_ne!(
+        ValueKey::from_value(&computed),
+        ValueKey::from_value(&literal),
+        "键同一：精确位不同 → distinct 计两个值"
+    );
+    // 三种键类型（CEP `distinct` 的 ValueKey / 作用域 ScopeKey / stats `DistinctKey`）
+    // 共用同一份位规范化，口径可证一致。
+    let bits = wf_cep::cep::key::canonical_f64_bits(0.3);
+    assert_eq!(ValueKey::from_value(&literal), ValueKey::Number(bits));
+    assert_eq!(
+        crate::match_engine::DistinctKey::from_f64(0.3),
+        crate::match_engine::DistinctKey::Float(bits)
+    );
+    assert_ne!(
+        crate::match_engine::DistinctKey::from_f64(0.1 + 0.2),
+        crate::match_engine::DistinctKey::from_f64(0.3),
+        "stats distinct 同口径：按位判同一"
+    );
+    assert_eq!(
+        crate::match_engine::ScopeKey::Float(bits),
+        crate::match_engine::ScopeKey::from_value(&literal),
+        "作用域键同口径"
+    );
+}
+
+/// epsilon 关系**非传递** —— 这正是键层不能用它做同一性、必须用精确位的理由。
+///
+/// 反例（EPS 在 0.3 处约合 4 ulp）：`0.3 ~ 0.3+1ulp ~ 0.3+4ulp`，但
+/// `0.3 ≁ 0.3+4ulp`。非传递关系无法定义哈希/分桶同一性（同一元素会按插入顺序落
+/// 不同桶），因此 `distinct`/join 索引/分片一律用精确 canonical 位。
+#[test]
+fn epsilon_relation_is_not_transitive() {
+    let a = 0.3;
+    let b = a + f64::EPSILON / 4.0; // 1 ulp
+    let c = a + f64::EPSILON; // 4 ulp
+    assert!(values_equal(&Value::Number(a), &Value::Number(b)), "a ~ b");
+    assert!(values_equal(&Value::Number(b), &Value::Number(c)), "b ~ c");
+    assert!(
+        !values_equal(&Value::Number(a), &Value::Number(c)),
+        "a ≁ c —— epsilon 非传递"
+    );
+}
+
 // ===========================================================================
 // key.rs — ScopeKey / ValueKey / scope_key_from_values / shard / stringify
 // ===========================================================================

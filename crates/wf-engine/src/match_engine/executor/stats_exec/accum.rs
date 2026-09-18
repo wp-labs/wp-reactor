@@ -289,6 +289,10 @@ pub struct TopEntry {
 pub enum DistinctKey {
     Int(i64),
     /// 非整数数值（小数）—— 保持原 f64 位（canonical）。
+    ///
+    /// 与 `ValueKey` 同口径：`distinct_count` 按**精确位**判同一（等价关系 +
+    /// 可哈希），而 `values_equal` 的 epsilon 是**比较**语义且非传递 —— 因此
+    /// `0.1 + 0.2` 与 `0.3` 在这里计两个值。
     Float(u64),
     Str(Box<str>),
 }
@@ -374,13 +378,9 @@ impl DistinctKey {
         if v.fract() == 0.0 && v.abs() < 9_007_199_254_740_992.0 {
             DistinctKey::Int(v as i64)
         } else {
-            DistinctKey::Float(if v == 0.0 {
-                0.0f64.to_bits()
-            } else if v.is_nan() {
-                f64::NAN.to_bits()
-            } else {
-                v.to_bits()
-            })
+            // 位规范化走**共享实现**（`ValueKey`/`ScopeKey` 同源）——此前这里是
+            // 第 4 份内联副本，改漏即三者同一性口径漂移。
+            DistinctKey::Float(wf_cep::cep::key::canonical_f64_bits(v))
         }
     }
     #[allow(clippy::should_implement_trait)] // 与 from_i64/from_f64 平行的构造器命名，非 FromStr 实现
