@@ -569,7 +569,7 @@ fn pinned_first_bytes(pinned: &PinnedFirst) -> usize {
 fn val_estimated_bytes(v: &Value) -> usize {
     match v {
         Value::Str(s) => s.len() + 24,
-        Value::Number(_) | Value::Bool(_) => 8,
+        Value::Number(_) | Value::Int(_) | Value::Bool(_) => 8,
         Value::Array(arr) => 24 + arr.iter().map(val_estimated_bytes).sum::<usize>(),
         Value::Object(map) => {
             24 + map

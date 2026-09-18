@@ -448,6 +448,10 @@ fn eval_arithmetic(op: BinOp, lv: f64, rv: f64) -> Option<Value> {
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => cmp::numeric_eq(*x, *y),
+        // 数值域统一：`Int` 与 `Number` 视为同一值（`|i| < 2^53` 时精确）。
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Int(x), Value::Number(y)) => cmp::numeric_eq(*x as f64, *y),
+        (Value::Number(x), Value::Int(y)) => cmp::numeric_eq(*x, *y as f64),
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Array(x), Value::Array(y)) => {

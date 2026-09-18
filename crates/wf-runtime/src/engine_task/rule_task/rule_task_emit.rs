@@ -1109,11 +1109,14 @@ pub(super) fn row_event_debug_ref(ev: &RowEvent<'_>, batch_seq: u64, row_index: 
 pub(super) fn value_debug_string(value: &wf_engine::match_engine::Value) -> String {
     match value {
         wf_engine::match_engine::Value::Number(value) => value.to_string(),
+        wf_engine::match_engine::Value::Int(value) => value.to_string(),
         wf_engine::match_engine::Value::Str(value) => value.to_string(),
         wf_engine::match_engine::Value::Bool(value) => value.to_string(),
         wf_engine::match_engine::Value::Array(_) | wf_engine::match_engine::Value::Object(_) => {
             "<structured>".to_string()
         }
+        // `#[non_exhaustive]`：未来变体默认按结构化占位符渲染。
+        _ => "<structured>".to_string(),
     }
 }
 

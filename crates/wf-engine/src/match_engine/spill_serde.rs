@@ -247,11 +247,20 @@ fn write_value(w: &mut Writer, v: &crate::match_engine::Value) -> Result<(), Spi
             w.u8(*b as u8);
             Ok(())
         }
+        // TODO(step 3): 新增 tag 5 落盘 `i64`。现在没有生产者产出 `Int`，
+        // 这里必须**显式失败**——用 tag 0 塞回 f64 等于把精度 bug 放回落盘边界。
+        crate::match_engine::Value::Int(_) => Err(SpillError::Unsupported(
+            "RowFields others 含 Int 值（spill tag 5 尚未启用）".into(),
+        )),
         crate::match_engine::Value::Array(_) => Err(SpillError::Unsupported(
             "RowFields others 含 Array 值".into(),
         )),
         crate::match_engine::Value::Object(_) => Err(SpillError::Unsupported(
             "RowFields others 含 Object 值".into(),
+        )),
+        // `#[non_exhaustive]`：未来变体默认拒绝（不静默丢值）。
+        _ => Err(SpillError::Unsupported(
+            "RowFields others 含未知 Value 变体".into(),
         )),
     }
 }
@@ -624,4 +633,37 @@ pub fn deserialize_spill_value(
 /// 便捷：单桶 hash（spill key 用 `scope_key_hash` 同值）。
 pub fn spill_hash(key: &ScopeKey) -> u64 {
     crate::match_engine::executor::scope_key_hash(key)
+}
+
+#[cfg(test)]
+mod value_int_tests {
+    use super::*;
+
+    /// 第 1 步（尚未启用 tag 5）：`Value::Int` 落盘必须**显式失败** ——
+    /// 用 tag 0 塞回 f64 等于把精度 bug 放回落盘边界（静默丢精度）。
+    #[test]
+    fn write_value_rejects_int_loudly() {
+        let mut w = Writer::new();
+        let err = write_value(&mut w, &crate::match_engine::Value::Int(42))
+            .expect_err("Int 尚无 spill tag，必须显式失败");
+        assert!(matches!(err, SpillError::Unsupported(_)), "got {err:?}");
+    }
+
+    /// 对照：标量 `Number` / `Str` / `Bool` 的 round-trip 保持不变。
+    #[test]
+    fn write_read_value_round_trips_scalars() {
+        let cases = [
+            crate::match_engine::Value::Number(1.5),
+            crate::match_engine::Value::Number(-0.0),
+            crate::match_engine::Value::Str("x".into()),
+            crate::match_engine::Value::Bool(true),
+        ];
+        for v in cases {
+            let mut w = Writer::new();
+            write_value(&mut w, &v).expect("标量可序列化");
+            let bytes = w.finish();
+            let got = read_value(&mut Reader::new(&bytes)).expect("标量可反序列化");
+            assert_eq!(got, v);
+        }
+    }
 }

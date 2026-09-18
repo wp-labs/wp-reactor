@@ -551,6 +551,8 @@ pub(crate) fn value_to_json(
         wf_engine::match_engine::Value::Number(n) if n.is_finite() => {
             Ok(serde_json::Value::from(*n))
         }
+        // 精确整数：输出 JSON 整数（不做 f64 往返）。
+        wf_engine::match_engine::Value::Int(i) => Ok(serde_json::Value::from(*i)),
         wf_engine::match_engine::Value::Number(_) => RuntimeReason::Bootstrap
             .to_err()
             .with_detail("structured numeric value must be finite")
@@ -574,6 +576,11 @@ pub(crate) fn value_to_json(
             }
             Ok(serde_json::Value::Object(object))
         }
+        // `#[non_exhaustive]`：未来变体默认不支持。
+        _ => RuntimeReason::Bootstrap
+            .to_err()
+            .with_detail("unsupported value variant")
+            .err(),
     }
 }
 

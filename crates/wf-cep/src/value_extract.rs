@@ -67,6 +67,8 @@ pub fn extract_field_value(field: &Field, col: &dyn Array, row: usize) -> Option
 /// 真正精确的路径是列式源的 [`extract_field_value_int`]。
 pub fn value_to_int(v: Option<&Value>) -> Option<i64> {
     match v? {
+        // 精确整数直接命中（无需经 f64 还原）。
+        Value::Int(i) => Some(*i),
         Value::Number(n)
             if n.is_finite()
                 && n.fract() == 0.0
@@ -105,6 +107,8 @@ pub fn extract_field_value_int(field: &Field, col: &dyn Array, row: usize) -> Op
 pub fn value_to_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => Some(*n),
+        // 整数域归一：`Int` 与整值 `Number` 走同一数值漏斗（`|i| < 2^53` 精确）。
+        Value::Int(i) => Some(*i as f64),
         _ => None,
     }
 }
@@ -160,6 +164,11 @@ fn extract_value(col: &dyn Array, row: usize) -> Option<Value> {
     }
 }
 
+/// JSON 标量 → [`Value`]。
+///
+/// **JSON 数字一律落 [`Value::Number`]，不猜整型**（2026-09-18 决策）：`serde_json` 的
+/// 整/浮形态取决于文本写法（`1` 与 `1.0`），不是可靠的类型信号；只有箭头列类型
+/// （Int64 / Timestamp(Ns)）这种可靠信号才产出 [`Value::Int`]。
 fn json_to_value(value: serde_json::Value) -> Option<Value> {
     match value {
         serde_json::Value::Null => None,
@@ -272,5 +281,33 @@ mod int_channel_tests {
         assert_eq!(value_to_f64(&Value::Bool(true)), None);
         assert_eq!(value_to_f64(&Value::Array(Vec::new())), None);
         assert_eq!(value_to_f64(&Value::Object(Default::default())), None);
+    }
+
+    /// 决策（2026-09-18）：**JSON 数字来源不猜整型**。`serde_json` 的整/浮形态
+    /// 取决于文本写法（`1` vs `1.0`），不是可靠信号 —— `json_to_value` 必须永远
+    /// 落 [`Value::Number`]，只有箭头列类型（Int64 / Timestamp(Ns)）才产出
+    /// [`Value::Int`]。本用例防止后续“顺手”把整值 JSON 猜成 `Int`。
+    #[test]
+    fn json_numbers_stay_number_never_guessed_as_int() {
+        for text in ["1", "1.0", "0", "-0", "9007199254740993", "1e18", "1.5"] {
+            let json: serde_json::Value = serde_json::from_str(text).unwrap();
+            let got = json_to_value(json).expect("json number → Some");
+            assert!(
+                matches!(got, Value::Number(_)),
+                "JSON `{text}` 必须落 Number，实际 {got:?}"
+            );
+        }
+        // 嵌套形态（数组 / 对象里的整数）同样不猜。
+        let nested: serde_json::Value = serde_json::from_str(r#"{"a":[1,2.5]}"#).unwrap();
+        let Value::Object(fields) = json_to_value(nested).expect("json object → Some") else {
+            panic!("expected object")
+        };
+        let Value::Array(items) = fields.get("a").expect("字段 a") else {
+            panic!("expected array")
+        };
+        assert!(
+            items.iter().all(|v| matches!(v, Value::Number(_))),
+            "嵌套元素也不猜: {items:?}"
+        );
     }
 }

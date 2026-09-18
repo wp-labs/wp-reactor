@@ -281,6 +281,8 @@ impl CepStateMachine {
             .and_then(|tf| event.fields.get(tf.as_str()))
             .and_then(|v| match v {
                 Value::Number(n) => Some(*n as i64),
+                // 精确整数（epoch-ns 超出 f64 精确域）直接返回，不经 f64。
+                Value::Int(i) => Some(*i),
                 _ => None,
             })
             .unwrap_or(0)

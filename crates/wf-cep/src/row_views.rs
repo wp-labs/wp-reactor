@@ -43,6 +43,7 @@ pub fn column_scalar_string(batch: &RecordBatch, col_idx: usize, row: usize) -> 
     match value {
         Value::Str(s) => Some(s.to_string()),
         Value::Number(n) => Some(n.to_string()),
+        Value::Int(i) => Some(i.to_string()),
         Value::Bool(b) => Some(b.to_string()),
         Value::Array(_) | Value::Object(_) => None,
     }

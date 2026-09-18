@@ -27,6 +27,10 @@ impl ValueKey {
     pub fn from_value(value: &Value) -> Self {
         match value {
             Value::Number(n) => Self::Number(canonical_f64_bits(*n)),
+            // 整数域与整值 `Number` 归一（`|i| < 2^53` 时 `i as f64` 精确）：
+            // 两变体落**同一** canonical 位键，否则 `Int(1)` 与 `Number(1.0)`
+            // 会在 distinct 计数里被当成两个值。
+            Value::Int(i) => Self::Number(canonical_f64_bits(*i as f64)),
             Value::Str(s) => Self::Str(s.to_string()),
             Value::Bool(b) => Self::Bool(*b),
             Value::Array(values) => Self::Array(values.iter().map(Self::from_value).collect()),
@@ -118,6 +122,8 @@ impl ScopeKey {
                 }
             }
             Value::Str(s) => ScopeKey::Str(s.clone()),
+            // 精确整数：直接落 `Int`（`|i| < 2^53` 时与 `Number` 路径同 variant/同哈希）。
+            Value::Int(i) => ScopeKey::Int(*i),
             Value::Bool(b) => ScopeKey::Str(if *b { "true" } else { "false" }.into()),
             // Structured values: fixed deterministic token (rare as a match key);
             // no `String` allocation on the typed-key path.
@@ -579,6 +585,8 @@ pub fn push_i64_exact_decimal(scratch: &mut impl StrSink, mut v: i64) {
 pub fn value_to_string(v: &Value) -> String {
     match v {
         Value::Number(n) => number_to_string(*n),
+        // `Int(i)` 与整值 `Number` 同为十进制文本（稳定 ID / 排序兜底共用）。
+        Value::Int(i) => i.to_string(),
         Value::Str(s) => s.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Array(_) => "[array]".to_string(),

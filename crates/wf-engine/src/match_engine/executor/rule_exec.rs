@@ -863,6 +863,7 @@ fn render_yield_value_as_string(value: Value) -> CoreResult<String> {
     match value {
         Value::Str(s) => Ok(s.to_string()),
         Value::Number(n) if n.is_finite() => Ok(n.to_string()),
+        Value::Int(i) => Ok(i.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
         Value::Array(_) | Value::Object(_) => serde_json::to_string(&yield_value_to_json(&value)?)
             .source_raw_err(CoreReason::DataFormat, "serialize structured yield value"),
@@ -870,12 +871,18 @@ fn render_yield_value_as_string(value: Value) -> CoreResult<String> {
             .to_err()
             .with_detail("yield string conversion requires finite numeric values")
             .err(),
+        // `#[non_exhaustive]`：未来变体默认不支持。
+        _ => CoreReason::DataFormat
+            .to_err()
+            .with_detail("unsupported value variant")
+            .err(),
     }
 }
 
 fn yield_value_to_json(value: &Value) -> CoreResult<serde_json::Value> {
     match value {
         Value::Number(n) if n.is_finite() => Ok(serde_json::Value::from(*n)),
+        Value::Int(i) => Ok(serde_json::Value::from(*i)),
         Value::Number(_) => CoreReason::DataFormat
             .to_err()
             .with_detail("structured numeric value must be finite")
@@ -899,6 +906,11 @@ fn yield_value_to_json(value: &Value) -> CoreResult<serde_json::Value> {
             }
             Ok(serde_json::Value::Object(object))
         }
+        // `#[non_exhaustive]`：未来变体默认不支持。
+        _ => CoreReason::DataFormat
+            .to_err()
+            .with_detail("unsupported value variant")
+            .err(),
     }
 }
 

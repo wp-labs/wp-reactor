@@ -8,6 +8,7 @@ mod coverage_more;
 mod coverage_r4;
 mod derived_key;
 mod first_match_time;
+mod value_int;
 
 use super::*;
 

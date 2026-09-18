@@ -121,6 +121,8 @@ impl JoinKey {
     pub fn from_value(v: &Value) -> Option<JoinKey> {
         match v {
             Value::Number(n) => Some(JoinKey::Int(*n as i64)),
+            // 精确整数：不经 f64（join 键 >2^53 不错配）。
+            Value::Int(i) => Some(JoinKey::Int(*i)),
             Value::Str(s) => Some(JoinKey::Str(s.to_string())),
             Value::Bool(b) => Some(JoinKey::Bool(*b)),
             _ => None,

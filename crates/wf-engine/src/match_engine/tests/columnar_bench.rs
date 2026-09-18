@@ -206,8 +206,10 @@ fn column_scalar_string_vs_batch_to_events() {
             set.insert(match val {
                 Value::Str(s) => s.to_string(),
                 Value::Number(v) => v.to_string(),
+                Value::Int(v) => v.to_string(),
                 Value::Bool(b) => b.to_string(),
                 Value::Array(_) | Value::Object(_) => continue,
+                _ => continue,
             });
         }
     }

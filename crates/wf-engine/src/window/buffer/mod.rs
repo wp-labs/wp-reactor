@@ -1554,7 +1554,8 @@ fn event_bytes(e: &Event) -> usize {
 /// the containing bucket via `map_heap_bytes`). Recurses into nested containers.
 fn value_heap_bytes(v: &Value) -> usize {
     match v {
-        Value::Number(_) | Value::Bool(_) => 0,
+        // 标量（含 `Int`：i64 内联）：无额外堆分配。
+        Value::Number(_) | Value::Int(_) | Value::Bool(_) => 0,
         Value::Str(s) => smol_str_heap_bytes(s),
         Value::Array(items) => {
             items.capacity() * size_of::<Value>()
@@ -1567,6 +1568,8 @@ fn value_heap_bytes(v: &Value) -> usize {
                     .map(|(k, v)| smol_str_heap_bytes(k) + value_heap_bytes(v))
                     .sum::<usize>()
         }
+        // `#[non_exhaustive]`：未来变体默认按内联计（与其余标量一致）。
+        _ => 0,
     }
 }
 

@@ -65,6 +65,11 @@ pub fn numeric_cmp_binop(op: BinOp, a: f64, b: f64) -> bool {
 pub fn compare_values(op: BinOp, lv: &Value, rv: &Value) -> bool {
     match (lv, rv) {
         (Value::Number(a), Value::Number(b)) => numeric_cmp_binop(op, *a, *b),
+        // `Int` 对 `Int` 走精确整数比较（不经 f64，避免 >2^53 量化错判）。
+        (Value::Int(a), Value::Int(b)) => compare_int_ints(op, *a, *b),
+        // 混合数值：`Int` 升为 f64 后走同一 epsilon 路径（`|i| < 2^53` 精确）。
+        (Value::Int(a), Value::Number(b)) => numeric_cmp_binop(op, *a as f64, *b),
+        (Value::Number(a), Value::Int(b)) => numeric_cmp_binop(op, *a, *b as f64),
         (Value::Str(a), Value::Str(b)) => compare_strs(op, a, b),
         (Value::Bool(a), Value::Bool(b)) => compare_bools(op, *a, *b),
         (Value::Array(_) | Value::Object(_), Value::Array(_) | Value::Object(_)) => match op {
@@ -96,6 +101,19 @@ fn compare_bools(op: BinOp, a: bool, b: bool) -> bool {
     match op {
         BinOp::Eq => a == b,
         BinOp::Ne => a != b,
+        _ => false,
+    }
+}
+
+/// 精确整数比较（`Int` 对 `Int`）：不经 f64，`|i| >= 2^53` 时不发生量化错判。
+fn compare_int_ints(op: BinOp, a: i64, b: i64) -> bool {
+    match op {
+        BinOp::Eq => a == b,
+        BinOp::Ne => a != b,
+        BinOp::Lt => a < b,
+        BinOp::Gt => a > b,
+        BinOp::Le => a <= b,
+        BinOp::Ge => a >= b,
         _ => false,
     }
 }
@@ -164,6 +182,14 @@ pub(super) fn compare_sortable_values(a: &Value, b: &Value) -> std::cmp::Orderin
         (Value::Number(x), Value::Number(y)) => {
             x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
         }
+        // 数值域统一：`Int`/`Number` 同序，避免两者都落到文本比较（`"10" < "9"`）。
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Int(x), Value::Number(y)) => (*x as f64)
+            .partial_cmp(y)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Number(x), Value::Int(y)) => x
+            .partial_cmp(&(*y as f64))
+            .unwrap_or(std::cmp::Ordering::Equal),
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         _ => value_to_string(a).cmp(&value_to_string(b)),
@@ -252,7 +278,9 @@ pub(super) fn eval_single_string_arg(
 
 pub fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Option<()> {
     let (tag, text) = match value {
-        Value::Number(_) => ("n", value_to_string(value)),
+        // 稳定 ID：`Int(i)` 与整值 `Number` 必须产出同一字节流（同 tag、同文本）
+        // —— `value_to_string` 对两者都渲染十进制文本。
+        Value::Number(_) | Value::Int(_) => ("n", value_to_string(value)),
         Value::Str(s) => ("s", s.to_string()),
         Value::Bool(_) => ("b", value_to_string(value)),
         Value::Array(_) | Value::Object(_) => return None,

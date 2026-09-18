@@ -495,27 +495,33 @@ pub(super) fn check_threshold(agg: &AggPlan, bs: &BranchState) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Ordering for Value (used by min/max on orderable fields).
-/// Number < Str < Bool < Array < Object for cross-type (shouldn't happen in practice).
+/// Number/Int < Str < Bool < Array < Object for cross-type (shouldn't happen in practice).
+///
+/// 数值域统一：`Int` 与 `Number` 同序（`|i| < 2^53` 时同一逻辑值）；`Int` 对 `Int`
+/// 走精确整数比较（见 [`Value::Int`] 文档）。
 fn value_ordering(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => {
             x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
         }
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Int(x), Value::Number(y)) => (*x as f64)
+            .partial_cmp(y)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Number(x), Value::Int(y)) => x
+            .partial_cmp(&(*y as f64))
+            .unwrap_or(std::cmp::Ordering::Equal),
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Array(x), Value::Array(y)) => x.len().cmp(&y.len()),
         (Value::Object(x), Value::Object(y)) => x.len().cmp(&y.len()),
-        // Cross-type: Number < Str < Bool < Array < Object
-        (Value::Number(_), _) => std::cmp::Ordering::Less,
-        (_, Value::Number(_)) => std::cmp::Ordering::Greater,
-        (Value::Str(_), Value::Bool(_) | Value::Array(_) | Value::Object(_)) => {
-            std::cmp::Ordering::Less
-        }
-        (Value::Bool(_) | Value::Array(_) | Value::Object(_), Value::Str(_)) => {
-            std::cmp::Ordering::Greater
-        }
-        (Value::Bool(_), Value::Array(_) | Value::Object(_)) => std::cmp::Ordering::Less,
-        (Value::Array(_) | Value::Object(_), Value::Bool(_)) => std::cmp::Ordering::Greater,
+        // Cross-type: Number/Int < Str < Bool < Array < Object
+        (Value::Number(_) | Value::Int(_), _) => std::cmp::Ordering::Less,
+        (_, Value::Number(_) | Value::Int(_)) => std::cmp::Ordering::Greater,
+        (Value::Str(_), _) => std::cmp::Ordering::Less,
+        (_, Value::Str(_)) => std::cmp::Ordering::Greater,
+        (Value::Bool(_), _) => std::cmp::Ordering::Less,
+        (_, Value::Bool(_)) => std::cmp::Ordering::Greater,
         (Value::Array(_), Value::Object(_)) => std::cmp::Ordering::Less,
         (Value::Object(_), Value::Array(_)) => std::cmp::Ordering::Greater,
     }
@@ -527,8 +533,10 @@ fn value_ordering(a: &Value, b: &Value) -> std::cmp::Ordering {
 fn compare_value_threshold(cmp: CmpOp, val: &Value, threshold: &Value) -> bool {
     let same_type = matches!(
         (val, threshold),
-        (Value::Number(_), Value::Number(_))
-            | (Value::Str(_), Value::Str(_))
+        (
+            Value::Number(_) | Value::Int(_),
+            Value::Number(_) | Value::Int(_)
+        ) | (Value::Str(_), Value::Str(_))
             | (Value::Bool(_), Value::Bool(_))
     );
     if !same_type {

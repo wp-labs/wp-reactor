@@ -233,6 +233,22 @@ mod split_tests {
         assert_eq!(a, c);
     }
 
+    /// `Value::Int(i)` 与整值 `Value::Number(i as f64)` 产出**同一** wfx_id
+    /// （同 tag / 同字节）—— 否则同一逻辑 key 在行式与列式路径上会拼出不同 ID。
+    #[test]
+    fn wfx_id_is_identical_for_int_and_integral_number() {
+        let rule = "q19_auction_top10_stats";
+        let fired = "2026-08-25T00:00:00.000Z";
+        let origin = AlertOrigin::Close {
+            reason: CloseReason::Timeout,
+        };
+        for i in [0i64, 42, -7, 421_762, (1i64 << 53) - 1] {
+            let ints = build_wfx_id(rule, &[Value::Int(i)], fired, &[], &origin);
+            let num = build_wfx_id(rule, &[Value::Number(i as f64)], fired, &[], &origin);
+            assert_eq!(ints, num, "wfx_id 同一 Int({i})/Number");
+        }
+    }
+
     /// wfx_id 前缀缓存（WfxPrefixCache）必须与 `build_wfx_id_split` 字节一致。
     #[test]
     fn wfx_prefix_cache_matches_split() {
@@ -458,10 +474,15 @@ mod split_tests {
 fn hash_value_bytes(hasher: &mut Fnv1a, v: &Value) {
     match v {
         Value::Number(n) => hasher.update(&n.to_bits().to_le_bytes()),
+        // `Int(i)` 与整值 `Number` 必须产出同一 id：按 `i as f64` 的位哈希
+        // （`|i| < 2^53` 精确且与 `Value::Number` 字节一致）。
+        Value::Int(i) => hasher.update(&(*i as f64).to_bits().to_le_bytes()),
         Value::Str(s) => hasher.update(s.as_bytes()),
         Value::Bool(b) => hasher.update(&[*b as u8]),
         Value::Array(_) => hasher.update(b"[array]"),
         Value::Object(_) => hasher.update(b"[object]"),
+        // `#[non_exhaustive]`：未来变体默认按固定 token 哈希（不静默等同于其它值）。
+        _ => hasher.update(b"[unknown]"),
     }
 }
 

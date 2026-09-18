@@ -356,6 +356,8 @@ fn export_typed_value(base_type: &BaseType, value: &Value) -> CoreResult<(DataTy
 fn export_untyped_value(value: &Value) -> CoreResult<(DataType, ModelValue)> {
     match value {
         Value::Number(n) if n.is_finite() => Ok((DataType::Float, ModelValue::from(*n))),
+        // 精确整数输出为 `Digit`（而非不精确的 Float）—— 见 `Value::Int` 语义。
+        Value::Int(i) => Ok((DataType::Digit, ModelValue::from(*i))),
         Value::Bool(b) => Ok((DataType::Bool, ModelValue::from(*b))),
         Value::Str(s) => Ok((DataType::Chars, ModelValue::from(s.as_str()))),
         Value::Array(_) => export_array_value(value, "auto"),
@@ -371,8 +373,14 @@ fn render_value_as_string(value: &Value) -> CoreResult<String> {
     match value {
         Value::Str(s) => Ok(s.to_string()),
         Value::Number(n) => Ok(n.to_string()),
+        Value::Int(i) => Ok(i.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
         Value::Array(_) | Value::Object(_) => structured_json_string(value),
+        // `#[non_exhaustive]`：未来变体默认按不支持的导出处理（不静默丢值）。
+        _ => CoreReason::DataFormat
+            .to_err()
+            .with_detail("unsupported value variant")
+            .err(),
     }
 }
 
@@ -483,6 +491,8 @@ fn rule_value_to_model_value(value: &Value) -> CoreResult<(DataType, ModelValue)
         Value::Number(n) if n.is_finite() && n.fract() == 0.0 => {
             Ok((DataType::Digit, ModelValue::from(*n as i64)))
         }
+        // 精确整数：不经 f64（>2^53 保持精确 Digit）。
+        Value::Int(i) => Ok((DataType::Digit, ModelValue::from(*i))),
         Value::Number(n) if n.is_finite() => Ok((DataType::Float, ModelValue::from(*n))),
         Value::Str(s) => Ok((DataType::Chars, ModelValue::from(s.as_str()))),
         Value::Bool(b) => Ok((DataType::Bool, ModelValue::from(*b))),
@@ -500,6 +510,11 @@ fn rule_value_to_model_value(value: &Value) -> CoreResult<(DataType, ModelValue)
             .to_err()
             .with_detail("structured numeric value must be finite")
             .err(),
+        // `#[non_exhaustive]`：未来变体默认不支持（不静默丢值）。
+        _ => CoreReason::DataFormat
+            .to_err()
+            .with_detail("unsupported value variant")
+            .err(),
     }
 }
 
@@ -516,6 +531,7 @@ fn rule_object_to_model(
 fn rule_value_to_json(value: &Value) -> CoreResult<serde_json::Value> {
     match value {
         Value::Number(n) if n.is_finite() => Ok(serde_json::Value::from(*n)),
+        Value::Int(i) => Ok(serde_json::Value::from(*i)),
         Value::Number(_) => CoreReason::DataFormat
             .to_err()
             .with_detail("structured numeric value must be finite")
@@ -539,6 +555,11 @@ fn rule_value_to_json(value: &Value) -> CoreResult<serde_json::Value> {
             }
             Ok(serde_json::Value::Object(object))
         }
+        // `#[non_exhaustive]`：未来变体默认不支持。
+        _ => CoreReason::DataFormat
+            .to_err()
+            .with_detail("unsupported value variant")
+            .err(),
     }
 }
 
