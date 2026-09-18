@@ -248,6 +248,7 @@ pub fn apply_fmt_template(template: &str, values: &[Value]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cep::types::Event;
     use std::cmp::Ordering;
     use wf_lang::ast::FieldRef;
 
@@ -273,6 +274,13 @@ mod tests {
             left: Box::new(l),
             right: Box::new(r),
         }
+    }
+
+    /// 单字段事件（`Event` 是 [`FieldSource`] 的生产实现，直接当测试替身用）。
+    fn event_with_str(name: &str, value: &str) -> Event {
+        let mut fields = EngineHashMap::default();
+        fields.insert(name.into(), strv(value));
+        Event { fields }
     }
 
     #[test]
@@ -446,6 +454,7 @@ mod tests {
         // 容器类型不参与
         let mut h = Sha256::new();
         assert!(update_stable_id_hash(&mut h, &Value::Array(vec![num(1.0)])).is_none());
+        assert!(update_stable_id_hash(&mut h, &Value::Object(EngineHashMap::default())).is_none());
     }
     #[test]
     fn const_fold_zero_guards_and_non_arithmetic_ops() {
@@ -471,6 +480,110 @@ mod tests {
             try_eval_expr_to_f64(&Expr::Bool(true)),
             None,
             "Bool 字面量非数值"
+        );
+    }
+
+    #[test]
+    fn sortable_values_mixed_types_fall_back_to_string_order() {
+        // 同类型走原生序（数值序）
+        assert_eq!(
+            compare_sortable_values(&num(9.0), &num(10.0)),
+            Ordering::Less
+        );
+        // 跨类型退化为 value_to_string 的字典序："2" > "10"（不是数值序）
+        assert_eq!(
+            compare_sortable_values(&num(2.0), &strv("10")),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_sortable_values(&b(true), &num(1.0)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_sortable_values(&strv("1"), &b(true)),
+            Ordering::Less
+        );
+        // 容器无原生序，取 "[array]" 占位串参与比较
+        assert_eq!(
+            compare_sortable_values(&Value::Array(vec![]), &strv("z")),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn time_nanos_to_value_is_millis_with_floor_semantics() {
+        assert_eq!(
+            time_nanos_to_value(1_700_000_000_123_456_789),
+            num(1_700_000_000_123.0)
+        );
+        assert_eq!(time_nanos_to_value(999_999), num(0.0));
+        // 负值按欧几里得取整（向 -inf），同一毫秒内的纳秒落回同一毫秒值
+        assert_eq!(time_nanos_to_value(-1_500_000), num(-2.0));
+        assert_eq!(time_nanos_to_value(-1), num(-1.0));
+    }
+
+    #[test]
+    fn parse_time_offset_and_date_only_branches() {
+        // 带时区偏移 → DateTime 分支
+        assert_eq!(
+            parse_time_to_timestamp_nanos("2023-11-14T22:13:20+00:00", "%Y-%m-%dT%H:%M:%S%:z"),
+            Some(1_700_000_000_000_000_000)
+        );
+        // 仅日期 → NaiveDate 分支，补 00:00:00Z
+        assert_eq!(
+            parse_time_to_timestamp_nanos("2023-11-14", "%Y-%m-%d"),
+            Some(1_699_920_000_000_000_000)
+        );
+        // 三个分支都不匹配 → None（调用方按「时间不可解析」处理）
+        assert_eq!(parse_time_to_timestamp_nanos("nope", "%Y-%m-%d"), None);
+        assert_eq!(
+            parse_time_to_timestamp_nanos("2023-11-14", "%Y-%m-%d %H:%M:%S"),
+            None
+        );
+    }
+
+    #[test]
+    fn eval_single_string_arg_requires_exactly_one_string() {
+        let mut baselines = EngineHashMap::default();
+        let event = event_with_str("msg", "hello");
+        let arg = |e: Expr| vec![e];
+        // 单个字符串实参：字面量 / 字段引用 → Some
+        assert_eq!(
+            eval_single_string_arg(
+                &arg(Expr::StringLit("lit".into())),
+                &event,
+                None,
+                &mut baselines
+            ),
+            Some("lit".to_string())
+        );
+        assert_eq!(
+            eval_single_string_arg(
+                &arg(Expr::Field(FieldRef::Simple("msg".into()))),
+                &event,
+                None,
+                &mut baselines
+            ),
+            Some("hello".to_string())
+        );
+        // 非字符串实参（求值出 Number）→ None
+        assert_eq!(
+            eval_single_string_arg(&arg(en(1.0)), &event, None, &mut baselines),
+            None
+        );
+        // 参数个数 != 1 → None（调用方据此短路，不进入求值）
+        assert_eq!(
+            eval_single_string_arg(&[], &event, None, &mut baselines),
+            None
+        );
+        assert_eq!(
+            eval_single_string_arg(
+                &[Expr::StringLit("a".into()), Expr::StringLit("b".into())],
+                &event,
+                None,
+                &mut baselines
+            ),
+            None
         );
     }
 }

@@ -541,6 +541,40 @@ fn growing_rule_memory_drop_oldest_evicts_current_without_get_mut() {
 }
 
 #[test]
+fn memory_drop_oldest_returns_inherited_shared_slot_when_nothing_left() {
+    // N2 回归锚（2026-09-18 拆分 `advance_window` 后补）：`max_instances` 让本片真实
+    // 持有共享槽位；共享内存被抬到必然超限后，内存门的 DropOldest 驱逐唯一实例
+    // （= 当前 key）并把重建 base cost 记回预算 → 循环继续 → 无实例可驱逐 → 必须归还
+    // **继承**来的槽位（`slot_inherited`）。否则共享 `instance_count` 泄漏，后续 key
+    // 会被误判超限拒绝。上一条用例（无 max_instances）无法断言这一点。
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![
+            step(vec![branch("e", count_ge(1.0))]),
+            step(vec![branch("e", count_ge(1.0))]),
+        ],
+    );
+    let shared = SharedLimits::new();
+    let mut sm = CepStateMachine::with_limits_shared(
+        "r".into(),
+        plan,
+        None,
+        limits(ExceedAction::DropOldest, Some(1), Some(2000)),
+        Arc::clone(&shared),
+    );
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    // step1 命中 → Advance；准入预留了本片唯一共享槽位。
+    assert_eq!(sm.advance_at("e", &e, 0), StepResult::Advance);
+    assert_eq!(sm.instance_count(), 1);
+    assert_eq!(shared.instance_count(), 1);
+    // 抬高共享内存 → 下一事件（增长规则）逐出当前 key 实例且预算仍超 → 放弃重建。
+    shared.add_memory(2000);
+    assert_eq!(sm.advance_at("e", &e, 1_000), StepResult::Accumulate);
+    assert_eq!(sm.instance_count(), 0);
+    assert_eq!(shared.instance_count(), 0, "N2 继承槽位必须归还");
+}
+
+#[test]
 fn memory_limit_amortized_shared_admission() {
     // 2026-08-31 limits 摊还 + shared（P2b）：单步 count（不可增长）规则在
     // 摊还后仍通过共享镜像做**准入**控制——shard B 的新 key 在共享总量
