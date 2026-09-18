@@ -6,6 +6,23 @@
 
 use super::*;
 
+/// 行式 fixture（手写 `HashMap`，整值为 `Number`）与列式路径（`Int64` 列 → `Value::Int`）
+/// 携带的是**同一逻辑值**（导出类型也一致：`|v| < 2^53` → Float）。逐元素按语义比较，
+/// null-ness 仍严格。
+fn assert_row_fields_equivalent(rv: &[Option<Value>], cv: &[Option<Value>], ctx: &str) {
+    assert_eq!(rv.len(), cv.len(), "{ctx}: 字段数");
+    for (i, (a, b)) in rv.iter().zip(cv.iter()).enumerate() {
+        match (a, b) {
+            (None, None) => {}
+            (Some(a), Some(b)) => assert!(
+                crate::match_engine::cep::values_equal(a, b),
+                "{ctx}: 第 {i} 个行字段不等: {a:?} vs {b:?}"
+            ),
+            _ => panic!("{ctx}: 第 {i} 个行字段 null-ness 不一致: {a:?} vs {b:?}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // P4 last/top 扩展度量（Q18/Q19）: last 保留最近合格行, top 保留 key DESC top-N;
 // rich close（close_window_by_bucket_rows）按条目携带行字段供 yield 注入。
@@ -95,8 +112,8 @@ fn stats_q18_shape_subset_excluding_keys_row_fields_readable() {
         .expect("列式: last 携带行字段");
     assert_eq!(
         row_val(c_rf, &["price".to_string()], "price"),
-        Some(num(250.0)),
-        "列式: 排除键字段后非键字段仍可读"
+        Some(Value::Int(250)),
+        "列式: 排除键字段后非键字段仍可读（Int64 列 → Value::Int）"
     );
 }
 
@@ -281,7 +298,7 @@ fn stats_last_top_columnar_matches_row_based() {
                 if let (Some(rf), Some(cf)) = (&re.row_fields, &ce.row_fields) {
                     let rv: Vec<Option<Value>> = rf.iter_values().collect();
                     let cv: Vec<Option<Value>> = cf.iter_values().collect();
-                    assert_eq!(rv, cv, "行字段一致");
+                    assert_row_fields_equivalent(&rv, &cv, "行/列式行字段");
                 }
             }
         }
@@ -394,7 +411,7 @@ fn stats_last_missing_field_keeps_row() {
     let col_names = sorted_schema_names(&batch); // [auction, bidder, price]
     assert_eq!(
         row_val(ce.row_fields.as_ref().unwrap(), &col_names, "bidder"),
-        Some(num(8.0))
+        Some(Value::Int(8))
     );
 }
 
@@ -475,7 +492,9 @@ fn stats_top_precheck_skips_below_cutoff_rows() {
             .as_ref()
             .expect("条目带行字段");
         assert!(
-            row.iter_values().any(|v| v == Some(num(1.0))),
+            row.iter_values().any(|v| v
+                .as_ref()
+                .is_some_and(|v| crate::match_engine::cep::values_equal(v, &Value::Int(1)))),
             "{name}: rank1 bidder=1"
         );
     }
@@ -568,14 +587,19 @@ fn stats_top_precheck_random_stream_matches_reference() {
                     e.measure_value, re.0,
                     "{name}: auction {auction} rank {k} price"
                 );
-                assert_eq!(
-                    row_val(
-                        e.row_fields.as_ref().expect("条目带行字段"),
-                        &names,
-                        "bidder"
-                    ),
-                    Some(num(re.1)),
-                    "{name}: auction {auction} rank {k} bidder"
+                let got = row_val(
+                    e.row_fields.as_ref().expect("条目带行字段"),
+                    &names,
+                    "bidder",
+                );
+                assert!(
+                    got.as_ref()
+                        .is_some_and(|v| crate::match_engine::cep::values_equal(
+                            v,
+                            &Value::Int(re.1 as i64)
+                        )),
+                    "{name}: auction {auction} rank {k} bidder（期望 {} 实际 {got:?}）",
+                    re.1 as i64
                 );
             }
         }
@@ -677,7 +701,7 @@ fn stats_row_fields_subset_both_paths_match() {
                 if let (Some(rf), Some(cf)) = (&re.row_fields, &ce.row_fields) {
                     let rv: Vec<Option<Value>> = rf.iter_values().collect();
                     let cv: Vec<Option<Value>> = cf.iter_values().collect();
-                    assert_eq!(rv, cv);
+                    assert_row_fields_equivalent(&rv, &cv, "子集行/列式行字段");
                 }
             }
         }

@@ -346,13 +346,19 @@ fn q18_columnar_layout_is_compact() {
     assert!(exec.process_batch(&batch), "列式前置应满足");
     let buckets = exec.close_window_by_bucket_rows();
     assert_eq!(buckets.len(), 2, "2 个 auction 桶");
-    // 行字段 layout：auction/price 数字槽 + channel 字符串槽。
+    // 行字段 layout：auction/price 走 **i64 槽**（8B/字段，与 f64 槽同宽，
+    // 精确承载 epoch-ns 量级）+ channel 字符串槽。
     let layout = buckets[0].measures[0][0]
         .row_fields
         .as_ref()
         .expect("last 携带行字段")
         .layout();
-    assert_eq!(layout.n_numeric(), 2, "auction/price 数字槽");
+    assert_eq!(
+        layout.n_int64(),
+        2,
+        "auction/price 走 i64 槽（8B，内存中性）"
+    );
+    assert_eq!(layout.n_numeric(), 0, "无浮点列 → 无 f64 槽");
     assert_eq!(layout.n_strings(), 1, "channel 字符串槽");
 }
 

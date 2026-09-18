@@ -503,6 +503,7 @@ struct Event {
 
 state Value {
   Number
+  Int
   Str
   Bool
   Array
@@ -511,6 +512,7 @@ state Value {
 
 state ValueKey {
   Number
+  Int
   Str
   Bool
   Array
@@ -624,6 +626,7 @@ struct NumericSoALayout {
 
 state RowFieldSlot {
   Numeric
+  Int64
   Str
   Other
 }
@@ -635,6 +638,7 @@ struct SoAColGroup {
 struct RowFields {
   layout: RowFieldLayout
   numeric: String
+  ints: String
   strings: String
   others: String
   null_mask: String
@@ -643,6 +647,7 @@ struct RowFields {
 struct RowFieldLayout {
   slots: List<RowFieldSlot>
   n_numeric: Int
+  n_int64: Int
   n_strings: Int
   n_others: Int
 }

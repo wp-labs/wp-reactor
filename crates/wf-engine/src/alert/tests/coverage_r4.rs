@@ -182,6 +182,6 @@ fn to_data_record_deferred_origin_untyped_fields() {
         Some(&ModelValue::from(""))
     );
     assert_eq!(record.get_value("msg"), Some(&ModelValue::from("hello")));
-    // untyped 整值导出 Digit（export_untyped_value：整值 Number → DataType::Digit）。
-    assert_eq!(record.get_value("n"), Some(&ModelValue::from(7_i64)));
+    // untyped 小整值沿用 Float（|v| < 2^53 时 f64 精确，保持兼容）。
+    assert_eq!(record.get_value("n"), Some(&ModelValue::from(7.0_f64)));
 }

@@ -56,21 +56,6 @@ impl FieldSource for DeferredLeft {
         }
     }
 
-    fn field_value_int(&self, name: &str) -> Option<i64> {
-        // 投影遮蔽同 `field_value`：投影外字段读 None。
-        match self {
-            DeferredLeft::Columnar(row) => {
-                if let JoinRow::Columnar { projection, .. } = row
-                    && projection.as_ref().is_some_and(|p| !p.contains(name))
-                {
-                    return None;
-                }
-                row.field_value_int(name)
-            }
-            DeferredLeft::Event(ev) => wf_cep::value_extract::value_to_int(ev.fields.get(name)),
-        }
-    }
-
     fn field_names(&self) -> Vec<&str> {
         match self {
             DeferredLeft::Columnar(row) => row.field_names(),

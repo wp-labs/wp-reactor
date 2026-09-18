@@ -756,10 +756,28 @@ fn write_derived_knowdb_assets(root: &Path, tables: &[CsvTable]) -> RuntimeResul
     Ok(())
 }
 
+/// 单个 KnowDB 原生值 → 引擎 `Value`。
+///
+/// **DDL 类型化的数字按类型映射**（`Digit(i64)` → [`EngineValue::Int`]、
+/// `Float(f64)` → [`EngineValue::Number`]）：这是**可靠类型信号**（列声明），
+/// 与箭头 `Int64`/`Timestamp` 列同口径 —— 不经「Display 文本 → f64」往返，
+/// 否则 `≥2^53` 的整数（epoch-ns 量级）会被量化到 ~256ns，用作 join 键或区间
+/// 界时随机失配。
+///
+/// 其余类型（含 `Chars`）沿用逐单元文本推断（[`infer_knowledge_value`]），
+/// 与老引擎一致（2026-08-23 q13 契约）——文本不携带可靠类型信号，不据此猜整型。
+fn engine_value_from_knowdb_value(v: &wp_model_core::model::Value) -> EngineValue {
+    match v {
+        wp_model_core::model::Value::Null => EngineValue::Str(String::new().into()),
+        wp_model_core::model::Value::Bool(b) => EngineValue::Bool(*b),
+        wp_model_core::model::Value::Digit(d) => EngineValue::Int(*d),
+        wp_model_core::model::Value::Float(f) => EngineValue::Number(*f),
+        other => infer_knowledge_value(&other.to_string()),
+    }
+}
+
 /// 引擎行边界转换：KnowDB 原生行（`RowData` = 列 → 值，DDL 类型化）→ 引擎
-/// `Value` 行。值语义与 PG 路径一致：`Bool` 直接映射，其余经 Display 走
-/// [`infer_knowledge_value`]（数字文本 → Number，true/false → Bool，其余 Str），
-/// 与老引擎逐单元推断结果一致（2026-08-23 q13 契约）。
+/// `Value` 行。逐值语义见 [`engine_value_from_knowdb_value`]。
 /// 借用入参：store 当前代快照由调用者持有（Arc），此处不复制整份原生行。
 pub(super) fn engine_rows_from_knowdb(
     rows: &[wp_knowledge::mem::RowData],
@@ -770,11 +788,7 @@ pub(super) fn engine_rows_from_knowdb(
             for field in row {
                 map.insert(
                     field.get_name().to_string(),
-                    match field.get_value() {
-                        wp_model_core::model::Value::Null => EngineValue::Str(String::new().into()),
-                        wp_model_core::model::Value::Bool(b) => EngineValue::Bool(*b),
-                        other => infer_knowledge_value(&other.to_string()),
-                    },
+                    engine_value_from_knowdb_value(field.get_value()),
                 );
             }
             map
@@ -1067,6 +1081,43 @@ mod tests {
 
     use wf_lang::ast::{CloseMode, Expr, MatchMode};
     use wf_lang::plan::{EntityPlan, MatchPlan, RulePlan, ScorePlan, WindowSpec, YieldPlan};
+
+    /// KnowDB 原生值 → 引擎值：**DDL 类型化的整数按类型精确保留**（不再经
+    /// 「Display 文本 → f64」往返，≥2^53 会被量化）；文本仍走逐单元推断。
+    #[test]
+    fn engine_value_from_knowdb_value_keeps_typed_integers_exact() {
+        use wp_model_core::model::Value as ModelValue;
+
+        let epoch_ns: i64 = 1_767_225_600_000_000_001;
+        assert_ne!(
+            epoch_ns as f64 as i64, epoch_ns,
+            "前提：该值经 f64 必丢精度"
+        );
+
+        assert_eq!(
+            engine_value_from_knowdb_value(&ModelValue::Digit(epoch_ns)),
+            EngineValue::Int(epoch_ns),
+            "整数列（Digit）→ Int，逐位保真"
+        );
+        assert_eq!(
+            engine_value_from_knowdb_value(&ModelValue::Float(1.5)),
+            EngineValue::Number(1.5),
+            "浮点列（Float）→ Number"
+        );
+        assert_eq!(
+            engine_value_from_knowdb_value(&ModelValue::from("2345")),
+            EngineValue::Number(2345.0),
+            "文本仍按逐单元推断（数字文本 → Number，不猜整型）"
+        );
+        assert_eq!(
+            engine_value_from_knowdb_value(&ModelValue::Null),
+            EngineValue::Str(String::new().into())
+        );
+        assert_eq!(
+            engine_value_from_knowdb_value(&ModelValue::Bool(true)),
+            EngineValue::Bool(true)
+        );
+    }
 
     #[test]
     fn infer_knowledge_value_types_numeric_bool_and_string() {

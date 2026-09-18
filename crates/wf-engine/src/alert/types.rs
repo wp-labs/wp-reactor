@@ -296,12 +296,10 @@ pub(crate) fn export_yield_f64(
         Some(FieldType::Base(BaseType::Chars)) => {
             Ok((DataType::Chars, ModelValue::from(n.to_string().as_str())))
         }
-        // 未声明类型：整值与 `export_untyped_value` 同口径导出 `Digit`（两条
-        // 执行路径必须一致），非整值仍为 `Float`。
-        None if n.is_finite() && n.fract() == 0.0 && n.abs() <= i64::MAX as f64 => {
-            Ok((DataType::Digit, ModelValue::from(n as i64)))
-        }
-        None if n.is_finite() => Ok((DataType::Float, ModelValue::from(n))),
+        // 未声明类型：与 `export_untyped_value` 走**同一**口径（见
+        // `untyped_numeric_export`）——列式 f64 快车道与行式 `Value` 路径必须
+        // 产出同一模型类型。
+        None if n.is_finite() => Ok(untyped_numeric_export(n)),
         // Any other target (Time / Ip / Hex / non-finite / array / object) —
         // fall back to the Value path for byte-identical handling.
         _ => export_yield_value(&Value::Number(n), field_type),
@@ -361,16 +359,39 @@ fn export_typed_value(base_type: &BaseType, value: &Value) -> CoreResult<(DataTy
     }
 }
 
+/// f64 精确整数域上界（2^53）。
+const UNTYPED_DIGIT_THRESHOLD: f64 = 9_007_199_254_740_992.0;
+
+/// **未声明类型**的数值导出（唯一口径，行式 `Value` 路径与列式 f64 快车道共用）。
+///
+/// 取舍（2026-09-18 第 2 步）：`|v| < 2^53` 时 f64 能精确表达该整数，沿用既有
+/// `Number`（零兼容破坏）；`|v| >= 2^53` 起 f64 会把它量化（epoch-ns ≈1.77e18
+/// 的 ulp ≈256ns），必须用 `Digit` 承载才不丢精度。两条执行路径（行式/列式）与
+/// 三种载体（`Int` / 整值 `Number` / 量化后的 f64）在同一逻辑值上必须得出一致结果。
+///
+/// 注：声明了 `digit` 的目标不受影响（`export_typed_value` 恒为 `Digit`）。
+fn untyped_numeric_export(n: f64) -> (DataType, ModelValue) {
+    let representable_as_i64 = n.abs() <= i64::MAX as f64;
+    if n.fract() == 0.0 && n.abs() >= UNTYPED_DIGIT_THRESHOLD && representable_as_i64 {
+        (DataType::Digit, ModelValue::from(n as i64))
+    } else {
+        (DataType::Float, ModelValue::from(n))
+    }
+}
+
+/// [`untyped_numeric_export`] 的精确整数入口（不经 f64，`>2^53` 逐位保真）。
+fn untyped_int_export(i: i64) -> (DataType, ModelValue) {
+    if i.unsigned_abs() >= (1u64 << 53) {
+        (DataType::Digit, ModelValue::from(i))
+    } else {
+        (DataType::Float, ModelValue::from(i as f64))
+    }
+}
+
 fn export_untyped_value(value: &Value) -> CoreResult<(DataType, ModelValue)> {
     match value {
-        // 整值 `Number` 与 `Int` 同口径导出 `Digit`：未声明类型的整数在行式
-        // （`Value::Int`）/列式（f64 快车道）两条路径上必须产出**同一**模型类型。
-        Value::Number(n) if n.is_finite() && n.fract() == 0.0 && n.abs() <= i64::MAX as f64 => {
-            Ok((DataType::Digit, ModelValue::from(*n as i64)))
-        }
-        Value::Number(n) if n.is_finite() => Ok((DataType::Float, ModelValue::from(*n))),
-        // 精确整数输出为 `Digit`（而非不精确的 Float）—— 见 `Value::Int` 语义。
-        Value::Int(i) => Ok((DataType::Digit, ModelValue::from(*i))),
+        Value::Number(n) if n.is_finite() => Ok(untyped_numeric_export(*n)),
+        Value::Int(i) => Ok(untyped_int_export(*i)),
         Value::Bool(b) => Ok((DataType::Bool, ModelValue::from(*b))),
         Value::Str(s) => Ok((DataType::Chars, ModelValue::from(s.as_str()))),
         Value::Array(_) => export_array_value(value, "auto"),

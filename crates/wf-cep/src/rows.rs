@@ -7,12 +7,17 @@ use crate::value::Value;
 use crate::value_extract::value_to_f64;
 
 /// 行字段槽型（2026-08-26 q18/q19：stats last/top 行字段紧凑化）。
-/// 每字段一个槽位：数字→`numeric`（f64 8B）、字符串→`strings`（SmolStr 24B
-/// 内联）、其它→`others`（原 `Option<Value>` 万能盒回退）。
+/// 每字段一个槽位：整数列→`ints`（i64 8B，**精确**）、浮点列→`numeric`（f64 8B）、
+/// 字符串→`strings`（SmolStr 24B 内联）、其它→`others`（原 `Option<Value>` 万能盒回退）。
+///
+/// `Int64` 槽与 `Numeric` 槽**同为 8B**（内存中性），区别只在保真：`Int64` /
+/// `Timestamp(Ns)` 列的值走它，`epoch-ns`（≈1.77e18 > 2^53）不再被 f64 量化到 ~256ns
+/// （与 `Value::Int` 同一条精度线）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ::jumo_derive::Jumo)]
 #[jumo(kind = "state", domain = "Engine", module = "Engine.StatsEngine")]
 pub enum RowFieldSlot {
     Numeric(usize),
+    Int64(usize),
     Str(usize),
     Other(usize),
 }
@@ -24,6 +29,7 @@ pub enum RowFieldSlot {
 pub struct RowFieldLayout {
     slots: Vec<RowFieldSlot>,
     n_numeric: usize,
+    n_int64: usize,
     n_strings: usize,
     n_others: usize,
 }
@@ -33,20 +39,25 @@ impl RowFieldLayout {
     /// `names` = 行字段列序（P5 子集，或全部 schema 字段排序）。
     pub fn from_schema(names: &[String], schema: &arrow::datatypes::Schema) -> Self {
         let mut slots = Vec::with_capacity(names.len());
-        let (mut n_num, mut n_str, mut n_oth) = (0, 0, 0);
+        let (mut n_num, mut n_int, mut n_str, mut n_oth) = (0, 0, 0, 0);
         for name in names {
             let slot = match schema.column_with_name(name).map(|(_, f)| f.data_type()) {
+                // 整数承载（`extract_value` 对这两类列产出 `Value::Int`）→ i64 槽，保精确
+                Some(arrow::datatypes::DataType::Int64)
+                | Some(arrow::datatypes::DataType::Timestamp(_, _)) => {
+                    let s = RowFieldSlot::Int64(n_int);
+                    n_int += 1;
+                    s
+                }
                 Some(arrow::datatypes::DataType::Int8)
                 | Some(arrow::datatypes::DataType::Int16)
                 | Some(arrow::datatypes::DataType::Int32)
-                | Some(arrow::datatypes::DataType::Int64)
                 | Some(arrow::datatypes::DataType::UInt8)
                 | Some(arrow::datatypes::DataType::UInt16)
                 | Some(arrow::datatypes::DataType::UInt32)
                 | Some(arrow::datatypes::DataType::UInt64)
                 | Some(arrow::datatypes::DataType::Float32)
-                | Some(arrow::datatypes::DataType::Float64)
-                | Some(arrow::datatypes::DataType::Timestamp(_, _)) => {
+                | Some(arrow::datatypes::DataType::Float64) => {
                     let s = RowFieldSlot::Numeric(n_num);
                     n_num += 1;
                     s
@@ -68,6 +79,7 @@ impl RowFieldLayout {
         Self {
             slots,
             n_numeric: n_num,
+            n_int64: n_int,
             n_strings: n_str,
             n_others: n_oth,
         }
@@ -82,6 +94,7 @@ impl RowFieldLayout {
                 .map(|(i, _)| RowFieldSlot::Other(i))
                 .collect(),
             n_numeric: 0,
+            n_int64: 0,
             n_strings: 0,
             n_others: names.len(),
         }
@@ -93,6 +106,11 @@ impl RowFieldLayout {
 
     pub fn n_numeric(&self) -> usize {
         self.n_numeric
+    }
+
+    /// `Int64` 槽数（i64 8B/字段，与 `n_numeric` 同宽）。
+    pub fn n_int64(&self) -> usize {
+        self.n_int64
     }
 
     pub fn n_strings(&self) -> usize {
@@ -118,6 +136,7 @@ impl RowFieldLayout {
 pub struct RowFields {
     layout: std::sync::Arc<RowFieldLayout>,
     numeric: Box<[f64]>,
+    ints: Box<[i64]>,
     strings: Box<[smol_str::SmolStr]>,
     others: Box<[Option<Value>]>,
     null_mask: Box<[u64]>,
@@ -127,11 +146,13 @@ impl RowFields {
     pub fn empty(layout: std::sync::Arc<RowFieldLayout>) -> Self {
         let n = layout.n_fields();
         let n_numeric = layout.n_numeric;
+        let n_int64 = layout.n_int64;
         let n_strings = layout.n_strings;
         let n_others = layout.n_others;
         Self {
             layout,
             numeric: vec![0.0; n_numeric].into_boxed_slice(),
+            ints: vec![0; n_int64].into_boxed_slice(),
             strings: vec![smol_str::SmolStr::default(); n_strings].into_boxed_slice(),
             others: vec![None; n_others].into_boxed_slice(),
             null_mask: vec![0u64; n.div_ceil(64)].into_boxed_slice(),
@@ -163,10 +184,22 @@ impl RowFields {
                 self.numeric[idx] = n;
                 self.mask_bit(i, false);
             }
-            // `Int` 落同一 f64 数值槽（槽宽 8B 的设计使然；`|i| < 2^53` 精确，
-            // 更大整数在此紧凑缓存里仍是既有 f64 边界——与 step 2 前同口径）。
+            // 浮点槽收到 `Int`：兜底路径（`from_schema` 已把 Int64/Timestamp 列
+            // 分到 `Int64` 槽），仅当行式路径把整值喂进浮点列槽时走到。
             (RowFieldSlot::Numeric(idx), Some(Value::Int(v))) => {
                 self.numeric[idx] = v as f64;
+                self.mask_bit(i, false);
+            }
+            // 整数槽：`Value::Int` 逐位保真（epoch-ns 不经 f64）。
+            (RowFieldSlot::Int64(idx), Some(Value::Int(v))) => {
+                self.ints[idx] = v;
+                self.mask_bit(i, false);
+            }
+            // 行式（JSON/派生）值喂进整数槽：仅接受 f64 可精确表达的整值。
+            (RowFieldSlot::Int64(idx), Some(Value::Number(n)))
+                if n.is_finite() && n.fract() == 0.0 && n.abs() <= i64::MAX as f64 =>
+            {
+                self.ints[idx] = n as i64;
                 self.mask_bit(i, false);
             }
             (RowFieldSlot::Str(idx), Some(Value::Str(s))) => {
@@ -194,6 +227,7 @@ impl RowFields {
         }
         match self.layout.slot(i) {
             RowFieldSlot::Numeric(idx) => Some(Value::Number(self.numeric[idx])),
+            RowFieldSlot::Int64(idx) => Some(Value::Int(self.ints[idx])),
             RowFieldSlot::Str(idx) => Some(Value::Str(self.strings[idx].clone())),
             RowFieldSlot::Other(idx) => self.others[idx].clone(),
         }
@@ -206,6 +240,8 @@ impl RowFields {
         }
         match self.layout.slot(i) {
             RowFieldSlot::Numeric(idx) => Some(self.numeric[idx]),
+            // 排序键是 f64 域（top-N 比较）；`|i| >= 2^53` 时量化与改动前同口径。
+            RowFieldSlot::Int64(idx) => Some(self.ints[idx] as f64),
             RowFieldSlot::Other(idx) => self.others[idx].as_ref().and_then(value_to_f64),
             RowFieldSlot::Str(_) => None,
         }
@@ -222,6 +258,11 @@ impl RowFields {
     /// 数字槽数组（layout 槽序）。
     pub fn numeric(&self) -> &[f64] {
         &self.numeric
+    }
+
+    /// 整数槽数组（layout 槽序）。
+    pub fn ints(&self) -> &[i64] {
+        &self.ints
     }
 
     /// 字符串槽数组（layout 槽序）。
@@ -244,6 +285,7 @@ impl RowFields {
     pub fn from_parts(
         layout: std::sync::Arc<RowFieldLayout>,
         numeric: Box<[f64]>,
+        ints: Box<[i64]>,
         strings: Box<[smol_str::SmolStr]>,
         others: Box<[Option<Value>]>,
         null_mask: Box<[u64]>,
@@ -251,6 +293,7 @@ impl RowFields {
         Self {
             layout,
             numeric,
+            ints,
             strings,
             others,
             null_mask,

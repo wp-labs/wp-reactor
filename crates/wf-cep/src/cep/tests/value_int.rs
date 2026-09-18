@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 use wf_lang::ast::BinOp;
 
 use super::*;
-use crate::value_extract::{value_to_f64, value_to_int};
+use crate::value_extract::value_to_f64;
 
 /// `|i| < 2^53`：`i as f64` 精确无损，`Int` 与 `Number` 必须**完全等价**。
 const EXACT_CASES: &[i64] = &[
@@ -87,8 +87,8 @@ fn int_comparison_is_exact_beyond_f64_precision() {
     assert!(values_equal(&Value::Int(b), &Value::Number(b as f64)));
 }
 
-/// 键同一性 + 哈希：`ValueKey` / `ScopeKey` / `JoinKey` 都必须把两个变体
-/// 归一到同一个键（否则去重 / join / 分片会静默错配）。
+/// 键同一性 + 哈希：`|i| < 2^53` 时 `ValueKey` / `ScopeKey` / `JoinKey` 都必须把
+/// 两个变体归一到同一个键（否则去重 / join / 分片会静默错配）。
 #[test]
 fn int_and_integral_number_share_identity_key() {
     for &i in EXACT_CASES {
@@ -97,36 +97,51 @@ fn int_and_integral_number_share_identity_key() {
 
         let ki = ValueKey::from_value(&ints);
         let kn = ValueKey::from_value(&num);
-        assert_eq!(ki, kn, "ValueKey 同一 Int({i})/Number");
+        assert_eq!(ki, kn, "ValueKey 同一 Int({i})/Float");
         assert_eq!(
             hash_of(&ki),
             hash_of(&kn),
-            "ValueKey 哈希同一 Int({i})/Number"
+            "ValueKey 哈希同一 Int({i})/Float"
         );
 
         let si = ScopeKey::from_value(&ints);
         let sn = ScopeKey::from_value(&num);
-        assert_eq!(si, sn, "ScopeKey 同一 Int({i})/Number");
+        assert_eq!(si, sn, "ScopeKey 同一 Int({i})/Float");
         assert_eq!(
             hash_of(&si),
             hash_of(&sn),
-            "ScopeKey 哈希同一 Int({i})/Number"
+            "ScopeKey 哈希同一 Int({i})/Float"
         );
 
         assert_eq!(
             JoinKey::from_value(&ints),
             JoinKey::from_value(&num),
-            "JoinKey 同一 Int({i})/Number"
+            "JoinKey 同一 Int({i})/Float"
         );
     }
 
-    // 超出 f64 精确域：`ValueKey` 仍按 canonical 位归一到同一键
-    // （`Number` 侧本就是量化后的值，故不产生新的错配）。
+    // 超出 f64 精确域：`>= 2^53` 的整数**不得**被 `i as f64` 量化 ——
+    // `ValueKey` 落精确 `Int`，而量化后的 `Number` 是另一个逻辑值 → 必须不同键。
     for &i in BEYOND_F64_CASES {
         assert_eq!(
             ValueKey::from_value(&Value::Int(i)),
+            ValueKey::Int(i),
+            "ValueKey 精确整数键 Int({i})"
+        );
+        assert_ne!(
+            ValueKey::from_value(&Value::Int(i)),
             ValueKey::from_value(&Value::Number(i as f64)),
-            "ValueKey 同一 Int({i})/量化 Number"
+            "量化后的 Float 不得与精确 Int({i}) 同键"
+        );
+    }
+
+    // 相邻大整数各自成键（此前一律量化为同一 f64 位 → `distinct` 静默少计）。
+    for i in [1i64 << 53, (1i64 << 53) + 1, (1i64 << 53) + 2] {
+        assert_ne!(
+            ValueKey::from_value(&Value::Int(i)),
+            ValueKey::from_value(&Value::Int(i + 1)),
+            "相邻精确整数 Int({i}) / Int({}) 必须不同键",
+            i + 1
         );
     }
 }
@@ -147,21 +162,18 @@ fn int_and_integral_number_stringify_identically() {
     assert_eq!(value_to_string(&Value::Int(i64::MIN)), i64::MIN.to_string());
 }
 
-/// 数值漏斗：`value_to_f64` / `value_to_int` 必须接受 `Int`，且 `Int` 不走 f64 还原。
+/// 数值漏斗：`value_to_f64` 必须接受 `Int`（列式与行式路径共用同一入口；
+/// 整数原本的精确读取通道已随 `Value::Int` 退役）。
 #[test]
 fn int_and_integral_number_share_numeric_funnel() {
     for &i in EXACT_CASES {
         assert_eq!(value_to_f64(&Value::Int(i)), Some(i as f64));
-        assert_eq!(value_to_int(Some(&Value::Int(i))), Some(i));
     }
-    // 精确整数不经 f64 —— 超出 2^53 也不丢精度。
     let big = 1_770_000_000_000_000_001_i64;
-    assert_eq!(value_to_int(Some(&Value::Int(big))), Some(big));
     assert_eq!(value_to_f64(&Value::Int(big)), Some(big as f64));
-    // 非整值依旧拒绝。
-    assert_eq!(value_to_int(Some(&Value::Number(7.5))), None);
-    assert_eq!(value_to_int(Some(&Value::Str("7".into()))), None);
+    // 非数值依旧拒绝。
     assert_eq!(value_to_f64(&Value::Str("7".into())), None);
+    assert_eq!(value_to_f64(&Value::Bool(true)), None);
 }
 
 /// 排序：`Int` / `Number` 同序（不会双双落到文本比较）。

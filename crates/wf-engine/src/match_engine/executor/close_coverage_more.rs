@@ -289,9 +289,10 @@ fn close_direct_batch_columnar_literal_bool_and_string_columns() {
         record.get_value("s"),
         Some(&wp_model_core::model::Value::from("lit"))
     );
+    // 未声明类型的小整值沿用 Float（|v| < 2^53）。
     assert_eq!(
         record.get_value("n"),
-        Some(&wp_model_core::model::Value::from(9_i64))
+        Some(&wp_model_core::model::Value::from(9.0_f64))
     );
 }
 

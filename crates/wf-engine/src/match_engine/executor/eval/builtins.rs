@@ -434,9 +434,14 @@ fn parse_stat_selector(expr: &wf_lang::ast::Expr) -> Option<StatSelector<'_>> {
     }
 }
 
+/// 统计选择器（`count(...)` / `value(...)`）取的数值字段 → 原样返回。
+///
+/// `Int` 必须**原样透传**（不降级为 `Number`）：`Int64`/`Timestamp(Ns)` 列经
+/// `Value::Int` 承载，`i64::MAX` 量级降级会丢精度；下游（算术走 `value_to_f64`、
+/// 导出走 `untyped_*` 阈值）都认识 `Int`。
 fn number_value(value: &Value) -> Option<Value> {
     match value {
-        Value::Number(n) => Some(Value::Number(*n)),
+        Value::Number(_) | Value::Int(_) => Some(value.clone()),
         _ => None,
     }
 }

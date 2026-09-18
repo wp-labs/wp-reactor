@@ -38,8 +38,16 @@ pub fn wfl_structured_field_kind(field: &Field) -> Option<&str> {
 }
 
 /// Arrow 列单格 → [`Value`]：行式事件桥（`batch_to_events`）与列式视图按需读
-/// 共用，null / 失败提取 → `None`（字段缺席）。Utf8 列先查 wfl metadata：
-/// structured JSON 列（object/array）解析成 `Value::Object` / `Value::Array`。
+/// 共用。Utf8 列先查 wfl metadata：structured JSON 列（object/array）解析成
+/// `Value::Object` / `Value::Array`。
+///
+/// **前置条件：调用方必须先过滤 null**（`col.is_null(row)` → 字段缺席）。本函数
+/// 位于字段读取热路径（q15 每事件 ~34 次），因此不在内部重复位图查询——所有调用点
+/// （`batch_to_events` / `materialize_rows` / `ColumnarEvent::value_at` /
+/// `JoinRow::field_value`）都已先查。不支持的列类型 / JSON 解析失败 → `None`。
+///
+/// 类型映射：[`Int64`](arrow::datatypes::DataType::Int64) 与
+/// `Timestamp(Ns)` → [`Value::Int`]（精确，不经 f64）；`Float64` → `Number`。
 pub fn extract_field_value(field: &Field, col: &dyn Array, row: usize) -> Option<Value> {
     // 先查列类型再查 metadata：只有 Utf8 列才可能是 structured JSON。旧实现先查
     // metadata（每次字段读取的纯开销）——q15 全 Int64 字段每事件 34 次白查，
@@ -55,51 +63,7 @@ pub fn extract_field_value(field: &Field, col: &dyn Array, row: usize) -> Option
     extract_value(col, row)
 }
 
-/// 列值的**精确整数**读取（Int64 / Timestamp(Ns) 列）。
-///
-/// [`extract_value`] 把这两类列都转成 `Value::Number(f64)`：纳秒时间戳（≈1.77e18）
-/// 超出 f64 精确整数范围（2^53≈9.0e15），会被量化到 ~256ns，使"真值相等/相差 <128ns"
-/// 的区间界比较随机翻转（同刻跨流配对丢约一半）。区间界求值因此优先走本函数。
-/// 其它列类型（含 structured Utf8）返回 `None`，调用方回落到 `Value` 路径，语义不变。
-/// `Value` → 精确 `i64`（**只接受整值**）。
-///
-/// 物化 `Event` 的字段已经过 `Value::Number(f64)`（纳秒精度已丢），这里只能尽力还原；
-/// 真正精确的路径是列式源的 [`extract_field_value_int`]。
-pub fn value_to_int(v: Option<&Value>) -> Option<i64> {
-    match v? {
-        // 精确整数直接命中（无需经 f64 还原）。
-        Value::Int(i) => Some(*i),
-        Value::Number(n)
-            if n.is_finite()
-                && n.fract() == 0.0
-                && *n >= i64::MIN as f64
-                && *n <= i64::MAX as f64 =>
-        {
-            Some(*n as i64)
-        }
-        _ => None,
-    }
-}
-
-pub fn extract_field_value_int(field: &Field, col: &dyn Array, row: usize) -> Option<i64> {
-    if col.is_null(row) {
-        return None;
-    }
-    if matches!(col.data_type(), DataType::Utf8) && wfl_structured_field_kind(field).is_some() {
-        return None;
-    }
-    match col.data_type() {
-        DataType::Int64 => Some(col.as_any().downcast_ref::<Int64Array>()?.value(row)),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => Some(
-            col.as_any()
-                .downcast_ref::<TimestampNanosecondArray>()?
-                .value(row),
-        ),
-        _ => None,
-    }
-}
-
-/// `Value` → `f64`（仅 [`Value::Number`]；其余变体 `None`）。
+/// `Value` → `f64`（[`Value::Number`] 与 [`Value::Int`]；其余变体 `None`）。
 ///
 /// 行式路径数值漏斗的**单一实现**：此前 `rows.rs` / `cep/step.rs` /
 /// `wf-engine …/stats_exec/eval/keys.rs` 各有一份同体副本，任一处改漏即口径漂移
@@ -219,58 +183,31 @@ mod int_channel_tests {
     use super::*;
     use arrow::array::TimestampNanosecondArray;
 
-    /// Int64 / Timestamp(Ns) 列走精确通道；`Value` 路径（f64）在同一值上丢精度。
+    /// Int64 / Timestamp(Ns) 列经 `Value` 路径**逐位精确**（`Value::Int`），
+    /// 不再有独立的精确读取通道；其余列类型仍按各自语义。
     #[test]
-    fn extract_field_value_int_is_exact_for_epoch_nanos() {
+    fn extract_field_value_is_exact_for_int_columns() {
         let ns: i64 = 1_767_225_600_000_000_001;
+        assert_ne!(ns as f64 as i64, ns, "前提：该值经 f64 必丢精度");
+
         let ints = Int64Array::from(vec![Some(ns), None, Some(7)]);
         let field = Field::new("t", DataType::Int64, true);
-        assert_eq!(
-            extract_field_value_int(&field, &ints, 0),
-            Some(ns),
-            "精确通道"
-        );
-        assert_eq!(
-            extract_field_value_int(&field, &ints, 1),
-            None,
-            "null → None"
-        );
-
-        // 2026-09-18（第 2 步）：Value 路径已改走精确整数通道，不再丢精度。
-        let via_value = match extract_field_value(&field, &ints, 0) {
-            Some(Value::Int(v)) => v,
-            other => panic!("expected exact int, got {other:?}"),
-        };
-        assert_eq!(via_value, ns, "Value 路径也必须精确（Int 变体）");
+        assert_eq!(extract_field_value(&field, &ints, 0), Some(Value::Int(ns)));
+        assert_eq!(extract_field_value(&field, &ints, 2), Some(Value::Int(7)));
+        // null 的过滤是**调用方**职责（见 `extract_field_value` 的前置条件）：
+        // 列式视图与事件桥都在调用前 `is_null` 判断，这里不重复断言。
 
         let ts = TimestampNanosecondArray::from(vec![Some(ns)]);
         let ts_field = Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true);
-        assert_eq!(
-            extract_field_value_int(&ts_field, &ts, 0),
-            Some(ns),
-            "Timestamp(Ns) 列同样是精确通道"
-        );
-    }
+        assert_eq!(extract_field_value(&ts_field, &ts, 0), Some(Value::Int(ns)));
 
-    /// 非整数列 / structured Utf8 不参与精确通道（调用方回落 `Value` 路径）。
-    #[test]
-    fn extract_field_value_int_declines_non_integral_columns() {
+        // 浮点列仍是 `Number`（不猜整型）。
         let floats = arrow::array::Float64Array::from(vec![1.5]);
-        let field = Field::new("f", DataType::Float64, false);
-        assert_eq!(extract_field_value_int(&field, &floats, 0), None);
-
-        let strings = StringArray::from(vec!["x"]);
-        let field = Field::new("s", DataType::Utf8, false);
-        assert_eq!(extract_field_value_int(&field, &strings, 0), None);
-    }
-
-    /// `Value` → i64 只接受整值。
-    #[test]
-    fn value_to_int_accepts_only_integrals() {
-        assert_eq!(value_to_int(Some(&Value::Number(7.0))), Some(7));
-        assert_eq!(value_to_int(Some(&Value::Number(7.5))), None);
-        assert_eq!(value_to_int(Some(&Value::Str("7".into()))), None);
-        assert_eq!(value_to_int(None), None);
+        let f_field = Field::new("f", DataType::Float64, false);
+        assert_eq!(
+            extract_field_value(&f_field, &floats, 0),
+            Some(Value::Number(1.5))
+        );
     }
 
     /// 数值漏斗契约：只有 `Number` 产出 `f64`，其它变体（含结构化）一律 `None`——
@@ -278,7 +215,7 @@ mod int_channel_tests {
     #[test]
     fn value_to_f64_only_accepts_numbers() {
         assert_eq!(value_to_f64(&Value::Number(-0.5)), Some(-0.5));
-        // 整值也走同一入口（精度由调用方按需走 `extract_field_value_int`）。
+        // 整值（`Int` / 整值 `Number`）也走同一入口。
         assert_eq!(value_to_f64(&Value::Number(3.0)), Some(3.0));
         assert_eq!(value_to_f64(&Value::Str("1".into())), None);
         assert_eq!(value_to_f64(&Value::Bool(true)), None);
@@ -291,13 +228,13 @@ mod int_channel_tests {
     /// 落 [`Value::Number`]，只有箭头列类型（Int64 / Timestamp(Ns)）才产出
     /// [`Value::Int`]。本用例防止后续“顺手”把整值 JSON 猜成 `Int`。
     #[test]
-    fn json_numbers_stay_number_never_guessed_as_int() {
+    fn json_numbers_stay_float_never_guessed_as_int() {
         for text in ["1", "1.0", "0", "-0", "9007199254740993", "1e18", "1.5"] {
             let json: serde_json::Value = serde_json::from_str(text).unwrap();
             let got = json_to_value(json).expect("json number → Some");
             assert!(
                 matches!(got, Value::Number(_)),
-                "JSON `{text}` 必须落 Number，实际 {got:?}"
+                "JSON `{text}` 必须落 Float，实际 {got:?}"
             );
         }
         // 嵌套形态（数组 / 对象里的整数）同样不猜。

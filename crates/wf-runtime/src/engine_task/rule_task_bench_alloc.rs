@@ -706,6 +706,7 @@ fn q18_close_fmt_vs_const() {
 fn row_fields_heap_bytes_test(rf: &wf_engine::match_engine::RowFields) -> usize {
     let l = rf.layout();
     l.n_numeric() * 8
+        + l.n_int64() * 8
         + l.n_strings() * 24 // SmolStr 24B 内联
         + l.n_others() * size_of::<Option<wf_engine::match_engine::Value>>()
         + l.n_fields().div_ceil(64) * 8 // null_mask

@@ -189,7 +189,7 @@ fn stats_accum_roundtrip_all_variants() {
     let last_back = back[2].last().as_ref().expect("last");
     assert_eq!(
         last_back.value_at(0),
-        Some(crate::match_engine::Value::Number(9800.0))
+        Some(crate::match_engine::Value::Int(9800))
     );
     assert_eq!(
         last_back.value_at(2),
@@ -226,7 +226,7 @@ fn last_shared_rowfields_dedup_roundtrip_shares_arc() {
     assert!(std::sync::Arc::ptr_eq(a0, a2), "读回 last0/last2 共享 Arc");
     assert_eq!(
         a0.value_at(0),
-        Some(crate::match_engine::Value::Number(7.0)),
+        Some(crate::match_engine::Value::Int(7)),
         "去重读回值不丢"
     );
     // 不同 Arc 的 last 不被误合并（引用索引必须精确匹配）
@@ -250,7 +250,7 @@ fn last_shared_rowfields_dedup_roundtrip_shares_arc() {
     );
     assert_eq!(
         back2[1].last().as_ref().expect("b").value_at(0),
-        Some(crate::match_engine::Value::Number(8.0))
+        Some(crate::match_engine::Value::Int(8))
     );
 }
 
@@ -315,6 +315,56 @@ fn row_fields_others_roundtrip_int_is_exact() {
         Some(crate::match_engine::Value::Int(epoch_ns)),
         "spill 往返必须逐位精确（f64 会量化到 ~256ns）"
     );
+}
+
+/// `Int64` / `Timestamp(Ns)` 列的行字段走 **i64 槽**（与 f64 槽同为 8B，内存中性）：
+/// `>2^53` 的值（epoch-ns）在这套紧凑存储里逐位保真，不经 f64 量化，也不再出现
+/// 「输出类型是整数、值却被量化」的不一致。
+#[test]
+fn row_fields_int64_slot_is_exact_and_spills_exactly() {
+    use wf_cep::rows::RowFieldSlot;
+
+    let layout = sample_layout(); // price / dateTime 为 Int64 列
+    assert!(
+        matches!(layout.slot(0), RowFieldSlot::Int64(_)),
+        "Int64 列应落 i64 槽（不是 f64 Numeric 槽）"
+    );
+    assert!(matches!(layout.slot(1), RowFieldSlot::Int64(_)));
+    assert!(matches!(layout.slot(2), RowFieldSlot::Str(_)));
+
+    let epoch_ns: i64 = 1_767_225_600_000_000_001;
+    assert_ne!(
+        epoch_ns as f64 as i64, epoch_ns,
+        "前提：该值经 f64 必丢精度"
+    );
+
+    let mut rf = RowFields::empty(std::sync::Arc::clone(&layout));
+    rf.set(0, Some(crate::match_engine::Value::Int(epoch_ns)));
+    assert_eq!(
+        rf.value_at(0),
+        Some(crate::match_engine::Value::Int(epoch_ns)),
+        "i64 槽逐位保真"
+    );
+
+    // 落盘往返同样精确（i64 槽数组 8B 直写）。
+    let accs = vec![StatsAccum::Last(Some(std::sync::Arc::new(rf)))];
+    let bytes = serialize_accs(&accs).expect("serialize");
+    let back = deserialize_accs(&bytes, &layout).expect("deserialize");
+    let StatsAccum::Last(Some(row)) = &back[0] else {
+        panic!("expected Last(Some)");
+    };
+    assert_eq!(
+        row.value_at(0),
+        Some(crate::match_engine::Value::Int(epoch_ns)),
+        "spill 往返逐位保真"
+    );
+
+    // 行式路径喂进 i64 槽的整值浮点也按整数落槽（非整值/超 i64 → null）。
+    let mut rf2 = RowFields::empty(std::sync::Arc::clone(&layout));
+    rf2.set(0, Some(crate::match_engine::Value::Number(42.0)));
+    assert_eq!(rf2.value_at(0), Some(crate::match_engine::Value::Int(42)));
+    rf2.set(0, Some(crate::match_engine::Value::Number(1.5)));
+    assert_eq!(rf2.value_at(0), None, "非整值喂整数槽 → null");
 }
 
 #[test]

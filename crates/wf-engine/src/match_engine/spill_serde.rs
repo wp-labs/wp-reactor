@@ -210,6 +210,9 @@ fn write_row_fields(w: &mut Writer, rf: &RowFields) -> Result<(), SpillError> {
     for v in rf.numeric() {
         w.f64(*v);
     }
+    for v in rf.ints() {
+        w.i64(*v);
+    }
     for s in rf.strings() {
         w.bytes(s.as_bytes());
     }
@@ -562,6 +565,10 @@ fn read_row_fields_with_layout(
     for _ in 0..layout.n_numeric() {
         numeric.push(r.f64()?);
     }
+    let mut ints = Vec::with_capacity(layout.n_int64());
+    for _ in 0..layout.n_int64() {
+        ints.push(r.i64()?);
+    }
     let mut strings = Vec::with_capacity(layout.n_strings());
     for _ in 0..layout.n_strings() {
         let s = r.bytes()?;
@@ -587,6 +594,7 @@ fn read_row_fields_with_layout(
     Ok(RowFields::from_parts(
         std::sync::Arc::clone(layout),
         numeric.into_boxed_slice(),
+        ints.into_boxed_slice(),
         strings.into_boxed_slice(),
         others.into_boxed_slice(),
         null_mask.into_boxed_slice(),

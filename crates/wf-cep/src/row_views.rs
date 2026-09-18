@@ -14,9 +14,7 @@ use smol_str::SmolStr;
 
 use crate::cep::key::{extract_scope_key_from_row, field_ref_name, scope_key_from_column};
 use crate::cep::{EngineHashMap, Event, FieldSource, ScopeKey, Value};
-use crate::value_extract::{
-    extract_field_value, extract_field_value_int, value_to_int, wfl_structured_field_kind,
-};
+use crate::value_extract::{extract_field_value, wfl_structured_field_kind};
 use wf_lang::ast::FieldRef;
 use wf_lang::plan::KeyMapPlan;
 
@@ -333,21 +331,6 @@ impl JoinRow {
                 extract_field_value(batch.schema_ref().field(idx), col.as_ref(), *row)
             }
             JoinRow::Event(ev) => ev.fields.get(name).cloned(),
-        }
-    }
-
-    /// 精确整数读取（区间界求值专用，见 [`extract_field_value_int`]）。
-    /// `Columnar` 直读原生 i64；`Event` 只能从 `Value`（f64）尽力还原。
-    pub fn field_value_int(&self, name: &str) -> Option<i64> {
-        match self {
-            JoinRow::Columnar {
-                batch, row, index, ..
-            } => {
-                let idx = *index.get(name)?;
-                let col = batch.column(idx);
-                extract_field_value_int(batch.schema_ref().field(idx), col.as_ref(), *row)
-            }
-            JoinRow::Event(ev) => value_to_int(ev.fields.get(name)),
         }
     }
 

@@ -20,10 +20,12 @@ All notable changes to wp-reactor will be documented in this file.
   刷新对查询性能的影响更小。**配置与使用方式不变**（`knowdb.toml` / `refresh` / VEL `code`
   写法、日志锚点均不变）。
 - **供给 SQL 变量（VEL）配置错误改为启动即报错**，不再推迟到首次刷新时才失败。
+- **未声明类型的整数字段输出类型**：`|v| >= 2^53`（f64 已无法精确表达）由浮点改为整数（精确）；`|v| < 2^53` 与声明了类型的字段（`digit` / `float` 等）均不变。若某列下游按固定浮点模式消费，需要相应放宽。
 
 ### Fixed
 
 - **修复刷新与动态 join 配置并发时的偶发 join 退化**（漏命中 / 降级为全表扫描）。
+- **整数精度：`>2^53` 的整数在部分路径上被量化（典型症状为纳秒时间戳）**：epoch 纳秒（≈1.77e18）超出 f64 的精确整数范围，此前经值层往返会被量化到 ~256ns，使「真值相等或相差 <128ns」的区间界比较随机翻转——同刻跨流配对（deferred join）实测丢约一半命中，且症状静默（规则偶尔不触发）。现由精确整数承载：时间戳换算、区间界、join 键、去重键（含 CEP `distinct` 的 `ValueKey`，`>= 2^53` 改用精确整数键）、输出 ID 与输出值全程不再量化；KnowDB 原生行（DDL 类型化的整数列，含 PG / `Digit` 列）也不再经「文本 → 浮点」往返。
 
 ### Removed
 
@@ -31,6 +33,10 @@ All notable changes to wp-reactor will be documented in this file.
   `.wfg` 的 AST 与解析器在本仓库与 `wfgen`（warp-fusion）各存一份，本仓库这份已无使用者，且仍停留在
   旧注入语法；为避免两份语法继续分叉，场景语法统一归口 `wfgen`。原先借它校验场景模板的 `wfadm`
   已改用 `wfgen` 的解析器；引擎（wf-engine / wf-cep / wf-runtime）不受影响。
+
+### Tests
+
+- 新增值层整数通道的性质测试：`Int` 与整值浮点在相等 / 键 / 哈希 / 排序 / 字符串化 / 数值漏斗上一致；`>2^53` 的精确性（不经 `f64` 量化）；行式 / 列式 / 解释三条执行路径输出类型一致；整数经持久化往返逐位精确。`wf-lang` 1235 / `wf-engine` 1075 / `wf-runtime` 653 / `wf-cep` 409 / `wf-config` 168 / `wf-data` 2 全绿。
 
 ## [2.0.24] -- latest
 

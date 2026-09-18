@@ -11,15 +11,28 @@ use super::types::{EngineHashMap, FieldSource, RollingStats, Value};
 #[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq, Eq, Hash)]
 #[jumo(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 pub enum ValueKey {
+    /// 浮点域的 canonical 位（含 `|i| < 2^53` 的整值）。
     Number(u64),
+    /// 精确整数：**仅** `|i| >= 2^53`（f64 已无法精确承载）走本变体。
+    ///
+    /// 小整数仍归一到 `ValueKey::Number` 位键，与 `Value::Number` 同键（保持既有键空间
+    /// 与 `0.0` / `NaN` 归一行为不变）。本变体是 `>2^53` 的精确逃生口：
+    /// 此前一律 `i as f64`，相邻纳秒时间戳（epoch-ns ≈1.77e18）会被量化成
+    /// **同一个键**，`distinct` 静默少计 —— 与 stats 路径的
+    /// `DistinctKey::Int` 同口径（该路径早已禁止 f64 化）。
+    Int(i64),
     Str(String),
     Bool(bool),
     Array(Vec<ValueKey>),
     Object(Vec<(String, ValueKey)>),
 }
 
+/// `|i| < 2^53` 时 `i as f64` 无损（与 `ScopeKey` / `DistinctKey` 同阈值）。
+const F64_EXACT_INT_LIMIT: u64 = 1 << 53;
+
 impl ValueKey {
-    /// 值的**同一性**键（精确 canonical 位；`0.0 == -0.0`、NaN 归一）。
+    /// 值的**同一性**键（精确 canonical 位；`0.0 == -0.0`、NaN 归一；
+    /// `|i| >= 2^53` 的整数走精确 `Int`）。
     ///
     /// 与 [`values_equal`](crate::cep::values_equal) 的 epsilon **比较**语义刻意
     /// 不同：epsilon 非传递（见其文档），不能作哈希同一性。因此 `distinct`
@@ -30,7 +43,11 @@ impl ValueKey {
             // 整数域与整值 `Number` 归一（`|i| < 2^53` 时 `i as f64` 精确）：
             // 两变体落**同一** canonical 位键，否则 `Int(1)` 与 `Number(1.0)`
             // 会在 distinct 计数里被当成两个值。
-            Value::Int(i) => Self::Number(canonical_f64_bits(*i as f64)),
+            Value::Int(i) if i.unsigned_abs() < F64_EXACT_INT_LIMIT => {
+                Self::Number(canonical_f64_bits(*i as f64))
+            }
+            // `>= 2^53`：f64 无精确表示，**不得**量化 —— 用精确 i64 作键。
+            Value::Int(i) => Self::Int(*i),
             Value::Str(s) => Self::Str(s.to_string()),
             Value::Bool(b) => Self::Bool(*b),
             Value::Array(values) => Self::Array(values.iter().map(Self::from_value).collect()),
@@ -47,7 +64,7 @@ impl ValueKey {
 
     pub fn estimated_bytes(&self) -> usize {
         match self {
-            Self::Number(_) | Self::Bool(_) => 8,
+            Self::Number(_) | Self::Int(_) | Self::Bool(_) => 8,
             Self::Str(s) => s.len() + 24,
             Self::Array(values) => 24 + values.iter().map(Self::estimated_bytes).sum::<usize>(),
             Self::Object(values) => {
@@ -90,8 +107,8 @@ pub fn canonical_f64_bits(value: f64) -> u64 {
 /// A typed match-key. `Pair` supports two key fields (the common case); deeper
 /// nesting builds up via `Pair`. Integer-valued numbers collapse to `Int`
 /// (including `Timestamp(Ns)`, read as `i64`), so a columnar `Int64` column and
-/// the row-based `Value::Number(f64)` (integer, `<2^53`) produce the **same**
-/// variant and hash equal.
+/// the row-based `Value::Number(f64)` holding an integer (`fract() == 0`,
+/// `<2^53`) produce the **same** variant and hash equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default, ::jumo_derive::Jumo)]
 #[jumo(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 pub enum ScopeKey {
@@ -239,7 +256,8 @@ impl InstanceKey {
 }
 
 /// Flatten a possibly-`Pair`ed [`ScopeKey`] into its leaf [`Value`]s, preserving
-/// the **original Value types** (`Int`/`Float` → `Number`/`Int`, `Str` → `Str`) so
+/// the **original Value types** (`ScopeKey::Int` → `Value::Int`,
+/// `ScopeKey::Float` → `Value::Number`, `ScopeKey::Str` → `Value::Str`) so
 /// the close path's `scope_key` is byte-identical to the event path's
 /// (`extract_key` returns the raw field Values). Previously Int keys flattened to `Str`, which
 /// broke digit-typed yield/entity fields on `on close` rules (`id = b.auction`

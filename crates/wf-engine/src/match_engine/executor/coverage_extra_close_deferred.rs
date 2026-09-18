@@ -1068,7 +1068,8 @@ fn eval_interval_bound_is_exact_on_columnar_epoch_nanos() {
     );
 
     // eager（物化 Event）同样精确：第 2 步起 `Value::Int` 承载原始 i64，
-    // `value_to_int` 不经 f64 —— 旧「物化即量化到 ~256ns」的损失已消除。
+    // `Value::Int` 精确承载原始 i64 —— 旧「物化即量化到 ~256ns」的损失已消除
+    // （独立的精确整数读取通道已退役，两条来源走同一条 `Value` 路径）。
     let eager = DeferredLeft::Event(batch_to_events(&batch).into_iter().next().unwrap());
     assert_eq!(
         eval_interval_bound(&bound, &eager, ns),

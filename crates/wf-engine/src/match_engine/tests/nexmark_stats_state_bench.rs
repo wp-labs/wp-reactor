@@ -456,6 +456,7 @@ fn scope_key_heap_bytes(k: &ScopeKey) -> usize {
 fn row_fields_heap_bytes(rf: &RowFields) -> usize {
     let l = rf.layout();
     l.n_numeric() * 8
+        + l.n_int64() * 8
         + l.n_strings() * 24 // SmolStr 24B 内联
         + l.n_others() * size_of::<Option<Value>>()
         + l.n_fields().div_ceil(64) * 8 // null_mask

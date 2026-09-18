@@ -74,6 +74,36 @@ fn alert_origin_serde_roundtrip_and_display() {
 // types.rs — export_yield_f64 fast lanes
 // ===========================================================================
 
+/// 未声明类型的**整值**导出阈值（第 2 步定稿口径）：`|v| < 2^53` → `Number`
+/// （沿用既有行为）；`>= 2^53` → `Digit`（f64 无法精确表达）。`Int` 与整值
+/// `Number` 同一逻辑值必须得出一致结果。
+#[test]
+fn untyped_integral_export_switches_to_digit_at_f64_precision_limit() {
+    use crate::alert::types::export_yield_value;
+    use wp_model_core::model::DataType;
+
+    // 小整值：两种载体都 → Float（兼容既有行为）
+    for v in [Value::Int(443), Value::Number(443.0)] {
+        let (meta, value) = export_yield_value(&v, None).unwrap();
+        assert_eq!(meta, DataType::Float, "{v:?}");
+        assert_eq!(value, ModelValue::from(443.0), "{v:?}");
+    }
+    // >2^53：`Int` 逐位保真 → Digit
+    let big = 1_767_225_600_000_000_001_i64;
+    let (meta, value) = export_yield_value(&Value::Int(big), None).unwrap();
+    assert_eq!(meta, DataType::Digit);
+    assert_eq!(value, ModelValue::from(big), "不经 f64，逐位保真");
+    // 边界：2^53 与 2^53+1 都 ≥ 阈值 → Digit（行式 `Int` 与列式量化 f64 同判）
+    let (meta, _) = export_yield_value(&Value::Int(9_007_199_254_740_992), None).unwrap();
+    assert_eq!(meta, DataType::Digit);
+    let (meta, _) = export_yield_value(&Value::Int(9_007_199_254_740_993), None).unwrap();
+    assert_eq!(meta, DataType::Digit);
+    // 声明 digit 的目标不受阈值影响（恒 Digit）
+    let ft = FieldType::Base(BaseType::Digit);
+    let (meta, _) = export_yield_value(&Value::Int(443), Some(&ft)).unwrap();
+    assert_eq!(meta, DataType::Digit);
+}
+
 #[test]
 fn export_yield_f64_fast_lanes_and_fallbacks() {
     use wp_model_core::model::DataType;
@@ -89,10 +119,17 @@ fn export_yield_f64_fast_lanes_and_fallbacks() {
     let (meta, value) = export_yield_f64(1.5, Some(&FieldType::Base(BaseType::Chars))).unwrap();
     assert_eq!(meta, DataType::Chars);
     assert_eq!(value, ModelValue::from("1.5"));
-    // Untyped: integer-valued finite → i64 digit.
+    // Untyped: `|v| < 2^53` 沿用 Float（既有行为，零兼容破坏）。
     let (meta, value) = export_yield_f64(2.0, None).unwrap();
+    assert_eq!(meta, DataType::Float);
+    assert_eq!(value, ModelValue::from(2.0));
+    // Untyped: `|v| >= 2^53` 起 f64 无法精确表达 → Digit（否则量化）。
+    let (meta, value) = export_yield_f64(9_007_199_254_740_992.0, None).unwrap(); // 2^53
     assert_eq!(meta, DataType::Digit);
-    assert_eq!(value, ModelValue::from(2_i64));
+    assert_eq!(value, ModelValue::from(9_007_199_254_740_992_i64));
+    let (meta, value) = export_yield_f64(1_767_225_600_000_000_000.0, None).unwrap();
+    assert_eq!(meta, DataType::Digit);
+    assert_eq!(value, ModelValue::from(1_767_225_600_000_000_000_i64));
     // Fractional digit → falls back to the Value path → error.
     assert!(export_yield_f64(1.5, Some(&FieldType::Base(BaseType::Digit))).is_err());
     // Non-finite float → falls back → error.
