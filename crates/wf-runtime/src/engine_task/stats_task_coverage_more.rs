@@ -216,7 +216,7 @@ fn record_with(target: &str) -> OutputRecord {
         matched_rows: Vec::new(),
         summary: "".into(),
         yield_target: target.into(),
-        yield_fields: vec![(Arc::from("id"), Value::Number(7.0))],
+        yield_fields: vec![(Arc::from("id"), Value::Float(7.0))],
         yield_field_types: Vec::new().into(),
         event_time_nanos: 100,
         machine_id: Arc::from(""),

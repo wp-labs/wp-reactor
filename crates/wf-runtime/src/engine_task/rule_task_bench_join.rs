@@ -162,7 +162,7 @@ fn q13b_production_path_bench() {
         let mut fields = wf_engine::match_engine::EngineHashMap::default();
         fields.insert(
             "key".into(),
-            wf_engine::match_engine::Value::Number(k as f64),
+            wf_engine::match_engine::Value::Float(k as f64),
         );
         fields.insert(
             "value".into(),
@@ -170,7 +170,7 @@ fn q13b_production_path_bench() {
         );
         let row = JoinRow::Event(Arc::new(wf_engine::match_engine::Event { fields }));
         index
-            .entry(JoinKey::from_value(&wf_engine::match_engine::Value::Number(k as f64)).unwrap())
+            .entry(JoinKey::from_value(&wf_engine::match_engine::Value::Float(k as f64)).unwrap())
             .or_default()
             .push(row);
     }
@@ -437,11 +437,11 @@ fn q13b_concurrent_lock_bench() {
         let mut index: StdMap<JoinKey, Vec<JoinRow>> = StdMap::new();
         for k in 0..10000i64 {
             let mut fields = wf_engine::match_engine::EngineHashMap::default();
-            fields.insert("key".into(), EValue::Number(k as f64));
+            fields.insert("key".into(), EValue::Float(k as f64));
             fields.insert("value".into(), EValue::Str(format!("value-{k}").into()));
             let row = JoinRow::Event(Arc::new(wf_engine::match_engine::Event { fields }));
             index
-                .entry(JoinKey::from_value(&EValue::Number(k as f64)).unwrap())
+                .entry(JoinKey::from_value(&EValue::Float(k as f64)).unwrap())
                 .or_default()
                 .push(row);
         }
@@ -473,12 +473,12 @@ fn q13b_concurrent_lock_bench() {
             let mut events = Vec::with_capacity(n);
             for i in 0..n {
                 let mut fields = wf_engine::match_engine::EngineHashMap::default();
-                fields.insert("id".into(), EValue::Number((t * n + i) as f64));
-                fields.insert("bidder".into(), EValue::Number((t * n + i) as f64));
-                fields.insert("auction".into(), EValue::Number((t * n + i) as f64));
-                fields.insert("price".into(), EValue::Number((t * n + i) as f64));
-                fields.insert("dateTime".into(), EValue::Number(NANOS as f64));
-                fields.insert("mod_key".into(), EValue::Number((i % 10000) as f64));
+                fields.insert("id".into(), EValue::Float((t * n + i) as f64));
+                fields.insert("bidder".into(), EValue::Float((t * n + i) as f64));
+                fields.insert("auction".into(), EValue::Float((t * n + i) as f64));
+                fields.insert("price".into(), EValue::Float((t * n + i) as f64));
+                fields.insert("dateTime".into(), EValue::Float(NANOS as f64));
+                fields.insert("mod_key".into(), EValue::Float((i % 10000) as f64));
                 events.push(Arc::new(wf_engine::match_engine::Event { fields }));
             }
             events

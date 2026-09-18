@@ -82,6 +82,6 @@ fn step_ctx(values: Vec<Value>) -> Event {
     fields.insert("_step_0_values".into(), Value::Array(values));
     fields.insert("_step_0_source".into(), Value::Str("e".into()));
     fields.insert("_step_0_label".into(), Value::Str("fail".into()));
-    fields.insert("_step_0_measure".into(), Value::Number(6.0));
+    fields.insert("_step_0_measure".into(), Value::Float(6.0));
     Event { fields }
 }

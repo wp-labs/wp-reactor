@@ -270,7 +270,7 @@ impl PipeBatchStager {
                 }
                 PipeColSource::EventTime => None,
                 PipeColSource::MetaRuleName => Some(&meta_rule),
-                PipeColSource::MetaScore => Some(&Value::Number(record.score)),
+                PipeColSource::MetaScore => Some(&Value::Float(record.score)),
                 PipeColSource::MetaEntityType => Some(&meta_entity_type),
                 PipeColSource::MetaEntityId => Some(&meta_entity_id),
                 PipeColSource::Missing => None,
@@ -317,7 +317,7 @@ impl PipeBatchStager {
                 PipeColSource::Yield(yield_idx) => values.get(*yield_idx).and_then(|v| v.as_ref()),
                 PipeColSource::EventTime => None,
                 PipeColSource::MetaRuleName => Some(&Value::Str(rule_name.into())),
-                PipeColSource::MetaScore => Some(&Value::Number(score)),
+                PipeColSource::MetaScore => Some(&Value::Float(score)),
                 PipeColSource::MetaEntityType => Some(&Value::Str(entity_type.into())),
                 PipeColSource::MetaEntityId => Some(&Value::Str(entity_id.into())),
                 PipeColSource::Missing => None,
@@ -444,12 +444,12 @@ fn push_pipe_col(
     }
     match col {
         PipeCol::Int64(b) => b.append_option(match value {
-            Some(wf_engine::match_engine::Value::Number(n)) => Some(*n as i64),
+            Some(wf_engine::match_engine::Value::Float(n)) => Some(*n as i64),
             Some(wf_engine::match_engine::Value::Int(i)) => Some(*i),
             _ => None,
         }),
         PipeCol::Float64(b) => b.append_option(match value {
-            Some(wf_engine::match_engine::Value::Number(n)) => Some(*n),
+            Some(wf_engine::match_engine::Value::Float(n)) => Some(*n),
             Some(wf_engine::match_engine::Value::Int(i)) => Some(*i as f64),
             _ => None,
         }),
@@ -465,7 +465,7 @@ fn push_pipe_col(
             // 原 `n.to_string()` / `b.to_string()` 逐字节一致（Display 实现相同）。
             match value {
                 Some(wf_engine::match_engine::Value::Str(s)) => b.append_value(s.as_str()),
-                Some(wf_engine::match_engine::Value::Number(n)) => {
+                Some(wf_engine::match_engine::Value::Float(n)) => {
                     use std::fmt::Write as _;
                     write!(b, "{n}").ok();
                     b.append_value("");
@@ -492,7 +492,7 @@ fn push_pipe_col(
                 b.append_value(event_time_nanos);
             } else {
                 b.append_option(match value {
-                    Some(wf_engine::match_engine::Value::Number(n)) => {
+                    Some(wf_engine::match_engine::Value::Float(n)) => {
                         normalize_epoch_timestamp_float_nanos(*n)
                     }
                     Some(wf_engine::match_engine::Value::Int(i)) => {
@@ -539,7 +539,7 @@ pub(crate) fn record_wfu_intermediate_meta_value(
 
     match field {
         WfuIntermediateMetaField::RuleName => Value::Str(record.rule_name.clone().into()),
-        WfuIntermediateMetaField::Score => Value::Number(record.score),
+        WfuIntermediateMetaField::Score => Value::Float(record.score),
         WfuIntermediateMetaField::EntityType => Value::Str(record.entity_type.clone().into()),
         WfuIntermediateMetaField::EntityId => Value::Str(record.entity_id.clone().into()),
     }
@@ -558,12 +558,12 @@ pub(crate) fn value_to_json(
     value: &wf_engine::match_engine::Value,
 ) -> RuntimeResult<serde_json::Value> {
     match value {
-        wf_engine::match_engine::Value::Number(n) if n.is_finite() => {
+        wf_engine::match_engine::Value::Float(n) if n.is_finite() => {
             Ok(serde_json::Value::from(*n))
         }
         // 精确整数：输出 JSON 整数（不做 f64 往返）。
         wf_engine::match_engine::Value::Int(i) => Ok(serde_json::Value::from(*i)),
-        wf_engine::match_engine::Value::Number(_) => RuntimeReason::Bootstrap
+        wf_engine::match_engine::Value::Float(_) => RuntimeReason::Bootstrap
             .to_err()
             .with_detail("structured numeric value must be finite")
             .err(),

@@ -175,7 +175,7 @@ impl RuleExecutor {
     ///
     /// What is hoisted (vs. calling `execute_each_direct` per event):
     /// - constant expressions evaluate once per call: a literal score
-    ///   (`Number`) is clamped once, a literal entity id / literal yield
+    ///   (`Float`) is clamped once, a literal entity id / literal yield
     ///   values are built once and cloned per row;
     /// - `Expr::Field` yields resolve through `eval_field_value` directly,
     ///   skipping the recursive expression interpreter and its per-node
@@ -246,7 +246,7 @@ impl RuleExecutor {
             .fields
             .iter()
             .map(|field| match &field.value {
-                Expr::Number(n) => YieldKind::Lit(Value::Number(*n)),
+                Expr::Number(n) => YieldKind::Lit(Value::Float(*n)),
                 Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
                 Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
                 Expr::Field(_) => YieldKind::Field,

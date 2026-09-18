@@ -61,7 +61,7 @@ fn eval_tier_key(args: &[Expr], row: &HashMap<String, Value>) -> Option<ScopeKey
 pub(crate) fn field_value_of(expr: &Expr, row: &HashMap<String, Value>) -> Option<f64> {
     match expr {
         Expr::Field(fr) => match row.get(field_name(fr)) {
-            Some(Value::Number(n)) => Some(*n),
+            Some(Value::Float(n)) => Some(*n),
             Some(Value::Int(i)) => Some(*i as f64),
             _ => None,
         },
@@ -115,17 +115,17 @@ mod tests {
     #[test]
     fn eval_row_key_single_and_composite() {
         // 单键字段
-        let k = eval_row_key(&[f("a")], &row(&[("a", Value::Number(3.0))]));
+        let k = eval_row_key(&[f("a")], &row(&[("a", Value::Float(3.0))]));
         assert_eq!(k, Some(ScopeKey::Int(3)));
         // 复合键 → 左深 Pair
         let k = eval_row_key(
             &[f("a"), f("b")],
-            &row(&[("a", Value::Number(3.0)), ("b", Value::Number(4.0))]),
+            &row(&[("a", Value::Float(3.0)), ("b", Value::Float(4.0))]),
         );
         assert!(matches!(k, Some(ScopeKey::Pair(..))));
         // 任一键缺失 → None（行跳过）
         assert_eq!(
-            eval_row_key(&[f("a"), f("nope")], &row(&[("a", Value::Number(1.0))])),
+            eval_row_key(&[f("a"), f("nope")], &row(&[("a", Value::Float(1.0))])),
             None
         );
     }
@@ -136,12 +136,12 @@ mod tests {
         let day = 86_400_000_000_000i64;
         let ts = (day * 3 + 5_000_000_000) as f64;
         let e = call("bucket", vec![f("ts"), Expr::StringLit("day".into())]);
-        let k = eval_row_bucket_key(&e, &row(&[("ts", Value::Number(ts))]));
+        let k = eval_row_bucket_key(&e, &row(&[("ts", Value::Float(ts))]));
         assert_eq!(k, Some(ScopeKey::Int(day * 3)));
         // 未知单位 → None
         let e2 = call("bucket", vec![f("ts"), Expr::StringLit("week".into())]);
         assert_eq!(
-            eval_row_bucket_key(&e2, &row(&[("ts", Value::Number(ts))])),
+            eval_row_bucket_key(&e2, &row(&[("ts", Value::Float(ts))])),
             None
         );
     }
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn tier_key_indexes_ordered_bounds() {
         let e = call("tier", vec![f("v"), num(10.0), num(20.0)]);
-        let r = |v: f64| eval_row_bucket_key(&e, &row(&[("v", Value::Number(v))]));
+        let r = |v: f64| eval_row_bucket_key(&e, &row(&[("v", Value::Float(v))]));
         assert_eq!(r(5.0), Some(ScopeKey::Int(0)));
         assert_eq!(r(15.0), Some(ScopeKey::Int(1)));
         assert_eq!(r(25.0), Some(ScopeKey::Int(2)));

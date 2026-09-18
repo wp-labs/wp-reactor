@@ -65,7 +65,7 @@ fn test_batch_to_events_timestamp() {
 #[test]
 fn test_batch_event_time_nanos_matches_extract_event_time_roundtrip() {
     // Int64 / Timestamp(Ns) go through an f64 round-trip exactly like the
-    // eager `extract_event_time` (Value::Number(n as f64) → `as i64`); only
+    // eager `extract_event_time` (Value::Float(n as f64) → `as i64`); only
     // Float64 is a direct `as i64` cast. This is the correctness contract
     // for the L2 deferred scan reading time straight from the column.
     let schema = make_schema(vec![
@@ -162,8 +162,8 @@ fn test_batch_to_events_float64() {
 
     let events = batch_to_events(&batch);
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].fields["score"], Value::Number(3.21));
-    assert_eq!(events[1].fields["score"], Value::Number(9.87));
+    assert_eq!(events[0].fields["score"], Value::Float(3.21));
+    assert_eq!(events[1].fields["score"], Value::Float(9.87));
 }
 
 #[test]
@@ -239,7 +239,7 @@ fn test_batch_to_events_parses_structured_utf8_json_only_with_metadata() {
     let Value::Object(extension) = &events[0].fields["extension"] else {
         panic!("expected extension object");
     };
-    assert_eq!(extension.get("severity"), Some(&Value::Number(10.0)));
+    assert_eq!(extension.get("severity"), Some(&Value::Float(10.0)));
     assert_eq!(
         extension.get("tags"),
         Some(&Value::Array(vec![Value::Str("ssh".into())]))
@@ -275,7 +275,7 @@ fn test_batch_to_events_parses_structured_array_utf8_json_with_metadata() {
     let events = batch_to_events(&batch);
     assert_eq!(
         events[0].fields["ports"],
-        Value::Array(vec![Value::Number(22.0), Value::Number(2222.0)])
+        Value::Array(vec![Value::Float(22.0), Value::Float(2222.0)])
     );
     assert_eq!(events[0].fields["plain"], Value::Str(r#"[22,2222]"#.into()));
 }

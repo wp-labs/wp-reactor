@@ -46,7 +46,7 @@ impl CloseCtxFields {
 /// Build a synthetic [`Event`] from match context for expression evaluation.
 ///
 /// - Maps `keys[i]` field name → `scope_key[i]` value (original type preserved)
-/// - Adds step labels as fields → `label` → `Value::Number(measure_value)`
+/// - Adds step labels as fields → `label` → `Value::Float(measure_value)`
 /// - Labels that collide with key names are silently skipped (keys take priority)
 /// - Adds `_step_{i}_values` fields with collected values for L3/aggregate functions
 /// - Adds `_step_{i}_measure` and `_step_{i}_label` fields for close-path aggregates
@@ -122,7 +122,7 @@ pub(crate) fn build_eval_context(
             && !fields.contains_key(label.as_str())
             && (all || needed.wants(label.as_str()))
         {
-            fields.insert(label.clone().into(), Value::Number(sd.measure_value));
+            fields.insert(label.clone().into(), Value::Float(sd.measure_value));
         }
         if all {
             // Store collected values for L3 functions (collect_set/list, first/last, stddev/percentile)
@@ -139,7 +139,7 @@ pub(crate) fn build_eval_context(
                 }
             }
             let measure_field = format!("_step_{}_measure", step_idx);
-            fields.insert(measure_field.into(), Value::Number(sd.measure_value));
+            fields.insert(measure_field.into(), Value::Float(sd.measure_value));
             if let Some(label) = &sd.label {
                 let label_field = format!("_step_{}_label", step_idx);
                 fields.insert(label_field.into(), Value::Str(label.clone().into()));
@@ -184,7 +184,7 @@ pub(crate) fn build_eval_context(
     for bd in bind_data {
         let count_field = format!("_bind_{}_count", bd.alias);
         if all || needed.wants(&count_field) {
-            fields.insert(count_field.into(), Value::Number(bd.count as f64));
+            fields.insert(count_field.into(), Value::Float(bd.count as f64));
         }
         for (field_name, values) in &bd.field_values {
             if all {
@@ -435,7 +435,7 @@ pub(crate) fn eval_interval_bound(
             // 使「真值相等/相差 <128ns」的 `>=`/`<` 随机翻转（同刻跨流配对实测丢约一半）。
             let value = eval_expr(e, ctx)?;
             match value {
-                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n),
+                Value::Float(n) => normalize_epoch_timestamp_float_nanos(n),
                 Value::Int(i) => normalize_epoch_timestamp_int_nanos(i),
                 _ => None,
             }
@@ -567,7 +567,7 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("bidder".into(), Value::Number(1.0));
+        ctx.fields.insert("bidder".into(), Value::Float(1.0));
 
         let joins = vec![JoinPlan {
             right_window: "person_events".to_string(),
@@ -599,7 +599,7 @@ mod tests {
         let joined = Arc::new(Event {
             fields: {
                 let mut f = EngineHashMap::default();
-                f.insert("id".into(), Value::Number(1.0));
+                f.insert("id".into(), Value::Float(1.0));
                 f.insert("name".into(), Value::Str("person".into()));
                 f
             },
@@ -628,7 +628,7 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("bidder".into(), Value::Number(1.0));
+        ctx.fields.insert("bidder".into(), Value::Float(1.0));
 
         let joins = vec![JoinPlan {
             right_window: "person_events".to_string(),
@@ -648,12 +648,12 @@ mod tests {
         assert!(ok, "an asof Hit must keep the event");
         assert_eq!(
             ctx.fields.get("person_events.id"),
-            Some(&Value::Number(1.0)),
+            Some(&Value::Float(1.0)),
             "qualified joined field must be enriched"
         );
         assert_eq!(
             ctx.fields.get("id"),
-            Some(&Value::Number(1.0)),
+            Some(&Value::Float(1.0)),
             "plain joined field must be enriched"
         );
     }
@@ -766,7 +766,7 @@ mod tests {
         // materialized `Event` wrapper (the old HashMap path).
         let mut ctx_fields = EngineHashMap::default();
         ctx_fields.insert("ip".into(), Value::Str("10.0.0.2".into()));
-        ctx_fields.insert("score".into(), Value::Number(100.0));
+        ctx_fields.insert("score".into(), Value::Float(100.0));
         let ctx = Event { fields: ctx_fields };
         let conds = vec![
             JoinCondPlan {
@@ -836,8 +836,8 @@ mod tests {
     /// 右窗行：`(ts, id, price)`。
     fn timed_row(ts: i64, id: f64, price: f64) -> (i64, JoinRow) {
         let mut fields = EngineHashMap::default();
-        fields.insert("id".into(), Value::Number(id));
-        fields.insert("price".into(), Value::Number(price));
+        fields.insert("id".into(), Value::Float(id));
+        fields.insert("price".into(), Value::Float(price));
         (ts, JoinRow::Event(Arc::new(Event { fields })))
     }
 
@@ -888,19 +888,19 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
 
         let joins = vec![interval_join(Some(within_lookback()), JoinMode::Inner)];
         let ok = execute_joins(&joins, &mut ctx, &lookup, 500_000_000_000);
         assert!(ok, "interval inner hit keeps event");
-        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(200.0)));
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Float(200.0)));
 
         // miss：ts=485s 落在 [490s, 500s] 之外 → 丢事件
         let lookup = TimedLookup(vec![timed_row(485_000_000_000, 1.0, 100.0)]);
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
         let ok = execute_joins(
             &[interval_join(Some(within_lookback()), JoinMode::Inner)],
             &mut ctx,
@@ -921,7 +921,7 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
         let ok = execute_joins(
             &[interval_join(Some(within_lookback()), JoinMode::Snapshot)],
             &mut ctx,
@@ -930,7 +930,7 @@ mod tests {
         );
         assert!(ok);
         // 区间内最早 = ts 495s（price 200）
-        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(200.0)));
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Float(200.0)));
     }
 
     #[test]
@@ -943,7 +943,7 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
         let ok = execute_joins(
             &[interval_join(
                 Some(within_lookback()),
@@ -955,7 +955,7 @@ mod tests {
         );
         assert!(ok);
         // 区间内最新 = ts 499s（price 300）
-        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(300.0)));
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Float(300.0)));
     }
 
     #[test]
@@ -965,7 +965,7 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
         let ok = execute_joins(
             &[interval_join(Some(within_lookback()), JoinMode::Anti)],
             &mut ctx,
@@ -982,7 +982,7 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
         let ok = execute_joins(
             &[interval_join(Some(within_lookback()), JoinMode::Anti)],
             &mut ctx,
@@ -1015,7 +1015,7 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
         let ok = execute_joins(
             &[interval_join(Some(within), JoinMode::Inner)],
             &mut ctx,
@@ -1046,11 +1046,11 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
         ctx.fields
-            .insert("lo_f".into(), Value::Number(490_000_000_000_000_000.0));
+            .insert("lo_f".into(), Value::Float(490_000_000_000_000_000.0));
         ctx.fields
-            .insert("hi_f".into(), Value::Number(493_000_000_000_000_000.0));
+            .insert("hi_f".into(), Value::Float(493_000_000_000_000_000.0));
         let ok = execute_joins(
             &[interval_join(Some(within), JoinMode::Inner)],
             &mut ctx,
@@ -1058,7 +1058,7 @@ mod tests {
             500_000_000_000,
         );
         assert!(ok, "row ts=492s inside [490s, 493s] matches");
-        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(100.0)));
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Float(100.0)));
     }
 
     #[test]
@@ -1070,7 +1070,7 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
         let ok = execute_joins(&[join], &mut ctx, &lookup, 500_000_000_000);
         assert!(
             ok,
@@ -1095,8 +1095,8 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
-        ctx.fields.insert("extra".into(), Value::Number(7.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
+        ctx.fields.insert("extra".into(), Value::Float(7.0));
         let join = JoinPlan {
             right_window: "bid_events".to_string(),
             mode: JoinMode::Inner,
@@ -1117,7 +1117,7 @@ mod tests {
         let ok = execute_joins(&[join], &mut ctx, &lookup, 500_000_000_000);
         assert!(ok);
         // 仅 extra=7 的行通过全部条件
-        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(250.0)));
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Float(250.0)));
     }
 
     /// 闭区间：ts 恰在 lo / hi 边界上必须匹配。
@@ -1131,7 +1131,7 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
         let ok = execute_joins(
             &[interval_join(Some(within_lookback()), JoinMode::Inner)],
             &mut ctx,
@@ -1140,7 +1140,7 @@ mod tests {
         );
         assert!(ok, "closed interval must include both boundary ts");
         // 最早 = ts 490s
-        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(100.0)));
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Float(100.0)));
     }
 
     /// snapshot interval miss：事件保留、不富化（与既有 snapshot 可选语义一致）。
@@ -1150,7 +1150,7 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
         let ok = execute_joins(
             &[interval_join(Some(within_lookback()), JoinMode::Snapshot)],
             &mut ctx,
@@ -1180,7 +1180,7 @@ mod tests {
             }
             fn snapshot(&self, _w: &str) -> Option<Vec<JoinRow>> {
                 let mut fields = EngineHashMap::default();
-                fields.insert("rid".into(), Value::Number(1.0));
+                fields.insert("rid".into(), Value::Float(1.0));
                 fields.insert("region".into(), Value::Str("cn".into()));
                 Some(vec![JoinRow::Event(Arc::new(Event { fields }))])
             }
@@ -1197,7 +1197,7 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
         let joins = vec![
             interval_join(Some(within_lookback()), JoinMode::Inner),
             JoinPlan {
@@ -1215,7 +1215,7 @@ mod tests {
         let ok = execute_joins(&joins, &mut ctx, &TwoLookup, 500_000_000_000);
         assert!(ok);
         // interval join 富化 price
-        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(200.0)));
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Float(200.0)));
         // plain snapshot join 富化 region（裸名 or_insert——price 已存在，region 新增）
         assert_eq!(ctx.fields.get("region"), Some(&Value::Str("cn".into())));
     }
@@ -1223,9 +1223,9 @@ mod tests {
     /// 右窗行：`(ts, id, price, extra)`。
     fn timed_row_extra(ts: i64, id: f64, price: f64, extra: f64) -> (i64, JoinRow) {
         let mut fields = EngineHashMap::default();
-        fields.insert("id".into(), Value::Number(id));
-        fields.insert("price".into(), Value::Number(price));
-        fields.insert("extra".into(), Value::Number(extra));
+        fields.insert("id".into(), Value::Float(id));
+        fields.insert("price".into(), Value::Float(price));
+        fields.insert("extra".into(), Value::Float(extra));
         (ts, JoinRow::Event(Arc::new(Event { fields })))
     }
 
@@ -1252,7 +1252,7 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(9.0));
+        ctx.fields.insert("aid".into(), Value::Float(9.0));
         let ok = execute_joins(
             &[interval_join(None, JoinMode::Inner)],
             &mut ctx,
@@ -1266,7 +1266,7 @@ mod tests {
         let mut ctx = Event {
             fields: EngineHashMap::default(),
         };
-        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("aid".into(), Value::Float(1.0));
         let ok = execute_joins(
             &[interval_join(None, JoinMode::Inner)],
             &mut ctx,
@@ -1274,6 +1274,6 @@ mod tests {
             500_000_000_000,
         );
         assert!(ok, "plain inner hit keeps event");
-        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(200.0)));
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Float(200.0)));
     }
 }

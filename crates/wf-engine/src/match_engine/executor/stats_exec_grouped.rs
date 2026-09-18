@@ -436,7 +436,7 @@ fn stats_columnar_row_subset_keyed_disjoint_partition() {
 #[test]
 fn stats_columnar_keyed_precision_matches_empty_key_native() {
     // D7/D8 回归（review 发现）: 带 key 列式路径曾经 `column_value` 把 Int64
-    // 转 `Value::Number(f64)`——≥2^53 的 id 被舍入（2^53 与 2^53+1 的 f64 相同）:
+    // 转 `Value::Float(f64)`——≥2^53 的 id 被舍入（2^53 与 2^53+1 的 f64 相同）:
     // distinct 从 2 塌缩到 1、sum 从 2^54+1 变成 2^54, 与空键列式原生路径发散。
     // 修复后带 key 走原生列值（column_i128/column_distinct_key）。
     let schema = Arc::new(Schema::new(vec![

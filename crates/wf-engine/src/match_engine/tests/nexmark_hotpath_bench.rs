@@ -981,9 +981,9 @@ impl AuctionLookup {
     fn row_for(&self, id: i64) -> JoinRow {
         let (cat, seller) = self.map.get(&id).copied().unwrap_or((10.0, 0.0));
         let mut fields = EngineHashMap::default();
-        fields.insert("id".into(), Value::Number(id as f64));
-        fields.insert("category".into(), Value::Number(cat));
-        fields.insert("seller".into(), Value::Number(seller));
+        fields.insert("id".into(), Value::Float(id as f64));
+        fields.insert("category".into(), Value::Float(cat));
+        fields.insert("seller".into(), Value::Float(seller));
         JoinRow::Event(Arc::new(Event { fields }))
     }
 }
@@ -997,7 +997,7 @@ impl WindowLookup for AuctionLookup {
     }
     fn join_lookup(&self, _w: &str, key_field: &str, key: &Value) -> Option<Vec<JoinRow>> {
         let k = match key {
-            Value::Number(n) => *n as i64,
+            Value::Float(n) => *n as i64,
             _ => return Some(vec![]),
         };
         let mut fields = EngineHashMap::default();
@@ -1006,9 +1006,9 @@ impl WindowLookup for AuctionLookup {
                 Some((c, s)) => (*c, *s),
                 None => return Some(vec![]),
             };
-            fields.insert("id".into(), Value::Number(k as f64));
-            fields.insert("category".into(), Value::Number(cat));
-            fields.insert("seller".into(), Value::Number(seller));
+            fields.insert("id".into(), Value::Float(k as f64));
+            fields.insert("category".into(), Value::Float(cat));
+            fields.insert("seller".into(), Value::Float(seller));
         } else {
             return Some(vec![]);
         }
@@ -1044,7 +1044,7 @@ impl PersonLookup {
             .iter()
             .map(|(id, (state, city))| {
                 let mut fields = EngineHashMap::default();
-                fields.insert("id".into(), Value::Number(*id as f64));
+                fields.insert("id".into(), Value::Float(*id as f64));
                 fields.insert("state".into(), Value::Str(state.clone().into()));
                 fields.insert("city".into(), Value::Str(city.clone().into()));
                 (*id, JoinRow::Event(Arc::new(Event { fields })))
@@ -1063,7 +1063,7 @@ impl WindowLookup for PersonLookup {
     }
     fn join_lookup(&self, _w: &str, key_field: &str, key: &Value) -> Option<Vec<JoinRow>> {
         let k = match key {
-            Value::Number(n) => *n as i64,
+            Value::Float(n) => *n as i64,
             _ => return Some(vec![]),
         };
         if key_field != "id" {

@@ -146,7 +146,7 @@ impl RuleExecutor {
         let lo_ns = eval_interval_bound(&wspec.lo, &left, event_time_nanos)?;
         let hi_ns = eval_interval_bound(&wspec.hi, &left, event_time_nanos)?;
         let expiry_nanos = eval_expr(emit_at, &left).and_then(|v| match v {
-            Value::Number(n) => normalize_epoch_timestamp_float_nanos(n),
+            Value::Float(n) => normalize_epoch_timestamp_float_nanos(n),
             Value::Int(i) => normalize_epoch_timestamp_int_nanos(i),
             _ => None,
         })?;
@@ -387,7 +387,7 @@ fn cmp_row_num(
 
 fn row_num(row: &crate::match_engine::JoinRow, field: &str) -> Option<f64> {
     match row.field_value(field)? {
-        Value::Number(n) => Some(n),
+        Value::Float(n) => Some(n),
         Value::Int(i) => Some(i as f64),
         _ => None,
     }

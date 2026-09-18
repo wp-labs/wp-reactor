@@ -140,7 +140,7 @@ fn summary_format() {
 #[test]
 fn numeric_key_preserves_type_in_eval_context() {
     // Use dport=443 as a numeric key, score = dport / 100.
-    // If dport is correctly preserved as Value::Number, score = 443/100 = 4.43.
+    // If dport is correctly preserved as Value::Float, score = 443/100 = 4.43.
     // If dport were stringified ("443") then the division would fail.
     let match_plan = simple_plan(
         vec![simple_key("dport")],

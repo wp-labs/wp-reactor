@@ -19,7 +19,7 @@ use crate::match_engine::RuleExecutor;
 use crate::match_engine::cep::{EngineHashMap, Value};
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn str_val(s: &str) -> Value {

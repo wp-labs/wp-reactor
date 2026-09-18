@@ -28,7 +28,7 @@ use crate::match_engine::executor::{CloseCtxFields, build_eval_context, execute_
 use crate::match_engine::{JoinRow, columnar_join_rows};
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn str_val(s: &str) -> Value {

@@ -239,7 +239,7 @@ loop {
 > 前情（2026-09-01 基线实测后重定向）：`batch_to_events`（Arrow → `Event`）的存在 =
 > **列式引擎未覆盖面的清单**。**动机从性能改为一致性**：
 > 1. **已存在语义分歧**：`>2^53` 整数 / 纳秒时间戳，列式路径原生 i64 精确、行式路径
->    `Value::Number(f64)` 丢精度（CHANGELOG 1.1.0 "documented semantic divergence"——
+>    `Value::Float(f64)` 丢精度（CHANGELOG 1.1.0 "documented semantic divergence"——
 >    同一查询两条路径可能给出不同结果，`2^53 == 2^53+1` 列式 false / 行式 true）；
 > 2. **双路径对拍约束**：`ColumnarEvent` 处处背 "byte-identical to eager path"——维护负担 + 漂移风险；
 > 3. **新功能双实现**：新增表达式构造要列式编译 + 行式解释各做一遍（触发面 8 门控即双实现清单）。

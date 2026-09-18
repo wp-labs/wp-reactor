@@ -83,7 +83,7 @@ impl YieldMeta<'_> {
         match field {
             WfuMetaField::Id => self.wfx_id.map(|value| Value::Str(value.into())),
             WfuMetaField::RuleName => self.rule_name.map(|value| Value::Str(value.into())),
-            WfuMetaField::Score => self.score.map(Value::Number),
+            WfuMetaField::Score => self.score.map(Value::Float),
             WfuMetaField::EntityType => self.entity_type.map(|value| Value::Str(value.into())),
             WfuMetaField::EntityId => self.entity_id.map(|value| Value::Str(value.into())),
             WfuMetaField::Origin => self.origin.map(|value| Value::Str(value.into())),
@@ -193,7 +193,7 @@ pub(super) fn eval_expr_with_l3(
 
     let _time_scope = EvalTimeScope::enter();
     match expr {
-        Expr::Number(n) => Some(Value::Number(*n)),
+        Expr::Number(n) => Some(Value::Float(*n)),
         Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
         Expr::Bool(b) => Some(Value::Bool(*b)),
         Expr::SystemVar(sv) => eval_system_var_value(sv, meta),
@@ -228,7 +228,7 @@ pub(super) fn eval_expr_with_l3(
 fn eval_system_var_value(sv: &wf_lang::ast::SystemVar, meta: YieldMeta<'_>) -> Option<Value> {
     use wf_lang::ast::SystemVar;
     match *sv {
-        SystemVar::Score => meta.score.map(Value::Number),
+        SystemVar::Score => meta.score.map(Value::Float),
         SystemVar::EventFirstTime => meta.event_first_time_nanos.map(time_nanos_to_value),
         SystemVar::EventLastTime => meta.event_last_time_nanos.map(time_nanos_to_value),
         SystemVar::EvidenceStartTime => meta.evidence_first_time_nanos.map(time_nanos_to_value),
@@ -277,10 +277,10 @@ fn eval_neg_with_l3(
     score: YieldMeta,
 ) -> Option<Value> {
     match eval_expr_with_l3(inner, ctx, score)? {
-        Value::Number(n) => Some(Value::Number(-n)),
+        Value::Float(n) => Some(Value::Float(-n)),
         Value::Int(i) => Some(match i.checked_neg() {
             Some(neg) => Value::Int(neg),
-            None => Value::Number(-(i as f64)),
+            None => Value::Float(-(i as f64)),
         }),
         _ => None,
     }
@@ -364,7 +364,7 @@ fn eval_arith_binop(
         }
         _ => unreachable!(),
     };
-    Some(Value::Number(out))
+    Some(Value::Float(out))
 }
 
 /// `expr in (...)` / `expr not in (...)`。
@@ -519,7 +519,7 @@ fn eval_logic_or_with_l3(
 pub(super) fn eval_score(expr: &wf_lang::ast::Expr, ctx: &dyn FieldSource) -> CoreResult<f64> {
     let val = eval_yield_expr(expr, ctx);
     let raw = match val {
-        Some(Value::Number(n)) => n,
+        Some(Value::Float(n)) => n,
         Some(Value::Int(i)) => i as f64,
         Some(other) => {
             return orion_error::prelude::StructError::from(CoreReason::RuleExec)

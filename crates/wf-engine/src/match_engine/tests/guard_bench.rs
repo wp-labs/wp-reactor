@@ -32,12 +32,12 @@ use super::helpers::{branch, count_ge, event, simple_key, simple_plan, simple_ru
 /// bid_events 形态的 7 字段事件（与 nexmark_pk 一致）。
 fn bid_event(auction: i64) -> Event {
     event(vec![
-        ("auction", Value::Number(auction as f64)),
-        ("bidder", Value::Number(1.0)),
-        ("price", Value::Number(7.0)),
+        ("auction", Value::Float(auction as f64)),
+        ("bidder", Value::Float(1.0)),
+        ("price", Value::Float(7.0)),
         ("channel", Value::Str("mobile".into())),
         ("url", Value::Str("http://example.com/1".into())),
-        ("dateTime", Value::Number(1_700_000_000_000.0)),
+        ("dateTime", Value::Float(1_700_000_000_000.0)),
         ("extra", Value::Str("x".into())),
     ])
 }
@@ -129,7 +129,7 @@ fn q2_field_lookup_per_event() {
     let start = Instant::now();
     let mut acc = 0.0f64;
     for ev in &events {
-        if let Some(Value::Number(v)) = ev.fields.get("auction") {
+        if let Some(Value::Float(v)) = ev.fields.get("auction") {
             acc += v;
         }
     }

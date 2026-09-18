@@ -359,8 +359,8 @@ fn sentinel_output_carries_four_tuple_fields() {
         .iter()
         .map(|(k, v)| (&**k, v.clone()))
         .collect();
-    assert_eq!(fields.get("round"), Some(&Value::Number(2.0)));
-    assert_eq!(fields.get("n"), Some(&Value::Number(500.0)));
+    assert_eq!(fields.get("round"), Some(&Value::Float(2.0)));
+    assert_eq!(fields.get("n"), Some(&Value::Float(500.0)));
     // start_ns/emit_ns 以字符串携带（epoch nanos 超出 f64 精确范围）。
     assert_eq!(fields.get("start_ns"), Some(&Value::Str("1111".into())));
     assert_eq!(fields.get("emit_ns"), Some(&Value::Str("2222".into())));
@@ -393,7 +393,7 @@ fn stage_output_carries_current_index() {
         .iter()
         .map(|(k, v)| (&**k, v.clone()))
         .collect();
-    assert_eq!(fields.get("current"), Some(&Value::Number(3.0)));
+    assert_eq!(fields.get("current"), Some(&Value::Float(3.0)));
     assert_eq!(fields.get("record_type"), Some(&Value::Str("stage".into())));
 }
 
@@ -817,7 +817,7 @@ async fn emit_sentinel_records_skips_unbuildable_record() {
         emit_ns: 2,
     });
     out.yield_fields
-        .push(("__wfu_reserved".into(), Value::Number(1.0)));
+        .push(("__wfu_reserved".into(), Value::Float(1.0)));
     emit_sentinel_records(vec![out], &fanout).await;
     assert!(rx.try_recv().is_err(), "构建失败 → 不发送");
 }

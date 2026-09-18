@@ -390,7 +390,7 @@ async fn emit_append_error_increments_append_failed() {
         ..Spec::default()
     });
     let mut record = record_with("alerts", 1);
-    record.yield_fields = vec![(Arc::from("x"), Value::Number(f64::NAN))];
+    record.yield_fields = vec![(Arc::from("x"), Value::Float(f64::NAN))];
     task.emit(record).await;
     // append_failed 计数无法直接读，仅验证不 panic 且 pending 未增长。
     assert_eq!(task.pending_alerts.lock().unwrap().count, 0);

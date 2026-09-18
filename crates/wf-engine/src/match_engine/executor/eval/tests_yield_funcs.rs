@@ -11,7 +11,7 @@ fn test_hash_and_id_functions_work_in_yield_eval() {
     fields.insert("msg".into(), Value::Str("hello".into()));
     fields.insert("empty".into(), Value::Str(String::new().into()));
     fields.insert("ip".into(), Value::Str("10.0.0.1".into()));
-    fields.insert("count".into(), Value::Number(3.0));
+    fields.insert("count".into(), Value::Float(3.0));
     fields.insert("special".into(), Value::Str("a|b".into()));
     fields.insert("percent".into(), Value::Str("10%".into()));
     let ctx = Event { fields };
@@ -288,7 +288,7 @@ fn test_now_functions_share_timestamp_within_yield_expression() {
         }),
     };
 
-    assert_eq!(eval_yield_expr(&expr, &ctx), Some(Value::Number(0.0)));
+    assert_eq!(eval_yield_expr(&expr, &ctx), Some(Value::Float(0.0)));
 }
 
 #[test]
@@ -351,12 +351,12 @@ fn test_phase_bucket_folding_matches_period_grid() {
     };
     // 基线时刻余 80s → 桶 5；+300s（余 140s）→ 桶 9；−75s（余 5s）→ 桶 0；
     // 周期回绕：+225s（余 65s+240s=305s→65s）→ 桶 4。
-    assert_eq!(pb(1_700_000_000.0), Some(Value::Number(5.0)));
-    assert_eq!(pb(1_700_000_300.0), Some(Value::Number(9.0)));
-    assert_eq!(pb(1_699_999_925.0), Some(Value::Number(0.0)));
-    assert_eq!(pb(1_700_000_225.0), Some(Value::Number(4.0)));
+    assert_eq!(pb(1_700_000_000.0), Some(Value::Float(5.0)));
+    assert_eq!(pb(1_700_000_300.0), Some(Value::Float(9.0)));
+    assert_eq!(pb(1_699_999_925.0), Some(Value::Float(0.0)));
+    assert_eq!(pb(1_700_000_225.0), Some(Value::Float(4.0)));
     // 负时间 → 桶 0（对齐 Phase::bucket_of）。
-    assert_eq!(pb(-60.0), Some(Value::Number(0.0)));
+    assert_eq!(pb(-60.0), Some(Value::Float(0.0)));
 }
 
 #[test]
@@ -528,9 +528,9 @@ fn test_startswith_and_endswith_in_yield_eval() {
 #[test]
 fn test_math_and_time_functions_in_yield_eval() {
     let mut fields = EngineHashMap::default();
-    fields.insert("n".into(), Value::Number(-12.345));
-    fields.insert("p".into(), Value::Number(16.0));
-    fields.insert("ts".into(), Value::Number(0.0));
+    fields.insert("n".into(), Value::Float(-12.345));
+    fields.insert("p".into(), Value::Float(16.0));
+    fields.insert("ts".into(), Value::Float(0.0));
     fields.insert("msg".into(), Value::Str("  failed_login_root  ".into()));
     fields.insert(
         "arr".into(),
@@ -733,21 +733,15 @@ fn test_math_and_time_functions_in_yield_eval() {
         args: vec![Expr::Field(FieldRef::Simple("arr".to_string()))],
     };
 
-    assert_eq!(
-        eval_yield_expr(&abs_expr, &ctx),
-        Some(Value::Number(12.345))
-    );
+    assert_eq!(eval_yield_expr(&abs_expr, &ctx), Some(Value::Float(12.345)));
     assert_eq!(
         eval_yield_expr(&round_expr, &ctx),
-        Some(Value::Number(-12.35))
+        Some(Value::Float(-12.35))
     );
-    assert_eq!(
-        eval_yield_expr(&ceil_expr, &ctx),
-        Some(Value::Number(-12.0))
-    );
+    assert_eq!(eval_yield_expr(&ceil_expr, &ctx), Some(Value::Float(-12.0)));
     assert_eq!(
         eval_yield_expr(&floor_expr, &ctx),
-        Some(Value::Number(-13.0))
+        Some(Value::Float(-13.0))
     );
     assert_eq!(
         eval_yield_expr(&strftime_expr, &ctx),
@@ -755,21 +749,21 @@ fn test_math_and_time_functions_in_yield_eval() {
     );
     assert_eq!(
         eval_yield_expr(&strptime_expr, &ctx),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
-    let Some(Value::Number(now_millis)) = eval_yield_expr(&now_expr, &ctx) else {
+    let Some(Value::Float(now_millis)) = eval_yield_expr(&now_expr, &ctx) else {
         panic!("now() should return a numeric timestamp");
     };
-    let Some(Value::Number(now_s)) = eval_yield_expr(&now_s_expr, &ctx) else {
+    let Some(Value::Float(now_s)) = eval_yield_expr(&now_s_expr, &ctx) else {
         panic!("now_s() should return a numeric timestamp");
     };
-    let Some(Value::Number(now_ms)) = eval_yield_expr(&now_ms_expr, &ctx) else {
+    let Some(Value::Float(now_ms)) = eval_yield_expr(&now_ms_expr, &ctx) else {
         panic!("now_ms() should return a numeric timestamp");
     };
-    let Some(Value::Number(now_us)) = eval_yield_expr(&now_us_expr, &ctx) else {
+    let Some(Value::Float(now_us)) = eval_yield_expr(&now_us_expr, &ctx) else {
         panic!("now_us() should return a numeric timestamp");
     };
-    let Some(Value::Number(now_ns)) = eval_yield_expr(&now_ns_expr, &ctx) else {
+    let Some(Value::Float(now_ns)) = eval_yield_expr(&now_ns_expr, &ctx) else {
         panic!("now_ns() should return a numeric timestamp");
     };
     let Some(Value::Str(year)) = eval_yield_expr(&now_fmt_expr, &ctx) else {
@@ -781,21 +775,21 @@ fn test_math_and_time_functions_in_yield_eval() {
     assert!(now_ms > 1_000_000_000_000.0);
     assert!(now_s > 1_000_000_000.0);
     assert!(year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()));
-    assert_eq!(eval_yield_expr(&sqrt_expr, &ctx), Some(Value::Number(4.0)));
-    assert_eq!(eval_yield_expr(&pow_expr, &ctx), Some(Value::Number(256.0)));
-    assert_eq!(eval_yield_expr(&log_expr, &ctx), Some(Value::Number(2.0)));
+    assert_eq!(eval_yield_expr(&sqrt_expr, &ctx), Some(Value::Float(4.0)));
+    assert_eq!(eval_yield_expr(&pow_expr, &ctx), Some(Value::Float(256.0)));
+    assert_eq!(eval_yield_expr(&log_expr, &ctx), Some(Value::Float(2.0)));
     assert_eq!(
         eval_yield_expr(&exp_expr, &ctx),
-        Some(Value::Number(std::f64::consts::E))
+        Some(Value::Float(std::f64::consts::E))
     );
     assert_eq!(
         eval_yield_expr(&clamp_expr, &ctx),
-        Some(Value::Number(100.0))
+        Some(Value::Float(100.0))
     );
-    assert_eq!(eval_yield_expr(&sign_expr, &ctx), Some(Value::Number(-1.0)));
+    assert_eq!(eval_yield_expr(&sign_expr, &ctx), Some(Value::Float(-1.0)));
     assert_eq!(
         eval_yield_expr(&trunc_expr, &ctx),
-        Some(Value::Number(-12.0))
+        Some(Value::Float(-12.0))
     );
     assert_eq!(eval_yield_expr(&finite_expr, &ctx), Some(Value::Bool(true)));
     assert_eq!(
@@ -810,7 +804,7 @@ fn test_math_and_time_functions_in_yield_eval() {
         eval_yield_expr(&concat_expr, &ctx),
         Some(Value::Str("ip=1.1.1.1".into()))
     );
-    assert_eq!(eval_yield_expr(&index_expr, &ctx), Some(Value::Number(9.0)));
+    assert_eq!(eval_yield_expr(&index_expr, &ctx), Some(Value::Float(9.0)));
     assert_eq!(
         eval_yield_expr(&replace_plain_expr, &ctx),
         Some(Value::Str("  failed-login-root  ".into()))
@@ -868,7 +862,7 @@ fn test_system_score_var_works_inside_builtin_functions() {
 
     assert_eq!(
         eval_yield_expr_with_score(&round_expr, &ctx, Some(70.126)),
-        Some(Value::Number(70.1))
+        Some(Value::Float(70.1))
     );
     assert_eq!(
         eval_yield_expr_with_score(&concat_expr, &ctx, Some(70.126)),

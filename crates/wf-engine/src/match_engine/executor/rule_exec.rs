@@ -159,7 +159,7 @@ impl RuleExecutor {
             .fields
             .iter()
             .map(|field| match &field.value {
-                Expr::Number(n) => YieldKind::Lit(Value::Number(*n)),
+                Expr::Number(n) => YieldKind::Lit(Value::Float(*n)),
                 Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
                 Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
                 Expr::Field(_) => YieldKind::Field,
@@ -779,7 +779,7 @@ fn coerce_yield_base_value(name: &str, base_type: &BaseType, value: Value) -> Co
             _ => render_yield_value_as_string(value).map(|s| Value::Str(s.into())),
         },
         BaseType::Digit => match value {
-            Value::Number(n) if n.is_finite() && n.fract() == 0.0 => Ok(Value::Number(n)),
+            Value::Float(n) if n.is_finite() && n.fract() == 0.0 => Ok(Value::Float(n)),
             // 精确整数：原样保留（导出层 Digit 走 `i64`，无 f64 往返）。
             Value::Int(i) => Ok(Value::Int(i)),
             _ => CoreReason::DataFormat
@@ -790,7 +790,7 @@ fn coerce_yield_base_value(name: &str, base_type: &BaseType, value: Value) -> Co
                 .err(),
         },
         BaseType::Float => match value {
-            Value::Number(n) if n.is_finite() => Ok(Value::Number(n)),
+            Value::Float(n) if n.is_finite() => Ok(Value::Float(n)),
             // 目标虽为 Float，但保留 `Int`（导出层再定 Float/Digit），避免精度丢失。
             Value::Int(i) => Ok(Value::Int(i)),
             _ => CoreReason::DataFormat
@@ -820,9 +820,7 @@ fn coerce_yield_base_value(name: &str, base_type: &BaseType, value: Value) -> Co
                 .err(),
         },
         BaseType::Hex => match value {
-            Value::Number(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => {
-                Ok(Value::Number(n))
-            }
+            Value::Float(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => Ok(Value::Float(n)),
             Value::Int(i) if i >= 0 => Ok(Value::Int(i)),
             Value::Str(text) => {
                 let normalized = text
@@ -856,13 +854,13 @@ fn coerce_yield_time_value(name: &str, value: Value) -> CoreResult<Value> {
             })?;
             Ok(Value::Int(i))
         }
-        Value::Number(n) => {
+        Value::Float(n) => {
             normalize_epoch_timestamp_float_nanos(n).ok_or_else(|| {
                 orion_error::StructError::from(CoreReason::DataFormat).with_detail(format!(
                     "yield field {name:?} expects a valid epoch timestamp"
                 ))
             })?;
-            Ok(Value::Number(n))
+            Ok(Value::Float(n))
         }
         _ => CoreReason::DataFormat
             .to_err()
@@ -876,12 +874,12 @@ fn coerce_yield_time_value(name: &str, value: Value) -> CoreResult<Value> {
 fn render_yield_value_as_string(value: Value) -> CoreResult<String> {
     match value {
         Value::Str(s) => Ok(s.to_string()),
-        Value::Number(n) if n.is_finite() => Ok(n.to_string()),
+        Value::Float(n) if n.is_finite() => Ok(n.to_string()),
         Value::Int(i) => Ok(i.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
         Value::Array(_) | Value::Object(_) => serde_json::to_string(&yield_value_to_json(&value)?)
             .source_raw_err(CoreReason::DataFormat, "serialize structured yield value"),
-        Value::Number(_) => CoreReason::DataFormat
+        Value::Float(_) => CoreReason::DataFormat
             .to_err()
             .with_detail("yield string conversion requires finite numeric values")
             .err(),
@@ -895,9 +893,9 @@ fn render_yield_value_as_string(value: Value) -> CoreResult<String> {
 
 fn yield_value_to_json(value: &Value) -> CoreResult<serde_json::Value> {
     match value {
-        Value::Number(n) if n.is_finite() => Ok(serde_json::Value::from(*n)),
+        Value::Float(n) if n.is_finite() => Ok(serde_json::Value::from(*n)),
         Value::Int(i) => Ok(serde_json::Value::from(*i)),
-        Value::Number(_) => CoreReason::DataFormat
+        Value::Float(_) => CoreReason::DataFormat
             .to_err()
             .with_detail("structured numeric value must be finite")
             .err(),

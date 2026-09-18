@@ -36,7 +36,7 @@ use wf_cep::rows::RowFieldLayout;
 // ---------------------------------------------------------------------------
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn count_measure(label: &str) -> StatsMeasurePlan {

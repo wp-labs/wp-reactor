@@ -487,7 +487,7 @@ mod tests {
         let lookup = RegistryLookup::new(&router);
         // 请求 key_field=score（≠ 索引 ip）→ 必须扫描回退，按 score 过滤。
         let rows = lookup
-            .join_lookup("threat_intel", "score", &Value::Number(95.0))
+            .join_lookup("threat_intel", "score", &Value::Float(95.0))
             .expect("field mismatch must fall back to scan, not return empty");
         assert_eq!(rows.len(), 1, "score=95 的行经扫描回退命中");
         assert_eq!(
@@ -513,13 +513,13 @@ mod tests {
         pw.load(vec![
             {
                 let mut m = HashMap::new();
-                m.insert("id".to_string(), Value::Number(5.0));
+                m.insert("id".to_string(), Value::Float(5.0));
                 m.insert("state".to_string(), Value::Str("CA".into()));
                 m
             },
             {
                 let mut m = HashMap::new();
-                m.insert("id".to_string(), Value::Number(7.0));
+                m.insert("id".to_string(), Value::Float(7.0));
                 m.insert("state".to_string(), Value::Str("ID".into()));
                 m
             },
@@ -530,21 +530,21 @@ mod tests {
 
         let lookup = RegistryLookup::new(&router);
         let rows = lookup
-            .join_lookup("person_table", "id", &Value::Number(7.0))
+            .join_lookup("person_table", "id", &Value::Float(7.0))
             .expect("provider join lookup must hit, not miss");
         assert_eq!(rows.len(), 1, "exactly one provider row matches id=7");
         assert_eq!(rows[0].field_value("state"), Some(Value::Str("ID".into())));
 
         // 未知键 → Some(空集)（窗口存在，只是无匹配）——与 buffer 窗口一致
         let none = lookup
-            .join_lookup("person_table", "id", &Value::Number(999.0))
+            .join_lookup("person_table", "id", &Value::Float(999.0))
             .expect("provider window exists");
         assert!(none.is_empty(), "unknown key → empty rows");
 
         // 不存在的窗口 → None（保持既有语义）
         assert!(
             lookup
-                .join_lookup("no_such_window", "id", &Value::Number(5.0))
+                .join_lookup("no_such_window", "id", &Value::Float(5.0))
                 .is_none()
         );
     }

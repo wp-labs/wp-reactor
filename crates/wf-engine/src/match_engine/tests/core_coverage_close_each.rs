@@ -314,7 +314,7 @@ fn execute_each_filter_and_lets_and_where() {
             .iter()
             .find(|(n, _)| &**n == "double")
             .map(|(_, v)| v.clone()),
-        Some(Value::Number(42.0))
+        Some(Value::Float(42.0))
     );
 
     // `where` after the ctx path: with a `let` present the where is evaluated.

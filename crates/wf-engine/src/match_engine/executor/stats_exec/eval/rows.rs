@@ -96,7 +96,7 @@ pub(crate) fn insert_top(entries: &mut Vec<TopEntry>, key: f64, row: RowFields, 
 
 pub(crate) fn value_to_distinct_key(v: &Value) -> DistinctKey {
     match v {
-        Value::Number(n) => DistinctKey::from_f64(*n),
+        Value::Float(n) => DistinctKey::from_f64(*n),
         // 精确整数：不经 f64（>2^53 不丢精度）。
         Value::Int(i) => DistinctKey::from_i64(*i),
         Value::Str(s) => DistinctKey::from_str(s),
@@ -179,7 +179,7 @@ fn batch_cell_value(
 }
 
 /// 从 batch 列读单行原生数值（Int64 原生 i64 → i128, 不走 f64——D8: ≥2^53 的
-/// Int64 经 `Value::Number(f64)` 会丢精度; Float64 按 `sum_masked` 同口径截断）。
+/// Int64 经 `Value::Float(f64)` 会丢精度; Float64 按 `sum_masked` 同口径截断）。
 /// null / 非数值列 → None（与行式 `value_to_i128` 的 None 一致）。
 pub(crate) fn column_i128_at(batch: &RecordBatch, ci: usize, row: usize) -> Option<i128> {
     let col = batch.column(ci);
@@ -196,7 +196,7 @@ pub(crate) fn column_i128_at(batch: &RecordBatch, ci: usize, row: usize) -> Opti
 }
 
 /// 从 batch 列读单行原生数值（top 快速淘汰预检用; 列索引预解析, 零 index_of）。
-/// Int64 → as f64 / Float64 → 原值——与行字段提取后 `value_to_f64(Value::Number)`
+/// Int64 → as f64 / Float64 → 原值——与行字段提取后 `value_to_f64(Value::Float)`
 /// 同口径（event_bridge 契约: Int64 → Number(i as f64), Float64 → Number(f)）。
 /// 非数值类型 → None（调用方回退原路径, 语义不变）。
 pub(crate) fn column_f64_at(batch: &RecordBatch, ci: usize, row: usize) -> Option<f64> {
@@ -215,7 +215,7 @@ pub(crate) fn column_f64_at(batch: &RecordBatch, ci: usize, row: usize) -> Optio
 
 /// 索引版 distinct 键读取（列索引批级预解析, 免每行 schema.index_of——q17 同款修复）。
 /// 与列式段 `insert_distinct_column` 同类型分派, 原生值构造（D7: 禁止
-/// `Value::Number(f64)` 化 ≥2^53 的 Int64）。null / 类型不在支持集 → None。
+/// `Value::Float(f64)` 化 ≥2^53 的 Int64）。null / 类型不在支持集 → None。
 pub(crate) fn column_distinct_key_at(
     batch: &RecordBatch,
     ci: usize,
@@ -291,7 +291,7 @@ mod tests {
             DistinctKey::Str(_)
         ));
         assert!(matches!(
-            value_to_distinct_key(&Value::Number(3.5)),
+            value_to_distinct_key(&Value::Float(3.5)),
             DistinctKey::Float(_) | DistinctKey::Int(_)
         ));
     }

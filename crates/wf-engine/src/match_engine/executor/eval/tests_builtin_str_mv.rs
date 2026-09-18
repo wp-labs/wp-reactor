@@ -59,7 +59,7 @@ fn external_service_must_be_string_literal() {
 fn builtin_contains_startswith_endswith() {
     let ctx = ctx_with(vec![
         ("msg", Value::Str("failed_login_root".into())),
-        ("n", Value::Number(5.0)),
+        ("n", Value::Float(5.0)),
     ]);
     assert_eq!(
         l3_ctx(&call("contains", vec![field("msg"), lit("login")]), &ctx),
@@ -216,7 +216,7 @@ fn builtin_substr_variants() {
 fn builtin_replace_trim_case_len() {
     let ctx = ctx_with(vec![
         ("msg", Value::Str("  HeLLo\t".into())),
-        ("n", Value::Number(42.0)),
+        ("n", Value::Float(42.0)),
         ("multibyte", Value::Str("你好".into())),
     ]);
     // replace (regex)
@@ -275,11 +275,11 @@ fn builtin_replace_trim_case_len() {
     // len: byte length (multibyte aware per Rust str.len())
     assert_eq!(
         l3_ctx(&call("len", vec![lit("hello")]), &ctx),
-        Some(Value::Number(5.0))
+        Some(Value::Float(5.0))
     );
     assert_eq!(
         l3_ctx(&call("len", vec![field("multibyte")]), &ctx),
-        Some(Value::Number(6.0))
+        Some(Value::Float(6.0))
     );
     assert_eq!(l3_ctx(&call("len", vec![field("n")]), &ctx), None);
     assert_eq!(l3_ctx(&call("len", vec![]), &ctx), None);
@@ -288,10 +288,10 @@ fn builtin_replace_trim_case_len() {
 #[test]
 fn builtin_merge_branches() {
     let mut base = EngineHashMap::default();
-    base.insert("severity".into(), Value::Number(3.0));
+    base.insert("severity".into(), Value::Float(3.0));
     let ctx = ctx_with(vec![
         ("extension", Value::Object(base)),
-        ("scalar", Value::Number(7.0)),
+        ("scalar", Value::Float(7.0)),
     ]);
     let obj = Expr::Object(vec![ObjectItem {
         targets: vec!["source".to_string()],
@@ -302,7 +302,7 @@ fn builtin_merge_branches() {
     let Some(Value::Object(merged)) = result else {
         panic!("expected object");
     };
-    assert_eq!(merged.get("severity"), Some(&Value::Number(3.0)));
+    assert_eq!(merged.get("severity"), Some(&Value::Float(3.0)));
     assert_eq!(merged.get("source"), Some(&Value::Str("wfl".into())));
 
     // missing field arg is skipped (treated as empty object)
@@ -331,18 +331,18 @@ fn builtin_mvcount_mvjoin_mvdedup_mvsort_mvreverse() {
         Value::Str("c".into()),
     ]);
     let nums = arr(vec![
-        Value::Number(3.0),
-        Value::Number(1.0),
-        Value::Number(2.0),
+        Value::Float(3.0),
+        Value::Float(1.0),
+        Value::Float(2.0),
     ]);
     let ctx = ctx_with(vec![
         ("vals", vals),
         ("nums", nums),
-        ("scalar", Value::Number(1.0)),
+        ("scalar", Value::Float(1.0)),
     ]);
     assert_eq!(
         l3_ctx(&call("mvcount", vec![field("vals")]), &ctx),
-        Some(Value::Number(4.0))
+        Some(Value::Float(4.0))
     );
     assert_eq!(
         l3_ctx(&call("mvjoin", vec![field("vals"), lit("|")]), &ctx),
@@ -359,9 +359,9 @@ fn builtin_mvcount_mvjoin_mvdedup_mvsort_mvreverse() {
     assert_eq!(
         l3_ctx(&call("mvsort", vec![field("nums")]), &ctx),
         Some(arr(vec![
-            Value::Number(1.0),
-            Value::Number(2.0),
-            Value::Number(3.0),
+            Value::Float(1.0),
+            Value::Float(2.0),
+            Value::Float(3.0),
         ]))
     );
     assert_eq!(
@@ -405,7 +405,7 @@ fn builtin_mvindex_single_and_range() {
         Value::Str("c".into()),
         Value::Str("d".into()),
     ]);
-    let ctx = ctx_with(vec![("vals", vals), ("scalar", Value::Number(1.0))]);
+    let ctx = ctx_with(vec![("vals", vals), ("scalar", Value::Float(1.0))]);
     // 2-arg: positive / negative / out of range
     assert_eq!(
         l3_ctx(
@@ -568,7 +568,7 @@ fn builtin_mvappend_split() {
             "vals",
             arr(vec![Value::Str("a".into()), Value::Str("b".into())]),
         ),
-        ("scalar", Value::Number(9.0)),
+        ("scalar", Value::Float(9.0)),
     ]);
     assert_eq!(
         l3_ctx(
@@ -579,7 +579,7 @@ fn builtin_mvappend_split() {
             Value::Str("a".into()),
             Value::Str("b".into()),
             Value::Str("c".into()),
-            Value::Number(9.0),
+            Value::Float(9.0),
         ]))
     );
     assert_eq!(l3_ctx(&call("mvappend", vec![]), &ctx), None);
@@ -621,26 +621,26 @@ fn builtin_math_funcs() {
 
     assert_eq!(
         l3_ctx(&call("abs", vec![neg(5.0)]), &ctx),
-        Some(Value::Number(5.0))
+        Some(Value::Float(5.0))
     );
     assert_eq!(
         l3_ctx(&call("abs", vec![n(2.5)]), &ctx),
-        Some(Value::Number(2.5))
+        Some(Value::Float(2.5))
     );
     assert_eq!(l3_ctx(&call("abs", vec![lit("x")]), &ctx), None);
     assert_eq!(l3_ctx(&call("abs", vec![]), &ctx), None);
 
     assert_eq!(
         l3_ctx(&call("round", vec![n(2.567)]), &ctx),
-        Some(Value::Number(3.0))
+        Some(Value::Float(3.0))
     );
     assert_eq!(
         l3_ctx(&call("round", vec![n(2.567), n(2.0)]), &ctx),
-        Some(Value::Number(2.57))
+        Some(Value::Float(2.57))
     );
     assert_eq!(
         l3_ctx(&call("round", vec![n(1234.5), neg(2.0)]), &ctx),
-        Some(Value::Number(1200.0))
+        Some(Value::Float(1200.0))
     );
     assert_eq!(l3_ctx(&call("round", vec![lit("x")]), &ctx), None);
     assert_eq!(l3_ctx(&call("round", vec![n(1.0), lit("x")]), &ctx), None);
@@ -655,33 +655,33 @@ fn builtin_math_funcs() {
 
     assert_eq!(
         l3_ctx(&call("ceil", vec![n(2.1)]), &ctx),
-        Some(Value::Number(3.0))
+        Some(Value::Float(3.0))
     );
     assert_eq!(
         l3_ctx(&call("ceil", vec![neg(2.1)]), &ctx),
-        Some(Value::Number(-2.0))
+        Some(Value::Float(-2.0))
     );
     assert_eq!(
         l3_ctx(&call("floor", vec![n(2.9)]), &ctx),
-        Some(Value::Number(2.0))
+        Some(Value::Float(2.0))
     );
     assert_eq!(
         l3_ctx(&call("floor", vec![neg(2.1)]), &ctx),
-        Some(Value::Number(-3.0))
+        Some(Value::Float(-3.0))
     );
     assert_eq!(l3_ctx(&call("ceil", vec![lit("x")]), &ctx), None);
     assert_eq!(l3_ctx(&call("floor", vec![lit("x")]), &ctx), None);
 
     assert_eq!(
         l3_ctx(&call("sqrt", vec![n(16.0)]), &ctx),
-        Some(Value::Number(4.0))
+        Some(Value::Float(4.0))
     );
     assert_eq!(l3_ctx(&call("sqrt", vec![neg(1.0)]), &ctx), None);
     assert_eq!(l3_ctx(&call("sqrt", vec![lit("x")]), &ctx), None);
 
     assert_eq!(
         l3_ctx(&call("pow", vec![n(2.0), n(8.0)]), &ctx),
-        Some(Value::Number(256.0))
+        Some(Value::Float(256.0))
     );
     // non-finite result → None
     assert_eq!(l3_ctx(&call("pow", vec![n(0.0), neg(1.0)]), &ctx), None);
@@ -689,11 +689,11 @@ fn builtin_math_funcs() {
 
     assert_eq!(
         l3_ctx(&call("log", vec![n(std::f64::consts::E)]), &ctx),
-        Some(Value::Number(1.0))
+        Some(Value::Float(1.0))
     );
     assert_eq!(
         l3_ctx(&call("log", vec![n(100.0), n(10.0)]), &ctx),
-        Some(Value::Number(2.0))
+        Some(Value::Float(2.0))
     );
     assert_eq!(l3_ctx(&call("log", vec![n(0.0)]), &ctx), None);
     assert_eq!(l3_ctx(&call("log", vec![neg(1.0)]), &ctx), None);
@@ -705,7 +705,7 @@ fn builtin_math_funcs() {
 
     assert_eq!(
         l3_ctx(&call("exp", vec![n(0.0)]), &ctx),
-        Some(Value::Number(1.0))
+        Some(Value::Float(1.0))
     );
     // overflow → None
     assert_eq!(l3_ctx(&call("exp", vec![n(1000.0)]), &ctx), None);
@@ -713,15 +713,15 @@ fn builtin_math_funcs() {
 
     assert_eq!(
         l3_ctx(&call("clamp", vec![n(120.0), n(0.0), n(100.0)]), &ctx),
-        Some(Value::Number(100.0))
+        Some(Value::Float(100.0))
     );
     assert_eq!(
         l3_ctx(&call("clamp", vec![n(-10.0), n(0.0), n(100.0)]), &ctx),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
     assert_eq!(
         l3_ctx(&call("clamp", vec![n(50.0), n(0.0), n(100.0)]), &ctx),
-        Some(Value::Number(50.0))
+        Some(Value::Float(50.0))
     );
     // min > max → None
     assert_eq!(
@@ -736,15 +736,15 @@ fn builtin_math_funcs() {
 
     assert_eq!(
         l3_ctx(&call("sign", vec![neg(5.0)]), &ctx),
-        Some(Value::Number(-1.0))
+        Some(Value::Float(-1.0))
     );
     assert_eq!(
         l3_ctx(&call("sign", vec![n(5.0)]), &ctx),
-        Some(Value::Number(1.0))
+        Some(Value::Float(1.0))
     );
     assert_eq!(
         l3_ctx(&call("sign", vec![n(0.0)]), &ctx),
-        Some(Value::Number(1.0))
+        Some(Value::Float(1.0))
     );
     // non-finite → None
     assert_eq!(l3_ctx(&call("sign", vec![n(f64::NAN)]), &ctx), None);
@@ -752,11 +752,11 @@ fn builtin_math_funcs() {
 
     assert_eq!(
         l3_ctx(&call("trunc", vec![n(2.9)]), &ctx),
-        Some(Value::Number(2.0))
+        Some(Value::Float(2.0))
     );
     assert_eq!(
         l3_ctx(&call("trunc", vec![neg(2.9)]), &ctx),
-        Some(Value::Number(-2.0))
+        Some(Value::Float(-2.0))
     );
     assert_eq!(l3_ctx(&call("trunc", vec![lit("x")]), &ctx), None);
 

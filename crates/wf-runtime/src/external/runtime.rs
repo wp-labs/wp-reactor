@@ -80,7 +80,7 @@ impl ExternalCallHandler for ExternalRuntime {
 fn value_to_str(v: &Value) -> Option<String> {
     match v {
         Value::Str(s) => Some(s.to_string()),
-        Value::Number(n) => Some(n.to_string()),
+        Value::Float(n) => Some(n.to_string()),
         Value::Int(i) => Some(i.to_string()),
         _ => None,
     }
@@ -100,9 +100,9 @@ mod tests {
             value_to_str(&Value::Str("hash".into())),
             Some("hash".into())
         );
-        assert_eq!(value_to_str(&Value::Number(42.0)), Some("42".into()));
+        assert_eq!(value_to_str(&Value::Float(42.0)), Some("42".into()));
         assert_eq!(value_to_str(&Value::Bool(true)), None); // not supported
-        assert_eq!(value_to_str(&Value::Number(0.0)), Some("0".into()));
+        assert_eq!(value_to_str(&Value::Float(0.0)), Some("0".into()));
     }
 
     #[test]

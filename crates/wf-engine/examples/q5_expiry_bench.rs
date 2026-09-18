@@ -24,7 +24,7 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 fn event(auction: f64) -> Event {
     let mut fields: EngineHashMap<SmolStr, Value> = EngineHashMap::default();
-    fields.insert("auction".into(), Value::Number(auction));
+    fields.insert("auction".into(), Value::Float(auction));
     Event { fields }
 }
 

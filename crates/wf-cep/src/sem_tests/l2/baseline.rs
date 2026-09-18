@@ -78,5 +78,5 @@ fn baseline_returns_zero_on_first_event() {
     let e = event(vec![("x", num(100.0))]);
     // eval_expr uses a temp baselines map — first call should return 0.0
     let result = eval_expr(&expr, &e);
-    assert_eq!(result, Some(Value::Number(0.0)));
+    assert_eq!(result, Some(Value::Float(0.0)));
 }

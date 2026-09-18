@@ -277,7 +277,7 @@ pub(crate) fn export_yield_value(
 
 /// Like [`export_yield_value`] for the common numeric fast lane (Q1 entity==yield
 /// `id=b.auction`), taking the raw `f64` instead of constructing a [`Value`]
-/// per cell. Byte-identical to the `Value::Number(f64)` path. Falls back to the
+/// per cell. Byte-identical to the `Value::Float(f64)` path. Falls back to the
 /// `Value` path for non-numeric target types (Time / Ip / Hex), and rejects
 /// non-finite numbers exactly like the `Value` path.
 pub(crate) fn export_yield_f64(
@@ -302,14 +302,14 @@ pub(crate) fn export_yield_f64(
         None if n.is_finite() => Ok(untyped_numeric_export(n)),
         // Any other target (Time / Ip / Hex / non-finite / array / object) —
         // fall back to the Value path for byte-identical handling.
-        _ => export_yield_value(&Value::Number(n), field_type),
+        _ => export_yield_value(&Value::Float(n), field_type),
     }
 }
 
 fn export_typed_value(base_type: &BaseType, value: &Value) -> CoreResult<(DataType, ModelValue)> {
     match base_type {
         BaseType::Digit => match value {
-            Value::Number(n) if n.is_finite() && n.fract() == 0.0 => {
+            Value::Float(n) if n.is_finite() && n.fract() == 0.0 => {
                 Ok((DataType::Digit, ModelValue::from(*n as i64)))
             }
             // 精确整数：不经 f64（>2^53 保持精确 Digit）。
@@ -320,7 +320,7 @@ fn export_typed_value(base_type: &BaseType, value: &Value) -> CoreResult<(DataTy
                 .err(),
         },
         BaseType::Float => match value {
-            Value::Number(n) if n.is_finite() => Ok((DataType::Float, ModelValue::from(*n))),
+            Value::Float(n) if n.is_finite() => Ok((DataType::Float, ModelValue::from(*n))),
             Value::Int(i) => Ok((DataType::Float, ModelValue::from(*i as f64))),
             _ => CoreReason::DataFormat
                 .to_err()
@@ -365,9 +365,9 @@ const UNTYPED_DIGIT_THRESHOLD: f64 = 9_007_199_254_740_992.0;
 /// **未声明类型**的数值导出（唯一口径，行式 `Value` 路径与列式 f64 快车道共用）。
 ///
 /// 取舍（2026-09-18 第 2 步）：`|v| < 2^53` 时 f64 能精确表达该整数，沿用既有
-/// `Number`（零兼容破坏）；`|v| >= 2^53` 起 f64 会把它量化（epoch-ns ≈1.77e18
+/// `Float`（零兼容破坏）；`|v| >= 2^53` 起 f64 会把它量化（epoch-ns ≈1.77e18
 /// 的 ulp ≈256ns），必须用 `Digit` 承载才不丢精度。两条执行路径（行式/列式）与
-/// 三种载体（`Int` / 整值 `Number` / 量化后的 f64）在同一逻辑值上必须得出一致结果。
+/// 三种载体（`Int` / 整值 `Float` / 量化后的 f64）在同一逻辑值上必须得出一致结果。
 ///
 /// 注：声明了 `digit` 的目标不受影响（`export_typed_value` 恒为 `Digit`）。
 fn untyped_numeric_export(n: f64) -> (DataType, ModelValue) {
@@ -390,7 +390,7 @@ fn untyped_int_export(i: i64) -> (DataType, ModelValue) {
 
 fn export_untyped_value(value: &Value) -> CoreResult<(DataType, ModelValue)> {
     match value {
-        Value::Number(n) if n.is_finite() => Ok(untyped_numeric_export(*n)),
+        Value::Float(n) if n.is_finite() => Ok(untyped_numeric_export(*n)),
         Value::Int(i) => Ok(untyped_int_export(*i)),
         Value::Bool(b) => Ok((DataType::Bool, ModelValue::from(*b))),
         Value::Str(s) => Ok((DataType::Chars, ModelValue::from(s.as_str()))),
@@ -406,7 +406,7 @@ fn export_untyped_value(value: &Value) -> CoreResult<(DataType, ModelValue)> {
 fn render_value_as_string(value: &Value) -> CoreResult<String> {
     match value {
         Value::Str(s) => Ok(s.to_string()),
-        Value::Number(n) => Ok(n.to_string()),
+        Value::Float(n) => Ok(n.to_string()),
         Value::Int(i) => Ok(i.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
         Value::Array(_) | Value::Object(_) => structured_json_string(value),
@@ -522,12 +522,12 @@ fn export_typed_array_item_value(
 
 fn rule_value_to_model_value(value: &Value) -> CoreResult<(DataType, ModelValue)> {
     match value {
-        Value::Number(n) if n.is_finite() && n.fract() == 0.0 => {
+        Value::Float(n) if n.is_finite() && n.fract() == 0.0 => {
             Ok((DataType::Digit, ModelValue::from(*n as i64)))
         }
         // 精确整数：不经 f64（>2^53 保持精确 Digit）。
         Value::Int(i) => Ok((DataType::Digit, ModelValue::from(*i))),
-        Value::Number(n) if n.is_finite() => Ok((DataType::Float, ModelValue::from(*n))),
+        Value::Float(n) if n.is_finite() => Ok((DataType::Float, ModelValue::from(*n))),
         Value::Str(s) => Ok((DataType::Chars, ModelValue::from(s.as_str()))),
         Value::Bool(b) => Ok((DataType::Bool, ModelValue::from(*b))),
         Value::Array(items) => Ok((
@@ -540,7 +540,7 @@ fn rule_value_to_model_value(value: &Value) -> CoreResult<(DataType, ModelValue)
             ),
         )),
         Value::Object(items) => Ok((DataType::Obj, ModelValue::Obj(rule_object_to_model(items)?))),
-        Value::Number(_) => CoreReason::DataFormat
+        Value::Float(_) => CoreReason::DataFormat
             .to_err()
             .with_detail("structured numeric value must be finite")
             .err(),
@@ -564,9 +564,9 @@ fn rule_object_to_model(
 
 fn rule_value_to_json(value: &Value) -> CoreResult<serde_json::Value> {
     match value {
-        Value::Number(n) if n.is_finite() => Ok(serde_json::Value::from(*n)),
+        Value::Float(n) if n.is_finite() => Ok(serde_json::Value::from(*n)),
         Value::Int(i) => Ok(serde_json::Value::from(*i)),
-        Value::Number(_) => CoreReason::DataFormat
+        Value::Float(_) => CoreReason::DataFormat
             .to_err()
             .with_detail("structured numeric value must be finite")
             .err(),
@@ -633,7 +633,7 @@ fn base_type_name(base_type: &BaseType) -> &'static str {
 
 fn parse_time_value(value: &Value) -> CoreResult<DateTimeValue> {
     match value {
-        Value::Number(n) if n.is_finite() && n.fract() == 0.0 => {
+        Value::Float(n) if n.is_finite() && n.fract() == 0.0 => {
             let nanos = normalize_epoch_timestamp_float_nanos(*n).ok_or_else(|| {
                 orion_error::StructError::from(CoreReason::DataFormat)
                     .with_detail("time field requires a finite epoch timestamp")
@@ -693,7 +693,7 @@ fn parse_ip_value(value: &Value) -> CoreResult<IpAddr> {
 
 fn parse_hex_value(value: &Value) -> CoreResult<HexT> {
     match value {
-        Value::Number(n) if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 => Ok(HexT(*n as u128)),
+        Value::Float(n) if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 => Ok(HexT(*n as u128)),
         Value::Int(i) if *i >= 0 => Ok(HexT(*i as u128)),
         Value::Str(text) => {
             let normalized = text
@@ -734,7 +734,7 @@ mod tests {
             summary: "demo".into(),
             yield_target: "out".into(),
             yield_fields: vec![
-                ("count".into(), Value::Number(3.0)),
+                ("count".into(), Value::Float(3.0)),
                 (
                     "items".into(),
                     Value::Array(vec![Value::Str("a".into()), Value::Str("b".into())]),
@@ -743,7 +743,7 @@ mod tests {
                     "risk_context".into(),
                     Value::Object(
                         [
-                            ("score".into(), Value::Number(70.5)),
+                            ("score".into(), Value::Float(70.5)),
                             (
                                 "tags".into(),
                                 Value::Array(vec![
@@ -842,9 +842,9 @@ mod tests {
             summary: "demo".into(),
             yield_target: "out".into(),
             yield_fields: vec![
-                ("count".into(), Value::Number(1.0)),
-                ("other".into(), Value::Number(2.0)),
-                ("count".into(), Value::Number(3.0)),
+                ("count".into(), Value::Float(1.0)),
+                ("other".into(), Value::Float(2.0)),
+                ("count".into(), Value::Float(3.0)),
             ],
             yield_field_types: Vec::new().into(),
             event_time_nanos: 0,
@@ -860,7 +860,7 @@ mod tests {
 
     #[test]
     fn parse_time_value_accepts_epoch_milliseconds() {
-        let dt = parse_time_value(&Value::Number(1_710_115_200_123.0)).expect("time");
+        let dt = parse_time_value(&Value::Float(1_710_115_200_123.0)).expect("time");
         assert_eq!(
             dt,
             DateTime::from_timestamp_millis(1_710_115_200_123)
@@ -945,7 +945,7 @@ mod tests {
             yield_target: "out".into(),
             yield_fields: vec![(
                 "scores".into(),
-                Value::Array(vec![Value::Number(1.0), Value::Str("high".into())]),
+                Value::Array(vec![Value::Float(1.0), Value::Str("high".into())]),
             )],
             yield_field_types: std::sync::Arc::from(vec![(
                 "scores".into(),
@@ -978,7 +978,7 @@ mod tests {
             yield_target: "out".into(),
             yield_fields: vec![(
                 "tags".into(),
-                Value::Array(vec![Value::Str("ssh".into()), Value::Number(22.0)]),
+                Value::Array(vec![Value::Str("ssh".into()), Value::Float(22.0)]),
             )],
             yield_field_types: std::sync::Arc::from(vec![(
                 "tags".into(),
@@ -1012,7 +1012,7 @@ mod tests {
             yield_fields: vec![(
                 "risk_context".into(),
                 Value::Object(
-                    [("score".into(), Value::Number(f64::NAN))]
+                    [("score".into(), Value::Float(f64::NAN))]
                         .into_iter()
                         .collect(),
                 ),
@@ -1053,7 +1053,7 @@ mod tests {
                 ("src_ip".into(), Value::Str("192.168.0.1".into())),
                 (
                     "seen_at".into(),
-                    Value::Number(1_710_115_200_000_000_000_f64),
+                    Value::Float(1_710_115_200_000_000_000_f64),
                 ),
                 ("sha".into(), Value::Str("0xFF".into())),
             ],

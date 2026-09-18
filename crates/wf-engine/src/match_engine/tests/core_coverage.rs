@@ -74,7 +74,7 @@ fn step_data(label: Option<&str>, measure: f64, field_values: Vec<(&str, Vec<Val
         measure_value: measure,
         event_first_time_nanos: None,
         event_last_time_nanos: None,
-        collected_values: vec![Value::Number(1.0), Value::Number(2.0)],
+        collected_values: vec![Value::Float(1.0), Value::Float(2.0)],
         field_values: field_values
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))

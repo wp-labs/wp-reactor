@@ -246,7 +246,7 @@ fn stats_memory_guard_merge_partial_rejects_over_limit() {
             row: {
                 let layout = std::sync::Arc::new(RowFieldLayout::all_other(&["price".to_string()]));
                 let mut rf = RowFields::empty(layout);
-                rf.set(0, Some(Value::Number(200.0)));
+                rf.set(0, Some(Value::Float(200.0)));
                 rf
             },
         }])]),

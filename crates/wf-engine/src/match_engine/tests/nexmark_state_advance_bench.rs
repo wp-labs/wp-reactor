@@ -159,7 +159,7 @@ fn q5_q7_window_conv_top() {
         let count = (next_u64(&mut rng) % 500) as f64;
         outputs.push(close_output(
             "q5_bench",
-            vec![Value::Number(auction)],
+            vec![Value::Float(auction)],
             "n",
             count,
         ));

@@ -16,7 +16,7 @@ fn blank_functions_work() {
     fields.insert("spaces".into(), Value::Str(" \t\n ".into()));
     fields.insert("host".into(), Value::Str("example.org".into()));
     fields.insert("fallback".into(), Value::Str("fallback".into()));
-    fields.insert("n".into(), Value::Number(42.0));
+    fields.insert("n".into(), Value::Float(42.0));
     let event = Event { fields };
 
     let is_empty_expr = Expr::FuncCall {
@@ -130,7 +130,7 @@ fn merge_shallow_merges_objects_in_l2_eval() {
     use crate::cep::{Event, eval_expr};
 
     let mut base = EngineHashMap::default();
-    base.insert("severity".into(), Value::Number(3.0));
+    base.insert("severity".into(), Value::Float(3.0));
     base.insert("rule".into(), Value::Str("webshell".into()));
 
     let mut fields = EngineHashMap::default();
@@ -162,7 +162,7 @@ fn merge_shallow_merges_objects_in_l2_eval() {
     };
     assert_eq!(object.get("rule"), Some(&Value::Str("webshell".into())));
     assert_eq!(object.get("source"), Some(&Value::Str("wfl".into())));
-    assert_eq!(object.get("severity"), Some(&Value::Number(10.0)));
+    assert_eq!(object.get("severity"), Some(&Value::Float(10.0)));
 }
 
 #[test]
@@ -226,7 +226,7 @@ fn hash_and_id_functions_work() {
     fields.insert("msg".into(), Value::Str("hello".into()));
     fields.insert("empty".into(), Value::Str(String::new().into()));
     fields.insert("ip".into(), Value::Str("10.0.0.1".into()));
-    fields.insert("count".into(), Value::Number(3.0));
+    fields.insert("count".into(), Value::Float(3.0));
     fields.insert("special".into(), Value::Str("a|b".into()));
     fields.insert("percent".into(), Value::Str("10%".into()));
     let event = Event { fields };
@@ -504,7 +504,7 @@ fn strptime_parses_date() {
     let event = Event {
         fields: EngineHashMap::default(),
     };
-    assert_eq!(eval_expr(&expr, &event), Some(Value::Number(0.0)));
+    assert_eq!(eval_expr(&expr, &event), Some(Value::Float(0.0)));
 }
 
 #[test]
@@ -524,7 +524,7 @@ fn strptime_returns_epoch_milliseconds() {
     };
     assert_eq!(
         eval_expr(&expr, &event),
-        Some(Value::Number(1_710_115_200_000.0))
+        Some(Value::Float(1_710_115_200_000.0))
     );
 }
 
@@ -645,7 +645,7 @@ fn mvcount_array_returns_length() {
         ]),
     );
     let event = Event { fields };
-    assert_eq!(eval_expr(&expr, &event), Some(Value::Number(3.0)));
+    assert_eq!(eval_expr(&expr, &event), Some(Value::Float(3.0)));
 }
 
 #[test]

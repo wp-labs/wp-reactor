@@ -114,7 +114,7 @@ fn alert_of(alert: &OutputRecord) -> Alert {
         other => panic!("alert_id 应为字符串，实际 {other:?}"),
     };
     let as_num = |name: &str| match field(name) {
-        Some(Value::Number(n)) => n,
+        Some(Value::Float(n)) => n,
         other => panic!("{name} 应为数值，实际 {other:?}"),
     };
     (

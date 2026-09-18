@@ -229,7 +229,7 @@ fn scope_key_from_column_type_lanes() {
     .unwrap();
     assert_eq!(
         scope_key_from_column(&f_batch, 0, 0),
-        Some(ScopeKey::from_value(&Value::Number(2.5)))
+        Some(ScopeKey::from_value(&Value::Float(2.5)))
     );
     assert_eq!(scope_key_from_column(&f_batch, 0, 1), None);
 

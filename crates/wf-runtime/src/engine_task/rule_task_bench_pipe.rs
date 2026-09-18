@@ -242,9 +242,9 @@ fn q4a_stage_bench() {
             summary: Arc::from(""),
             yield_target: Arc::from("auction_finals"),
             yield_fields: vec![
-                (Arc::from("id"), Value::Number(i as f64)),
-                (Arc::from("category"), Value::Number((i % 5) as f64)),
-                (Arc::from("final"), Value::Number(10.0 + i as f64)),
+                (Arc::from("id"), Value::Float(i as f64)),
+                (Arc::from("category"), Value::Float((i % 5) as f64)),
+                (Arc::from("final"), Value::Float(10.0 + i as f64)),
                 // dateTime 缺失 → 时间列回退 event_time_nanos
             ],
             yield_field_types: Vec::new().into(),

@@ -17,7 +17,7 @@ use crate::match_engine::Value;
 use crate::match_engine::executor::stats_exec::{DistinctKey, StatsExecutor};
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn row(pairs: &[(&str, Value)]) -> HashMap<String, Value> {

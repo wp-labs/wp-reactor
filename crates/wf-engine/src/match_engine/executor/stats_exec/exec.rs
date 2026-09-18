@@ -901,7 +901,7 @@ impl StatsExecutor {
     ///
     /// 字段读取走**原生列值**（`column_i128_at`/`column_distinct_key_at`, 列索引
     /// 批级预解析——与空键列式段同精度（D7/D8: ≥2^53 的 Int64 不得经
-    /// `Value::Number(f64)` 舍入; Timestamp 列 distinct 也走原生 i64, 不得静默跳过）。
+    /// `Value::Float(f64)` 舍入; Timestamp 列 distinct 也走原生 i64, 不得静默跳过）。
     ///
     /// **复合键优化（P5+）**: 键数 ≤ 4 走扁平键路径——栈上叶数组（`key_column_comp`
     /// 预解析列, 无 Box 分配/无逐行 downcast）→ `comps_hash` → `keyed_bucket_mut`

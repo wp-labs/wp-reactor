@@ -89,7 +89,7 @@ fn columnar_field_value_vs_eager() {
     let mut acc = 0.0f64;
     let start = Instant::now();
     for ev in &events {
-        if let Some(Value::Number(v)) = ev.field_value("price") {
+        if let Some(Value::Float(v)) = ev.field_value("price") {
             acc += v;
         }
     }
@@ -100,7 +100,7 @@ fn columnar_field_value_vs_eager() {
     let start = Instant::now();
     for row in 0..n {
         let ce = ColumnarEvent::with_index(&batch, row, Arc::clone(&index));
-        if let Some(Value::Number(v)) = ce.field_value("price") {
+        if let Some(Value::Float(v)) = ce.field_value("price") {
             acc_c += v;
         }
     }
@@ -169,7 +169,7 @@ fn join_row_field_value_vs_map_get() {
     let mut acc = 0.0f64;
     let start = Instant::now();
     for row in &map_rows {
-        if let Some(Value::Number(v)) = row.get("price") {
+        if let Some(Value::Float(v)) = row.get("price") {
             acc += v;
         }
     }
@@ -178,7 +178,7 @@ fn join_row_field_value_vs_map_get() {
     let mut acc_c = 0.0f64;
     let start = Instant::now();
     for row in &rows {
-        if let Some(Value::Number(v)) = row.field_value("price") {
+        if let Some(Value::Float(v)) = row.field_value("price") {
             acc_c += v;
         }
     }
@@ -205,7 +205,7 @@ fn column_scalar_string_vs_batch_to_events() {
         if let Some(val) = ev.fields.get("price") {
             set.insert(match val {
                 Value::Str(s) => s.to_string(),
-                Value::Number(v) => v.to_string(),
+                Value::Float(v) => v.to_string(),
                 Value::Int(v) => v.to_string(),
                 Value::Bool(b) => b.to_string(),
                 Value::Array(_) | Value::Object(_) => continue,
@@ -362,7 +362,7 @@ fn join_index_lookup_vs_full_scan() {
         let rows = columnar_join_rows(win.snapshot(), None);
         scan_hits += rows
             .iter()
-            .filter(|row| row.field_value("key") == Some(Value::Number(key as f64)))
+            .filter(|row| row.field_value("key") == Some(Value::Float(key as f64)))
             .count();
     }
     let scan_ns = start.elapsed().as_secs_f64() * 1e9 / s as f64;
@@ -403,7 +403,7 @@ fn join_index_timestamped_lookup_vs_full_scan() {
         let rows = columnar_timestamped_join_rows(win.snapshot(), ts_col, None);
         scan_hits += rows
             .iter()
-            .filter(|(_, row)| row.field_value("key") == Some(Value::Number(key as f64)))
+            .filter(|(_, row)| row.field_value("key") == Some(Value::Float(key as f64)))
             .count();
     }
     let scan_ns = start.elapsed().as_secs_f64() * 1e9 / s as f64;

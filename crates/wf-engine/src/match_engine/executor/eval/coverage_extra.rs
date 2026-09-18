@@ -171,7 +171,7 @@ fn str_val(s: &str) -> Value {
 }
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn arr_1_2_3() -> Value {
@@ -826,7 +826,7 @@ fn builtin_misc_math_and_time() {
         &call("log", vec![num_expr(8.0), num_expr(2.0)]),
         &ctx_with(vec![]),
     ) {
-        Some(Value::Number(n)) => assert!((n - 3.0).abs() < 1e-9),
+        Some(Value::Float(n)) => assert!((n - 3.0).abs() < 1e-9),
         other => panic!("expected log(8, 2) = 3, got {other:?}"),
     }
     // ceil / floor / trunc.

@@ -469,7 +469,7 @@ impl RuleExecutor {
             self.plan.yield_plan.fields.iter().zip(yield_specs.iter())
         {
             let literal: Option<Value> = match &field.value {
-                Expr::Number(n) => Some(Value::Number(*n)),
+                Expr::Number(n) => Some(Value::Float(*n)),
                 Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
                 Expr::Bool(b) => Some(Value::Bool(*b)),
                 _ => None,
@@ -637,7 +637,7 @@ impl RuleExecutor {
                     {
                         continue;
                     }
-                    Expr::Number(n) => Value::Number(*n),
+                    Expr::Number(n) => Value::Float(*n),
                     Expr::StringLit(s) => Value::Str(s.clone().into()),
                     Expr::Bool(b) => Value::Bool(*b),
                     Expr::Field(_) => {
@@ -775,7 +775,7 @@ fn resolve_close_field(close: &CloseOutput, keys: &[FieldRef], name: &str) -> Op
         if let Some(label) = &sd.label
             && label.as_str() == name
         {
-            return Some(Value::Number(sd.measure_value));
+            return Some(Value::Float(sd.measure_value));
         }
         if let Some(v) = sd.field_values.get(name).and_then(|vs| vs.last()) {
             return Some(v.clone());
@@ -944,7 +944,7 @@ impl RuleExecutor {
             self.plan.yield_plan.fields.iter().zip(yield_specs.iter())
         {
             let literal: Option<Value> = match &field.value {
-                Expr::Number(n) => Some(Value::Number(*n)),
+                Expr::Number(n) => Some(Value::Float(*n)),
                 Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
                 Expr::Bool(b) => Some(Value::Bool(*b)),
                 _ => None,
@@ -1111,7 +1111,7 @@ impl RuleExecutor {
                         {
                             continue;
                         }
-                        Expr::Number(n) => Value::Number(*n),
+                        Expr::Number(n) => Value::Float(*n),
                         Expr::StringLit(s) => Value::Str(s.clone().into()),
                         Expr::Bool(b) => Value::Bool(*b),
                         Expr::Field(_) => resolve_stats_bucket_field(
@@ -1209,7 +1209,7 @@ fn stats_scope_key_to_values(key: &crate::match_engine::cep::ScopeKey) -> Vec<Va
         crate::match_engine::cep::ScopeKey::Empty => vec![],
         crate::match_engine::cep::ScopeKey::Int(i) => vec![Value::Int(*i)],
         crate::match_engine::cep::ScopeKey::Float(b) => {
-            vec![Value::Number(f64::from_bits(*b))]
+            vec![Value::Float(f64::from_bits(*b))]
         }
         crate::match_engine::cep::ScopeKey::Str(s) => vec![Value::Str(s.clone())],
         crate::match_engine::cep::ScopeKey::Pair(a, b) => {
@@ -1246,7 +1246,7 @@ fn resolve_stats_bucket_field(
                 .get(i)
                 .and_then(|m| m.get(usize::min(record, m.len().saturating_sub(1))))
                 .map_or(0.0, |e| e.measure_value);
-            return Some(Value::Number(mv));
+            return Some(Value::Float(mv));
         }
     }
     // 3. 行字段（row_fields → value_at, 与 CloseOutput.row_fields 同口径）

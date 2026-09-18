@@ -110,13 +110,13 @@ fn make_provider_join_task(
     pw.load(vec![
         {
             let mut m = HashMap::new();
-            m.insert("id".to_string(), Value::Number(5.0));
+            m.insert("id".to_string(), Value::Float(5.0));
             m.insert("state".to_string(), Value::Str("CA".into()));
             m
         },
         {
             let mut m = HashMap::new();
-            m.insert("id".to_string(), Value::Number(7.0));
+            m.insert("id".to_string(), Value::Float(7.0));
             m.insert("state".to_string(), Value::Str("ID".into()));
             m
         },

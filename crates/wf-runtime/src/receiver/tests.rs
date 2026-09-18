@@ -236,7 +236,7 @@ fn string_value<'a>(
 
 fn number_value(row: &std::collections::HashMap<String, Value>, key: &str) -> Option<f64> {
     match row.get(key) {
-        Some(Value::Number(value)) => Some(*value),
+        Some(Value::Float(value)) => Some(*value),
         _ => None,
     }
 }

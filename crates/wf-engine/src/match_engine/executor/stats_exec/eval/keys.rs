@@ -248,7 +248,7 @@ pub(crate) fn scope_key_from_comps(comps: &[ScopeKey]) -> ScopeKey {
 
 pub(crate) fn value_to_i128(v: &Value) -> Option<i128> {
     match v {
-        Value::Number(n) => Some(*n as i128),
+        Value::Float(n) => Some(*n as i128),
         Value::Int(i) => Some(*i as i128),
         _ => None,
     }
@@ -332,9 +332,9 @@ mod tests {
 
     #[test]
     fn value_number_projections() {
-        assert_eq!(value_to_i128(&Value::Number(7.0)), Some(7));
+        assert_eq!(value_to_i128(&Value::Float(7.0)), Some(7));
         assert_eq!(value_to_i128(&Value::Str("x".into())), None);
-        assert_eq!(value_to_f64(&Value::Number(1.5)), Some(1.5));
+        assert_eq!(value_to_f64(&Value::Float(1.5)), Some(1.5));
         assert_eq!(value_to_f64(&Value::Bool(true)), None);
     }
 }

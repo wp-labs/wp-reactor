@@ -118,7 +118,7 @@ fn scope_key_from_column(batch, col_idx, row) -> Option<ScopeKey> {
     match col.data_type() {
         DataType::Int64 | DataType::Timestamp(Nanosecond, _) =>
             Some(ScopeKey::Int(a.value(row))),    // 原生 i64，无 f64 往返
-        DataType::Float64 => Some(ScopeKey::from_value(&Value::Number(a.value(row)))),
+        DataType::Float64 => Some(ScopeKey::from_value(&Value::Float(a.value(row)))),
         DataType::Utf8    => Some(ScopeKey::Str(a.value(row).into())),
         DataType::Boolean => Some(ScopeKey::Str((if a.value(row) {"true"} else {"false"}).into())),
         _ => column_scalar(batch, col_idx, row).map(|v| ScopeKey::from_value(&v)),

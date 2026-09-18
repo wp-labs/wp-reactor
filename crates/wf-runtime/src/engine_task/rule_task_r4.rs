@@ -663,8 +663,8 @@ async fn deferred_only_scan_timeouts_after_watermark_advances() {
     });
     // 事件带键字段与时间字段 → deferred_pending_for 成功 → watermark 推进。
     let mut fields = EngineHashMap::default();
-    fields.insert("id".into(), Value::Number(1.0));
-    fields.insert("event_time".into(), Value::Number(1_000.0));
+    fields.insert("id".into(), Value::Float(1.0));
+    fields.insert("event_time".into(), Value::Float(1_000.0));
     let events: Arc<Vec<Arc<Event>>> = Arc::new(vec![Arc::new(Event { fields })]);
     run_with_dispatch(no_debug_dispatch(), move || async move {
         let push = RulePush {
@@ -782,7 +782,7 @@ fn pipe_stager_event_time_field_null_column_and_timestamp_non_number() {
 fn value_to_json_object_success_path() {
     let value = Value::Object(
         [
-            ("a".into(), Value::Number(1.0)),
+            ("a".into(), Value::Float(1.0)),
             ("b".into(), Value::Bool(true)),
         ]
         .into_iter()
@@ -791,7 +791,7 @@ fn value_to_json_object_success_path() {
     let json = value_to_json(&value).expect("object serializes");
     assert_eq!(json, serde_json::json!({"a": 1.0, "b": true}));
     // 嵌套数组。
-    let value = Value::Array(vec![Value::Number(2.0), Value::Str("x".into())]);
+    let value = Value::Array(vec![Value::Float(2.0), Value::Str("x".into())]);
     let json = value_to_json(&value).expect("array serializes");
     assert_eq!(json, serde_json::json!([2.0, "x"]));
 }
@@ -823,7 +823,7 @@ async fn emit_each_direct_append_failure_path() {
     record.yield_fields = vec![(
         Arc::from("sip"),
         Value::Object(
-            [("score".into(), Value::Number(f64::NAN))]
+            [("score".into(), Value::Float(f64::NAN))]
                 .into_iter()
                 .collect(),
         ),

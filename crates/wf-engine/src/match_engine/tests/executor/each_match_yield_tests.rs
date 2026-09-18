@@ -324,7 +324,7 @@ fn execute_each_yield_can_reference_time_system_vars() {
     assert_eq!(field("rule_window_start"), Some(num(event_time_ms as f64)));
     assert_eq!(field("rule_window_end"), Some(num(event_time_ms as f64)));
 
-    let Some(Value::Number(emit_time_ms)) = field("latest_analysis_time") else {
+    let Some(Value::Float(emit_time_ms)) = field("latest_analysis_time") else {
         panic!("missing latest_analysis_time");
     };
     assert!(emit_time_ms > 0.0);
@@ -377,7 +377,7 @@ fn execute_each_yield_first_match_time_is_processing_wall_clock() {
             .map(|(_, value)| value.clone())
     };
     let event_time_ms = event_time_nanos as f64 / 1_000_000.0;
-    let Some(Value::Number(first_match_ms)) = field("first_match_time") else {
+    let Some(Value::Float(first_match_ms)) = field("first_match_time") else {
         panic!("missing first_match_time: {:?}", field("first_match_time"));
     };
     assert!(first_match_ms > 0.0, "必须记录处理墙钟");
@@ -385,7 +385,7 @@ fn execute_each_yield_first_match_time_is_processing_wall_clock() {
         first_match_ms > event_time_ms * 1_000_000.0,
         "on each 首次满足 = 系统墙钟（{first_match_ms}），不是输入事件时间（{event_time_ms}）"
     );
-    let Some(Value::Number(to_ms)) = field("first_match_ms") else {
+    let Some(Value::Float(to_ms)) = field("first_match_ms") else {
         panic!("missing first_match_ms");
     };
     assert_eq!(

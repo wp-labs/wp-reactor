@@ -82,13 +82,13 @@ fn make_batch(schema: &SchemaRef, n: usize) -> RecordBatch {
 /// pending 都是真实 seller，扫描与索引两侧同口径）。
 fn measure_ns_per_call(lookup: &RegistryLookup<'_>, n: usize) -> f64 {
     // warmup（首调含索引/扫描结构预热）
-    let _ = lookup.asof_candidates("auction_events", "seller", &Value::Number(1.0));
+    let _ = lookup.asof_candidates("auction_events", "seller", &Value::Float(1.0));
     let budget = Duration::from_millis(250);
     let start = Instant::now();
     let mut ops = 0u64;
     loop {
         for _ in 0..64 {
-            let key = Value::Number((ops as usize % n) as f64 + 1.0);
+            let key = Value::Float((ops as usize % n) as f64 + 1.0);
             let rows = lookup.asof_candidates("auction_events", "seller", &key);
             std::hint::black_box(&rows);
             ops += 1;

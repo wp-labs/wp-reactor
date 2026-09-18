@@ -40,15 +40,15 @@ impl WindowLookup for MockAuctionLookup {
                 .iter()
                 .map(|(&id, &cat)| {
                     let mut f = EngineHashMap::default();
-                    f.insert("id".into(), Value::Number(id as f64));
-                    f.insert("category".into(), Value::Number(cat));
+                    f.insert("id".into(), Value::Float(id as f64));
+                    f.insert("category".into(), Value::Float(cat));
                     JoinRow::Event(Arc::new(Event { fields: f }))
                 })
                 .collect(),
         )
     }
     fn join_lookup(&self, _w: &str, _kf: &str, key: &Value) -> Option<Vec<JoinRow>> {
-        let Value::Number(n) = key else {
+        let Value::Float(n) = key else {
             return Some(vec![]);
         };
         let id = *n as i64;
@@ -56,8 +56,8 @@ impl WindowLookup for MockAuctionLookup {
             return Some(vec![]); // join miss
         };
         let mut f = EngineHashMap::default();
-        f.insert("id".into(), Value::Number(id as f64));
-        f.insert("category".into(), Value::Number(cat));
+        f.insert("id".into(), Value::Float(id as f64));
+        f.insert("category".into(), Value::Float(cat));
         Some(vec![JoinRow::Event(Arc::new(Event { fields: f }))])
     }
 }

@@ -712,7 +712,7 @@ fn resolve_match_field(m: &MatchedContext, keys: &[FieldRef], name: &str) -> Opt
         if let Some(label) = &sd.label
             && label.as_str() == name
         {
-            return Some(Value::Number(sd.measure_value));
+            return Some(Value::Float(sd.measure_value));
         }
         if let Some(v) = sd.field_values.get(name).and_then(|vs| vs.last()) {
             return Some(v.clone());

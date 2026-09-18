@@ -107,7 +107,7 @@ fn reference_q15(rows: &[HashMap<String, Value>]) -> Vec<u64> {
 
     for r in rows {
         let price = match r.get("price") {
-            Some(Value::Number(p)) => Some(*p),
+            Some(Value::Float(p)) => Some(*p),
             _ => None,
         };
         let tier = price.map(q15_price_tier);
@@ -116,11 +116,11 @@ fn reference_q15(rows: &[HashMap<String, Value>]) -> Vec<u64> {
             count[t + 1] += 1;
         }
         let bidder = match r.get("bidder") {
-            Some(Value::Number(n)) => Some(*n as i64),
+            Some(Value::Float(n)) => Some(*n as i64),
             _ => None,
         };
         let auction = match r.get("auction") {
-            Some(Value::Number(n)) => Some(*n as i64),
+            Some(Value::Float(n)) => Some(*n as i64),
             _ => None,
         };
         if let Some(b) = bidder {

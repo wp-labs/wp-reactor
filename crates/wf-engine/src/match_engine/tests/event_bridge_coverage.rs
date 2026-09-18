@@ -203,10 +203,10 @@ fn structured_json_cells_with_json_null_are_dropped() {
         panic!("expected object");
     };
     assert_eq!(m.len(), 1, "JSON null member dropped");
-    assert_eq!(m.get("b"), Some(&Value::Number(2.0)));
+    assert_eq!(m.get("b"), Some(&Value::Float(2.0)));
     assert_eq!(
         events[0].fields["ports"],
-        Value::Array(vec![Value::Number(1.0), Value::Number(3.0)])
+        Value::Array(vec![Value::Float(1.0), Value::Float(3.0)])
     );
 }
 

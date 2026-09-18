@@ -207,9 +207,9 @@ fn RuleTask::process_batch(batch: &RecordBatch) {
 
 | Value（现有） | Arrow 列（列式） | 列式运算 | 等价性 |
 |---|---|---|---|
-| `Number(f64)` | `Int64/Int32/UInt*` | 按原生整数（取模/比较） | **需验证**：现有 f64 `%` 对 \|v\|<2^53 精确 → Int64 取模等价；负值符号一致（Rust `%` 均为截断余数） |
-| `Number(f64)` | `Float64` | f64 运算（同现有） | 天然一致 |
-| `Number(f64)` | `Timestamp(Ns)` | 时间戳按 i64 比较 | **需验证（比整数 2^53 更危险）**：纳秒 ~1.7e18 ≫ 2^53，现有 `Timestamp → Value::Number(ns as f64)` 已丢精度——列式按 i64 更准但**可能改变比较结果**（相邻纳秒在 f64 判等、i64 判不等）；时间戳是规则高频比较字段，进 §3.4 对拍清单 |
+| `Float(f64)` | `Int64/Int32/UInt*` | 按原生整数（取模/比较） | **需验证**：现有 f64 `%` 对 \|v\|<2^53 精确 → Int64 取模等价；负值符号一致（Rust `%` 均为截断余数） |
+| `Float(f64)` | `Float64` | f64 运算（同现有） | 天然一致 |
+| `Float(f64)` | `Timestamp(Ns)` | 时间戳按 i64 比较 | **需验证（比整数 2^53 更危险）**：纳秒 ~1.7e18 ≫ 2^53，现有 `Timestamp → Value::Float(ns as f64)` 已丢精度——列式按 i64 更准但**可能改变比较结果**（相邻纳秒在 f64 判等、i64 判不等）；时间戳是规则高频比较字段，进 §3.4 对拍清单 |
 | `Str(SmolStr)` | `Utf8` | 字节比较/前缀 | 一致（Utf8 字节序 == Value::Str 比较） |
 | `Bool` | `Boolean` | 位运算 | 一致 |
 | `Array/Object` | `List/Struct` | **不回退列式**（逐行 interpreted） | 语义不变 |

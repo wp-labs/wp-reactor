@@ -37,10 +37,10 @@ const NOW: i64 = 1_750_000_000_000_000_000;
 /// 右窗候选行：`(ts_nanos, auction, bidder, price, dateTime)`。
 fn timed_bid(ts: i64, auction: f64, bidder: f64, price: f64) -> (i64, JoinRow) {
     let mut fields = EngineHashMap::default();
-    fields.insert("auction".into(), Value::Number(auction));
-    fields.insert("bidder".into(), Value::Number(bidder));
-    fields.insert("price".into(), Value::Number(price));
-    fields.insert("dateTime".into(), Value::Number(ts as f64));
+    fields.insert("auction".into(), Value::Float(auction));
+    fields.insert("bidder".into(), Value::Float(bidder));
+    fields.insert("price".into(), Value::Float(price));
+    fields.insert("dateTime".into(), Value::Float(ts as f64));
     (ts, JoinRow::Event(Arc::new(Event { fields })))
 }
 
@@ -129,11 +129,11 @@ fn deferred_plan(reduce: bool) -> RulePlan {
 /// 驱动 auction 事件：id=5, dateTime=NOW, expires=NOW+60s（无 lets）。
 fn auction_event() -> Event {
     let mut fields = EngineHashMap::default();
-    fields.insert("id".into(), Value::Number(5.0));
-    fields.insert("dateTime".into(), Value::Number(NOW as f64));
+    fields.insert("id".into(), Value::Float(5.0));
+    fields.insert("dateTime".into(), Value::Float(NOW as f64));
     fields.insert(
         "expires".into(),
-        Value::Number((NOW + 60_000_000_000) as f64),
+        Value::Float((NOW + 60_000_000_000) as f64),
     );
     Event { fields }
 }
@@ -150,7 +150,7 @@ fn auction_event_with_let() -> (RulePlan, Event) {
         },
     }];
     let mut event = auction_event();
-    event.fields.insert("extra".into(), Value::Number(7.0));
+    event.fields.insert("extra".into(), Value::Float(7.0));
     (plan, event)
 }
 
@@ -290,7 +290,7 @@ fn deferred_join_hot_paths() {
     let mut eager_ctx = Event {
         fields: EngineHashMap::default(),
     };
-    eager_ctx.fields.insert("aid".into(), Value::Number(5.0));
+    eager_ctx.fields.insert("aid".into(), Value::Float(5.0));
     let start = Instant::now();
     for _ in 0..N {
         let mut c = eager_ctx.clone();
@@ -334,12 +334,12 @@ fn q4a_deferred_plan() -> RulePlan {
 /// q4a 驱动 auction 事件（含 category）。
 fn q4a_auction_event() -> Event {
     let mut fields = EngineHashMap::default();
-    fields.insert("id".into(), Value::Number(5.0));
-    fields.insert("category".into(), Value::Number(3.0));
-    fields.insert("dateTime".into(), Value::Number(NOW as f64));
+    fields.insert("id".into(), Value::Float(5.0));
+    fields.insert("category".into(), Value::Float(3.0));
+    fields.insert("dateTime".into(), Value::Float(NOW as f64));
     fields.insert(
         "expires".into(),
-        Value::Number((NOW + 60_000_000_000) as f64),
+        Value::Float((NOW + 60_000_000_000) as f64),
     );
     Event { fields }
 }
@@ -622,7 +622,7 @@ fn deferred_join_overhead_bounded() {
     let mut eager_ctx = Event {
         fields: EngineHashMap::default(),
     };
-    eager_ctx.fields.insert("aid".into(), Value::Number(5.0));
+    eager_ctx.fields.insert("aid".into(), Value::Float(5.0));
     let start = Instant::now();
     for _ in 0..n {
         let mut c = eager_ctx.clone();

@@ -3,7 +3,7 @@ use super::*;
 fn pending(lo_ns: i64) -> DeferredPending {
     DeferredPending {
         key_field: "auction".into(),
-        key: wf_engine::match_engine::Value::Number(1.0),
+        key: wf_engine::match_engine::Value::Float(1.0),
         lo_ns,
         hi_ns: lo_ns + 1_000_000_000,
         lo_open: false,

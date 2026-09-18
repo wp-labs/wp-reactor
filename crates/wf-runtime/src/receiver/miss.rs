@@ -150,11 +150,11 @@ fn record_window_miss_row(
     }) {
         let mut existing = rows.remove(existing_idx);
         let count = number_field(&existing, "count").unwrap_or(0.0) + miss.rows as f64;
-        existing.insert("count".into(), Value::Number(count));
-        existing.insert("last_seen".into(), Value::Number(now));
+        existing.insert("count".into(), Value::Float(count));
+        existing.insert("last_seen".into(), Value::Float(now));
         existing.insert(
             "payload_bytes".into(),
-            Value::Number(miss.payload_bytes as f64),
+            Value::Float(miss.payload_bytes as f64),
         );
         if !miss.sample_payload.is_empty() {
             existing.insert(
@@ -190,11 +190,11 @@ fn record_window_miss_row(
     );
     row.insert(
         "payload_bytes".into(),
-        Value::Number(miss.payload_bytes as f64),
+        Value::Float(miss.payload_bytes as f64),
     );
-    row.insert("first_seen".into(), Value::Number(now));
-    row.insert("last_seen".into(), Value::Number(now));
-    row.insert("count".into(), Value::Number(miss.rows as f64));
+    row.insert("first_seen".into(), Value::Float(now));
+    row.insert("last_seen".into(), Value::Float(now));
+    row.insert("count".into(), Value::Float(miss.rows as f64));
     rows.push(row);
 
     if rows.len() > MAX_WINDOW_MISS_ROWS {
@@ -213,7 +213,7 @@ fn str_field<'a>(row: &'a HashMap<String, Value>, key: &str) -> Option<&'a str> 
 
 fn number_field(row: &HashMap<String, Value>, key: &str) -> Option<f64> {
     match row.get(key) {
-        Some(Value::Number(value)) => Some(*value),
+        Some(Value::Float(value)) => Some(*value),
         Some(Value::Int(value)) => Some(*value as f64),
         _ => None,
     }
@@ -289,7 +289,7 @@ mod tests {
             rows[0].get("stream_tag"),
             Some(&Value::Str("unknown".into()))
         );
-        assert_eq!(rows[0].get("count"), Some(&Value::Number(4.0)));
+        assert_eq!(rows[0].get("count"), Some(&Value::Float(4.0)));
     }
 
     #[test]

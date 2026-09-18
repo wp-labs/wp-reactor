@@ -32,7 +32,7 @@ async fn q13_dual_chain_sharded_push_high_slope_repro() {
     let mut pw = ProviderWindow::new("side_input".into(), "SELECT * FROM side_input".into(), None);
     pw.load(vec![{
         let mut m = HashMap::new();
-        m.insert("key".to_string(), Value::Number(1.0));
+        m.insert("key".to_string(), Value::Float(1.0));
         m.insert("value".to_string(), Value::Str("v1".into()));
         m
     }]);
@@ -223,7 +223,7 @@ async fn q13_dual_chain_sharded_producer_and_consumer() {
     let mut pw = ProviderWindow::new("side_input".into(), "SELECT * FROM side_input".into(), None);
     pw.load(vec![{
         let mut m = HashMap::new();
-        m.insert("key".to_string(), Value::Number(1.0));
+        m.insert("key".to_string(), Value::Float(1.0));
         m.insert("value".to_string(), Value::Str("v1".into()));
         m
     }]);

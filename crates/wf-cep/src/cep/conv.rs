@@ -242,7 +242,7 @@ fn build_eval_context(output: &CloseOutput, keys: &[FieldRef]) -> Event {
         .chain(output.close_step_data.iter())
     {
         if let Some(ref label) = step.label {
-            fields.insert(label.clone().into(), Value::Number(step.measure_value));
+            fields.insert(label.clone().into(), Value::Float(step.measure_value));
         }
     }
 
@@ -261,18 +261,16 @@ fn compare_option_values(a: &Option<Value>, b: &Option<Value>) -> std::cmp::Orde
 
 /// Compare two values for sorting: numbers numerically, strings lexicographically.
 ///
-/// 数值域统一：`Int` 与 `Number` 同序（`|i| < 2^53` 时两者是同一逻辑值，见
+/// 数值域统一：`Int` 与 `Float` 同序（`|i| < 2^53` 时两者是同一逻辑值，见
 /// [`Value::Int`] 文档）；`Int` 对 `Int` 走精确整数比较，不经 f64。
 fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => {
-            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-        }
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Int(x), Value::Number(y)) => (*x as f64)
+        (Value::Int(x), Value::Float(y)) => (*x as f64)
             .partial_cmp(y)
             .unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Number(x), Value::Int(y)) => x
+        (Value::Float(x), Value::Int(y)) => x
             .partial_cmp(&(*y as f64))
             .unwrap_or(std::cmp::Ordering::Equal),
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
@@ -280,8 +278,8 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Array(x), Value::Array(y)) => x.len().cmp(&y.len()),
         (Value::Object(x), Value::Object(y)) => x.len().cmp(&y.len()),
         // Mixed types: Number/Int < Str < Bool < Array < Object
-        (Value::Number(_) | Value::Int(_), _) => std::cmp::Ordering::Less,
-        (_, Value::Number(_) | Value::Int(_)) => std::cmp::Ordering::Greater,
+        (Value::Float(_) | Value::Int(_), _) => std::cmp::Ordering::Less,
+        (_, Value::Float(_) | Value::Int(_)) => std::cmp::Ordering::Greater,
         (Value::Str(_), _) => std::cmp::Ordering::Less,
         (_, Value::Str(_)) => std::cmp::Ordering::Greater,
         (Value::Bool(_), _) => std::cmp::Ordering::Less,

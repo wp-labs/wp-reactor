@@ -160,22 +160,22 @@ fn execute_match_l3_yield_expressions() {
         Expr::Number(70.0),
     );
     let matched = matched_with_values(vec![
-        Value::Number(10.0),
-        Value::Number(20.0),
-        Value::Number(30.0),
+        Value::Float(10.0),
+        Value::Float(20.0),
+        Value::Float(30.0),
     ]);
     let alert = exec.execute_match(&matched).unwrap();
 
-    assert_eq!(yield_value(&alert, "first"), Some(&Value::Number(10.0)));
-    assert_eq!(yield_value(&alert, "mvcount"), Some(&Value::Number(3.0)));
-    assert_eq!(yield_value(&alert, "p50"), Some(&Value::Number(20.0)));
+    assert_eq!(yield_value(&alert, "first"), Some(&Value::Float(10.0)));
+    assert_eq!(yield_value(&alert, "mvcount"), Some(&Value::Float(3.0)));
+    assert_eq!(yield_value(&alert, "p50"), Some(&Value::Float(20.0)));
     // sum(fail) 走 step measure（collected_values.len() = 3）
-    assert_eq!(yield_value(&alert, "agg_sum"), Some(&Value::Number(3.0)));
+    assert_eq!(yield_value(&alert, "agg_sum"), Some(&Value::Float(3.0)));
     assert_eq!(
         yield_value(&alert, "joined"),
         Some(&Value::Str("10,20,30".into()))
     );
-    assert_eq!(yield_value(&alert, "sys_score"), Some(&Value::Number(70.0)));
+    assert_eq!(yield_value(&alert, "sys_score"), Some(&Value::Float(70.0)));
     let Some(Value::Str(wfu)) = yield_value(&alert, "wfu") else {
         panic!("wfu yield expected string");
     };
@@ -265,9 +265,9 @@ fn execute_match_yield_let_derived_l3_value_is_not_empty() {
     let exec = RuleExecutor::new(plan);
 
     let matched = matched_with_values(vec![
-        Value::Number(10.0),
-        Value::Number(20.0),
-        Value::Number(30.0),
+        Value::Float(10.0),
+        Value::Float(20.0),
+        Value::Float(30.0),
     ]);
     let alert = exec.execute_match(&matched).unwrap();
 
@@ -306,9 +306,9 @@ fn execute_match_yield_let_derived_l3_list_value_is_not_empty() {
     let exec = RuleExecutor::new(plan);
 
     let matched = matched_with_values(vec![
-        Value::Number(10.0),
-        Value::Number(20.0),
-        Value::Number(30.0),
+        Value::Float(10.0),
+        Value::Float(20.0),
+        Value::Float(30.0),
     ]);
     let alert = exec.execute_match(&matched).unwrap();
 

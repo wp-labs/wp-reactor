@@ -50,7 +50,7 @@ fn str_val(s: &str) -> Value {
 }
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn l3(expr: &Expr, ctx: &Event, meta: YieldMeta) -> Option<Value> {
@@ -92,7 +92,7 @@ fn wfu_meta_fields_resolve_every_variant() {
     for (field, expected) in [
         (WfuMetaField::Id, Value::Str("wx".into())),
         (WfuMetaField::RuleName, Value::Str("r".into())),
-        (WfuMetaField::Score, Value::Number(88.0)),
+        (WfuMetaField::Score, Value::Float(88.0)),
         (WfuMetaField::EntityType, Value::Str("ip".into())),
         (WfuMetaField::EntityId, Value::Str("1.2.3.4".into())),
         (WfuMetaField::Origin, Value::Str("event".into())),

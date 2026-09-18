@@ -426,7 +426,7 @@ pub fn eval_guard_columnar(expr: &Expr, view: &ColumnarBatch<'_>) -> BooleanArra
 pub(crate) fn cscalar_to_value(s: &CScalar) -> Value {
     match s {
         CScalar::Int(i) => Value::Int(*i),
-        CScalar::Float(f) => Value::Number(*f),
+        CScalar::Float(f) => Value::Float(*f),
         CScalar::Str(s) => Value::Str(s.clone()),
         CScalar::Bool(b) => Value::Bool(*b),
         CScalar::Structured => Value::Array(Vec::new()),

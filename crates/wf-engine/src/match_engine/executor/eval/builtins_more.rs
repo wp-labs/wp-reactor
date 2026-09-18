@@ -50,7 +50,7 @@ fn str_val(s: &str) -> Value {
 }
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn l3_ctx(expr: &Expr, ctx: &Event) -> Option<Value> {

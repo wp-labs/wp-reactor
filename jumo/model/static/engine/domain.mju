@@ -502,7 +502,7 @@ struct Event {
 }
 
 state Value {
-  Number
+  Float
   Int
   Str
   Bool

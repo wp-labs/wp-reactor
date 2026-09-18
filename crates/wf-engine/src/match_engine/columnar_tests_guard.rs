@@ -415,7 +415,7 @@ fn list_index_json_numeric_and_bool_elements() {
         ],
         vec![Some(1); 3],
     );
-    // Number elements compare as f64 (interpreted `Value::Number`).
+    // Number elements compare as f64 (interpreted `Value::Float`).
     let expr = bin(BinOp::Eq, tags_index(0), num(5.0));
     assert_equiv(&expr, &batch);
     let expr = bin(BinOp::Gt, tags_index(0), num(4.0));
@@ -619,7 +619,7 @@ fn list_index_bool_logic_and_negation() {
     .unwrap();
     // Bool elements flow through the three-valued `&&` (bool_at over a
     // heterogeneous cell); non-bool elements read null, exactly like
-    // `Value::Bool` vs `Value::Number` in the interpreted evaluator.
+    // `Value::Bool` vs `Value::Float` in the interpreted evaluator.
     let expr = bin(BinOp::And, tags_index(0), field("flag"));
     assert!(wf_lang::columnar::expr_is_columnar(&expr));
     assert_equiv(&expr, &batch);

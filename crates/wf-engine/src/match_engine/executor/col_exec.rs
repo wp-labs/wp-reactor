@@ -264,7 +264,7 @@ impl RuleExecutor {
             .fields
             .iter()
             .map(|field| match &field.value {
-                Expr::Number(n) => YieldKind::Lit(Value::Number(*n)),
+                Expr::Number(n) => YieldKind::Lit(Value::Float(*n)),
                 Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
                 Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
                 // list-index 字段（`c.tags[0]`，gap-5 2026-09-02）：Field 快
@@ -480,7 +480,7 @@ impl RuleExecutor {
                 match &prepared.score_cvec {
                     Some(cvec) => match cvec.scalar_at(event.row()) {
                         Some(s) => match cscalar_to_value(&s) {
-                            Value::Number(n) => Some(n.clamp(0.0, 100.0)),
+                            Value::Float(n) => Some(n.clamp(0.0, 100.0)),
                             Value::Int(i) => Some((i as f64).clamp(0.0, 100.0)),
                             _ => None,
                         },
@@ -826,7 +826,7 @@ impl RuleExecutor {
             .fields
             .iter()
             .map(|field| match &field.value {
-                Expr::Number(n) => YieldKind::Lit(Value::Number(*n)),
+                Expr::Number(n) => YieldKind::Lit(Value::Float(*n)),
                 Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
                 Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
                 Expr::Field(_) => YieldKind::Field,

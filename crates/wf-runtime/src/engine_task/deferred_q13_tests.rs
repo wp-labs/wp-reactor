@@ -46,13 +46,13 @@ async fn q13_dual_chain_intermediate_window_pressure() {
     pw.load(vec![
         {
             let mut m = HashMap::new();
-            m.insert("key".to_string(), Value::Number(1.0));
+            m.insert("key".to_string(), Value::Float(1.0));
             m.insert("value".to_string(), Value::Str("v1".into()));
             m
         },
         {
             let mut m = HashMap::new();
-            m.insert("key".to_string(), Value::Number(2.0));
+            m.insert("key".to_string(), Value::Float(2.0));
             m.insert("value".to_string(), Value::Str("v2".into()));
             m
         },
@@ -260,13 +260,13 @@ async fn q13_dual_chain_sharded_push_consumption_complete() {
     pw.load(vec![
         {
             let mut m = HashMap::new();
-            m.insert("key".to_string(), Value::Number(1.0));
+            m.insert("key".to_string(), Value::Float(1.0));
             m.insert("value".to_string(), Value::Str("v1".into()));
             m
         },
         {
             let mut m = HashMap::new();
-            m.insert("key".to_string(), Value::Number(2.0));
+            m.insert("key".to_string(), Value::Float(2.0));
             m.insert("value".to_string(), Value::Str("v2".into()));
             m
         },

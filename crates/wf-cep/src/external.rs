@@ -113,10 +113,10 @@ mod tests {
     fn mock_handler_returns_bool_and_number() {
         let mut results = std::collections::HashMap::new();
         results.insert("bf".to_string(), Some(Value::Bool(false)));
-        results.insert("score".to_string(), Some(Value::Number(0.85)));
+        results.insert("score".to_string(), Some(Value::Float(0.85)));
         let handler = MockHandler { results };
 
         assert_eq!(handler.call("bf", &[]), Some(Value::Bool(false)));
-        assert_eq!(handler.call("score", &[]), Some(Value::Number(0.85)));
+        assert_eq!(handler.call("score", &[]), Some(Value::Float(0.85)));
     }
 }

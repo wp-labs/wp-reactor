@@ -186,7 +186,7 @@ fn sample_output_record() -> OutputRecord {
         matched_rows: Vec::new(),
         summary: Arc::from("r4"),
         yield_target: Arc::from("out"),
-        yield_fields: vec![("count".into(), Value::Number(3.0))],
+        yield_fields: vec![("count".into(), Value::Float(3.0))],
         yield_field_types: Arc::from([]),
         event_time_nanos: 0,
         machine_id: Arc::from(""),

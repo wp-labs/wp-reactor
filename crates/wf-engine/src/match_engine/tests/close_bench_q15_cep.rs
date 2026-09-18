@@ -11,7 +11,7 @@ use super::*;
 
 fn v_f64(v: Option<Value>) -> f64 {
     match v {
-        Some(Value::Number(n)) => n,
+        Some(Value::Float(n)) => n,
         _ => 0.0,
     }
 }

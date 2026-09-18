@@ -1028,9 +1028,9 @@ fn execute_deferred_join_empty_and_missing_paths() {
 // ---------------------------------------------------------------------------
 
 /// 构造 2 行 auction 驱动批：id / dateTime / expires / category（均 i64）。
-/// 经 `extract_field_value` → Value::Number(f64)，与 `batch_to_events` 同转换。
+/// 经 `extract_field_value` → Value::Float(f64)，与 `batch_to_events` 同转换。
 /// 区间界（裸时间字段引用）在**列式**源上必须精确：epoch-ns 超出 f64 精确整数范围
-/// （2^53≈9.0e15），经 `Value::Number(f64)` 往返会把界量化到 ~256ns，使"真值相等或相差
+/// （2^53≈9.0e15），经 `Value::Float(f64)` 往返会把界量化到 ~256ns，使"真值相等或相差
 /// <128ns"的 `>=`/`<` 随机翻转（同刻跨流配对实测丢约一半，症状是静默的"规则偶尔不触发"）。
 /// 回归：用**非 256 对齐**的纳秒值（对齐值恰好可精确表示，测不出差异）。
 #[test]
@@ -1080,7 +1080,7 @@ fn eval_interval_bound_is_exact_on_columnar_epoch_nanos() {
 
 /// 回归（同刻配对）：右行 ts **等于**区间下界时，deferred 求值必须命中。
 ///
-/// 下界来自裸时间字段（`a.dateTime`，列式源）——修复前它经 `Value::Number(f64)` 被量化到
+/// 下界来自裸时间字段（`a.dateTime`，列式源）——修复前它经 `Value::Float(f64)` 被量化到
 /// ~256ns（epoch-ns ≈1.77e18 超出 f64 精确整数范围 2^53），约一半时间戳会让 `row_ts >= lo`
 /// 不成立而丢掉配对，症状是**静默**的"规则偶尔不触发"（实测 wfgen 侧 200 对同刻丢 98 对）。
 #[test]

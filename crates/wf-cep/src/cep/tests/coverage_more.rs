@@ -35,7 +35,7 @@ fn event(fields: Vec<(&str, Value)>) -> Event {
 }
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn str_val(s: &str) -> Value {

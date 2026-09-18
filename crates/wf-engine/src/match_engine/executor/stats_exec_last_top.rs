@@ -6,7 +6,7 @@
 
 use super::*;
 
-/// 行式 fixture（手写 `HashMap`，整值为 `Number`）与列式路径（`Int64` 列 → `Value::Int`）
+/// 行式 fixture（手写 `HashMap`，整值为 `Float`）与列式路径（`Int64` 列 → `Value::Int`）
 /// 携带的是**同一逻辑值**（导出类型也一致：`|v| < 2^53` → Float）。逐元素按语义比较，
 /// null-ness 仍严格。
 fn assert_row_fields_equivalent(rv: &[Option<Value>], cv: &[Option<Value>], ctx: &str) {
@@ -532,15 +532,15 @@ fn stats_top_precheck_random_stream_matches_reference() {
     let mut reference: HashMap<u64, Vec<(f64, f64, usize)>> = HashMap::new();
     for (i, r) in rows.iter().enumerate() {
         let auction = match r.get("auction") {
-            Some(Value::Number(n)) => *n as u64,
+            Some(Value::Float(n)) => *n as u64,
             _ => unreachable!(),
         };
         let price = match r.get("price") {
-            Some(Value::Number(n)) => *n,
+            Some(Value::Float(n)) => *n,
             _ => unreachable!(),
         };
         let bidder = match r.get("bidder") {
-            Some(Value::Number(n)) => *n,
+            Some(Value::Float(n)) => *n,
             _ => unreachable!(),
         };
         reference

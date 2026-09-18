@@ -58,9 +58,9 @@ pub(super) fn eval_func_sha1_n(
         Value::Str(s) => s,
         _ => return None,
     };
-    // 数值内置函数是 f64 域：`Value::Int` 经 `i as f64` 归一，走与 `Number` 相同路径。
+    // 数值内置函数是 f64 域：`Value::Int` 经 `i as f64` 归一，走与 `Float` 相同路径。
     let len = match eval_expr_ext(&args[1], event, windows, baselines)? {
-        Value::Number(n) if n.is_finite() && n.fract() == 0.0 => n as usize,
+        Value::Float(n) if n.is_finite() && n.fract() == 0.0 => n as usize,
         Value::Int(i) => i as usize,
         _ => return None,
     };
@@ -163,9 +163,7 @@ pub(super) fn eval_func_now_s(
     if !args.is_empty() {
         return None;
     }
-    Some(Value::Number(
-        (current_time_nanos()? / 1_000_000_000) as f64,
-    ))
+    Some(Value::Float((current_time_nanos()? / 1_000_000_000) as f64))
 }
 pub(super) fn eval_func_now_us(
     args: &[Expr],
@@ -176,7 +174,7 @@ pub(super) fn eval_func_now_us(
     if !args.is_empty() {
         return None;
     }
-    Some(Value::Number((current_time_nanos()? / 1_000) as f64))
+    Some(Value::Float((current_time_nanos()? / 1_000) as f64))
 }
 pub(super) fn eval_func_now_ns(
     args: &[Expr],
@@ -187,7 +185,7 @@ pub(super) fn eval_func_now_ns(
     if !args.is_empty() {
         return None;
     }
-    Some(Value::Number(current_time_nanos()? as f64))
+    Some(Value::Float(current_time_nanos()? as f64))
 }
 pub(super) fn eval_func_strftime(
     args: &[Expr],
@@ -199,7 +197,7 @@ pub(super) fn eval_func_strftime(
         return None;
     }
     let ts_nanos = match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Float(n) => normalize_epoch_timestamp_float_nanos(n)?,
         Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
@@ -284,16 +282,16 @@ pub(super) fn eval_func_time_diff(
         return None;
     }
     let t1 = match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Float(n) => normalize_epoch_timestamp_float_nanos(n)?,
         Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let t2 = match eval_expr_ext(&args[1], event, windows, baselines)? {
-        Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Float(n) => normalize_epoch_timestamp_float_nanos(n)?,
         Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
-    Some(Value::Number((t1 - t2).abs() as f64 / 1_000_000_000.0))
+    Some(Value::Float((t1 - t2).abs() as f64 / 1_000_000_000.0))
 }
 pub(super) fn eval_func_time_bucket(
     args: &[Expr],
@@ -305,12 +303,12 @@ pub(super) fn eval_func_time_bucket(
         return None;
     }
     let t = match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Float(n) => normalize_epoch_timestamp_float_nanos(n)?,
         Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let interval = match eval_expr_ext(&args[1], event, windows, baselines)? {
-        Value::Number(n) => n,
+        Value::Float(n) => n,
         Value::Int(i) => i as f64,
         _ => return None,
     };
@@ -330,12 +328,12 @@ pub(super) fn eval_func_bucket_end(
         return None;
     }
     let t = match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Float(n) => normalize_epoch_timestamp_float_nanos(n)?,
         Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let interval = match eval_expr_ext(&args[1], event, windows, baselines)? {
-        Value::Number(n) => n,
+        Value::Float(n) => n,
         Value::Int(i) => i as f64,
         _ => return None,
     };
@@ -357,17 +355,17 @@ pub(super) fn eval_func_phase_bucket(
         return None;
     }
     let t = match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+        Value::Float(n) => normalize_epoch_timestamp_float_nanos(n)?,
         Value::Int(i) => normalize_epoch_timestamp_int_nanos(i)?,
         _ => return None,
     };
     let period = match eval_expr_ext(&args[1], event, windows, baselines)? {
-        Value::Number(n) => positive_interval_seconds_to_nanos(n)?,
+        Value::Float(n) => positive_interval_seconds_to_nanos(n)?,
         Value::Int(i) => positive_interval_seconds_to_nanos(i as f64)?,
         _ => return None,
     };
     let bucket = match eval_expr_ext(&args[2], event, windows, baselines)? {
-        Value::Number(n) => positive_interval_seconds_to_nanos(n)?,
+        Value::Float(n) => positive_interval_seconds_to_nanos(n)?,
         Value::Int(i) => positive_interval_seconds_to_nanos(i as f64)?,
         _ => return None,
     };
@@ -379,7 +377,7 @@ pub(super) fn eval_func_phase_bucket(
     } else {
         (t as u64 % period as u64) / bucket as u64
     };
-    Some(Value::Number(idx as f64))
+    Some(Value::Float(idx as f64))
 }
 /// L3 集合/统计函数（`collect_set` / `collect_list` / `first` / `last` / `stddev` /
 /// `percentile`）在 CEP 侧逐事件求值中的**占位**：这些函数需要 instance 的收集

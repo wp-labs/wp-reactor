@@ -174,7 +174,7 @@ pub(super) fn get_step_label(ctx: &dyn FieldSource, step_idx: usize) -> Option<S
 pub(super) fn get_step_measure(ctx: &dyn FieldSource, step_idx: usize) -> Option<f64> {
     let field_name = format!("_step_{}_measure", step_idx);
     match ctx.field_value(&field_name) {
-        Some(Value::Number(n)) => Some(n),
+        Some(Value::Float(n)) => Some(n),
         _ => None,
     }
 }
@@ -190,7 +190,7 @@ pub(super) fn get_step_stage(ctx: &dyn FieldSource, step_idx: usize) -> Option<S
 pub(super) fn get_bind_count(ctx: &dyn FieldSource, alias: &str) -> Option<f64> {
     let field_name = format!("_bind_{}_count", alias);
     match ctx.field_value(&field_name) {
-        Some(Value::Number(n)) => Some(n),
+        Some(Value::Float(n)) => Some(n),
         _ => None,
     }
 }

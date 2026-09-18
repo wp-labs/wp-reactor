@@ -74,10 +74,10 @@ fn conv_measures(out: &[CloseOutput]) -> Vec<f64> {
 fn conv_sort_preserves_values_and_stable_order() {
     let keys = vec![wf_lang::ast::FieldRef::Simple("auction".into())];
     let outputs = vec![
-        conv_close("m", 30.0, vec![Value::Number(3.0)]),
-        conv_close("m", 10.0, vec![Value::Number(1.0)]),
-        conv_close("m", 20.0, vec![Value::Number(2.0)]),
-        conv_close("m", 10.0, vec![Value::Number(9.0)]), // 与第 2 个同键 → 稳定序
+        conv_close("m", 30.0, vec![Value::Float(3.0)]),
+        conv_close("m", 10.0, vec![Value::Float(1.0)]),
+        conv_close("m", 20.0, vec![Value::Float(2.0)]),
+        conv_close("m", 10.0, vec![Value::Float(9.0)]), // 与第 2 个同键 → 稳定序
     ];
     // 降序：30 > 20 > 10 == 10（稳定序：auction 1 在 auction 9 前）
     let sorted = apply_conv(&conv_sort_plan(true), &keys, outputs.clone());
@@ -85,7 +85,7 @@ fn conv_sort_preserves_values_and_stable_order() {
     let scope_keys: Vec<f64> = sorted
         .iter()
         .map(|o| match &o.scope_key[0] {
-            Value::Number(n) => *n,
+            Value::Float(n) => *n,
             _ => 0.0,
         })
         .collect();
@@ -155,7 +155,7 @@ fn make_event(fields: Vec<(&str, Value)>) -> Event {
 fn extract_event_str() {
     let e = make_event(vec![
         ("sip", Value::Str("10.0.0.1".into())),
-        ("n", Value::Number(5.0)),
+        ("n", Value::Float(5.0)),
         ("flag", Value::Bool(true)),
     ]);
     assert_eq!(CepStateMachine::extract_event_str(&e, "sip"), "10.0.0.1");

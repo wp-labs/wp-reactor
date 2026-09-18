@@ -114,7 +114,7 @@ fn rows_from_events(events: &[Event]) -> Vec<HashMap<String, Value>> {
 fn rows_to_batch(rows: &[HashMap<String, Value>]) -> RecordBatch {
     fn i64_of(row: &HashMap<String, Value>, name: &str) -> Option<i64> {
         match row.get(name) {
-            Some(Value::Number(n)) => Some(*n as i64),
+            Some(Value::Float(n)) => Some(*n as i64),
             _ => None,
         }
     }
@@ -336,16 +336,16 @@ fn q15_stats_executor_profile() {
     let start = Instant::now();
     for row in &rows {
         let price = match row.get("price") {
-            Some(Value::Number(p)) => *p,
+            Some(Value::Float(p)) => *p,
             _ => 0.0,
         };
         let tier = price_tier(price);
         let b = DistinctKey::from_f64(match row.get("bidder") {
-            Some(Value::Number(n)) => *n,
+            Some(Value::Float(n)) => *n,
             _ => 0.0,
         });
         let a = DistinctKey::from_f64(match row.get("auction") {
-            Some(Value::Number(n)) => *n,
+            Some(Value::Float(n)) => *n,
             _ => 0.0,
         });
         for (idx, key) in [(0usize, &b), (1 + tier, &b), (4, &a), (5 + tier, &a)] {

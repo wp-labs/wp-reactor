@@ -497,18 +497,16 @@ pub(super) fn check_threshold(agg: &AggPlan, bs: &BranchState) -> bool {
 /// Ordering for Value (used by min/max on orderable fields).
 /// Number/Int < Str < Bool < Array < Object for cross-type (shouldn't happen in practice).
 ///
-/// 数值域统一：`Int` 与 `Number` 同序（`|i| < 2^53` 时同一逻辑值）；`Int` 对 `Int`
+/// 数值域统一：`Int` 与 `Float` 同序（`|i| < 2^53` 时同一逻辑值）；`Int` 对 `Int`
 /// 走精确整数比较（见 [`Value::Int`] 文档）。
 fn value_ordering(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => {
-            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-        }
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Int(x), Value::Number(y)) => (*x as f64)
+        (Value::Int(x), Value::Float(y)) => (*x as f64)
             .partial_cmp(y)
             .unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Number(x), Value::Int(y)) => x
+        (Value::Float(x), Value::Int(y)) => x
             .partial_cmp(&(*y as f64))
             .unwrap_or(std::cmp::Ordering::Equal),
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
@@ -516,8 +514,8 @@ fn value_ordering(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Array(x), Value::Array(y)) => x.len().cmp(&y.len()),
         (Value::Object(x), Value::Object(y)) => x.len().cmp(&y.len()),
         // Cross-type: Number/Int < Str < Bool < Array < Object
-        (Value::Number(_) | Value::Int(_), _) => std::cmp::Ordering::Less,
-        (_, Value::Number(_) | Value::Int(_)) => std::cmp::Ordering::Greater,
+        (Value::Float(_) | Value::Int(_), _) => std::cmp::Ordering::Less,
+        (_, Value::Float(_) | Value::Int(_)) => std::cmp::Ordering::Greater,
         (Value::Str(_), _) => std::cmp::Ordering::Less,
         (_, Value::Str(_)) => std::cmp::Ordering::Greater,
         (Value::Bool(_), _) => std::cmp::Ordering::Less,
@@ -534,8 +532,8 @@ fn compare_value_threshold(cmp: CmpOp, val: &Value, threshold: &Value) -> bool {
     let same_type = matches!(
         (val, threshold),
         (
-            Value::Number(_) | Value::Int(_),
-            Value::Number(_) | Value::Int(_)
+            Value::Float(_) | Value::Int(_),
+            Value::Float(_) | Value::Int(_)
         ) | (Value::Str(_), Value::Str(_))
             | (Value::Bool(_), Value::Bool(_))
     );
@@ -563,7 +561,7 @@ mod tests {
 
     fn event_with(field: &str, value: i64) -> Event {
         let mut fields = EngineHashMap::default();
-        fields.insert(field.to_string().into(), Value::Number(value as f64));
+        fields.insert(field.to_string().into(), Value::Float(value as f64));
         Event { fields }
     }
 
@@ -584,7 +582,7 @@ mod tests {
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         // The retained window is the most recent entries; `.last()` is the latest event,
         // which is what yield field resolution (`e.dip`) reads.
-        assert_eq!(values.back(), Some(&Value::Number((over - 1) as f64)));
+        assert_eq!(values.back(), Some(&Value::Float((over - 1) as f64)));
         // count tracks every event regardless of the value cap.
         assert_eq!(state.count, over as u64);
     }
@@ -604,8 +602,8 @@ mod tests {
             .and_then(|m| m.get("event_id"))
             .expect("event_id collected");
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
-        assert!(!values.contains(&Value::Number(0.0)));
-        assert_eq!(values.back(), Some(&Value::Number((over - 1) as f64)));
+        assert!(!values.contains(&Value::Float(0.0)));
+        assert_eq!(values.back(), Some(&Value::Float((over - 1) as f64)));
         assert_eq!(state.count, over as u64);
     }
 
@@ -633,7 +631,7 @@ mod tests {
             .expect("dport collected");
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         // `.last()` — the value yield field resolution reads — stays correct.
-        assert_eq!(values.back(), Some(&Value::Number((over - 1) as f64)));
+        assert_eq!(values.back(), Some(&Value::Float((over - 1) as f64)));
     }
 
     #[test]
@@ -655,8 +653,8 @@ mod tests {
         let values = series.get("dport").expect("dport series");
         // `[首值] ++ 最近 MAX 个`：长度上界 1025，首值 / 尾值均正确。
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES + 1);
-        assert_eq!(values.first(), Some(&Value::Number(0.0)));
-        assert_eq!(values.last(), Some(&Value::Number((over - 1) as f64)));
+        assert_eq!(values.first(), Some(&Value::Float(0.0)));
+        assert_eq!(values.last(), Some(&Value::Float((over - 1) as f64)));
         // 原始环形队列仍只保留最近 MAX 个（内存上界不变）。
         assert_eq!(
             bs.field_values
@@ -678,8 +676,8 @@ mod tests {
         let series = state.field_series();
         let values = series.get("event_id").expect("event_id series");
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES + 1);
-        assert_eq!(values.first(), Some(&Value::Number(0.0)));
-        assert_eq!(values.last(), Some(&Value::Number(over as f64 - 1.0)));
+        assert_eq!(values.first(), Some(&Value::Float(0.0)));
+        assert_eq!(values.last(), Some(&Value::Float(over as f64 - 1.0)));
         // count 不受钉扎影响。
         assert_eq!(state.count, over as u64);
     }
@@ -689,20 +687,20 @@ mod tests {
         // 未裁剪 → 无钉扎槽，序列与历史逐位一致（无额外首值 / 无重复）。
         let mut bs = BranchState::new();
         for i in 0..3i64 {
-            bs.push_field_value("dport", Value::Number(i as f64));
-            bs.push_collected(Value::Number(i as f64));
+            bs.push_field_value("dport", Value::Float(i as f64));
+            bs.push_collected(Value::Float(i as f64));
         }
 
         assert!(bs.pinned_first.is_none());
         assert_eq!(
             bs.field_series().get("dport").cloned(),
-            Some(vec![0.0, 1.0, 2.0].into_iter().map(Value::Number).collect())
+            Some(vec![0.0, 1.0, 2.0].into_iter().map(Value::Float).collect())
         );
         assert_eq!(
             bs.collected_series(),
             vec![0.0, 1.0, 2.0]
                 .into_iter()
-                .map(Value::Number)
+                .map(Value::Float)
                 .collect::<Vec<_>>()
         );
     }
@@ -712,13 +710,13 @@ mod tests {
         let mut bs = BranchState::new();
         let over = MAX_TRACKED_FIELD_VALUES + 1;
         for i in 0..over as i64 {
-            bs.push_collected(Value::Number(i as f64));
+            bs.push_collected(Value::Float(i as f64));
         }
 
         let series = bs.collected_series();
         assert_eq!(series.len(), MAX_TRACKED_FIELD_VALUES + 1);
-        assert_eq!(series.first(), Some(&Value::Number(0.0)));
-        assert_eq!(series.last(), Some(&Value::Number(over as f64 - 1.0)));
+        assert_eq!(series.first(), Some(&Value::Float(0.0)));
+        assert_eq!(series.last(), Some(&Value::Float(over as f64 - 1.0)));
     }
 
     #[test]
@@ -726,12 +724,12 @@ mod tests {
         // 首次裁剪记录首值后，后续裁剪丢弃的值更晚，不得覆盖。
         let mut bs = BranchState::new();
         for i in 0..(MAX_TRACKED_FIELD_VALUES * 3) as i64 {
-            bs.push_collected(Value::Number(i as f64));
+            bs.push_collected(Value::Float(i as f64));
         }
 
         assert_eq!(
             bs.collected_series().first(),
-            Some(&Value::Number(0.0)),
+            Some(&Value::Float(0.0)),
             "首值必须始终是最早样本"
         );
     }
@@ -741,7 +739,7 @@ mod tests {
         let mut state = AliasState::new();
         let mut fields = EngineHashMap::default();
         fields.insert("sip".into(), Value::Str("10.0.0.1".into()));
-        fields.insert("dport".into(), Value::Number(443.0));
+        fields.insert("dport".into(), Value::Float(443.0));
         let event = Event { fields };
         let tracked = HashSet::from(["sip".to_string()]);
 
@@ -767,8 +765,8 @@ mod tests {
         let mut bs = BranchState::new();
         let mut fields = EngineHashMap::default();
         fields.insert("sip".into(), Value::Str("10.0.0.1".into()));
-        fields.insert("dport".into(), Value::Number(443.0));
-        fields.insert("bytes".into(), Value::Number(100.0));
+        fields.insert("dport".into(), Value::Float(443.0));
+        fields.insert("bytes".into(), Value::Float(100.0));
         let event = Event { fields };
         let tracked = HashSet::from(["sip".to_string()]);
         let branch_field = FieldSelector::Dot("dport".to_string());
@@ -803,7 +801,7 @@ mod tests {
         let mut bs = BranchState::new();
         let mut fields = EngineHashMap::default();
         fields.insert("sip".into(), Value::Str("10.0.0.1".into()));
-        fields.insert("dport".into(), Value::Number(443.0));
+        fields.insert("dport".into(), Value::Float(443.0));
         let event = Event { fields };
         let tracked_alias_fields = HashSet::from(["sip".to_string()]);
         let tracked_plain_fields = HashSet::from(["dport".to_string()]);
@@ -833,11 +831,11 @@ mod tests {
         let mut bs = BranchState::new();
         let over = MAX_TRACKED_FIELD_VALUES * 5;
         for i in 0..over as i64 {
-            update_measure(&Measure::Count, &Some(Value::Number(i as f64)), &mut bs);
+            update_measure(&Measure::Count, &Some(Value::Float(i as f64)), &mut bs);
             // F9：collected_values 收集移到调用方（gate = needs_field_history），
             // update_measure 自身不再收集——测试补 push 以保持对 cap 的断言。
             // 走 `push_collected`（而非裸 `push_capped`）以免演示绕过首值钉扎的写法。
-            bs.push_collected(Value::Number(i as f64));
+            bs.push_collected(Value::Float(i as f64));
         }
 
         assert_eq!(
@@ -846,14 +844,14 @@ mod tests {
         );
         assert_eq!(
             bs.collected_values.as_deref().and_then(|v| v.back()),
-            Some(&Value::Number((over - 1) as f64))
+            Some(&Value::Float((over - 1) as f64))
         );
         // Threshold accumulators still see every event; only the raw value list is capped.
         assert_eq!(bs.count, over as u64);
         // 裁剪丢弃的首值已被钉扎（同一序列的 first 语义来源）。
         assert_eq!(
             bs.collected_series().first(),
-            Some(&Value::Number(0.0)),
+            Some(&Value::Float(0.0)),
             "collected_values 裁剪后的首项必须是钉扎的最早样本"
         );
     }
@@ -865,28 +863,28 @@ mod tests {
         let mut values: VecDeque<Value> = VecDeque::new();
         for i in 0..MAX_TRACKED_FIELD_VALUES as i64 {
             assert_eq!(
-                push_capped(&mut values, Value::Number(i as f64)),
+                push_capped(&mut values, Value::Float(i as f64)),
                 None,
                 "上限内不得报告丢弃（第 {i} 次）"
             );
         }
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         assert_eq!(
-            push_capped(&mut values, Value::Number(MAX_TRACKED_FIELD_VALUES as f64)),
-            Some(Value::Number(0.0)),
+            push_capped(&mut values, Value::Float(MAX_TRACKED_FIELD_VALUES as f64)),
+            Some(Value::Float(0.0)),
             "首次裁剪报告最早样本"
         );
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         assert_eq!(
             values.back(),
-            Some(&Value::Number(MAX_TRACKED_FIELD_VALUES as f64))
+            Some(&Value::Float(MAX_TRACKED_FIELD_VALUES as f64))
         );
         assert_eq!(
             push_capped(
                 &mut values,
-                Value::Number(MAX_TRACKED_FIELD_VALUES as f64 + 1.0)
+                Value::Float(MAX_TRACKED_FIELD_VALUES as f64 + 1.0)
             ),
-            Some(Value::Number(1.0)),
+            Some(Value::Float(1.0)),
             "后续裁剪逐次报告当时的首项"
         );
     }
@@ -898,7 +896,7 @@ mod tests {
         let mut state = AliasState::new();
         let over = MAX_TRACKED_FIELD_VALUES * 2 + 7;
         for i in 0..over as i64 {
-            state.push_field_value("event_id", Value::Number(i as f64));
+            state.push_field_value("event_id", Value::Float(i as f64));
             if i < 3 {
                 state.push_field_value("rare", Value::Str(format!("rare-{i}").into()));
             }
@@ -907,8 +905,8 @@ mod tests {
         let series = state.field_series();
         let dense = series.get("event_id").expect("event_id series");
         assert_eq!(dense.len(), MAX_TRACKED_FIELD_VALUES + 1);
-        assert_eq!(dense.first(), Some(&Value::Number(0.0)));
-        assert_eq!(dense.last(), Some(&Value::Number((over - 1) as f64)));
+        assert_eq!(dense.first(), Some(&Value::Float(0.0)));
+        assert_eq!(dense.last(), Some(&Value::Float((over - 1) as f64)));
 
         let rare = series.get("rare").expect("rare series");
         assert_eq!(
@@ -935,7 +933,7 @@ mod tests {
 
         assert!(apply_transforms(
             &[Transform::Distinct],
-            &Some(Value::Number(1.0)),
+            &Some(Value::Float(1.0)),
             &mut bs
         ));
         assert!(apply_transforms(
@@ -945,7 +943,7 @@ mod tests {
         ));
         assert!(!apply_transforms(
             &[Transform::Distinct],
-            &Some(Value::Number(1.0)),
+            &Some(Value::Float(1.0)),
             &mut bs
         ));
     }
@@ -956,22 +954,22 @@ mod tests {
 
         assert!(apply_transforms(
             &[Transform::Distinct],
-            &Some(Value::Number(-0.0)),
+            &Some(Value::Float(-0.0)),
             &mut bs
         ));
         assert!(!apply_transforms(
             &[Transform::Distinct],
-            &Some(Value::Number(0.0)),
+            &Some(Value::Float(0.0)),
             &mut bs
         ));
         assert!(apply_transforms(
             &[Transform::Distinct],
-            &Some(Value::Number(f64::NAN)),
+            &Some(Value::Float(f64::NAN)),
             &mut bs
         ));
         assert!(!apply_transforms(
             &[Transform::Distinct],
-            &Some(Value::Number(f64::from_bits(0x7ff8_0000_0000_0001))),
+            &Some(Value::Float(f64::from_bits(0x7ff8_0000_0000_0001))),
             &mut bs
         ));
     }

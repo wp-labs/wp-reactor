@@ -100,7 +100,7 @@ pub(super) fn eval_func_indexof(
         _ => return None,
     };
     let idx = text.find(needle.as_str()).map(|x| x as f64).unwrap_or(-1.0);
-    Some(Value::Number(idx))
+    Some(Value::Float(idx))
 }
 pub(super) fn eval_func_replace_plain(
     args: &[Expr],

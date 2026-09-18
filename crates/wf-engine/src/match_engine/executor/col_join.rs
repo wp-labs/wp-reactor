@@ -140,7 +140,7 @@ impl RuleExecutor {
             .fields
             .iter()
             .map(|field| match &field.value {
-                Expr::Number(n) => YieldKind::Lit(Value::Number(*n)),
+                Expr::Number(n) => YieldKind::Lit(Value::Float(*n)),
                 Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
                 Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
                 Expr::Field(_) => YieldKind::Field,
@@ -279,7 +279,7 @@ impl RuleExecutor {
         };
         // entity 列直读（2026-08-26 移植无 join 列式路径的 `EntityCol`）：
         // q13b 的 `entity(digit, m.bidder)` 是 Left Int64——原实现每行走
-        // `event.value_at` → `Value::Number(f64)` → `value_to_string`（SmolStr
+        // `event.value_at` → `Value::Float(f64)` → `value_to_string`（SmolStr
         // + 浮点 format，27.6M 行的 per-row 分配 churn 之一）。直读 Int64 列用
         // `write_int64_value` 直写 String（整数格式化，无 Value/SmolStr 中转）。
         let entity_col: EntityCol<'_> = match (entity_left_idx, batch0) {
@@ -417,7 +417,7 @@ impl RuleExecutor {
                                 Some(v) => {
                                     let mut b = smol_str::SmolStrBuilder::new();
                                     write_int64_value(&mut b, v);
-                                    (b.into(), Some(Value::Number(v as f64)), Some(v as f64))
+                                    (b.into(), Some(Value::Float(v as f64)), Some(v as f64))
                                 }
                                 None => (smol_str::SmolStr::new(""), None, None),
                             },
@@ -1039,14 +1039,14 @@ fn join_cmp(op: BinOp, lv: &Value, rv: &Value) -> bool {
         BinOp::Eq => values_equal(lv, rv),
         BinOp::Ne => !values_equal(lv, rv),
         BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => match (lv, rv) {
-            (Value::Number(a), Value::Number(b)) => match op {
+            (Value::Float(a), Value::Float(b)) => match op {
                 BinOp::Lt => a < b,
                 BinOp::Gt => a > b,
                 BinOp::Le => a <= b,
                 BinOp::Ge => a >= b,
                 _ => false,
             },
-            // 数值域统一：`Int` 与 `Number` 同序（混合时升 f64）。
+            // 数值域统一：`Int` 与 `Float` 同序（混合时升 f64）。
             (Value::Int(a), Value::Int(b)) => match op {
                 BinOp::Lt => a < b,
                 BinOp::Gt => a > b,
@@ -1054,7 +1054,7 @@ fn join_cmp(op: BinOp, lv: &Value, rv: &Value) -> bool {
                 BinOp::Ge => a >= b,
                 _ => false,
             },
-            (Value::Int(a), Value::Number(b)) => {
+            (Value::Int(a), Value::Float(b)) => {
                 let a = *a as f64;
                 match op {
                     BinOp::Lt => a < *b,
@@ -1064,7 +1064,7 @@ fn join_cmp(op: BinOp, lv: &Value, rv: &Value) -> bool {
                     _ => false,
                 }
             }
-            (Value::Number(a), Value::Int(b)) => {
+            (Value::Float(a), Value::Int(b)) => {
                 let b = *b as f64;
                 match op {
                     BinOp::Lt => *a < b,

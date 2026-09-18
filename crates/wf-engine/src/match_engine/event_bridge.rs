@@ -99,7 +99,7 @@ pub fn batch_event_time_nanos(batch: &RecordBatch, time_field: Option<&str>, row
 /// | Arrow Type           | → | CEP Value               |
 /// |----------------------|---|-------------------------|
 /// | Int64                | → | Value::Int(i)           |
-/// | Float64              | → | Value::Number(f)        |
+/// | Float64              | → | Value::Float(f)        |
 /// | Utf8                 | → | Value::Str(s)           |
 /// | Boolean              | → | Value::Bool(b)          |
 /// | Timestamp(Ns, _)     | → | Value::Int(ns)          |

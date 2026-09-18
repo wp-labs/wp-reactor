@@ -55,7 +55,7 @@ fn binop(op: BinOp, left: Expr, right: Expr) -> Expr {
 }
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn ctx_with(pairs: Vec<(&str, Value)>) -> Event {

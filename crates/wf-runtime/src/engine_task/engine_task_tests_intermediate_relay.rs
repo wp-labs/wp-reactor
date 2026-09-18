@@ -354,7 +354,7 @@ async fn intermediate_target_writes_window_instead_of_alert_channel() {
     );
     assert_eq!(
         rows[0].fields.get("__wfu_score"),
-        Some(&wf_engine::match_engine::Value::Number(7.0))
+        Some(&wf_engine::match_engine::Value::Float(7.0))
     );
     assert_eq!(
         rows[0].fields.get("__wfu_rule_name"),

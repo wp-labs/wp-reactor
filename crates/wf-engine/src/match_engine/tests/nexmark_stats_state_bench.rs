@@ -212,12 +212,12 @@ fn q19_close_entry(
     window_end: i64,
 ) -> CloseOutput {
     let mut field_values = EngineHashMap::default();
-    field_values.insert("auction".into(), vec![Value::Number(auction as f64)]);
-    field_values.insert("bidder".into(), vec![Value::Number(bidder as f64)]);
-    field_values.insert("price".into(), vec![Value::Number(price as f64)]);
+    field_values.insert("auction".into(), vec![Value::Float(auction as f64)]);
+    field_values.insert("bidder".into(), vec![Value::Float(bidder as f64)]);
+    field_values.insert("price".into(), vec![Value::Float(price as f64)]);
     CloseOutput {
         rule_name: rule.to_string(),
-        scope_key: vec![Value::Number(auction as f64)],
+        scope_key: vec![Value::Float(auction as f64)],
         close_reason: CloseReason::Timeout,
         event_ok: true,
         close_ok: true,

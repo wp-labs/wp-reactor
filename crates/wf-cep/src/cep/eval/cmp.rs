@@ -64,12 +64,12 @@ pub fn numeric_cmp_binop(op: BinOp, a: f64, b: f64) -> bool {
 /// 类型不匹配（标量 vs 结构化、不同标量类型）不声称相等，`Ne` 取其补（`Ne ≡ !Eq`）。
 pub fn compare_values(op: BinOp, lv: &Value, rv: &Value) -> bool {
     match (lv, rv) {
-        (Value::Number(a), Value::Number(b)) => numeric_cmp_binop(op, *a, *b),
+        (Value::Float(a), Value::Float(b)) => numeric_cmp_binop(op, *a, *b),
         // `Int` 对 `Int` 走精确整数比较（不经 f64，避免 >2^53 量化错判）。
         (Value::Int(a), Value::Int(b)) => compare_int_ints(op, *a, *b),
         // 混合数值：`Int` 升为 f64 后走同一 epsilon 路径（`|i| < 2^53` 精确）。
-        (Value::Int(a), Value::Number(b)) => numeric_cmp_binop(op, *a as f64, *b),
-        (Value::Number(a), Value::Int(b)) => numeric_cmp_binop(op, *a, *b as f64),
+        (Value::Int(a), Value::Float(b)) => numeric_cmp_binop(op, *a as f64, *b),
+        (Value::Float(a), Value::Int(b)) => numeric_cmp_binop(op, *a, *b as f64),
         (Value::Str(a), Value::Str(b)) => compare_strs(op, a, b),
         (Value::Bool(a), Value::Bool(b)) => compare_bools(op, *a, *b),
         (Value::Array(_) | Value::Object(_), Value::Array(_) | Value::Object(_)) => match op {
@@ -160,10 +160,10 @@ pub fn try_eval_expr_to_f64(expr: &Expr) -> Option<f64> {
 /// — `check_threshold` 据此判为「不满足」（分支永不触发）。
 pub fn try_eval_expr_to_value(expr: &Expr) -> Option<Value> {
     match expr {
-        Expr::Number(n) => Some(Value::Number(*n)),
+        Expr::Number(n) => Some(Value::Float(*n)),
         Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
         Expr::Bool(b) => Some(Value::Bool(*b)),
-        _ => try_eval_expr_to_f64(expr).map(Value::Number),
+        _ => try_eval_expr_to_f64(expr).map(Value::Float),
     }
 }
 
@@ -179,15 +179,13 @@ pub(super) fn normalize_index(index: i64, len: usize) -> Option<usize> {
 
 pub(super) fn compare_sortable_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => {
-            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        // 数值域统一：`Int`/`Number` 同序，避免两者都落到文本比较（`"10" < "9"`）。
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        // 数值域统一：`Int`/`Float` 同序，避免两者都落到文本比较（`"10" < "9"`）。
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Int(x), Value::Number(y)) => (*x as f64)
+        (Value::Int(x), Value::Float(y)) => (*x as f64)
             .partial_cmp(y)
             .unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Number(x), Value::Int(y)) => x
+        (Value::Float(x), Value::Int(y)) => x
             .partial_cmp(&(*y as f64))
             .unwrap_or(std::cmp::Ordering::Equal),
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
@@ -230,7 +228,7 @@ pub fn timestamp_nanos_to_utc(timestamp_nanos: i64) -> Option<DateTime<Utc>> {
 }
 
 pub(super) fn time_nanos_to_value(nanos: i64) -> Value {
-    Value::Number(epoch_nanos_to_millis(nanos) as f64)
+    Value::Float(epoch_nanos_to_millis(nanos) as f64)
 }
 
 pub(super) fn parse_time_to_timestamp_nanos(text: &str, fmt: &str) -> Option<i64> {
@@ -278,9 +276,9 @@ pub(super) fn eval_single_string_arg(
 
 pub fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Option<()> {
     let (tag, text) = match value {
-        // 稳定 ID：`Int(i)` 与整值 `Number` 必须产出同一字节流（同 tag、同文本）
+        // 稳定 ID：`Int(i)` 与整值 `Float` 必须产出同一字节流（同 tag、同文本）
         // —— `value_to_string` 对两者都渲染十进制文本。
-        Value::Number(_) | Value::Int(_) => ("n", value_to_string(value)),
+        Value::Float(_) | Value::Int(_) => ("n", value_to_string(value)),
         Value::Str(s) => ("s", s.to_string()),
         Value::Bool(_) => ("b", value_to_string(value)),
         Value::Array(_) | Value::Object(_) => return None,
@@ -320,7 +318,7 @@ mod tests {
     use wf_lang::ast::FieldRef;
 
     fn num(v: f64) -> Value {
-        Value::Number(v)
+        Value::Float(v)
     }
 
     fn strv(v: &str) -> Value {

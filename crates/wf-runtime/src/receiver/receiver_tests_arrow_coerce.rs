@@ -345,7 +345,7 @@ fn route_projects_plain_utf8_json_into_structured_window_schema() {
     let Value::Object(extension) = &events[0].fields["extension"] else {
         panic!("expected extension object");
     };
-    assert_eq!(extension.get("severity"), Some(&Value::Number(10.0)));
+    assert_eq!(extension.get("severity"), Some(&Value::Float(10.0)));
 }
 
 #[test]
@@ -398,7 +398,7 @@ fn route_projects_wrong_structured_utf8_metadata_into_target_window_schema() {
     let Value::Object(extension) = &events[0].fields["extension"] else {
         panic!("expected extension object");
     };
-    assert_eq!(extension.get("severity"), Some(&Value::Number(10.0)));
+    assert_eq!(extension.get("severity"), Some(&Value::Float(10.0)));
 }
 
 #[test]

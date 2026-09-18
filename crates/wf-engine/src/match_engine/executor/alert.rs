@@ -197,7 +197,7 @@ mod split_tests {
     #[test]
     fn build_wfx_id_split_matches_combined() {
         let rule = "q19_auction_top10_stats";
-        let scope = vec![Value::Number(42.0)];
+        let scope = vec![Value::Float(42.0)];
         let fired = "2026-08-25T00:00:00.000Z";
         let origin = AlertOrigin::Close {
             reason: CloseReason::Timeout,
@@ -208,10 +208,10 @@ mod split_tests {
             measure_value: 3.5,
             event_first_time_nanos: Some(1),
             event_last_time_nanos: Some(2),
-            collected_values: vec![Value::Number(1.0), Value::Number(2.0)],
+            collected_values: vec![Value::Float(1.0), Value::Float(2.0)],
             field_values: {
                 let mut m = EngineHashMap::default();
-                m.insert("price".into(), vec![Value::Number(99.0)]);
+                m.insert("price".into(), vec![Value::Float(99.0)]);
                 m
             },
         };
@@ -233,7 +233,7 @@ mod split_tests {
         assert_eq!(a, c);
     }
 
-    /// `Value::Int(i)` 与整值 `Value::Number(i as f64)` 产出**同一** wfx_id
+    /// `Value::Int(i)` 与整值 `Value::Float(i as f64)` 产出**同一** wfx_id
     /// （同 tag / 同字节）—— 否则同一逻辑 key 在行式与列式路径上会拼出不同 ID。
     #[test]
     fn wfx_id_is_identical_for_int_and_integral_number() {
@@ -244,7 +244,7 @@ mod split_tests {
         };
         for i in [0i64, 42, -7, 421_762, (1i64 << 53) - 1] {
             let ints = build_wfx_id(rule, &[Value::Int(i)], fired, &[], &origin);
-            let num = build_wfx_id(rule, &[Value::Number(i as f64)], fired, &[], &origin);
+            let num = build_wfx_id(rule, &[Value::Float(i as f64)], fired, &[], &origin);
             assert_eq!(ints, num, "wfx_id 同一 Int({i})/Number");
         }
     }
@@ -266,12 +266,12 @@ mod split_tests {
             collected_values: vec![],
             field_values: {
                 let mut m = EngineHashMap::default();
-                m.insert("bidder".into(), vec![Value::Number(bidder as f64)]);
+                m.insert("bidder".into(), vec![Value::Float(bidder as f64)]);
                 m
             },
         };
         // 同桶（scope_key 相同）top-10 条：只有 measure 变化。
-        let scope = vec![Value::Number(42.0)];
+        let scope = vec![Value::Float(42.0)];
         let steps: Vec<StepData> = (0..10).map(|i| mk(i as f64 * 1.5, 100 + i)).collect();
         let mut cache = None::<WfxPrefixCache>;
         for sd in &steps {
@@ -296,7 +296,7 @@ mod split_tests {
             );
         }
         // 换桶（scope_key 不同）→ 前缀不匹配 → 重建。
-        let scope2 = vec![Value::Number(99.0)];
+        let scope2 = vec![Value::Float(99.0)];
         let sd = mk(3.0, 7);
         let expected = build_wfx_id_split(
             rule,
@@ -326,7 +326,7 @@ mod split_tests {
         };
         let labels = ["top_price", "count"];
         // 同桶（scope_key 相同）多条：只有 measure 变化。
-        let scope = vec![Value::Number(42.0)];
+        let scope = vec![Value::Float(42.0)];
         let rows: Vec<Vec<f64>> = (0..10)
             .map(|i| vec![i as f64 * 1.5, i as f64 * 2.0])
             .collect();
@@ -361,7 +361,7 @@ mod split_tests {
             );
         }
         // 换桶（scope_key 不同）→ 前缀不匹配 → 重建。
-        let scope2 = vec![Value::Number(99.0)];
+        let scope2 = vec![Value::Float(99.0)];
         let measures = [3.0, 7.0];
         let steps = labels
             .iter()
@@ -393,7 +393,7 @@ mod split_tests {
     fn wfx_prefix_matches_rejects_label_mismatch() {
         let rule = "q19_auction_top10_stats";
         let fired = "2026-08-25T00:00:00.000Z";
-        let scope = vec![Value::Number(42.0)];
+        let scope = vec![Value::Float(42.0)];
         let mk_label = |l: &str| StepData {
             satisfied_branch_index: 0,
             label: Some(l.to_string()),
@@ -418,8 +418,8 @@ mod split_tests {
     #[test]
     fn entity_id_cache_reuses_on_same_key() {
         let mut cache = EntityIdCache::new();
-        let key_a = vec![Value::Number(42.0)];
-        let key_b = vec![Value::Number(99.0)];
+        let key_a = vec![Value::Float(42.0)];
+        let key_b = vec![Value::Float(99.0)];
         let calls = std::cell::Cell::new(0usize);
         let f = || {
             let n = calls.get() + 1;
@@ -473,9 +473,9 @@ mod split_tests {
 /// and distinct values stay distinct (f64 bits are injective).
 fn hash_value_bytes(hasher: &mut Fnv1a, v: &Value) {
     match v {
-        Value::Number(n) => hasher.update(&n.to_bits().to_le_bytes()),
-        // `Int(i)` 与整值 `Number` 必须产出同一 id：按 `i as f64` 的位哈希
-        // （`|i| < 2^53` 精确且与 `Value::Number` 字节一致）。
+        Value::Float(n) => hasher.update(&n.to_bits().to_le_bytes()),
+        // `Int(i)` 与整值 `Float` 必须产出同一 id：按 `i as f64` 的位哈希
+        // （`|i| < 2^53` 精确且与 `Value::Float` 字节一致）。
         Value::Int(i) => hasher.update(&(*i as f64).to_bits().to_le_bytes()),
         Value::Str(s) => hasher.update(s.as_bytes()),
         Value::Bool(b) => hasher.update(&[*b as u8]),
@@ -742,7 +742,7 @@ impl EachWfxPrefix {
     }
 }
 
-/// Append `v` exactly as `value_to_string(&Value::Number(v as f64))` renders
+/// Append `v` exactly as `value_to_string(&Value::Float(v as f64))` renders
 /// it: `|v| <= 2^53` takes the itoa fast path (the exact f64 Display of such
 /// an integer is the plain decimal — no ".0", no exponent), larger magnitudes
 /// keep the lossy f64 round-trip Display for byte-identity with the eager
@@ -1087,7 +1087,7 @@ mod format_tests {
         // The 2^53 integer fast path in `write_int64_value` (the single
         // rendering source for Int64 / Timestamp(ns) entity columns on the
         // columnar on-each path) must be byte-identical to the eager
-        // `Value::Number(v as f64)` rendering for every value, across the
+        // `Value::Float(v as f64)` rendering for every value, across the
         // 2^53 exactness boundary.
         let edge_vals: Vec<i64> = vec![
             i64::MIN,
@@ -1108,7 +1108,7 @@ mod format_tests {
         for &v in edge_vals.iter() {
             let mut scratch = String::new();
             write_int64_value(&mut scratch, v);
-            let expect = value_to_string(&Value::Number(v as f64));
+            let expect = value_to_string(&Value::Float(v as f64));
             assert_eq!(scratch, expect, "int64 v={v}");
         }
     }
@@ -1233,7 +1233,7 @@ mod format_tests {
         }
 
         let keys = [FieldRef::Simple("auction".to_string())];
-        let scope = [Value::Number(421_762.0)];
+        let scope = [Value::Float(421_762.0)];
         let steps = [step(1.0, None), step(2.5, Some("count"))];
 
         // Empty scope + empty steps.

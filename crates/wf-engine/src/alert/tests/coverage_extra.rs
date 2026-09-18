@@ -74,16 +74,16 @@ fn alert_origin_serde_roundtrip_and_display() {
 // types.rs — export_yield_f64 fast lanes
 // ===========================================================================
 
-/// 未声明类型的**整值**导出阈值（第 2 步定稿口径）：`|v| < 2^53` → `Number`
+/// 未声明类型的**整值**导出阈值（第 2 步定稿口径）：`|v| < 2^53` → `Float`
 /// （沿用既有行为）；`>= 2^53` → `Digit`（f64 无法精确表达）。`Int` 与整值
-/// `Number` 同一逻辑值必须得出一致结果。
+/// `Float` 同一逻辑值必须得出一致结果。
 #[test]
 fn untyped_integral_export_switches_to_digit_at_f64_precision_limit() {
     use crate::alert::types::export_yield_value;
     use wp_model_core::model::DataType;
 
     // 小整值：两种载体都 → Float（兼容既有行为）
-    for v in [Value::Int(443), Value::Number(443.0)] {
+    for v in [Value::Int(443), Value::Float(443.0)] {
         let (meta, value) = export_yield_value(&v, None).unwrap();
         assert_eq!(meta, DataType::Float, "{v:?}");
         assert_eq!(value, ModelValue::from(443.0), "{v:?}");
@@ -156,11 +156,11 @@ fn export_typed_bool_success_and_typed_errors() {
     assert_eq!(meta, DataType::Bool);
     assert_eq!(value, ModelValue::from(true));
     // Bool target with a number → error.
-    let err = export_yield_value(&Value::Number(1.0), Some(&FieldType::Base(BaseType::Bool)))
+    let err = export_yield_value(&Value::Float(1.0), Some(&FieldType::Base(BaseType::Bool)))
         .expect_err("bool requires a boolean");
     assert!(err.to_string().contains("bool field requires"));
     // Digit target with a fractional number → error.
-    let err = export_yield_value(&Value::Number(1.5), Some(&FieldType::Base(BaseType::Digit)))
+    let err = export_yield_value(&Value::Float(1.5), Some(&FieldType::Base(BaseType::Digit)))
         .expect_err("digit requires integer");
     assert!(err.to_string().contains("digit field requires"));
     // Digit target with a non-number → error.
@@ -173,21 +173,21 @@ fn export_typed_bool_success_and_typed_errors() {
     );
     // Float target with NaN → error.
     let err = export_yield_value(
-        &Value::Number(f64::NAN),
+        &Value::Float(f64::NAN),
         Some(&FieldType::Base(BaseType::Float)),
     )
     .expect_err("float requires finite");
     assert!(err.to_string().contains("float field requires"));
     // Untyped non-finite number → error.
-    let err = export_yield_value(&Value::Number(f64::NAN), None)
-        .expect_err("untyped non-finite rejected");
+    let err =
+        export_yield_value(&Value::Float(f64::NAN), None).expect_err("untyped non-finite rejected");
     assert!(err.to_string().contains("unsupported untyped yield value"));
     // Array-any target with a non-array → error.
-    let err = export_yield_value(&Value::Number(1.0), Some(&FieldType::ArrayAny))
+    let err = export_yield_value(&Value::Float(1.0), Some(&FieldType::ArrayAny))
         .expect_err("array export requires an array");
     assert!(err.to_string().contains("array export expects"));
     // Object target with a non-object → error.
-    let err = export_yield_value(&Value::Number(1.0), Some(&FieldType::Object))
+    let err = export_yield_value(&Value::Float(1.0), Some(&FieldType::Object))
         .expect_err("object export requires an object");
     assert!(err.to_string().contains("object export expects"));
 }
@@ -247,13 +247,11 @@ fn export_time_ip_hex_via_string_and_number_lanes() {
         )
         .is_err()
     );
-    assert!(
-        export_yield_value(&Value::Number(1.0), Some(&FieldType::Base(BaseType::Ip)),).is_err()
-    );
+    assert!(export_yield_value(&Value::Float(1.0), Some(&FieldType::Base(BaseType::Ip)),).is_err());
 
     // Hex: number lane, "0x"/"0X" prefix lanes, invalid lanes.
     let (meta, value) =
-        export_yield_value(&Value::Number(255.0), Some(&FieldType::Base(BaseType::Hex))).unwrap();
+        export_yield_value(&Value::Float(255.0), Some(&FieldType::Base(BaseType::Hex))).unwrap();
     assert_eq!(meta, DataType::Hex);
     assert_eq!(value, ModelValue::from(wp_model_core::model::HexT(255)));
     for text in ["0xff", "0XFF", "ff"] {
@@ -272,7 +270,7 @@ fn export_time_ip_hex_via_string_and_number_lanes() {
         .is_err()
     );
     assert!(
-        export_yield_value(&Value::Number(-1.0), Some(&FieldType::Base(BaseType::Hex)),).is_err()
+        export_yield_value(&Value::Float(-1.0), Some(&FieldType::Base(BaseType::Hex)),).is_err()
     );
     assert!(
         export_yield_value(&Value::Bool(true), Some(&FieldType::Base(BaseType::Hex)),).is_err()
@@ -285,12 +283,12 @@ fn typed_array_element_lanes_for_each_base_type() {
     for (item_type, item_value, expected_meta) in [
         (
             BaseType::Digit,
-            Value::Number(7.0),
+            Value::Float(7.0),
             DataType::Array("digit".to_string()),
         ),
         (
             BaseType::Float,
-            Value::Number(1.5),
+            Value::Float(1.5),
             DataType::Array("float".to_string()),
         ),
         (
@@ -300,7 +298,7 @@ fn typed_array_element_lanes_for_each_base_type() {
         ),
         (
             BaseType::Time,
-            Value::Number(1_710_115_200_000_000_000.0),
+            Value::Float(1_710_115_200_000_000_000.0),
             DataType::Array("time".to_string()),
         ),
         (
@@ -310,7 +308,7 @@ fn typed_array_element_lanes_for_each_base_type() {
         ),
         (
             BaseType::Hex,
-            Value::Number(1.0),
+            Value::Float(1.0),
             DataType::Array("hex".to_string()),
         ),
     ] {
@@ -324,14 +322,14 @@ fn typed_array_element_lanes_for_each_base_type() {
     }
     // Array(Chars) with a non-string element → error.
     let err = export_yield_value(
-        &Value::Array(vec![Value::Number(1.0)]),
+        &Value::Array(vec![Value::Float(1.0)]),
         Some(&FieldType::Array(BaseType::Chars)),
     )
     .expect_err("array/chars rejects non-string elements");
     assert!(err.to_string().contains("array/chars field requires"));
     // ArrayAny over mixed elements works.
     let (meta, _) = export_yield_value(
-        &Value::Array(vec![Value::Number(1.0), Value::Str("x".into())]),
+        &Value::Array(vec![Value::Float(1.0), Value::Str("x".into())]),
         Some(&FieldType::ArrayAny),
     )
     .unwrap();
@@ -343,8 +341,8 @@ fn untyped_object_with_digit_bool_and_string_members() {
     // rule_value_to_model_value lanes inside an untyped object:
     // Number(integer) → Digit, Number(fraction) → Float, Bool, Str.
     let mut obj = EngineHashMap::default();
-    obj.insert("n".into(), Value::Number(3.0));
-    obj.insert("f".into(), Value::Number(1.5));
+    obj.insert("n".into(), Value::Float(3.0));
+    obj.insert("f".into(), Value::Float(1.5));
     obj.insert("b".into(), Value::Bool(true));
     obj.insert("s".into(), Value::Str("x".into()));
     let (meta, value) = export_yield_value(&Value::Object(obj), Some(&FieldType::Object)).unwrap();
@@ -439,8 +437,8 @@ fn commit_close_rows_batch_matches_record_appended_rows() {
         let mut record = sample_record(
             AlertOrigin::Close { reason },
             vec![
-                (Arc::from("auction_id"), Value::Number((1000 + i) as f64)),
-                (Arc::from("price"), Value::Number(9.5 + i as f64 * 10.0)),
+                (Arc::from("auction_id"), Value::Float((1000 + i) as f64)),
+                (Arc::from("price"), Value::Float(9.5 + i as f64 * 10.0)),
             ],
         );
         if !present {
@@ -479,11 +477,11 @@ fn commit_close_rows_batch_matches_record_appended_rows() {
     let summaries: Vec<Arc<str>> = (0..n).map(|i| Arc::from(format!("summary{i}"))).collect();
     let mut staged_rows = Vec::with_capacity(n);
     for (i, &present) in price_present.iter().enumerate() {
-        let a = export_yield_value(&Value::Number((1000 + i) as f64), Some(&ft_float)).unwrap();
+        let a = export_yield_value(&Value::Float((1000 + i) as f64), Some(&ft_float)).unwrap();
         let mut row_cells = vec![(auction_col, a.0, a.1)];
         if present {
             let p =
-                export_yield_value(&Value::Number(9.5 + i as f64 * 10.0), Some(&ft_float)).unwrap();
+                export_yield_value(&Value::Float(9.5 + i as f64 * 10.0), Some(&ft_float)).unwrap();
             row_cells.push((price_col, p.0, p.1));
         }
         staged_rows.push(row_cells);
@@ -627,13 +625,13 @@ fn register_yield_column_const_value_fills_untouched_rows() {
     builder
         .append_record(&sample_record(
             AlertOrigin::Event,
-            vec![(Arc::from("auction_id"), Value::Number(1.0))],
+            vec![(Arc::from("auction_id"), Value::Float(1.0))],
         ))
         .unwrap();
     builder
         .append_record(&sample_record(
             AlertOrigin::Event,
-            vec![(Arc::from("auction_id"), Value::Number(2.0))],
+            vec![(Arc::from("auction_id"), Value::Float(2.0))],
         ))
         .unwrap();
     let batch = builder.finish();
@@ -657,7 +655,7 @@ fn reserve_rows_and_take_staged_smoke() {
         .stage_yield_cell(
             &Arc::from("x"),
             Some(&FieldType::Base(BaseType::Float)),
-            &Value::Number(1.5),
+            &Value::Float(1.5),
         )
         .unwrap();
     let staged = builder.take_staged();
@@ -686,7 +684,7 @@ fn staged_row_with_const_column_matches_append_path() {
         let mut record = sample_record(
             AlertOrigin::Event,
             vec![
-                (Arc::from("v"), Value::Number((10 + i) as f64)),
+                (Arc::from("v"), Value::Float((10 + i) as f64)),
                 (Arc::from("t"), Value::Str("const".into())),
             ],
         );
@@ -718,7 +716,7 @@ fn staged_row_with_const_column_matches_append_path() {
         // 与 record 路径同口径：`v` 未声明类型（未声明整值 → Digit，两条路径
         // 必须产出一致的 DataType/ModelValue）。
         via_staged
-            .stage_yield_cell(&v_name, None, &Value::Number((10 + i) as f64))
+            .stage_yield_cell(&v_name, None, &Value::Float((10 + i) as f64))
             .unwrap();
         via_staged.commit_each_row(EachRowCells {
             wfx_id: format!("id{i}").into(),

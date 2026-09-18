@@ -367,7 +367,7 @@ data_file = "side_input.csv"
         .find(|row| {
             matches!(
                 row.get("key"),
-                Some(wf_engine::match_engine::Value::Number(n)) if *n == 2345.0
+                Some(wf_engine::match_engine::Value::Float(n)) if *n == 2345.0
             )
         })
         .expect("key=2345 行以 Number 加载");
@@ -378,11 +378,11 @@ data_file = "side_input.csv"
     // 索引按 Number 键建立 → 引擎 lookup 键（Number）直接命中。
     pw.set_join_key("key".into());
     let hits = pw
-        .join_lookup(&wf_engine::match_engine::Value::Number(2345.0))
+        .join_lookup(&wf_engine::match_engine::Value::Float(2345.0))
         .expect("索引命中");
     assert_eq!(hits.len(), 1, "key=2345 恰一行");
     assert!(
-        pw.join_lookup(&wf_engine::match_engine::Value::Number(99999.0))
+        pw.join_lookup(&wf_engine::match_engine::Value::Float(99999.0))
             .is_none()
     );
 }

@@ -38,7 +38,7 @@ impl WindowLookup for TestLookup {
     }
 
     fn join_lookup(&self, window: &str, key_field: &str, key: &Value) -> Option<Vec<JoinRow>> {
-        let Value::Number(n) = key else {
+        let Value::Float(n) = key else {
             return None;
         };
         // Same truncation as the real hash index (JoinKey::from_value).

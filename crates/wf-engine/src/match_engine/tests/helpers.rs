@@ -17,7 +17,7 @@ pub fn event(fields: Vec<(&str, Value)>) -> Event {
 }
 
 pub fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 pub fn str_val(s: &str) -> Value {

@@ -25,11 +25,11 @@ fn time_diff_returns_seconds() {
     };
     let mut fields = EngineHashMap::default();
     // 5 seconds apart in epoch milliseconds.
-    fields.insert("t1".into(), Value::Number(1_700_000_005_000.0));
-    fields.insert("t2".into(), Value::Number(1_700_000_000_000.0));
+    fields.insert("t1".into(), Value::Float(1_700_000_005_000.0));
+    fields.insert("t2".into(), Value::Float(1_700_000_000_000.0));
     let event = Event { fields };
     let result = eval_expr(&expr, &event);
-    assert_eq!(result, Some(Value::Number(5.0)));
+    assert_eq!(result, Some(Value::Float(5.0)));
 }
 
 #[test]
@@ -46,11 +46,11 @@ fn time_diff_absolute_value() {
     };
     let mut fields = EngineHashMap::default();
     // Reversed order: t1 < t2.
-    fields.insert("t1".into(), Value::Number(1_700_000_000_000.0));
-    fields.insert("t2".into(), Value::Number(1_700_000_005_000.0));
+    fields.insert("t1".into(), Value::Float(1_700_000_000_000.0));
+    fields.insert("t2".into(), Value::Float(1_700_000_005_000.0));
     let event = Event { fields };
     let result = eval_expr(&expr, &event);
-    assert_eq!(result, Some(Value::Number(5.0)));
+    assert_eq!(result, Some(Value::Float(5.0)));
 }
 
 // ===========================================================================
@@ -71,10 +71,10 @@ fn time_bucket_floors_to_interval() {
     };
     let mut fields = EngineHashMap::default();
     // 75 seconds after an epoch millisecond timestamp.
-    fields.insert("ts".into(), Value::Number(1_700_000_075_000.0));
+    fields.insert("ts".into(), Value::Float(1_700_000_075_000.0));
     let event = Event { fields };
     let result = eval_expr(&expr, &event);
-    assert_eq!(result, Some(Value::Number(1_700_000_040_000.0)));
+    assert_eq!(result, Some(Value::Float(1_700_000_040_000.0)));
 }
 
 #[test]
@@ -91,10 +91,10 @@ fn time_bucket_exact_boundary() {
     };
     let mut fields = EngineHashMap::default();
     // Exact 5-minute bucket boundary in epoch milliseconds.
-    fields.insert("ts".into(), Value::Number(1_700_000_100_000.0));
+    fields.insert("ts".into(), Value::Float(1_700_000_100_000.0));
     let event = Event { fields };
     let result = eval_expr(&expr, &event);
-    assert_eq!(result, Some(Value::Number(1_700_000_100_000.0)));
+    assert_eq!(result, Some(Value::Float(1_700_000_100_000.0)));
 }
 
 // ===========================================================================
@@ -116,11 +116,11 @@ fn bucket_end_returns_bucket_upper_edge() {
     };
     let mut fields = EngineHashMap::default();
     // ts = 75s（epoch ms）→ 60s 桶 [1_700_000_040_000, 1_700_000_100_000)，桶末 = 1_700_000_100_000
-    fields.insert("ts".into(), Value::Number(1_700_000_075_000.0));
+    fields.insert("ts".into(), Value::Float(1_700_000_075_000.0));
     let event = Event { fields };
     assert_eq!(
         eval_expr(&expr, &event),
-        Some(Value::Number(1_700_000_100_000.0))
+        Some(Value::Float(1_700_000_100_000.0))
     );
 }
 
@@ -138,11 +138,11 @@ fn bucket_end_at_exact_boundary_moves_to_next_bucket() {
         ],
     };
     let mut fields = EngineHashMap::default();
-    fields.insert("ts".into(), Value::Number(1_700_000_040_000.0));
+    fields.insert("ts".into(), Value::Float(1_700_000_040_000.0));
     let event = Event { fields };
     assert_eq!(
         eval_expr(&expr, &event),
-        Some(Value::Number(1_700_000_100_000.0))
+        Some(Value::Float(1_700_000_100_000.0))
     );
 }
 
@@ -172,9 +172,9 @@ fn math_functions_work() {
     use crate::cep::{Event, eval_expr};
 
     let mut fields = EngineHashMap::default();
-    fields.insert("n".into(), Value::Number(-12.345));
-    fields.insert("p".into(), Value::Number(16.0));
-    fields.insert("ts".into(), Value::Number(0.0));
+    fields.insert("n".into(), Value::Float(-12.345));
+    fields.insert("p".into(), Value::Float(16.0));
+    fields.insert("ts".into(), Value::Float(0.0));
     fields.insert("msg".into(), Value::Str("  failed_login_root  ".into()));
     fields.insert(
         "arr".into(),
@@ -339,24 +339,24 @@ fn math_functions_work() {
         args: vec![Expr::Field(FieldRef::Simple("arr".to_string()))],
     };
 
-    assert_eq!(eval_expr(&abs_expr, &event), Some(Value::Number(12.345)));
-    assert_eq!(eval_expr(&ceil_expr, &event), Some(Value::Number(-12.0)));
-    assert_eq!(eval_expr(&floor_expr, &event), Some(Value::Number(-13.0)));
-    assert_eq!(eval_expr(&round_expr, &event), Some(Value::Number(-12.35)));
+    assert_eq!(eval_expr(&abs_expr, &event), Some(Value::Float(12.345)));
+    assert_eq!(eval_expr(&ceil_expr, &event), Some(Value::Float(-12.0)));
+    assert_eq!(eval_expr(&floor_expr, &event), Some(Value::Float(-13.0)));
+    assert_eq!(eval_expr(&round_expr, &event), Some(Value::Float(-12.35)));
     assert_eq!(
         eval_expr(&fmt_expr, &event),
         Some(Value::Str("1970-01-01".into()))
     );
-    assert_eq!(eval_expr(&sqrt_expr, &event), Some(Value::Number(4.0)));
-    assert_eq!(eval_expr(&pow_expr, &event), Some(Value::Number(256.0)));
-    assert_eq!(eval_expr(&log_expr, &event), Some(Value::Number(2.0)));
+    assert_eq!(eval_expr(&sqrt_expr, &event), Some(Value::Float(4.0)));
+    assert_eq!(eval_expr(&pow_expr, &event), Some(Value::Float(256.0)));
+    assert_eq!(eval_expr(&log_expr, &event), Some(Value::Float(2.0)));
     assert_eq!(
         eval_expr(&exp_expr, &event),
-        Some(Value::Number(std::f64::consts::E))
+        Some(Value::Float(std::f64::consts::E))
     );
-    assert_eq!(eval_expr(&clamp_expr, &event), Some(Value::Number(100.0)));
-    assert_eq!(eval_expr(&sign_expr, &event), Some(Value::Number(-1.0)));
-    assert_eq!(eval_expr(&trunc_expr, &event), Some(Value::Number(-12.0)));
+    assert_eq!(eval_expr(&clamp_expr, &event), Some(Value::Float(100.0)));
+    assert_eq!(eval_expr(&sign_expr, &event), Some(Value::Float(-1.0)));
+    assert_eq!(eval_expr(&trunc_expr, &event), Some(Value::Float(-12.0)));
     assert_eq!(eval_expr(&finite_expr, &event), Some(Value::Bool(true)));
     assert_eq!(
         eval_expr(&ltrim_expr, &event),
@@ -370,7 +370,7 @@ fn math_functions_work() {
         eval_expr(&concat_expr, &event),
         Some(Value::Str("ip=1.1.1.1".into()))
     );
-    assert_eq!(eval_expr(&index_expr, &event), Some(Value::Number(9.0)));
+    assert_eq!(eval_expr(&index_expr, &event), Some(Value::Float(9.0)));
     assert_eq!(
         eval_expr(&replace_plain_expr, &event),
         Some(Value::Str("  failed-login-root  ".into()))
@@ -444,19 +444,19 @@ fn now_functions_work() {
         args: vec![Expr::Number(1.0)],
     };
 
-    let Some(Value::Number(now_millis)) = eval_expr(&now_expr, &event) else {
+    let Some(Value::Float(now_millis)) = eval_expr(&now_expr, &event) else {
         panic!("now() should return a numeric timestamp");
     };
-    let Some(Value::Number(now_s)) = eval_expr(&now_s_expr, &event) else {
+    let Some(Value::Float(now_s)) = eval_expr(&now_s_expr, &event) else {
         panic!("now_s() should return a numeric timestamp");
     };
-    let Some(Value::Number(now_ms)) = eval_expr(&now_ms_expr, &event) else {
+    let Some(Value::Float(now_ms)) = eval_expr(&now_ms_expr, &event) else {
         panic!("now_ms() should return a numeric timestamp");
     };
-    let Some(Value::Number(now_us)) = eval_expr(&now_us_expr, &event) else {
+    let Some(Value::Float(now_us)) = eval_expr(&now_us_expr, &event) else {
         panic!("now_us() should return a numeric timestamp");
     };
-    let Some(Value::Number(now_ns)) = eval_expr(&now_ns_expr, &event) else {
+    let Some(Value::Float(now_ns)) = eval_expr(&now_ns_expr, &event) else {
         panic!("now_ns() should return a numeric timestamp");
     };
     let Some(Value::Str(year)) = eval_expr(&fmt_expr, &event) else {
@@ -493,5 +493,5 @@ fn now_functions_share_timestamp_within_expression() {
         }),
     };
 
-    assert_eq!(eval_expr(&expr, &event), Some(Value::Number(0.0)));
+    assert_eq!(eval_expr(&expr, &event), Some(Value::Float(0.0)));
 }

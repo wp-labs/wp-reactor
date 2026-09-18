@@ -30,10 +30,10 @@ pub(super) fn eval_func_count_char(
         _ => return None,
     };
     if needle.is_empty() {
-        return Some(Value::Number(0.0));
+        return Some(Value::Float(0.0));
     }
     let ch = needle.chars().next().unwrap();
-    Some(Value::Number(
+    Some(Value::Float(
         text.chars().filter(|&c| c == ch).count() as f64
     ))
 }
@@ -107,9 +107,9 @@ pub(super) fn eval_func_substr(
         Value::Str(s) => s,
         _ => return None,
     };
-    // 数值内置函数是 f64 域：`Value::Int` 经 `i as f64` 归一，走与 `Number` 相同路径。
+    // 数值内置函数是 f64 域：`Value::Int` 经 `i as f64` 归一，走与 `Float` 相同路径。
     let start = match eval_expr_ext(&args[1], event, windows, baselines)? {
-        Value::Number(n) => n.trunc() as i64,
+        Value::Float(n) => n.trunc() as i64,
         Value::Int(i) => i,
         _ => return None,
     };
@@ -131,7 +131,7 @@ pub(super) fn eval_func_substr(
     let mut end_idx = len;
     if args.len() == 3 {
         let length = match eval_expr_ext(&args[2], event, windows, baselines)? {
-            Value::Number(n) => n.trunc() as i64,
+            Value::Float(n) => n.trunc() as i64,
             Value::Int(i) => i,
             _ => return None,
         };
@@ -225,7 +225,7 @@ pub(super) fn eval_func_len(
         return None;
     }
     match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Str(s) => Some(Value::Number(s.len() as f64)),
+        Value::Str(s) => Some(Value::Float(s.len() as f64)),
         _ => None,
     }
 }
@@ -239,7 +239,7 @@ pub(super) fn eval_func_mvcount(
         return None;
     }
     match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Array(arr) => Some(Value::Number(arr.len() as f64)),
+        Value::Array(arr) => Some(Value::Float(arr.len() as f64)),
         _ => None,
     }
 }
@@ -282,7 +282,7 @@ pub(super) fn eval_func_mvindex(
     };
     if args.len() == 2 {
         let idx = match eval_expr_ext(&args[1], event, windows, baselines)? {
-            Value::Number(n) => normalize_index(n.trunc() as i64, arr.len()),
+            Value::Float(n) => normalize_index(n.trunc() as i64, arr.len()),
             Value::Int(i) => normalize_index(i, arr.len()),
             _ => return None,
         }?;
@@ -292,12 +292,12 @@ pub(super) fn eval_func_mvindex(
         return Some(Value::Array(Vec::new()));
     }
     let start = match eval_expr_ext(&args[1], event, windows, baselines)? {
-        Value::Number(n) => n.trunc() as i64,
+        Value::Float(n) => n.trunc() as i64,
         Value::Int(i) => i,
         _ => return None,
     };
     let end = match eval_expr_ext(&args[2], event, windows, baselines)? {
-        Value::Number(n) => n.trunc() as i64,
+        Value::Float(n) => n.trunc() as i64,
         Value::Int(i) => i,
         _ => return None,
     };

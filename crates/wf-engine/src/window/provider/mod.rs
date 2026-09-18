@@ -223,47 +223,45 @@ mod tests {
         let rows = vec![
             {
                 let mut m = HashMap::new();
-                m.insert("key".into(), Value::Number(1.0));
+                m.insert("key".into(), Value::Float(1.0));
                 m.insert("value".into(), Value::Str("a".into()));
                 m
             },
             {
                 let mut m = HashMap::new();
-                m.insert("key".into(), Value::Number(2.0));
+                m.insert("key".into(), Value::Float(2.0));
                 m.insert("value".into(), Value::Str("b".into()));
                 m
             },
             {
                 let mut m = HashMap::new();
-                m.insert("key".into(), Value::Number(1.0));
+                m.insert("key".into(), Value::Float(1.0));
                 m.insert("value".into(), Value::Str("c".into()));
                 m
             },
         ];
         w.load(rows);
         assert!(
-            w.join_lookup(&Value::Number(1.0)).is_none(),
+            w.join_lookup(&Value::Float(1.0)).is_none(),
             "无索引时返回 None（回退扫描）"
         );
         w.set_join_key("key".into());
-        let hits = w.join_lookup(&Value::Number(1.0)).expect("索引命中");
+        let hits = w.join_lookup(&Value::Float(1.0)).expect("索引命中");
         assert_eq!(hits.len(), 2, "key=1 两行（a/c）");
-        assert!(w.join_lookup(&Value::Number(3.0)).is_none(), "miss → None");
+        assert!(w.join_lookup(&Value::Float(3.0)).is_none(), "miss → None");
         // load 替换 rows 后索引重建（防陈旧索引返回错行）。
         w.load(vec![{
             let mut m = HashMap::new();
-            m.insert("key".into(), Value::Number(5.0));
+            m.insert("key".into(), Value::Float(5.0));
             m.insert("value".into(), Value::Str("e".into()));
             m
         }]);
         assert_eq!(
-            w.join_lookup(&Value::Number(5.0))
-                .expect("重建后命中")
-                .len(),
+            w.join_lookup(&Value::Float(5.0)).expect("重建后命中").len(),
             1
         );
         assert!(
-            w.join_lookup(&Value::Number(1.0)).is_none(),
+            w.join_lookup(&Value::Float(1.0)).is_none(),
             "旧 key 已不在新索引"
         );
     }
@@ -275,19 +273,19 @@ mod tests {
         let rows = vec![
             {
                 let mut m = HashMap::new();
-                m.insert("key".into(), Value::Number(1.0));
+                m.insert("key".into(), Value::Float(1.0));
                 m.insert("value".into(), Value::Str("a".into()));
                 m
             },
             {
                 let mut m = HashMap::new();
-                m.insert("key".into(), Value::Number(2.0));
+                m.insert("key".into(), Value::Float(2.0));
                 m.insert("value".into(), Value::Str("b".into()));
                 m
             },
             {
                 let mut m = HashMap::new();
-                m.insert("key".into(), Value::Number(1.0));
+                m.insert("key".into(), Value::Float(1.0));
                 m.insert("value".into(), Value::Str("c".into()));
                 m
             },
@@ -313,14 +311,14 @@ mod tests {
         assert_eq!(swapped.row_count(), classic.row_count());
         assert_eq!(swapped.snapshot(), classic.snapshot());
         let hits_swap = swapped
-            .join_rows_lookup(&Value::Number(1.0))
+            .join_rows_lookup(&Value::Float(1.0))
             .expect("新窗口索引命中");
         let hits_classic = classic
-            .join_rows_lookup(&Value::Number(1.0))
+            .join_rows_lookup(&Value::Float(1.0))
             .expect("经典路径索引命中");
         assert_eq!(hits_swap.len(), hits_classic.len(), "key=1 两行");
         assert!(
-            swapped.join_rows_lookup(&Value::Number(3.0)).is_none(),
+            swapped.join_rows_lookup(&Value::Float(3.0)).is_none(),
             "miss"
         );
         assert_eq!(swapped.join_key(), Some("key"));
@@ -338,20 +336,20 @@ mod tests {
         let gen1 = vec![
             {
                 let mut m = HashMap::new();
-                m.insert("key".into(), Value::Number(1.0));
+                m.insert("key".into(), Value::Float(1.0));
                 m.insert("value".into(), Value::Str("a1".into()));
                 m
             },
             {
                 let mut m = HashMap::new();
-                m.insert("key".into(), Value::Number(1.0));
+                m.insert("key".into(), Value::Float(1.0));
                 m.insert("value".into(), Value::Str("a2".into()));
                 m
             },
         ];
         let gen2 = vec![{
             let mut m = HashMap::new();
-            m.insert("key".into(), Value::Number(1.0));
+            m.insert("key".into(), Value::Float(1.0));
             m.insert("value".into(), Value::Str("b".into()));
             m
         }];
@@ -392,7 +390,7 @@ mod tests {
                 while !s.load(Ordering::SeqCst) {
                     let guard = w.read().expect("read lock");
                     let hits = guard
-                        .join_rows_lookup(&Value::Number(1.0))
+                        .join_rows_lookup(&Value::Float(1.0))
                         .expect("key=1 始终命中");
                     match hits.len() {
                         // 每代数据行数固定——索引与行必须同代（RwLock 原子换入）。
@@ -437,13 +435,13 @@ mod tests {
         let rows = vec![
             {
                 let mut m = HashMap::new();
-                m.insert("key".into(), Value::Number(1.0));
+                m.insert("key".into(), Value::Float(1.0));
                 m.insert("value".into(), Value::Str("a".into()));
                 m
             },
             {
                 let mut m = HashMap::new();
-                m.insert("key".into(), Value::Number(2.0));
+                m.insert("key".into(), Value::Float(2.0));
                 m.insert("value".into(), Value::Str("b".into()));
                 m
             },
@@ -461,12 +459,12 @@ mod tests {
         assert_eq!(current.join_key(), Some("key"), "并发新键不得被旧快照覆盖");
         assert_eq!(
             current
-                .join_rows_lookup(&Value::Number(1.0))
+                .join_rows_lookup(&Value::Float(1.0))
                 .expect("索引命中")
                 .len(),
             1,
             "按当前键重建的索引可命中"
         );
-        assert!(current.join_rows_lookup(&Value::Number(3.0)).is_none());
+        assert!(current.join_rows_lookup(&Value::Float(3.0)).is_none());
     }
 }

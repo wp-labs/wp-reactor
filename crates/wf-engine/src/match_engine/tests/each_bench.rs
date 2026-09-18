@@ -287,7 +287,7 @@ fn q1_each_components_per_row() {
             .stage_yield_cell(&name_det, ft_str.as_ref(), &v)
             .unwrap();
         // request_count（Number 字面量）
-        let v = Value::Number(1.0);
+        let v = Value::Float(1.0);
         let v = RuleExecutor::coerce_yield_field_value_with("request_count", ft_float.as_ref(), v)
             .unwrap()
             .unwrap();
@@ -350,7 +350,7 @@ fn q1_each_components_per_row() {
             builder
                 .stage_yield_cell(&name_det, ft_str.as_ref(), &v)
                 .unwrap();
-            let v = Value::Number(1.0);
+            let v = Value::Float(1.0);
             let v =
                 RuleExecutor::coerce_yield_field_value_with("request_count", ft_float.as_ref(), v)
                     .unwrap()

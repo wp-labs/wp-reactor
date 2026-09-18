@@ -29,7 +29,7 @@ use crate::match_engine::executor::{
 use wf_cep::rows::{RowFieldLayout, RowFields};
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn str_val(s: &str) -> Value {
@@ -191,7 +191,7 @@ fn price_range(lo: f64, hi: f64) -> Expr {
 fn rows_to_batch(rows: &[HashMap<String, Value>]) -> RecordBatch {
     fn i64_of(row: &HashMap<String, Value>, name: &str) -> Option<i64> {
         match row.get(name) {
-            Some(Value::Number(n)) => Some(*n as i64),
+            Some(Value::Float(n)) => Some(*n as i64),
             _ => None,
         }
     }
@@ -219,7 +219,7 @@ fn rows_to_batch(rows: &[HashMap<String, Value>]) -> RecordBatch {
 fn rows_to_batch_with_null_price(rows: &[HashMap<String, Value>]) -> RecordBatch {
     fn i64_of(row: &HashMap<String, Value>, name: &str) -> Option<i64> {
         match row.get(name) {
-            Some(Value::Number(n)) => Some(*n as i64),
+            Some(Value::Float(n)) => Some(*n as i64),
             _ => None,
         }
     }

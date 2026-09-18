@@ -167,7 +167,7 @@ fn side_input_rows() -> Vec<JoinRow> {
     (0..SIDE_ROWS)
         .map(|k| {
             let mut fields = EngineHashMap::default();
-            fields.insert("key".into(), Value::Number(k as f64));
+            fields.insert("key".into(), Value::Float(k as f64));
             fields.insert("value".into(), Value::Str(format!("value-{k}").into()));
             JoinRow::Event(Arc::new(Event { fields }))
         })

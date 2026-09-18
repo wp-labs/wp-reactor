@@ -392,8 +392,8 @@ pub fn sentinel_record_output(rec: &SentinelRecord) -> OutputRecord {
         yield_target: Arc::from(PERF_SENTINEL_WINDOW),
         yield_fields: vec![
             ("record_type".into(), Value::Str("sentinel".into())),
-            ("round".into(), Value::Number(rec.round as f64)),
-            ("n".into(), Value::Number(rec.n as f64)),
+            ("round".into(), Value::Float(rec.round as f64)),
+            ("n".into(), Value::Float(rec.n as f64)),
             (
                 "start_ns".into(),
                 Value::Str(rec.start_ns.to_string().into()),
@@ -428,7 +428,7 @@ pub fn stage_record_output(current: usize) -> OutputRecord {
         yield_target: Arc::from(PERF_SENTINEL_WINDOW),
         yield_fields: vec![
             ("record_type".into(), Value::Str("stage".into())),
-            ("current".into(), Value::Number(current as f64)),
+            ("current".into(), Value::Float(current as f64)),
         ],
         yield_field_types: Arc::from(vec![("current".into(), FieldType::Base(BaseType::Digit))]),
         event_time_nanos: 0,

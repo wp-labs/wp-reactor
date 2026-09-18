@@ -49,7 +49,7 @@ fn empty_router() -> Arc<Router> {
 
 #[test]
 fn value_to_json_variants() {
-    let number = value_to_json(&Value::Number(3.5)).expect("number");
+    let number = value_to_json(&Value::Float(3.5)).expect("number");
     assert_eq!(number, serde_json::json!(3.5));
 
     let string = value_to_json(&Value::Str("hello".into())).expect("str");
@@ -59,14 +59,14 @@ fn value_to_json_variants() {
     assert_eq!(bool, serde_json::json!(true));
 
     let array = value_to_json(&Value::Array(vec![
-        Value::Number(1.0),
+        Value::Float(1.0),
         Value::Str("x".into()),
     ]))
     .expect("array");
     assert_eq!(array, serde_json::json!([1.0, "x"]));
 
     let mut object = EngineHashMap::default();
-    object.insert(SmolStr::new("b"), Value::Number(2.0));
+    object.insert(SmolStr::new("b"), Value::Float(2.0));
     object.insert(SmolStr::new("a"), Value::Bool(false));
     let object = value_to_json(&Value::Object(object)).expect("object");
     // Keys are sorted for deterministic output.
@@ -81,16 +81,16 @@ fn value_to_json_variants() {
 
 #[test]
 fn value_to_json_non_finite_number_errors() {
-    let err = value_to_json(&Value::Number(f64::NAN)).expect_err("NaN must fail");
+    let err = value_to_json(&Value::Float(f64::NAN)).expect_err("NaN must fail");
     assert!(err.to_string().contains("finite"), "got: {err:?}");
-    let err = value_to_json(&Value::Number(f64::INFINITY)).expect_err("inf must fail");
+    let err = value_to_json(&Value::Float(f64::INFINITY)).expect_err("inf must fail");
     assert!(err.to_string().contains("finite"), "got: {err:?}");
 }
 
 #[test]
 fn value_to_json_string_structured() {
     let mut object = EngineHashMap::default();
-    object.insert(SmolStr::new("a"), Value::Number(1.0));
+    object.insert(SmolStr::new("a"), Value::Float(1.0));
     let json = value_to_json_string(&Value::Object(object)).expect("serialize");
     assert_eq!(json, r#"{"a":1.0}"#);
 }
@@ -109,7 +109,7 @@ fn event_time_nanos_missing_field_returns_zero() {
     let mut fields = EngineHashMap::default();
     fields.insert(
         SmolStr::new("event_time"),
-        Value::Number(1_700_000_000_000_000_000.0),
+        Value::Float(1_700_000_000_000_000_000.0),
     );
     let event = Event { fields };
     assert_eq!(
@@ -185,7 +185,7 @@ fn record_wfu_intermediate_meta_value_variants() {
     );
     assert_eq!(
         record_wfu_intermediate_meta_value(&record, WfuIntermediateMetaField::Score),
-        Value::Number(70.0)
+        Value::Float(70.0)
     );
     assert_eq!(
         record_wfu_intermediate_meta_value(&record, WfuIntermediateMetaField::EntityType),
@@ -243,11 +243,11 @@ fn event_debug_ref_priority_and_fallback() {
 
 #[test]
 fn value_debug_string_variants() {
-    assert_eq!(value_debug_string(&Value::Number(1.5)), "1.5");
+    assert_eq!(value_debug_string(&Value::Float(1.5)), "1.5");
     assert_eq!(value_debug_string(&Value::Str("s".into())), "s");
     assert_eq!(value_debug_string(&Value::Bool(true)), "true");
     assert_eq!(
-        value_debug_string(&Value::Array(vec![Value::Number(1.0)])),
+        value_debug_string(&Value::Array(vec![Value::Float(1.0)])),
         "<structured>"
     );
     assert_eq!(
@@ -259,7 +259,7 @@ fn value_debug_string_variants() {
 #[test]
 fn debug_scope_key_joins_values() {
     let key = [
-        Value::Number(1.0),
+        Value::Float(1.0),
         Value::Str("a".into()),
         Value::Bool(false),
         Value::Array(vec![]),
@@ -273,7 +273,7 @@ fn log_output_helpers_do_not_panic() {
     let record = output_record("alerts", vec![]);
     log_output_emitted("execute_close", "close", "alert", &record, &[]);
     log_output_suppressed("test_rule", "execute_close", None);
-    log_output_suppressed("test_rule", "execute_close", Some(&[Value::Number(1.0)]));
+    log_output_suppressed("test_rule", "execute_close", Some(&[Value::Float(1.0)]));
 }
 
 // ---------------------------------------------------------------------------

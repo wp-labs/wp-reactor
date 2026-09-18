@@ -21,6 +21,7 @@ All notable changes to wp-reactor will be documented in this file.
   写法、日志锚点均不变）。
 - **供给 SQL 变量（VEL）配置错误改为启动即报错**，不再推迟到首次刷新时才失败。
 - **未声明类型的整数字段输出类型**：`|v| >= 2^53`（f64 已无法精确表达）由浮点改为整数（精确）；`|v| < 2^53` 与声明了类型的字段（`digit` / `float` 等）均不变。若某列下游按固定浮点模式消费，需要相应放宽。
+- **值层浮点变体改名 `Value::Number` → `Value::Float`**（源码级重命名，无行为变化）：与既有的 `Value::Int`、`ScopeKey::Float` 命名对齐，消除「`Number` 涵盖所有数字」的误导——整数被 f64 量化正是从这个名字开始的。`Value` 是 `#[non_exhaustive]` 公开枚举，按变体名匹配的下游需同步改名（编译期报错，不会静默）；`serde_json::Value::Number` 与 `wf-lang` 的 `Expr::Number`（AST 浮点字面量）名字不同、不受影响。
 
 ### Fixed
 

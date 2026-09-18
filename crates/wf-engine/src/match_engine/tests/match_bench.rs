@@ -93,14 +93,14 @@ fn yield_types() -> HashMap<String, FieldType> {
 
 fn bid_event(auction: i64, bidder: i64) -> Event {
     let mut fields = EngineHashMap::default();
-    fields.insert("auction".into(), Value::Number(auction as f64));
-    fields.insert("bidder".into(), Value::Number(bidder as f64));
+    fields.insert("auction".into(), Value::Float(auction as f64));
+    fields.insert("bidder".into(), Value::Float(bidder as f64));
     Event { fields }
 }
 
 fn person_event(id: i64) -> Event {
     let mut fields = EngineHashMap::default();
-    fields.insert("id".into(), Value::Number(id as f64));
+    fields.insert("id".into(), Value::Float(id as f64));
     fields.insert("name".into(), Value::Str("person".into()));
     Event { fields }
 }
@@ -132,7 +132,7 @@ impl WindowLookup for HitLookup {
 fn matched_context(trigger: Arc<Event>) -> MatchedContext {
     MatchedContext {
         rule_name: "q22_asof_person".to_string(),
-        scope_key: vec![Value::Number(1.0)],
+        scope_key: vec![Value::Float(1.0)],
         step_data: vec![StepData {
             satisfied_branch_index: 0,
             label: None,
@@ -255,7 +255,7 @@ fn q22_match_pipeline_components() {
     .line(baseline_ns);
 
     // ---- exec 内部三个子阶段（build_eval_context / execute_joins / build_match_alert） ----
-    let scope_key = vec![Value::Number(1.0)];
+    let scope_key = vec![Value::Float(1.0)];
     let step_data = vec![StepData {
         satisfied_branch_index: 0,
         label: None,

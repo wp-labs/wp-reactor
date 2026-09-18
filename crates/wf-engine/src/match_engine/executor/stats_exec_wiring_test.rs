@@ -198,7 +198,7 @@ fn extract(row: &HashMap<String, Value>, name: &str) -> Option<Value> {
 }
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn row(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -260,7 +260,7 @@ fn reference_q15(rows: &[HashMap<String, Value>]) -> Vec<u64> {
 
     for r in rows {
         let price = match r.get("price") {
-            Some(Value::Number(p)) => Some(*p),
+            Some(Value::Float(p)) => Some(*p),
             _ => None,
         };
         let t = price.map(tier);
@@ -268,14 +268,14 @@ fn reference_q15(rows: &[HashMap<String, Value>]) -> Vec<u64> {
         if let Some(t) = t {
             count[t + 1] += 1;
         }
-        if let Some(Value::Number(b)) = r.get("bidder") {
+        if let Some(Value::Float(b)) = r.get("bidder") {
             let b = *b as i64;
             bidders[0].insert(b);
             if let Some(t) = t {
                 bidders[t + 1].insert(b);
             }
         }
-        if let Some(Value::Number(a)) = r.get("auction") {
+        if let Some(Value::Float(a)) = r.get("auction") {
             let a = *a as i64;
             auctions[0].insert(a);
             if let Some(t) = t {
@@ -374,7 +374,7 @@ fn stats_wiring_close_output_fields_carried() {
             .iter()
             .find(|(n, _)| &**n == "request_count")
             .map(|(_, v)| v.clone()),
-        Some(Value::Number(1.0))
+        Some(Value::Float(1.0))
     );
 }
 
@@ -386,7 +386,7 @@ fn stats_wiring_close_output_fields_carried() {
 fn rows_to_batch(rows: &[HashMap<String, Value>]) -> arrow::record_batch::RecordBatch {
     fn i64_of(row: &HashMap<String, Value>, name: &str) -> Option<i64> {
         match row.get(name) {
-            Some(Value::Number(n)) => Some(*n as i64),
+            Some(Value::Float(n)) => Some(*n as i64),
             _ => None,
         }
     }

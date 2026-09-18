@@ -64,7 +64,7 @@ fn str_val(s: &str) -> Value {
 }
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn arr(items: Vec<Value>) -> Value {

@@ -72,7 +72,7 @@ impl ScorePlan {
                 let idx = score_idx?;
                 let v = event.value_at(idx)?;
                 match v {
-                    Value::Number(n) => Some((n * const_v).clamp(0.0, 100.0)),
+                    Value::Float(n) => Some((n * const_v).clamp(0.0, 100.0)),
                     Value::Int(i) => Some((i as f64 * const_v).clamp(0.0, 100.0)),
                     _ => None,
                 }
@@ -281,7 +281,7 @@ fn parse_where_preds(expr: &Expr, right_window: &str, out: &mut Vec<WherePred>) 
                 return false;
             }
             let const_val = match right.as_ref() {
-                Expr::Number(n) => Value::Number(*n),
+                Expr::Number(n) => Value::Float(*n),
                 Expr::StringLit(s) => Value::Str(s.clone().into()),
                 Expr::Bool(b) => Value::Bool(*b),
                 _ => return false,

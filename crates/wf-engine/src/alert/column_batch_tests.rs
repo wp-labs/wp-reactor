@@ -70,16 +70,16 @@ fn assert_mid_gap_at(builder: &AlertColumnBuilder, name: &Arc<str>, row: usize) 
 fn column_batch_row_view_matches_to_data_record() {
     let records = vec![
         sample_record(vec![
-            (Arc::from("auction_id"), Value::Number(1000.0)),
-            (Arc::from("price"), Value::Number(99.5)),
+            (Arc::from("auction_id"), Value::Float(1000.0)),
+            (Arc::from("price"), Value::Float(99.5)),
         ]),
         sample_record(vec![
-            (Arc::from("auction_id"), Value::Number(1001.0)),
-            (Arc::from("price"), Value::Number(79.25)),
+            (Arc::from("auction_id"), Value::Float(1001.0)),
+            (Arc::from("price"), Value::Float(79.25)),
         ]),
         sample_record(vec![
-            (Arc::from("auction_id"), Value::Number(1002.0)),
-            (Arc::from("price"), Value::Number(10.0)),
+            (Arc::from("auction_id"), Value::Float(1002.0)),
+            (Arc::from("price"), Value::Float(10.0)),
         ]),
     ];
     let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
@@ -140,7 +140,7 @@ fn commit_each_rows_batch_matches_repeated_commit_each_row() {
             .stage_yield_cell(
                 &Arc::from("auction_id"),
                 Some(&ft_float),
-                &Value::Number((1000 + i) as f64),
+                &Value::Float((1000 + i) as f64),
             )
             .unwrap();
         if *price_present {
@@ -148,7 +148,7 @@ fn commit_each_rows_batch_matches_repeated_commit_each_row() {
                 .stage_yield_cell(
                     &Arc::from("price"),
                     Some(&ft_float),
-                    &Value::Number(9.5 + i as f64 * 10.0),
+                    &Value::Float(9.5 + i as f64 * 10.0),
                 )
                 .unwrap();
         }
@@ -203,11 +203,11 @@ fn commit_each_rows_batch_matches_repeated_commit_each_row() {
     let fats: Vec<String> = (0..n).map(|i| format!("ts{i}")).collect();
     let mut staged_rows = Vec::with_capacity(n);
     for (i, price_present) in price_present.iter().enumerate() {
-        let a = export_yield_value(&Value::Number((1000 + i) as f64), Some(&ft_float)).unwrap();
+        let a = export_yield_value(&Value::Float((1000 + i) as f64), Some(&ft_float)).unwrap();
         let mut row_cells = vec![(auction_col, a.0, a.1)];
         if *price_present {
             let p =
-                export_yield_value(&Value::Number(9.5 + i as f64 * 10.0), Some(&ft_float)).unwrap();
+                export_yield_value(&Value::Float(9.5 + i as f64 * 10.0), Some(&ft_float)).unwrap();
             row_cells.push((price_col, p.0, p.1));
         }
         staged_rows.push(row_cells);
@@ -326,13 +326,13 @@ fn commit_each_rows_batch_dense_all_present() {
 fn append_rejects_reserved_prefix_and_duplicates() {
     let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
 
-    let bad_prefix = sample_record(vec![(Arc::from("__wfu_evil"), Value::Number(1.0))]);
+    let bad_prefix = sample_record(vec![(Arc::from("__wfu_evil"), Value::Float(1.0))]);
     assert!(builder.append_record(&bad_prefix).is_err());
     assert_eq!(builder.len(), 0, "failed append must not touch columns");
 
     let dup = sample_record(vec![
-        (Arc::from("price"), Value::Number(1.0)),
-        (Arc::from("price"), Value::Number(2.0)),
+        (Arc::from("price"), Value::Float(1.0)),
+        (Arc::from("price"), Value::Float(2.0)),
     ]);
     assert!(builder.append_record(&dup).is_err());
     assert_eq!(builder.len(), 0);
@@ -403,15 +403,15 @@ fn sparse_yield_columns_read_back_as_ignore_null() {
     let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
     builder
         .append_record(&sample_record(vec![
-            (Arc::from("auction_id"), Value::Number(1.0)),
-            (Arc::from("price"), Value::Number(2.0)),
+            (Arc::from("auction_id"), Value::Float(1.0)),
+            (Arc::from("price"), Value::Float(2.0)),
         ]))
         .unwrap();
     // A later record with an extra yield field extends the layout.
     builder
         .append_record(&sample_record(vec![
-            (Arc::from("auction_id"), Value::Number(3.0)),
-            (Arc::from("price"), Value::Number(4.0)),
+            (Arc::from("auction_id"), Value::Float(3.0)),
+            (Arc::from("price"), Value::Float(4.0)),
             (Arc::from("extra"), Value::Str("x".into())),
         ]))
         .unwrap();
@@ -428,7 +428,7 @@ fn finish_leaves_builder_empty() {
     builder
         .append_record(&sample_record(vec![(
             Arc::from("auction_id"),
-            Value::Number(1.0),
+            Value::Float(1.0),
         )]))
         .unwrap();
     let _ = builder.finish();
@@ -460,9 +460,9 @@ fn staged_rows_match_record_appended_rows() {
         ("c3d4e5f60718a1b2", "10.0.0.3", "2026-08-16T00:00:02Z"),
     ];
     let values = [
-        (Value::Number(1000.0), Value::Number(99.5)),
-        (Value::Number(1001.0), Value::Number(79.25)),
-        (Value::Number(1002.0), Value::Number(10.0)),
+        (Value::Float(1000.0), Value::Float(99.5)),
+        (Value::Float(1001.0), Value::Float(79.25)),
+        (Value::Float(1002.0), Value::Float(10.0)),
     ];
 
     // Record path: one OutputRecord per row, appended via append_record.
@@ -514,23 +514,23 @@ fn staged_optional_omission_creates_sparse_cells() {
     // Row 0: a, c (b omitted).
     builder.begin_row();
     builder
-        .stage_yield_cell(&names[0], ft.as_ref(), &Value::Number(1.0))
+        .stage_yield_cell(&names[0], ft.as_ref(), &Value::Float(1.0))
         .unwrap();
     builder
-        .stage_yield_cell(&names[2], ft.as_ref(), &Value::Number(3.0))
+        .stage_yield_cell(&names[2], ft.as_ref(), &Value::Float(3.0))
         .unwrap();
     commit_staged(&mut builder, "id0", "e0", "t0");
 
     // Row 1: full a, b, c.
     builder.begin_row();
     builder
-        .stage_yield_cell(&names[0], ft.as_ref(), &Value::Number(4.0))
+        .stage_yield_cell(&names[0], ft.as_ref(), &Value::Float(4.0))
         .unwrap();
     builder
-        .stage_yield_cell(&names[1], ft.as_ref(), &Value::Number(5.0))
+        .stage_yield_cell(&names[1], ft.as_ref(), &Value::Float(5.0))
         .unwrap();
     builder
-        .stage_yield_cell(&names[2], ft.as_ref(), &Value::Number(6.0))
+        .stage_yield_cell(&names[2], ft.as_ref(), &Value::Float(6.0))
         .unwrap();
     commit_staged(&mut builder, "id1", "e1", "t1");
 
@@ -553,7 +553,7 @@ fn stage_rejects_reserved_prefix_and_duplicates_and_keeps_row_clean() {
     builder.begin_row();
     assert!(
         builder
-            .stage_yield_cell(&bad, None, &Value::Number(1.0))
+            .stage_yield_cell(&bad, None, &Value::Float(1.0))
             .is_err()
     );
 
@@ -561,12 +561,12 @@ fn stage_rejects_reserved_prefix_and_duplicates_and_keeps_row_clean() {
     let a2 = Arc::from("dup");
     builder.begin_row();
     builder
-        .stage_yield_cell(&a, None, &Value::Number(1.0))
+        .stage_yield_cell(&a, None, &Value::Float(1.0))
         .unwrap();
     // Same name again (different Arc, equal string) → duplicate error.
     assert!(
         builder
-            .stage_yield_cell(&a2, None, &Value::Number(2.0))
+            .stage_yield_cell(&a2, None, &Value::Float(2.0))
             .is_err()
     );
     assert_eq!(builder.len(), 0, "failed rows must not touch columns");
@@ -580,25 +580,25 @@ fn failed_staging_then_successful_row_is_consistent() {
     let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
     builder.begin_row();
     builder
-        .stage_yield_cell(&n, None, &Value::Number(1.0))
+        .stage_yield_cell(&n, None, &Value::Float(1.0))
         .unwrap();
     let bad = Arc::from("__wfu_bad");
     assert!(
         builder
-            .stage_yield_cell(&bad, None, &Value::Number(2.0))
+            .stage_yield_cell(&bad, None, &Value::Float(2.0))
             .is_err()
     );
     // begin_row clears the staged cells; commit must still be balanced.
     builder.begin_row();
     builder
-        .stage_yield_cell(&n, None, &Value::Number(3.0))
+        .stage_yield_cell(&n, None, &Value::Float(3.0))
         .unwrap();
     commit_staged(&mut builder, "id", "e", "t");
     let batch = builder.finish();
     assert_eq!(batch.len(), 1);
     let row = batch.iter_data_records().next().unwrap().unwrap();
     match row.field("x").unwrap().get_value() {
-        // 未声明类型的小整值沿用 `Number`（|v| < 2^53）。
+        // 未声明类型的小整值沿用 `Float`（|v| < 2^53）。
         ModelValue::Float(n) => assert_eq!(*n, 3.0),
         other => panic!("unexpected value for x: {other:?}"),
     }

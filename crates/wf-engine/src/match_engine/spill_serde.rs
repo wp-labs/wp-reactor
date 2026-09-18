@@ -240,7 +240,7 @@ fn write_row_fields(w: &mut Writer, rf: &RowFields) -> Result<(), SpillError> {
 /// （可接受的降级方向：绝不静默改写精度）。
 fn write_value(w: &mut Writer, v: &crate::match_engine::Value) -> Result<(), SpillError> {
     match v {
-        crate::match_engine::Value::Number(n) => {
+        crate::match_engine::Value::Float(n) => {
             w.u8(0);
             w.f64(*n);
             Ok(())
@@ -275,7 +275,7 @@ fn write_value(w: &mut Writer, v: &crate::match_engine::Value) -> Result<(), Spi
 
 fn read_value(r: &mut Reader<'_>) -> Result<crate::match_engine::Value, SpillError> {
     Ok(match r.u8()? {
-        0 => crate::match_engine::Value::Number(r.f64()?),
+        0 => crate::match_engine::Value::Float(r.f64()?),
         1 => {
             let s = r.bytes()?;
             crate::match_engine::Value::Str(
@@ -653,13 +653,13 @@ pub fn spill_hash(key: &ScopeKey) -> u64 {
 mod value_int_tests {
     use super::*;
 
-    /// 标量 round-trip：`Number` / `Str` / `Bool` 不变；`Int(i64)` 走 tag 5，
+    /// 标量 round-trip：`Float` / `Str` / `Bool` 不变；`Int(i64)` 走 tag 5，
     /// **>2^53 也逐位精确**（epoch-ns 量级经 f64 会量化到 ~256ns）。
     #[test]
     fn write_read_value_round_trips_scalars() {
         let cases = [
-            crate::match_engine::Value::Number(1.5),
-            crate::match_engine::Value::Number(-0.0),
+            crate::match_engine::Value::Float(1.5),
+            crate::match_engine::Value::Float(-0.0),
             crate::match_engine::Value::Str("x".into()),
             crate::match_engine::Value::Bool(true),
             crate::match_engine::Value::Int(42),

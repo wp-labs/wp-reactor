@@ -199,7 +199,7 @@ where
         let mut kind: Option<ColKind> = None;
         for row in 0..n {
             match resolve(row, fname) {
-                Some(Value::Number(_) | Value::Int(_)) => {
+                Some(Value::Float(_) | Value::Int(_)) => {
                     kind = Some(ColKind::Num);
                     break;
                 }
@@ -224,7 +224,7 @@ where
                 let mut b = Float64Builder::with_capacity(n);
                 for row in 0..n {
                     match resolve(row, fname) {
-                        Some(Value::Number(f)) => b.append_value(f),
+                        Some(Value::Float(f)) => b.append_value(f),
                         // 该桥构建 Float64 列，`Int` 按数值写入（列型即 f64 域）。
                         Some(Value::Int(i)) => b.append_value(i as f64),
                         Some(_) => return None,
@@ -373,7 +373,7 @@ fn compile_expr(expr: &Expr, view: &ColumnarBatch<'_>) -> Option<ColumnExpr> {
             let list_values: Option<Vec<Value>> = list
                 .iter()
                 .map(|item| match item {
-                    Expr::Number(n) => Some(Value::Number(*n)),
+                    Expr::Number(n) => Some(Value::Float(*n)),
                     Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
                     Expr::Bool(b) => Some(Value::Bool(*b)),
                     _ => None,

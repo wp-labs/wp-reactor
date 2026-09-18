@@ -106,7 +106,7 @@ fn if_then_else_true_branch() {
         fields: EngineHashMap::default(),
     };
     let result = eval_expr(&expr, &event);
-    assert_eq!(result, Some(Value::Number(80.0)));
+    assert_eq!(result, Some(Value::Float(80.0)));
 }
 
 #[test]
@@ -122,7 +122,7 @@ fn if_then_else_false_branch() {
         fields: EngineHashMap::default(),
     };
     let result = eval_expr(&expr, &event);
-    assert_eq!(result, Some(Value::Number(40.0)));
+    assert_eq!(result, Some(Value::Float(40.0)));
 }
 
 #[test]
@@ -143,7 +143,7 @@ fn if_then_else_nested() {
         fields: EngineHashMap::default(),
     };
     let result = eval_expr(&expr, &event);
-    assert_eq!(result, Some(Value::Number(2.0)));
+    assert_eq!(result, Some(Value::Float(2.0)));
 }
 
 #[test]
@@ -164,12 +164,12 @@ fn if_then_else_with_field_condition() {
     let mut fields = EngineHashMap::default();
     fields.insert("action".into(), Value::Str("failed".into()));
     let event = Event { fields };
-    assert_eq!(eval_expr(&expr, &event), Some(Value::Number(80.0)));
+    assert_eq!(eval_expr(&expr, &event), Some(Value::Float(80.0)));
 
     let mut fields2 = EngineHashMap::default();
     fields2.insert("action".into(), Value::Str("success".into()));
     let event2 = Event { fields: fields2 };
-    assert_eq!(eval_expr(&expr, &event2), Some(Value::Number(40.0)));
+    assert_eq!(eval_expr(&expr, &event2), Some(Value::Float(40.0)));
 }
 
 // ===========================================================================

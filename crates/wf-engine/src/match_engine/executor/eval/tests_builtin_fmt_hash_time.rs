@@ -12,7 +12,7 @@ use super::*;
 fn builtin_fmt_concat_join() {
     let ctx = ctx_with(vec![
         ("a", Value::Str("x".into())),
-        ("n", Value::Number(3.0)),
+        ("n", Value::Float(3.0)),
         ("arr", arr(vec![Value::Str("q".into())])),
     ]);
     // fmt
@@ -82,11 +82,11 @@ fn builtin_fmt_concat_join() {
             &call("indexof", vec![lit("hello world"), lit("world")]),
             &ctx
         ),
-        Some(Value::Number(6.0))
+        Some(Value::Float(6.0))
     );
     assert_eq!(
         l3_ctx(&call("indexof", vec![lit("hello"), lit("zzz")]), &ctx),
-        Some(Value::Number(-1.0))
+        Some(Value::Float(-1.0))
     );
     assert_eq!(l3_ctx(&call("indexof", vec![lit("a")]), &ctx), None);
     assert_eq!(
@@ -158,7 +158,7 @@ fn builtin_null_blank_funcs() {
         ("spaces", Value::Str(" \t\n ".into())),
         ("host", Value::Str("example.org".into())),
         ("fallback", Value::Str("fb".into())),
-        ("n", Value::Number(42.0)),
+        ("n", Value::Float(42.0)),
     ]);
     // coalesce: skips null and blank, returns first good value
     assert_eq!(
@@ -273,7 +273,7 @@ fn builtin_null_blank_funcs() {
 fn builtin_hash_funcs() {
     let ctx = ctx_with(vec![
         ("msg", Value::Str("hello".into())),
-        ("n", Value::Number(42.0)),
+        ("n", Value::Float(42.0)),
     ]);
     assert_eq!(
         l3_ctx(&call("md5", vec![lit("hello")]), &ctx),
@@ -337,7 +337,7 @@ fn builtin_hash_funcs() {
     );
     assert_eq!(l3_ctx(&call("stable_id", vec![lit("p")]), &ctx), None);
     // array/object values are not hashable → None
-    let arr_ctx = ctx_with(vec![("a", arr(vec![Value::Number(1.0)]))]);
+    let arr_ctx = ctx_with(vec![("a", arr(vec![Value::Float(1.0)]))]);
     assert_eq!(
         l3_ctx(&call("stable_id", vec![lit("p"), field("a")]), &arr_ctx),
         None
@@ -359,7 +359,7 @@ fn builtin_now_variants() {
         ("now_ns", 1_000_000_000_000_000_000.0),
     ] {
         let result = l3_ctx(&call(name, vec![]), &ctx);
-        let Some(Value::Number(v)) = result else {
+        let Some(Value::Float(v)) = result else {
             panic!("{}() should return a number, got {:?}", name, result);
         };
         assert!(v > min_ts, "{}() timestamp too small: {}", name, v);
@@ -372,12 +372,12 @@ fn builtin_now_variants() {
         left: Box::new(call("now", vec![])),
         right: Box::new(call("now_ms", vec![])),
     };
-    assert_eq!(l3_ctx(&expr, &ctx), Some(Value::Number(0.0)));
+    assert_eq!(l3_ctx(&expr, &ctx), Some(Value::Float(0.0)));
 }
 
 #[test]
 fn builtin_strftime_strptime() {
-    let ctx = ctx_with(vec![("ts", Value::Number(0.0)), ("n", Value::Number(7.0))]);
+    let ctx = ctx_with(vec![("ts", Value::Float(0.0)), ("n", Value::Float(7.0))]);
     // explicit format
     assert_eq!(
         l3_ctx(
@@ -436,7 +436,7 @@ fn builtin_strftime_strptime() {
             &call("strptime", vec![lit("1970-01-01"), lit("%Y-%m-%d")]),
             &ctx
         ),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
     assert_eq!(
         l3_ctx(
@@ -446,7 +446,7 @@ fn builtin_strftime_strptime() {
             ),
             &ctx
         ),
-        Some(Value::Number(1_710_115_200_000.0))
+        Some(Value::Float(1_710_115_200_000.0))
     );
     assert_eq!(
         l3_ctx(
@@ -456,7 +456,7 @@ fn builtin_strftime_strptime() {
             ),
             &ctx
         ),
-        Some(Value::Number(1_710_086_400_000.0))
+        Some(Value::Float(1_710_086_400_000.0))
     );
     assert_eq!(
         l3_ctx(
@@ -515,7 +515,7 @@ fn builtin_regex_time_funcs() {
             ),
             &ctx
         ),
-        Some(Value::Number(5.0))
+        Some(Value::Float(5.0))
     );
     assert_eq!(
         l3_ctx(
@@ -528,7 +528,7 @@ fn builtin_regex_time_funcs() {
             ),
             &ctx
         ),
-        Some(Value::Number(5.0))
+        Some(Value::Float(5.0))
     );
     assert_eq!(
         l3_ctx(&call("time_diff", vec![Expr::Number(1.0)]), &ctx),
@@ -555,7 +555,7 @@ fn builtin_regex_time_funcs() {
             ),
             &ctx
         ),
-        Some(Value::Number(1_700_000_040_000.0))
+        Some(Value::Float(1_700_000_040_000.0))
     );
     // bucket_end = bucket + interval
     assert_eq!(
@@ -566,7 +566,7 @@ fn builtin_regex_time_funcs() {
             ),
             &ctx
         ),
-        Some(Value::Number(1_700_000_100_000.0))
+        Some(Value::Float(1_700_000_100_000.0))
     );
     // invalid intervals
     for bad in [0.0, -60.0, f64::INFINITY, f64::NAN] {

@@ -158,7 +158,7 @@ rule tracked_close {
             .yield_fields
             .iter()
             .find(|(name, _)| &**name == "avg_count"),
-        Some(&("avg_count".into(), Value::Number(20.0)))
+        Some(&("avg_count".into(), Value::Float(20.0)))
     );
     assert_eq!(
         alert

@@ -1108,7 +1108,7 @@ pub(super) fn row_event_debug_ref(ev: &RowEvent<'_>, batch_seq: u64, row_index: 
 
 pub(super) fn value_debug_string(value: &wf_engine::match_engine::Value) -> String {
     match value {
-        wf_engine::match_engine::Value::Number(value) => value.to_string(),
+        wf_engine::match_engine::Value::Float(value) => value.to_string(),
         wf_engine::match_engine::Value::Int(value) => value.to_string(),
         wf_engine::match_engine::Value::Str(value) => value.to_string(),
         wf_engine::match_engine::Value::Bool(value) => value.to_string(),
@@ -1181,7 +1181,7 @@ pub(super) fn event_time_nanos(event: &dyn FieldSource, time_field: Option<&str>
     time_field
         .and_then(|field| event.field_value(field))
         .and_then(|value| match value {
-            wf_engine::match_engine::Value::Number(n) => Some(n as i64),
+            wf_engine::match_engine::Value::Float(n) => Some(n as i64),
             wf_engine::match_engine::Value::Int(i) => Some(i),
             _ => None,
         })

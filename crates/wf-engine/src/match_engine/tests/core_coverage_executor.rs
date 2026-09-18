@@ -93,7 +93,7 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Base(BaseType::Chars)),
-            Value::Number(1.5)
+            Value::Float(1.5)
         ),
         Ok(Some(Value::Str("1.5".into())))
     );
@@ -110,7 +110,7 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Base(BaseType::Chars)),
-            Value::Array(vec![Value::Number(1.0), Value::Str("x".into())])
+            Value::Array(vec![Value::Float(1.0), Value::Str("x".into())])
         ),
         Ok(Some(Value::Str(s))) if s == r#"[1.0,"x"]"#
     ));
@@ -118,7 +118,7 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Base(BaseType::Chars)),
-            Value::Number(f64::NAN)
+            Value::Float(f64::NAN)
         )
         .is_err()
     );
@@ -146,15 +146,15 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Base(BaseType::Digit)),
-            Value::Number(3.0)
+            Value::Float(3.0)
         ),
-        Ok(Some(Value::Number(3.0)))
+        Ok(Some(Value::Float(3.0)))
     );
     assert!(
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Base(BaseType::Digit)),
-            Value::Number(3.5)
+            Value::Float(3.5)
         )
         .is_err()
     );
@@ -172,7 +172,7 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Base(BaseType::Float)),
-            Value::Number(1.5)
+            Value::Float(1.5)
         )
         .is_ok()
     );
@@ -180,7 +180,7 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Base(BaseType::Float)),
-            Value::Number(f64::NAN)
+            Value::Float(f64::NAN)
         )
         .is_err()
     );
@@ -216,7 +216,7 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Base(BaseType::Time)),
-            Value::Number(1_700_000_000_000_000_000.0)
+            Value::Float(1_700_000_000_000_000_000.0)
         )
         .is_ok()
     );
@@ -224,7 +224,7 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Base(BaseType::Time)),
-            Value::Number(1e300)
+            Value::Float(1e300)
         )
         .is_err()
     );
@@ -258,7 +258,7 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Base(BaseType::Ip)),
-            Value::Number(1.0)
+            Value::Float(1.0)
         )
         .is_err()
     );
@@ -279,7 +279,7 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Base(BaseType::Hex)),
-            Value::Number(16.0)
+            Value::Float(16.0)
         )
         .is_ok()
     );
@@ -295,7 +295,7 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Base(BaseType::Hex)),
-            Value::Number(-1.0)
+            Value::Float(-1.0)
         )
         .is_err()
     );
@@ -303,7 +303,7 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Base(BaseType::Hex)),
-            Value::Number(1.5)
+            Value::Float(1.5)
         )
         .is_err()
     );
@@ -321,7 +321,7 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Array(BaseType::Chars)),
-            Value::Number(1.0)
+            Value::Float(1.0)
         )
         .is_err()
     );
@@ -345,15 +345,15 @@ fn coerce_yield_field_value_covered_for_all_types_and_failures() {
         RuleExecutor::coerce_yield_field_value_with(
             "f",
             Some(&FieldType::Object),
-            Value::Number(1.0)
+            Value::Float(1.0)
         )
         .is_err()
     );
 
     // No declared type → value passes through untouched.
     assert_eq!(
-        RuleExecutor::coerce_yield_field_value_with("f", None, Value::Number(1.0)),
-        Ok(Some(Value::Number(1.0)))
+        RuleExecutor::coerce_yield_field_value_with("f", None, Value::Float(1.0)),
+        Ok(Some(Value::Float(1.0)))
     );
 }
 
@@ -395,7 +395,7 @@ fn yield_kinds_precomputed_per_expression_class() {
     ];
     let exec = RuleExecutor::new(plan);
     let kinds = &exec.output_static().yield_kinds;
-    assert!(matches!(kinds[0], YieldKind::Lit(Value::Number(1.0))));
+    assert!(matches!(kinds[0], YieldKind::Lit(Value::Float(1.0))));
     assert!(matches!(kinds[1], YieldKind::Lit(Value::Str(ref s)) if s == "s"));
     assert!(matches!(kinds[2], YieldKind::Lit(Value::Bool(true))));
     assert!(matches!(kinds[3], YieldKind::Field));

@@ -22,17 +22,19 @@ pub const MACHINE_ID: &str = "wp_src_ip";
 
 /// Scalar value carried inside an event row or expression.
 ///
-/// `Number` 承载浮点；**整数域由 `Int` 精确承载**（箭头 Int64/Timestamp 列、
-/// digit 字段、整值计数）—— 避免 epoch-ns（≈1.77e18 > 2^53）经 f64 往返被量化到
-/// ~256ns（2026-09-18 精度修复的根治处）。
+/// 数值域拆成两个变体：[`Value::Float`] 承载真正的浮点，[`Value::Int`] 精确承载
+/// 整数（箭头 Int64/Timestamp 列、digit 字段、整值计数）—— 后者避免 epoch-ns
+/// （≈1.77e18 > 2^53）经 f64 往返被量化到 ~256ns（2026-09-18 精度修复的根治处）。
 ///
 /// `#[non_exhaustive]`：外部 crate 匹配必须带兜底分支，后续再加变体不再是破坏性变更。
 #[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq)]
 #[jumo(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 #[non_exhaustive]
 pub enum Value {
-    Number(f64),
-    /// 精确整数（`i64`）。语义归一：`|i| < 2^53` 时与 `Number(i as f64)` 视为**同一
+    /// 浮点域（JSON 小数、`Float64` 列、除法等运算结果）。刻意不叫 `Number`：
+    /// 那个名字暗示「数字都归它管」，正是整数被 f64 量化的温床。
+    Float(f64),
+    /// 精确整数（`i64`）。语义归一：`|i| < 2^53` 时与 `Float(i as f64)` 视为**同一
     /// 值**（比较/同一性/哈希/序列化漏斗统一处理，见 `cep::eval::cmp` 与 `cep::key`）。
     Int(i64),
     Str(SmolStr),

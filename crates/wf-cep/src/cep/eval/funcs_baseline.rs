@@ -22,9 +22,9 @@ pub(super) fn eval_func_baseline_dev(
     }
     let entity = value_to_string(&eval_expr_ext(&args[0], event, windows, baselines)?);
     let metric = value_to_string(&eval_expr_ext(&args[1], event, windows, baselines)?);
-    // 数值内置函数是 f64 域：`Value::Int` 经 `i as f64` 归一，走与 `Number` 相同路径。
+    // 数值内置函数是 f64 域：`Value::Int` 经 `i as f64` 归一，走与 `Float` 相同路径。
     let value = match eval_expr_ext(&args[2], event, windows, baselines)? {
-        Value::Number(n) => n,
+        Value::Float(n) => n,
         Value::Int(i) => i as f64,
         _ => return None,
     };
@@ -32,11 +32,11 @@ pub(super) fn eval_func_baseline_dev(
     // 同期比较。事件无 event_time 字段 → None：相位关闭时无影响；相位开启时退化为
     // 全桶并集（保守：仅无时间来源的诊断场景）。
     let at = match event.field_value("event_time") {
-        Some(Value::Number(n)) if n.is_finite() => Some(n as i64),
+        Some(Value::Float(n)) if n.is_finite() => Some(n as i64),
         Some(Value::Int(i)) => Some(i),
         _ => None,
     };
     crate::baseline::store()
         .deviation_at(&entity, &metric, value, at)
-        .map(Value::Number)
+        .map(Value::Float)
 }

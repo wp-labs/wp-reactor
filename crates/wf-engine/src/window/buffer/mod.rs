@@ -1555,7 +1555,7 @@ fn event_bytes(e: &Event) -> usize {
 fn value_heap_bytes(v: &Value) -> usize {
     match v {
         // 标量（含 `Int`：i64 内联）：无额外堆分配。
-        Value::Number(_) | Value::Int(_) | Value::Bool(_) => 0,
+        Value::Float(_) | Value::Int(_) | Value::Bool(_) => 0,
         Value::Str(s) => smol_str_heap_bytes(s),
         Value::Array(items) => {
             items.capacity() * size_of::<Value>()

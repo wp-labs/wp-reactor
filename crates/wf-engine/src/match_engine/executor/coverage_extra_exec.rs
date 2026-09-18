@@ -78,7 +78,7 @@ fn output_static_precomputes_plan_constants() {
     use crate::match_engine::executor::YieldKind;
     assert!(matches!(
         statics.yield_kinds[0],
-        YieldKind::Lit(Value::Number(1.0))
+        YieldKind::Lit(Value::Float(1.0))
     ));
     assert!(matches!(
         statics.yield_kinds[1],

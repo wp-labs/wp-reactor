@@ -15,7 +15,7 @@ pub enum ValueKey {
     Number(u64),
     /// 精确整数：**仅** `|i| >= 2^53`（f64 已无法精确承载）走本变体。
     ///
-    /// 小整数仍归一到 `ValueKey::Number` 位键，与 `Value::Number` 同键（保持既有键空间
+    /// 小整数仍归一到 `ValueKey::Number` 位键，与 `Value::Float` 同键（保持既有键空间
     /// 与 `0.0` / `NaN` 归一行为不变）。本变体是 `>2^53` 的精确逃生口：
     /// 此前一律 `i as f64`，相邻纳秒时间戳（epoch-ns ≈1.77e18）会被量化成
     /// **同一个键**，`distinct` 静默少计 —— 与 stats 路径的
@@ -39,9 +39,9 @@ impl ValueKey {
     /// 计数按**位**判同一 —— `0.1 + 0.2` 与 `0.3` 计两个值（而 `==` 认为相等）。
     pub fn from_value(value: &Value) -> Self {
         match value {
-            Value::Number(n) => Self::Number(canonical_f64_bits(*n)),
-            // 整数域与整值 `Number` 归一（`|i| < 2^53` 时 `i as f64` 精确）：
-            // 两变体落**同一** canonical 位键，否则 `Int(1)` 与 `Number(1.0)`
+            Value::Float(n) => Self::Number(canonical_f64_bits(*n)),
+            // 整数域与整值 `Float` 归一（`|i| < 2^53` 时 `i as f64` 精确）：
+            // 两变体落**同一** canonical 位键，否则 `Int(1)` 与 `Float(1.0)`
             // 会在 distinct 计数里被当成两个值。
             Value::Int(i) if i.unsigned_abs() < F64_EXACT_INT_LIMIT => {
                 Self::Number(canonical_f64_bits(*i as f64))
@@ -107,7 +107,7 @@ pub fn canonical_f64_bits(value: f64) -> u64 {
 /// A typed match-key. `Pair` supports two key fields (the common case); deeper
 /// nesting builds up via `Pair`. Integer-valued numbers collapse to `Int`
 /// (including `Timestamp(Ns)`, read as `i64`), so a columnar `Int64` column and
-/// the row-based `Value::Number(f64)` holding an integer (`fract() == 0`,
+/// the row-based `Value::Float(f64)` holding an integer (`fract() == 0`,
 /// `<2^53`) produce the **same** variant and hash equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default, ::jumo_derive::Jumo)]
 #[jumo(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
@@ -131,7 +131,7 @@ impl ScopeKey {
     /// form so they still shard deterministically.
     pub fn from_value(value: &Value) -> Self {
         match value {
-            Value::Number(n) => {
+            Value::Float(n) => {
                 if n.fract() == 0.0 && n.abs() < TWO_POW_53 {
                     ScopeKey::Int(*n as i64)
                 } else {
@@ -139,7 +139,7 @@ impl ScopeKey {
                 }
             }
             Value::Str(s) => ScopeKey::Str(s.clone()),
-            // 精确整数：直接落 `Int`（`|i| < 2^53` 时与 `Number` 路径同 variant/同哈希）。
+            // 精确整数：直接落 `Int`（`|i| < 2^53` 时与 `Float` 路径同 variant/同哈希）。
             Value::Int(i) => ScopeKey::Int(*i),
             Value::Bool(b) => ScopeKey::Str(if *b { "true" } else { "false" }.into()),
             // Structured values: fixed deterministic token (rare as a match key);
@@ -257,7 +257,7 @@ impl InstanceKey {
 
 /// Flatten a possibly-`Pair`ed [`ScopeKey`] into its leaf [`Value`]s, preserving
 /// the **original Value types** (`ScopeKey::Int` → `Value::Int`,
-/// `ScopeKey::Float` → `Value::Number`, `ScopeKey::Str` → `Value::Str`) so
+/// `ScopeKey::Float` → `Value::Float`, `ScopeKey::Str` → `Value::Str`) so
 /// the close path's `scope_key` is byte-identical to the event path's
 /// (`extract_key` returns the raw field Values). Previously Int keys flattened to `Str`, which
 /// broke digit-typed yield/entity fields on `on close` rules (`id = b.auction`
@@ -266,7 +266,7 @@ pub(super) fn flatten_scope_values(key: &ScopeKey) -> Vec<Value> {
     match key {
         ScopeKey::Empty => vec![],
         ScopeKey::Int(v) => vec![Value::Int(*v)],
-        ScopeKey::Float(bits) => vec![Value::Number(f64::from_bits(*bits))],
+        ScopeKey::Float(bits) => vec![Value::Float(f64::from_bits(*bits))],
         ScopeKey::Str(s) => vec![Value::Str(s.clone())],
         ScopeKey::Pair(a, b) => {
             let mut out = flatten_scope_values(a);
@@ -602,8 +602,8 @@ pub fn push_i64_exact_decimal(scratch: &mut impl StrSink, mut v: i64) {
 /// re-serialized string). Kept inline for reference / legacy tests.
 pub fn value_to_string(v: &Value) -> String {
     match v {
-        Value::Number(n) => number_to_string(*n),
-        // `Int(i)` 与整值 `Number` 同为十进制文本（稳定 ID / 排序兜底共用）。
+        Value::Float(n) => number_to_string(*n),
+        // `Int(i)` 与整值 `Float` 同为十进制文本（稳定 ID / 排序兜底共用）。
         Value::Int(i) => i.to_string(),
         Value::Str(s) => s.to_string(),
         Value::Bool(b) => b.to_string(),
@@ -679,7 +679,7 @@ pub fn scope_key_from_column(batch: &RecordBatch, col_idx: usize, row: usize) ->
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
                 .map(|a| a.value(row));
-            v.map(|f| ScopeKey::from_value(&Value::Number(f)))
+            v.map(|f| ScopeKey::from_value(&Value::Float(f)))
         }
         DataType::Utf8 => col
             .as_any()
@@ -1108,7 +1108,7 @@ mod tests {
         );
         assert_eq!(
             flatten_scope_values(&ScopeKey::Float(f64::to_bits(7.5))),
-            vec![Value::Number(7.5)]
+            vec![Value::Float(7.5)]
         );
         assert_eq!(
             flatten_scope_values(&ScopeKey::Str("abc".into())),
@@ -1157,13 +1157,13 @@ mod tests {
         ];
         for &n in cases {
             assert_eq!(
-                value_to_string(&Value::Number(n)),
+                value_to_string(&Value::Float(n)),
                 n.to_string(),
                 "value_to_string mismatch for f64 {n:?}"
             );
         }
         // Spot-check the fast path renders an integer-valued f64 as a plain
         // decimal (no `.0` suffix), matching f64 Display.
-        assert_eq!(value_to_string(&Value::Number(421_762.0)), "421762");
+        assert_eq!(value_to_string(&Value::Float(421_762.0)), "421762");
     }
 }

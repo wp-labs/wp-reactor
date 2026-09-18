@@ -9,15 +9,15 @@ use super::*;
 /// 列式输出 cell（fmt/strftime/count_char）与解释路径逐行对拍，含 yield
 /// 语义的 None→空串包装（`eval_yield_expr_with_meta` 对缺字段/null 参数
 /// 替换空串）。
-/// `Value::Int(i)` 与整值 `Value::Number(i as f64)` 是**同一逻辑值**（见
+/// `Value::Int(i)` 与整值 `Value::Float(i as f64)` 是**同一逻辑值**（见
 /// `Value::Int` 契约），但两个引擎的实现天然产出不同**变体**：列式 int 车道产出
 /// `CScalar::Int` → `Value::Int`，解释路径（`Expr::Number` 字面量 / f64 域内置
-/// 函数）产出 `Value::Number`。此处按契约归一后比较——null-ness 与其它类型
+/// 函数）产出 `Value::Float`。此处按契约归一后比较——null-ness 与其它类型
 /// 仍严格逐位；**用户可见的输出类型**由 `export_*` 层统一（未声明整值 → Digit，
 /// 见 `export_untyped_value` / `export_yield_f64`），与本变体差异无关。
 fn normalize_int_to_number(v: Value) -> Value {
     match v {
-        Value::Int(i) if i.unsigned_abs() < (1u64 << 53) => Value::Number(i as f64),
+        Value::Int(i) if i.unsigned_abs() < (1u64 << 53) => Value::Float(i as f64),
         Value::Array(items) => {
             Value::Array(items.into_iter().map(normalize_int_to_number).collect())
         }

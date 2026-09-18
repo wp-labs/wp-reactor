@@ -262,7 +262,7 @@ fn expr_key_numeric_and_bool_results_type_consistently() {
     // review 4：表达式键的数值/布尔结果经 ScopeKey::from_value 归一，与同值
     // 普通字段键同构（Int 塌缩、Bool → "true"/"false" 字符串）——typed key
     // 与列式/行式分组跨路径一致。
-    let num_ev = event(vec![("a", Value::Number(2.0)), ("b", Value::Number(4.0))]);
+    let num_ev = event(vec![("a", Value::Float(2.0)), ("b", Value::Float(4.0))]);
     let add = Expr::BinOp {
         op: wf_lang::ast::BinOp::Add,
         left: Box::new(Expr::Field(FieldRef::Qualified("s".into(), "a".into()))),
@@ -275,7 +275,7 @@ fn expr_key_numeric_and_bool_results_type_consistently() {
         "2+4 表达式键 → Int(6)（与普通字段 6 同构）"
     );
     // 缺字段 → 求值 None → 跳过。
-    let missing = event(vec![("a", Value::Number(2.0))]);
+    let missing = event(vec![("a", Value::Float(2.0))]);
     let add2 = Expr::BinOp {
         op: wf_lang::ast::BinOp::Add,
         left: Box::new(Expr::Field(FieldRef::Qualified("s".into(), "a".into()))),
@@ -287,7 +287,7 @@ fn expr_key_numeric_and_bool_results_type_consistently() {
     );
 
     // 比较表达式键 → Bool → 归一为 "true"，与普通 bool 字段键一致。
-    let cmp_ev = event(vec![("a", Value::Number(7.0)), ("b", Value::Number(3.0))]);
+    let cmp_ev = event(vec![("a", Value::Float(7.0)), ("b", Value::Float(3.0))]);
     let gt = Expr::BinOp {
         op: wf_lang::ast::BinOp::Gt,
         left: Box::new(Expr::Field(FieldRef::Qualified("s".into(), "a".into()))),

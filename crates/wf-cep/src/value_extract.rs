@@ -3,7 +3,7 @@
 //!
 //! 行式事件桥（`batch_to_events` / 物化 / 列式视图按需读）与列式求值的值
 //! 转换**共用**本模块：Utf8 列带 wfl metadata 时按 structured JSON 解析，
-//! 其余按原生列类型转换（Int64/Timestamp(Ns) → `Number` f64 round-trip、
+//! 其余按原生列类型转换（Int64/Timestamp(Ns) → `Float` f64 round-trip、
 //! Utf8 → `Str`、Boolean → `Bool`、Struct/List 递归）——字节一致性由
 //! 对拍测试（columnar_tests / event_bridge_r4 / coverage）锁定。
 //! 引擎经 `wf_engine::match_engine::event_bridge` re-export 消费，路径不变。
@@ -47,7 +47,7 @@ pub fn wfl_structured_field_kind(field: &Field) -> Option<&str> {
 /// `JoinRow::field_value`）都已先查。不支持的列类型 / JSON 解析失败 → `None`。
 ///
 /// 类型映射：[`Int64`](arrow::datatypes::DataType::Int64) 与
-/// `Timestamp(Ns)` → [`Value::Int`]（精确，不经 f64）；`Float64` → `Number`。
+/// `Timestamp(Ns)` → [`Value::Int`]（精确，不经 f64）；`Float64` → `Float`。
 pub fn extract_field_value(field: &Field, col: &dyn Array, row: usize) -> Option<Value> {
     // 先查列类型再查 metadata：只有 Utf8 列才可能是 structured JSON。旧实现先查
     // metadata（每次字段读取的纯开销）——q15 全 Int64 字段每事件 34 次白查，
@@ -63,15 +63,15 @@ pub fn extract_field_value(field: &Field, col: &dyn Array, row: usize) -> Option
     extract_value(col, row)
 }
 
-/// `Value` → `f64`（[`Value::Number`] 与 [`Value::Int`]；其余变体 `None`）。
+/// `Value` → `f64`（[`Value::Float`] 与 [`Value::Int`]；其余变体 `None`）。
 ///
 /// 行式路径数值漏斗的**单一实现**：此前 `rows.rs` / `cep/step.rs` /
 /// `wf-engine …/stats_exec/eval/keys.rs` 各有一份同体副本，任一处改漏即口径漂移
 /// （列式与行式结果不一致会是静默错配）。
 pub fn value_to_f64(v: &Value) -> Option<f64> {
     match v {
-        Value::Number(n) => Some(*n),
-        // 整数域归一：`Int` 与整值 `Number` 走同一数值漏斗（`|i| < 2^53` 精确）。
+        Value::Float(n) => Some(*n),
+        // 整数域归一：`Int` 与整值 `Float` 走同一数值漏斗（`|i| < 2^53` 精确）。
         Value::Int(i) => Some(*i as f64),
         _ => None,
     }
@@ -86,7 +86,7 @@ fn extract_value(col: &dyn Array, row: usize) -> Option<Value> {
         }
         DataType::Float64 => {
             let arr = col.as_any().downcast_ref::<Float64Array>()?;
-            Some(Value::Number(arr.value(row)))
+            Some(Value::Float(arr.value(row)))
         }
         DataType::Utf8 => {
             let arr = col.as_any().downcast_ref::<StringArray>()?;
@@ -132,14 +132,14 @@ fn extract_value(col: &dyn Array, row: usize) -> Option<Value> {
 
 /// JSON 标量 → [`Value`]。
 ///
-/// **JSON 数字一律落 [`Value::Number`]，不猜整型**（2026-09-18 决策）：`serde_json` 的
+/// **JSON 数字一律落 [`Value::Float`]，不猜整型**（2026-09-18 决策）：`serde_json` 的
 /// 整/浮形态取决于文本写法（`1` 与 `1.0`），不是可靠的类型信号；只有箭头列类型
 /// （Int64 / Timestamp(Ns)）这种可靠信号才产出 [`Value::Int`]。
 fn json_to_value(value: serde_json::Value) -> Option<Value> {
     match value {
         serde_json::Value::Null => None,
         serde_json::Value::Bool(v) => Some(Value::Bool(v)),
-        serde_json::Value::Number(v) => v.as_f64().map(Value::Number),
+        serde_json::Value::Number(v) => v.as_f64().map(Value::Float),
         serde_json::Value::String(v) => Some(Value::Str(v.into())),
         serde_json::Value::Array(values) => Some(Value::Array(
             values.into_iter().filter_map(json_to_value).collect(),
@@ -201,22 +201,22 @@ mod int_channel_tests {
         let ts_field = Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true);
         assert_eq!(extract_field_value(&ts_field, &ts, 0), Some(Value::Int(ns)));
 
-        // 浮点列仍是 `Number`（不猜整型）。
+        // 浮点列仍是 `Float`（不猜整型）。
         let floats = arrow::array::Float64Array::from(vec![1.5]);
         let f_field = Field::new("f", DataType::Float64, false);
         assert_eq!(
             extract_field_value(&f_field, &floats, 0),
-            Some(Value::Number(1.5))
+            Some(Value::Float(1.5))
         );
     }
 
-    /// 数值漏斗契约：只有 `Number` 产出 `f64`，其它变体（含结构化）一律 `None`——
+    /// 数值漏斗契约：只有 `Float` 产出 `f64`，其它变体（含结构化）一律 `None`——
     /// 列式与行式路径都走本函数，契约漂移会是静默错配。
     #[test]
     fn value_to_f64_only_accepts_numbers() {
-        assert_eq!(value_to_f64(&Value::Number(-0.5)), Some(-0.5));
-        // 整值（`Int` / 整值 `Number`）也走同一入口。
-        assert_eq!(value_to_f64(&Value::Number(3.0)), Some(3.0));
+        assert_eq!(value_to_f64(&Value::Float(-0.5)), Some(-0.5));
+        // 整值（`Int` / 整值 `Float`）也走同一入口。
+        assert_eq!(value_to_f64(&Value::Float(3.0)), Some(3.0));
         assert_eq!(value_to_f64(&Value::Str("1".into())), None);
         assert_eq!(value_to_f64(&Value::Bool(true)), None);
         assert_eq!(value_to_f64(&Value::Array(Vec::new())), None);
@@ -225,7 +225,7 @@ mod int_channel_tests {
 
     /// 决策（2026-09-18）：**JSON 数字来源不猜整型**。`serde_json` 的整/浮形态
     /// 取决于文本写法（`1` vs `1.0`），不是可靠信号 —— `json_to_value` 必须永远
-    /// 落 [`Value::Number`]，只有箭头列类型（Int64 / Timestamp(Ns)）才产出
+    /// 落 [`Value::Float`]，只有箭头列类型（Int64 / Timestamp(Ns)）才产出
     /// [`Value::Int`]。本用例防止后续“顺手”把整值 JSON 猜成 `Int`。
     #[test]
     fn json_numbers_stay_float_never_guessed_as_int() {
@@ -233,7 +233,7 @@ mod int_channel_tests {
             let json: serde_json::Value = serde_json::from_str(text).unwrap();
             let got = json_to_value(json).expect("json number → Some");
             assert!(
-                matches!(got, Value::Number(_)),
+                matches!(got, Value::Float(_)),
                 "JSON `{text}` 必须落 Float，实际 {got:?}"
             );
         }
@@ -246,7 +246,7 @@ mod int_channel_tests {
             panic!("expected array")
         };
         assert!(
-            items.iter().all(|v| matches!(v, Value::Number(_))),
+            items.iter().all(|v| matches!(v, Value::Float(_))),
             "嵌套元素也不猜: {items:?}"
         );
     }

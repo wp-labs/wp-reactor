@@ -540,7 +540,7 @@ fn strftime_vec(ts: CVec, fmt: &SmolStr, n: usize) -> CVec {
             }
         };
         let nanos = match cscalar_to_value(&cell) {
-            Value::Number(v) => normalize_epoch_timestamp_float_nanos(v),
+            Value::Float(v) => normalize_epoch_timestamp_float_nanos(v),
             Value::Int(i) => normalize_epoch_timestamp_int_nanos(i),
             _ => None,
         };
@@ -776,7 +776,7 @@ fn nth_json_array_scalar(cell: &str, index: usize) -> Option<CScalar> {
 }
 
 /// Map one non-null JSON array element to a [`CScalar`], mirroring
-/// `event_bridge::json_to_value`: `Bool` → bool, `Number` → f64, `String` →
+/// `event_bridge::json_to_value`: `Bool` → bool, `Float` → f64, `String` →
 /// str, and anything structured → [`CScalar::Structured`].
 fn json_scalar(v: &serde_json::Value) -> CScalar {
     match v {

@@ -63,15 +63,15 @@ fn varied_records() -> Vec<OutputRecord> {
             vec![
                 (
                     "event_time".into(),
-                    Value::Number(1_700_000_000_000_000_000.0),
+                    Value::Float(1_700_000_000_000_000_000.0),
                 ),
-                ("n_i".into(), Value::Number(7.0)),
-                ("n_f".into(), Value::Number(1.5)),
+                ("n_i".into(), Value::Float(7.0)),
+                ("n_f".into(), Value::Float(1.5)),
                 ("flag".into(), Value::Bool(true)),
                 ("label".into(), Value::Str("x".into())),
                 (
                     "blob".into(),
-                    Value::Array(vec![Value::Number(1.0), Value::Str("a".into())]),
+                    Value::Array(vec![Value::Float(1.0), Value::Str("a".into())]),
                 ),
             ],
         ),
@@ -81,8 +81,8 @@ fn varied_records() -> Vec<OutputRecord> {
             "t",
             2_000,
             vec![
-                ("n_f".into(), Value::Number(2.0)),
-                ("label".into(), Value::Number(42.0)),
+                ("n_f".into(), Value::Float(2.0)),
+                ("label".into(), Value::Float(42.0)),
             ],
         ),
         // Type mismatches -> null; Utf8 coercion of Bool.
@@ -91,7 +91,7 @@ fn varied_records() -> Vec<OutputRecord> {
             3_000,
             vec![
                 ("n_i".into(), Value::Str("zz".into())),
-                ("flag".into(), Value::Number(1.0)),
+                ("flag".into(), Value::Float(1.0)),
                 ("label".into(), Value::Bool(true)),
             ],
         ),
@@ -120,7 +120,7 @@ fn staged_batch_coercion_matrix() {
         Some(&Value::Int(1_700_000_000_000_000_000))
     );
     assert_eq!(f.get("n_i"), Some(&Value::Int(7)));
-    assert_eq!(f.get("n_f"), Some(&Value::Number(1.5)));
+    assert_eq!(f.get("n_f"), Some(&Value::Float(1.5)));
     assert_eq!(f.get("flag"), Some(&Value::Bool(true)));
     assert_eq!(f.get("label"), Some(&Value::Str("x".into())));
     assert_eq!(f.get("blob"), Some(&Value::Str(r#"[1.0,"a"]"#.into())));
@@ -136,7 +136,7 @@ fn staged_batch_coercion_matrix() {
         "missing time-col value must fall back to event_time_nanos"
     );
     assert_eq!(f.get("n_i"), None);
-    assert_eq!(f.get("n_f"), Some(&Value::Number(2.0)));
+    assert_eq!(f.get("n_f"), Some(&Value::Float(2.0)));
     assert_eq!(f.get("flag"), None);
     assert_eq!(f.get("label"), Some(&Value::Str("42".into())));
     assert_eq!(f.get("blob"), None);
@@ -163,7 +163,7 @@ fn staged_row_rejects_non_finite_number_inside_structured_value() {
         vec![(
             "blob".into(),
             Value::Object(
-                [("score".into(), Value::Number(f64::NAN))]
+                [("score".into(), Value::Float(f64::NAN))]
                     .into_iter()
                     .collect(),
             ),
@@ -188,7 +188,7 @@ fn staged_timestamp_preserves_time_yield_as_epoch_nanos() {
     let record = record_with(
         "t",
         0,
-        vec![("event_time".into(), Value::Number(1_700_000_000_123.0))],
+        vec![("event_time".into(), Value::Float(1_700_000_000_123.0))],
     );
     stager.push_record(&record).expect("stage row");
     let (_, staged, _) = stager.take_events().unwrap().expect("rows staged");
@@ -264,7 +264,7 @@ fn stager_column_alignment_holds_over_many_rows() {
                 "t",
                 i as i64,
                 vec![
-                    ("n_i".into(), Value::Number(i as f64)),
+                    ("n_i".into(), Value::Float(i as f64)),
                     ("label".into(), Value::Str(format!("row-{i}").into())),
                     ("flag".into(), Value::Bool(i % 2 == 0)),
                 ],
@@ -330,9 +330,9 @@ fn q4a_records() -> Vec<OutputRecord> {
                 "auction_finals",
                 1_700_000_000_000_000_000 + i * 1_000,
                 vec![
-                    ("id".into(), Value::Number(i as f64)),
-                    ("category".into(), Value::Number((i % 5) as f64)),
-                    ("final".into(), Value::Number(10.0 + i as f64)),
+                    ("id".into(), Value::Float(i as f64)),
+                    ("category".into(), Value::Float((i % 5) as f64)),
+                    ("final".into(), Value::Float(10.0 + i as f64)),
                     // dateTime 缺失 → 时间列回退 event_time_nanos
                 ],
             );

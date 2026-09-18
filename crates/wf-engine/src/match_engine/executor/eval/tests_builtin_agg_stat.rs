@@ -19,36 +19,36 @@ fn builtin_unknown_name_returns_none() {
 #[test]
 fn builtin_l3_funcs() {
     let ctx = step_ctx(vec![
-        Value::Number(10.0),
-        Value::Number(20.0),
-        Value::Number(30.0),
+        Value::Float(10.0),
+        Value::Float(20.0),
+        Value::Float(30.0),
     ]);
     assert_eq!(
         l3_ctx(&call("collect_list", vec![field("e")]), &ctx),
         Some(arr(vec![
-            Value::Number(10.0),
-            Value::Number(20.0),
-            Value::Number(30.0)
+            Value::Float(10.0),
+            Value::Float(20.0),
+            Value::Float(30.0)
         ]))
     );
     assert_eq!(
         l3_ctx(&call("collect_set", vec![field("e")]), &ctx),
         Some(arr(vec![
-            Value::Number(10.0),
-            Value::Number(20.0),
-            Value::Number(30.0)
+            Value::Float(10.0),
+            Value::Float(20.0),
+            Value::Float(30.0)
         ]))
     );
     assert_eq!(
         l3_ctx(&call("first", vec![field("e")]), &ctx),
-        Some(Value::Number(10.0))
+        Some(Value::Float(10.0))
     );
     assert_eq!(
         l3_ctx(&call("last", vec![field("e")]), &ctx),
-        Some(Value::Number(30.0))
+        Some(Value::Float(30.0))
     );
     // stddev of [10,20,30] = sqrt(200/3) ≈ 8.1649658
-    let Some(Value::Number(sd)) = l3_ctx(&call("stddev", vec![field("e")]), &ctx) else {
+    let Some(Value::Float(sd)) = l3_ctx(&call("stddev", vec![field("e")]), &ctx) else {
         panic!("stddev expected number");
     };
     assert!((sd - 8.16496580927726).abs() < 1e-9, "stddev = {}", sd);
@@ -58,21 +58,21 @@ fn builtin_l3_funcs() {
             &call("percentile", vec![field("e"), Expr::Number(50.0)]),
             &ctx
         ),
-        Some(Value::Number(20.0))
+        Some(Value::Float(20.0))
     );
     assert_eq!(
         l3_ctx(
             &call("percentile", vec![field("e"), Expr::Number(0.0)]),
             &ctx
         ),
-        Some(Value::Number(10.0))
+        Some(Value::Float(10.0))
     );
     assert_eq!(
         l3_ctx(
             &call("percentile", vec![field("e"), Expr::Number(100.0)]),
             &ctx
         ),
-        Some(Value::Number(30.0))
+        Some(Value::Float(30.0))
     );
     // wrong arg counts
     assert_eq!(
@@ -94,24 +94,24 @@ fn builtin_l3_funcs() {
     assert_eq!(l3_ctx(&call("last", vec![field("e")]), &empty), None);
     assert_eq!(
         l3_ctx(&call("stddev", vec![field("e")]), &empty),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
     assert_eq!(
         l3_ctx(
             &call("percentile", vec![field("e"), Expr::Number(50.0)]),
             &empty
         ),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
     assert_eq!(
         l3_ctx(&call("collect_list", vec![field("e")]), &empty),
         Some(arr(vec![]))
     );
     // single value: stddev → 0 (needs >= 2 numbers)
-    let single = step_ctx(vec![Value::Number(7.0)]);
+    let single = step_ctx(vec![Value::Float(7.0)]);
     assert_eq!(
         l3_ctx(&call("stddev", vec![field("e")]), &single),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
 
     // dedup in collect_set
@@ -129,52 +129,52 @@ fn builtin_l3_funcs() {
     let mut bf = EngineHashMap::default();
     bf.insert(
         "_bind_b_field_x".into(),
-        arr(vec![Value::Number(1.0), Value::Number(2.0)]),
+        arr(vec![Value::Float(1.0), Value::Float(2.0)]),
     );
-    bf.insert("_bind_b_count".into(), Value::Number(2.0));
+    bf.insert("_bind_b_count".into(), Value::Float(2.0));
     let bctx = Event { fields: bf };
     let qualified = Expr::Field(FieldRef::Qualified("b".to_string(), "x".to_string()));
     assert_eq!(
         l3_ctx(&call("collect_list", vec![qualified.clone()]), &bctx),
-        Some(arr(vec![Value::Number(1.0), Value::Number(2.0)]))
+        Some(arr(vec![Value::Float(1.0), Value::Float(2.0)]))
     );
     assert_eq!(
         l3_ctx(&call("first", vec![qualified.clone()]), &bctx),
-        Some(Value::Number(1.0))
+        Some(Value::Float(1.0))
     );
     assert_eq!(
         l3_ctx(&call("last", vec![qualified]), &bctx),
-        Some(Value::Number(2.0))
+        Some(Value::Float(2.0))
     );
 }
 
 #[test]
 fn builtin_aggregate_funcs() {
     let ctx = step_ctx(vec![
-        Value::Number(1.0),
-        Value::Number(2.0),
-        Value::Number(3.0),
+        Value::Float(1.0),
+        Value::Float(2.0),
+        Value::Float(3.0),
     ]);
     // Simple field matching step source alias "e" → measure-based aggregates
     assert_eq!(
         l3_ctx(&call("sum", vec![field("e")]), &ctx),
-        Some(Value::Number(6.0))
+        Some(Value::Float(6.0))
     );
     assert_eq!(
         l3_ctx(&call("count", vec![field("e")]), &ctx),
-        Some(Value::Number(6.0))
+        Some(Value::Float(6.0))
     );
     assert_eq!(
         l3_ctx(&call("avg", vec![field("e")]), &ctx),
-        Some(Value::Number(6.0))
+        Some(Value::Float(6.0))
     );
     assert_eq!(
         l3_ctx(&call("min", vec![field("e")]), &ctx),
-        Some(Value::Number(6.0))
+        Some(Value::Float(6.0))
     );
     assert_eq!(
         l3_ctx(&call("max", vec![field("e")]), &ctx),
-        Some(Value::Number(6.0))
+        Some(Value::Float(6.0))
     );
 
     // Qualified field → value-based aggregates over _step_0_field_x
@@ -182,17 +182,17 @@ fn builtin_aggregate_funcs() {
     fields.insert(
         "_step_0_field_x".into(),
         arr(vec![
-            Value::Number(1.0),
-            Value::Number(2.0),
-            Value::Number(3.0),
+            Value::Float(1.0),
+            Value::Float(2.0),
+            Value::Float(3.0),
         ]),
     );
     fields.insert(
         "_step_0_values".into(),
         arr(vec![
-            Value::Number(1.0),
-            Value::Number(2.0),
-            Value::Number(3.0),
+            Value::Float(1.0),
+            Value::Float(2.0),
+            Value::Float(3.0),
         ]),
     );
     fields.insert("_step_0_source".into(), Value::Str("e".into()));
@@ -200,23 +200,23 @@ fn builtin_aggregate_funcs() {
     let qualified = Expr::Field(FieldRef::Qualified("e".to_string(), "x".to_string()));
     assert_eq!(
         l3_ctx(&call("count", vec![qualified.clone()]), &qctx),
-        Some(Value::Number(3.0))
+        Some(Value::Float(3.0))
     );
     assert_eq!(
         l3_ctx(&call("sum", vec![qualified.clone()]), &qctx),
-        Some(Value::Number(6.0))
+        Some(Value::Float(6.0))
     );
     assert_eq!(
         l3_ctx(&call("avg", vec![qualified.clone()]), &qctx),
-        Some(Value::Number(2.0))
+        Some(Value::Float(2.0))
     );
     assert_eq!(
         l3_ctx(&call("min", vec![qualified.clone()]), &qctx),
-        Some(Value::Number(1.0))
+        Some(Value::Float(1.0))
     );
     assert_eq!(
         l3_ctx(&call("max", vec![qualified]), &qctx),
-        Some(Value::Number(3.0))
+        Some(Value::Float(3.0))
     );
 
     // value-based over strings: min/max compare lexicographically, sum skips non-numeric
@@ -250,22 +250,22 @@ fn builtin_aggregate_funcs() {
     );
     assert_eq!(
         l3_ctx(&call("sum", vec![qualified.clone()]), &sctx),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
     assert_eq!(
         l3_ctx(&call("avg", vec![qualified.clone()]), &sctx),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
     assert_eq!(
         l3_ctx(&call("count", vec![qualified]), &sctx),
-        Some(Value::Number(3.0))
+        Some(Value::Float(3.0))
     );
 
     // count via bind count (_bind_b_count), no steps
-    let bctx = ctx_with(vec![("_bind_b_count", Value::Number(7.0))]);
+    let bctx = ctx_with(vec![("_bind_b_count", Value::Float(7.0))]);
     assert_eq!(
         l3_ctx(&call("count", vec![field("b")]), &bctx),
-        Some(Value::Number(7.0))
+        Some(Value::Float(7.0))
     );
 
     // empty series aggregates: step exists but no values/measure → None
@@ -296,51 +296,51 @@ fn builtin_aggregate_over_helpers() {
     // over numbers: count/sum/avg/min/max, empty avg/min/max → 0.0
     assert_eq!(
         eval_aggregate_over_numbers("count", &[1.0, 2.0, 3.0]),
-        Some(Value::Number(6.0))
+        Some(Value::Float(6.0))
     );
     assert_eq!(
         eval_aggregate_over_numbers("sum", &[1.0, 2.0, 3.0]),
-        Some(Value::Number(6.0))
+        Some(Value::Float(6.0))
     );
     assert_eq!(
         eval_aggregate_over_numbers("avg", &[1.0, 2.0, 3.0]),
-        Some(Value::Number(2.0))
+        Some(Value::Float(2.0))
     );
     assert_eq!(
         eval_aggregate_over_numbers("min", &[3.0, 1.0, 2.0]),
-        Some(Value::Number(1.0))
+        Some(Value::Float(1.0))
     );
     assert_eq!(
         eval_aggregate_over_numbers("max", &[3.0, 1.0, 2.0]),
-        Some(Value::Number(3.0))
+        Some(Value::Float(3.0))
     );
     assert_eq!(
         eval_aggregate_over_numbers("avg", &[]),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
     assert_eq!(
         eval_aggregate_over_numbers("min", &[]),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
     assert_eq!(
         eval_aggregate_over_numbers("max", &[]),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
     assert_eq!(eval_aggregate_over_numbers("nope", &[1.0]), None);
 
     // over values: numeric coercion + string min/max via compare_sortable_values
-    let values = vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)];
+    let values = vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)];
     assert_eq!(
         eval_aggregate_over_values("count", &values),
-        Some(Value::Number(3.0))
+        Some(Value::Float(3.0))
     );
     assert_eq!(
         eval_aggregate_over_values("sum", &values),
-        Some(Value::Number(6.0))
+        Some(Value::Float(6.0))
     );
     assert_eq!(
         eval_aggregate_over_values("avg", &values),
-        Some(Value::Number(2.0))
+        Some(Value::Float(2.0))
     );
     let strings = vec![Value::Str("b".into()), Value::Str("a".into())];
     assert_eq!(
@@ -353,24 +353,24 @@ fn builtin_aggregate_over_helpers() {
     );
     assert_eq!(
         eval_aggregate_over_values("sum", &strings),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
     assert_eq!(
         eval_aggregate_over_values("avg", &strings),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
     assert_eq!(
         eval_aggregate_over_values("count", &[]),
-        Some(Value::Number(0.0))
+        Some(Value::Float(0.0))
     );
     assert_eq!(eval_aggregate_over_values("nope", &values), None);
 
     assert_eq!(
-        numeric_values(&[Value::Number(1.0), Value::Str("x".into())]),
+        numeric_values(&[Value::Float(1.0), Value::Str("x".into())]),
         vec![1.0]
     );
     assert_eq!(
-        sum_numeric_values(&[Value::Number(1.0), Value::Str("x".into())]),
+        sum_numeric_values(&[Value::Float(1.0), Value::Str("x".into())]),
         1.0
     );
 }
@@ -391,42 +391,42 @@ fn builtin_stat_selectors() {
 
     // stat.count(window_event(x)) reads _bind_x_count
     let ctx = ctx_with(vec![
-        ("_bind_x_count", Value::Number(5.0)),
-        ("label", Value::Number(9.0)),
+        ("_bind_x_count", Value::Float(5.0)),
+        ("label", Value::Float(9.0)),
     ]);
     let count_expr = Expr::FuncCall {
         qualifier: Some("stat".to_string()),
         name: "count".to_string(),
         args: vec![call("window_event", vec![field("x")])],
     };
-    assert_eq!(l3_ctx(&count_expr, &ctx), Some(Value::Number(5.0)));
+    assert_eq!(l3_ctx(&count_expr, &ctx), Some(Value::Float(5.0)));
     // stat.count(match_event(label)) reads the label field directly
     let match_expr = Expr::FuncCall {
         qualifier: Some("stat".to_string()),
         name: "count".to_string(),
         args: vec![call("match_event", vec![field("label")])],
     };
-    assert_eq!(l3_ctx(&match_expr, &ctx), Some(Value::Number(9.0)));
+    assert_eq!(l3_ctx(&match_expr, &ctx), Some(Value::Float(9.0)));
     // stat.count(match_distinct(label)) same read path
     let distinct_expr = Expr::FuncCall {
         qualifier: Some("stat".to_string()),
         name: "count".to_string(),
         args: vec![call("match_distinct", vec![field("label")])],
     };
-    assert_eq!(l3_ctx(&distinct_expr, &ctx), Some(Value::Number(9.0)));
+    assert_eq!(l3_ctx(&distinct_expr, &ctx), Some(Value::Float(9.0)));
     // stat.value(trigger(label)) / stat.value(final(label))
     let trigger_expr = Expr::FuncCall {
         qualifier: Some("stat".to_string()),
         name: "value".to_string(),
         args: vec![call("trigger", vec![field("label")])],
     };
-    assert_eq!(l3_ctx(&trigger_expr, &ctx), Some(Value::Number(9.0)));
+    assert_eq!(l3_ctx(&trigger_expr, &ctx), Some(Value::Float(9.0)));
     let final_expr = Expr::FuncCall {
         qualifier: Some("stat".to_string()),
         name: "value".to_string(),
         args: vec![call("final", vec![field("label")])],
     };
-    assert_eq!(l3_ctx(&final_expr, &ctx), Some(Value::Number(9.0)));
+    assert_eq!(l3_ctx(&final_expr, &ctx), Some(Value::Float(9.0)));
     // unknown stat selector name → None
     let unknown_sel = Expr::FuncCall {
         qualifier: Some("stat".to_string()),

@@ -447,7 +447,7 @@ fn init_knowledge_redis_if_configured(knowdb_path: &Path, base_dir: &Path) {
 
 /// Infer a typed engine value from a raw knowdb cell (CSV / PG string).
 ///
-/// Numeric-looking cells become `Number` so numeric side-input columns can
+/// Numeric-looking cells become `Float` so numeric side-input columns can
 /// join numeric expressions (q13: `mod(auction,10000) = side_input.key` —
 /// the loader used to store every column as `Str`, so the provider join
 /// index key (`JoinKey::Str`) never matched the lookup key
@@ -458,7 +458,7 @@ fn infer_knowledge_value(cell: &str) -> EngineValue {
     if let Ok(n) = cell.parse::<f64>()
         && n.is_finite()
     {
-        return EngineValue::Number(n);
+        return EngineValue::Float(n);
     }
     match cell {
         "true" => EngineValue::Bool(true),
@@ -759,7 +759,7 @@ fn write_derived_knowdb_assets(root: &Path, tables: &[CsvTable]) -> RuntimeResul
 /// 单个 KnowDB 原生值 → 引擎 `Value`。
 ///
 /// **DDL 类型化的数字按类型映射**（`Digit(i64)` → [`EngineValue::Int`]、
-/// `Float(f64)` → [`EngineValue::Number`]）：这是**可靠类型信号**（列声明），
+/// `Float(f64)` → [`EngineValue::Float`]）：这是**可靠类型信号**（列声明），
 /// 与箭头 `Int64`/`Timestamp` 列同口径 —— 不经「Display 文本 → f64」往返，
 /// 否则 `≥2^53` 的整数（epoch-ns 量级）会被量化到 ~256ns，用作 join 键或区间
 /// 界时随机失配。
@@ -771,7 +771,7 @@ fn engine_value_from_knowdb_value(v: &wp_model_core::model::Value) -> EngineValu
         wp_model_core::model::Value::Null => EngineValue::Str(String::new().into()),
         wp_model_core::model::Value::Bool(b) => EngineValue::Bool(*b),
         wp_model_core::model::Value::Digit(d) => EngineValue::Int(*d),
-        wp_model_core::model::Value::Float(f) => EngineValue::Number(*f),
+        wp_model_core::model::Value::Float(f) => EngineValue::Float(*f),
         other => infer_knowledge_value(&other.to_string()),
     }
 }
@@ -1101,12 +1101,12 @@ mod tests {
         );
         assert_eq!(
             engine_value_from_knowdb_value(&ModelValue::Float(1.5)),
-            EngineValue::Number(1.5),
+            EngineValue::Float(1.5),
             "浮点列（Float）→ Number"
         );
         assert_eq!(
             engine_value_from_knowdb_value(&ModelValue::from("2345")),
-            EngineValue::Number(2345.0),
+            EngineValue::Float(2345.0),
             "文本仍按逐单元推断（数字文本 → Number，不猜整型）"
         );
         assert_eq!(
@@ -1126,12 +1126,12 @@ mod tests {
         // 类型推断后数字列必须进 Number，join 索引才命中。
         assert_eq!(
             infer_knowledge_value("2345"),
-            EngineValue::Number(2345.0),
+            EngineValue::Float(2345.0),
             "整数字符串 → Number"
         );
         assert_eq!(
             infer_knowledge_value("1.5"),
-            EngineValue::Number(1.5),
+            EngineValue::Float(1.5),
             "浮点字符串 → Number"
         );
         assert_eq!(

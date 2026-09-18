@@ -131,7 +131,7 @@ fn materialize_wfu_meta(
 ) -> Option<wf_lang::ast::Expr> {
     use wf_lang::ast::Expr;
     match score.resolve_wfu_meta(field)? {
-        Value::Number(n) => Some(Expr::Number(n)),
+        Value::Float(n) => Some(Expr::Number(n)),
         Value::Int(i) => Some(Expr::Number(i as f64)),
         Value::Str(s) => Some(Expr::StringLit(s.to_string())),
         Value::Bool(b) => Some(Expr::Bool(b)),
@@ -436,12 +436,12 @@ fn parse_stat_selector(expr: &wf_lang::ast::Expr) -> Option<StatSelector<'_>> {
 
 /// 统计选择器（`count(...)` / `value(...)`）取的数值字段 → 原样返回。
 ///
-/// `Int` 必须**原样透传**（不降级为 `Number`）：`Int64`/`Timestamp(Ns)` 列经
+/// `Int` 必须**原样透传**（不降级为 `Float`）：`Int64`/`Timestamp(Ns)` 列经
 /// `Value::Int` 承载，`i64::MAX` 量级降级会丢精度；下游（算术走 `value_to_f64`、
 /// 导出走 `untyped_*` 阈值）都认识 `Int`。
 fn number_value(value: &Value) -> Option<Value> {
     match value {
-        Value::Number(_) | Value::Int(_) => Some(value.clone()),
+        Value::Float(_) | Value::Int(_) => Some(value.clone()),
         _ => None,
     }
 }
@@ -485,14 +485,14 @@ pub(super) fn eval_l3_func(
             if args.len() != 1 {
                 return None;
             }
-            Some(Value::Number(series_stddev(&values)))
+            Some(Value::Float(series_stddev(&values)))
         }
         "percentile" => {
             if args.len() != 2 {
                 return None;
             }
             let p = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Number(n) => n.clamp(0.0, 100.0) / 100.0,
+                Value::Float(n) => n.clamp(0.0, 100.0) / 100.0,
                 Value::Int(i) => (i as f64).clamp(0.0, 100.0) / 100.0,
                 _ => return None,
             };
@@ -540,11 +540,11 @@ fn series_stddev(values: &[Value]) -> f64 {
 fn percentile_value(values: &[Value], p: f64) -> Value {
     let mut nums: Vec<f64> = numeric_values(values);
     if nums.is_empty() {
-        return Value::Number(0.0);
+        return Value::Float(0.0);
     }
     nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let idx = ((nums.len() - 1) as f64 * p).round() as usize;
-    Value::Number(nums[idx.min(nums.len() - 1)])
+    Value::Float(nums[idx.min(nums.len() - 1)])
 }
 
 pub(super) fn eval_aggregate_func(
@@ -582,7 +582,7 @@ pub(super) fn eval_aggregate_func(
                 && let Some(alias) = args.first().and_then(step_data::extract_bind_ref)
                 && let Some(count) = step_data::get_bind_count(ctx, alias)
             {
-                return Some(Value::Number(count));
+                return Some(Value::Float(count));
             }
             let step_values = step_data::flatten_step_series(ctx, &step_indices, args.first());
             if !step_values.is_empty() {
@@ -615,13 +615,13 @@ fn eval_join_arg_with_l3(
 
 pub(super) fn eval_aggregate_over_numbers(name: &str, values: &[f64]) -> Option<Value> {
     match name {
-        "count" => Some(Value::Number(values.iter().sum())),
-        "sum" => Some(Value::Number(values.iter().sum())),
+        "count" => Some(Value::Float(values.iter().sum())),
+        "sum" => Some(Value::Float(values.iter().sum())),
         "avg" => {
             if values.is_empty() {
-                Some(Value::Number(0.0))
+                Some(Value::Float(0.0))
             } else {
-                Some(Value::Number(
+                Some(Value::Float(
                     values.iter().sum::<f64>() / values.len() as f64,
                 ))
             }
@@ -630,28 +630,28 @@ pub(super) fn eval_aggregate_over_numbers(name: &str, values: &[f64]) -> Option<
             .iter()
             .copied()
             .reduce(f64::min)
-            .map(Value::Number)
-            .or(Some(Value::Number(0.0))),
+            .map(Value::Float)
+            .or(Some(Value::Float(0.0))),
         "max" => values
             .iter()
             .copied()
             .reduce(f64::max)
-            .map(Value::Number)
-            .or(Some(Value::Number(0.0))),
+            .map(Value::Float)
+            .or(Some(Value::Float(0.0))),
         _ => None,
     }
 }
 
 pub(super) fn eval_aggregate_over_values(name: &str, values: &[Value]) -> Option<Value> {
     match name {
-        "count" => Some(Value::Number(values.len() as f64)),
-        "sum" => Some(Value::Number(sum_numeric_values(values))),
+        "count" => Some(Value::Float(values.len() as f64)),
+        "sum" => Some(Value::Float(sum_numeric_values(values))),
         "avg" => {
             let nums = numeric_values(values);
             if nums.is_empty() {
-                Some(Value::Number(0.0))
+                Some(Value::Float(0.0))
             } else {
-                Some(Value::Number(nums.iter().sum::<f64>() / nums.len() as f64))
+                Some(Value::Float(nums.iter().sum::<f64>() / nums.len() as f64))
             }
         }
         "min" => values
@@ -679,7 +679,7 @@ mod split_tests {
     use super::*;
 
     fn nums(values: &[f64]) -> Vec<Value> {
-        values.iter().map(|n| Value::Number(*n)).collect()
+        values.iter().map(|n| Value::Float(*n)).collect()
     }
 
     #[test]
@@ -690,10 +690,10 @@ mod split_tests {
         assert!((sd - 2.0).abs() < 1e-9);
         // 非数值成员被忽略
         let mixed = vec![
-            Value::Number(2.0),
-            Value::Number(4.0),
+            Value::Float(2.0),
+            Value::Float(4.0),
             Value::Str("x".into()),
-            Value::Number(4.0),
+            Value::Float(4.0),
         ];
         let sd = series_stddev(&mixed);
         assert!(sd >= 0.0);
@@ -702,31 +702,31 @@ mod split_tests {
 
     #[test]
     fn percentile_uses_nearest_rank_and_empty_guard() {
-        assert_eq!(percentile_value(&nums(&[]), 0.5), Value::Number(0.0));
+        assert_eq!(percentile_value(&nums(&[]), 0.5), Value::Float(0.0));
         assert_eq!(
             percentile_value(&nums(&[1.0, 2.0, 3.0, 4.0]), 0.5),
-            Value::Number(3.0) // idx = round(3 * 0.5) = 2
+            Value::Float(3.0) // idx = round(3 * 0.5) = 2
         );
         assert_eq!(
             percentile_value(&nums(&[10.0, 20.0, 30.0]), 0.0),
-            Value::Number(10.0)
+            Value::Float(10.0)
         );
         assert_eq!(
             percentile_value(&nums(&[10.0, 20.0, 30.0]), 1.0),
-            Value::Number(30.0)
+            Value::Float(30.0)
         );
     }
 
     #[test]
     fn dedup_values_uses_value_equality() {
         let out = dedup_values(vec![
-            Value::Number(1.0),
+            Value::Float(1.0),
             Value::Str("a".into()),
-            Value::Number(1.0),
+            Value::Float(1.0),
         ]);
         assert_eq!(out.len(), 2);
         // 近等数值按 epsilon 语义去重
-        let near = dedup_values(vec![Value::Number(1.0), Value::Number(1.0 + 1e-16)]);
+        let near = dedup_values(vec![Value::Float(1.0), Value::Float(1.0 + 1e-16)]);
         assert_eq!(near.len(), 1);
     }
 }

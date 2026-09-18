@@ -19,10 +19,10 @@ pub(super) fn eval_func_abs(
     if args.len() != 1 {
         return None;
     }
-    // 数值内置函数是 f64 域：`Value::Int` 经 `i as f64` 归一，走与 `Number` 相同路径。
+    // 数值内置函数是 f64 域：`Value::Int` 经 `i as f64` 归一，走与 `Float` 相同路径。
     match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => Some(Value::Number(n.abs())),
-        Value::Int(i) => Some(Value::Number((i as f64).abs())),
+        Value::Float(n) => Some(Value::Float(n.abs())),
+        Value::Int(i) => Some(Value::Float((i as f64).abs())),
         _ => None,
     }
 }
@@ -36,13 +36,13 @@ pub(super) fn eval_func_round(
         return None;
     }
     let value = match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => n,
+        Value::Float(n) => n,
         Value::Int(i) => i as f64,
         _ => return None,
     };
     let precision = if args.len() == 2 {
         match eval_expr_ext(&args[1], event, windows, baselines)? {
-            Value::Number(n) => f64_to_i64_trunc(n)?,
+            Value::Float(n) => f64_to_i64_trunc(n)?,
             Value::Int(i) => i,
             _ => return None,
         }
@@ -50,7 +50,7 @@ pub(super) fn eval_func_round(
         0
     };
     let rounded = round_with_precision(value, precision)?;
-    Some(Value::Number(rounded))
+    Some(Value::Float(rounded))
 }
 pub(super) fn eval_func_ceil(
     args: &[Expr],
@@ -62,8 +62,8 @@ pub(super) fn eval_func_ceil(
         return None;
     }
     match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => Some(Value::Number(n.ceil())),
-        Value::Int(i) => Some(Value::Number((i as f64).ceil())),
+        Value::Float(n) => Some(Value::Float(n.ceil())),
+        Value::Int(i) => Some(Value::Float((i as f64).ceil())),
         _ => None,
     }
 }
@@ -77,8 +77,8 @@ pub(super) fn eval_func_floor(
         return None;
     }
     match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => Some(Value::Number(n.floor())),
-        Value::Int(i) => Some(Value::Number((i as f64).floor())),
+        Value::Float(n) => Some(Value::Float(n.floor())),
+        Value::Int(i) => Some(Value::Float((i as f64).floor())),
         _ => None,
     }
 }
@@ -92,8 +92,8 @@ pub(super) fn eval_func_sqrt(
         return None;
     }
     match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) if n >= 0.0 => Some(Value::Number(n.sqrt())),
-        Value::Int(i) if (i as f64) >= 0.0 => Some(Value::Number((i as f64).sqrt())),
+        Value::Float(n) if n >= 0.0 => Some(Value::Float(n.sqrt())),
+        Value::Int(i) if (i as f64) >= 0.0 => Some(Value::Float((i as f64).sqrt())),
         _ => None,
     }
 }
@@ -107,18 +107,18 @@ pub(super) fn eval_func_pow(
         return None;
     }
     let x = match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => n,
+        Value::Float(n) => n,
         Value::Int(i) => i as f64,
         _ => return None,
     };
     let y = match eval_expr_ext(&args[1], event, windows, baselines)? {
-        Value::Number(n) => n,
+        Value::Float(n) => n,
         Value::Int(i) => i as f64,
         _ => return None,
     };
     let out = x.powf(y);
     if out.is_finite() {
-        Some(Value::Number(out))
+        Some(Value::Float(out))
     } else {
         None
     }
@@ -133,7 +133,7 @@ pub(super) fn eval_func_log(
         return None;
     }
     let x = match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => n,
+        Value::Float(n) => n,
         Value::Int(i) => i as f64,
         _ => return None,
     };
@@ -142,7 +142,7 @@ pub(super) fn eval_func_log(
     }
     let out = if args.len() == 2 {
         let base = match eval_expr_ext(&args[1], event, windows, baselines)? {
-            Value::Number(n) => n,
+            Value::Float(n) => n,
             Value::Int(i) => i as f64,
             _ => return None,
         };
@@ -154,7 +154,7 @@ pub(super) fn eval_func_log(
         x.ln()
     };
     if out.is_finite() {
-        Some(Value::Number(out))
+        Some(Value::Float(out))
     } else {
         None
     }
@@ -169,13 +169,13 @@ pub(super) fn eval_func_exp(
         return None;
     }
     let x = match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => n,
+        Value::Float(n) => n,
         Value::Int(i) => i as f64,
         _ => return None,
     };
     let out = x.exp();
     if out.is_finite() {
-        Some(Value::Number(out))
+        Some(Value::Float(out))
     } else {
         None
     }
@@ -190,24 +190,24 @@ pub(super) fn eval_func_clamp(
         return None;
     }
     let x = match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => n,
+        Value::Float(n) => n,
         Value::Int(i) => i as f64,
         _ => return None,
     };
     let min = match eval_expr_ext(&args[1], event, windows, baselines)? {
-        Value::Number(n) => n,
+        Value::Float(n) => n,
         Value::Int(i) => i as f64,
         _ => return None,
     };
     let max = match eval_expr_ext(&args[2], event, windows, baselines)? {
-        Value::Number(n) => n,
+        Value::Float(n) => n,
         Value::Int(i) => i as f64,
         _ => return None,
     };
     if min > max {
         return None;
     }
-    Some(Value::Number(x.clamp(min, max)))
+    Some(Value::Float(x.clamp(min, max)))
 }
 pub(super) fn eval_func_sign(
     args: &[Expr],
@@ -219,8 +219,8 @@ pub(super) fn eval_func_sign(
         return None;
     }
     match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) if n.is_finite() => Some(Value::Number(n.signum())),
-        Value::Int(i) => Some(Value::Number((i as f64).signum())),
+        Value::Float(n) if n.is_finite() => Some(Value::Float(n.signum())),
+        Value::Int(i) => Some(Value::Float((i as f64).signum())),
         _ => None,
     }
 }
@@ -234,8 +234,8 @@ pub(super) fn eval_func_trunc(
         return None;
     }
     match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => Some(Value::Number(n.trunc())),
-        Value::Int(i) => Some(Value::Number((i as f64).trunc())),
+        Value::Float(n) => Some(Value::Float(n.trunc())),
+        Value::Int(i) => Some(Value::Float((i as f64).trunc())),
         _ => None,
     }
 }
@@ -249,7 +249,7 @@ pub(super) fn eval_func_is_finite(
         return None;
     }
     match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Number(n) => Some(Value::Bool(n.is_finite())),
+        Value::Float(n) => Some(Value::Bool(n.is_finite())),
         Value::Int(_) => Some(Value::Bool(true)),
         _ => None,
     }

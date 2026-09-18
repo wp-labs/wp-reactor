@@ -20,7 +20,7 @@ fn utils_normalize_index_and_sort() {
 
     use std::cmp::Ordering;
     assert_eq!(
-        utils::compare_sortable_values(&Value::Number(1.0), &Value::Number(2.0)),
+        utils::compare_sortable_values(&Value::Float(1.0), &Value::Float(2.0)),
         Ordering::Less
     );
     assert_eq!(
@@ -33,11 +33,11 @@ fn utils_normalize_index_and_sort() {
     );
     // mixed types fall back to string comparison
     assert_eq!(
-        utils::compare_sortable_values(&Value::Number(2.0), &Value::Str("10".into())),
+        utils::compare_sortable_values(&Value::Float(2.0), &Value::Str("10".into())),
         Ordering::Greater
     );
     assert_eq!(
-        utils::compare_sortable_values(&Value::Array(vec![]), &Value::Number(1.0)),
+        utils::compare_sortable_values(&Value::Array(vec![]), &Value::Float(1.0)),
         Ordering::Greater
     );
 }
@@ -63,7 +63,7 @@ fn utils_f64_helpers() {
 
 #[test]
 fn utils_fmt_template() {
-    let values = vec![Value::Str("a".into()), Value::Number(3.0)];
+    let values = vec![Value::Str("a".into()), Value::Float(3.0)];
     assert_eq!(
         utils::apply_fmt_template("{}:{}!", &values),
         Some("a:3!".to_string())
@@ -82,7 +82,7 @@ fn utils_time_helpers() {
 
     assert_eq!(
         utils::time_nanos_to_value(1_700_000_000_123_000_000),
-        Value::Number(1_700_000_000_123.0)
+        Value::Float(1_700_000_000_123.0)
     );
     match utils::time_nanos_to_expr(1_700_000_000_000_000_000) {
         Expr::Number(v) => assert_eq!(v, 1_700_000_000_000.0),
@@ -130,7 +130,7 @@ fn utils_time_helpers() {
 fn utils_stable_id_hash_and_time() {
     // number / string / bool values hash to Some; array / object → None
     assert_eq!(
-        utils::update_stable_id_hash(&mut Sha256::new(), &Value::Number(42.0)),
+        utils::update_stable_id_hash(&mut Sha256::new(), &Value::Float(42.0)),
         Some(())
     );
     assert_eq!(
@@ -142,11 +142,11 @@ fn utils_stable_id_hash_and_time() {
         Some(())
     );
     assert_eq!(
-        utils::update_stable_id_hash(&mut Sha256::new(), &Value::Array(vec![Value::Number(1.0)])),
+        utils::update_stable_id_hash(&mut Sha256::new(), &Value::Array(vec![Value::Float(1.0)])),
         None
     );
     let mut obj = EngineHashMap::default();
-    obj.insert("k".into(), Value::Number(1.0));
+    obj.insert("k".into(), Value::Float(1.0));
     assert_eq!(
         utils::update_stable_id_hash(&mut Sha256::new(), &Value::Object(obj)),
         None
@@ -154,7 +154,7 @@ fn utils_stable_id_hash_and_time() {
 
     // deterministic + type-tagged: number 42 and str "42" differ
     let mut h1 = Sha256::new();
-    utils::update_stable_id_hash(&mut h1, &Value::Number(42.0)).unwrap();
+    utils::update_stable_id_hash(&mut h1, &Value::Float(42.0)).unwrap();
     let mut h2 = Sha256::new();
     utils::update_stable_id_hash(&mut h2, &Value::Str("42".into())).unwrap();
     let (d1, d2) = (hex::encode(h1.finalize()), hex::encode(h2.finalize()));
@@ -169,7 +169,7 @@ fn utils_stable_id_hash_and_time() {
 // ===========================================================================
 
 /// 第 2 步（精确整数）：`Int64` 列经 `batch_to_events`/列式桥产出 `Value::Int`，
-/// score / entity / 内置函数读到它必须照常求值（此前只认 `Value::Number` →
+/// score / entity / 内置函数读到它必须照常求值（此前只认 `Value::Float` →
 /// 整行 failed，是真实回归）。
 #[test]
 fn eval_score_and_builtins_accept_int_values() {
@@ -249,12 +249,12 @@ fn eval_yield_expr_falls_back_to_empty_string() {
     );
     assert_eq!(
         eval_yield_expr(&Expr::Number(5.0), &ctx),
-        Some(Value::Number(5.0))
+        Some(Value::Float(5.0))
     );
     // score-aware variant
     assert_eq!(
         eval_yield_expr_with_score(&Expr::SystemVar(SystemVar::Score), &ctx, Some(70.0)),
-        Some(Value::Number(70.0))
+        Some(Value::Float(70.0))
     );
     assert_eq!(
         eval_yield_expr_with_score(&Expr::SystemVar(SystemVar::Score), &ctx, None),
@@ -268,16 +268,16 @@ fn eval_yield_expr_falls_back_to_empty_string() {
 
 #[test]
 fn l3_expression_literals_and_fields() {
-    let ctx = ctx_with(vec![("x", Value::Number(5.0))]);
-    assert_eq!(l3_ctx(&Expr::Number(1.5), &ctx), Some(Value::Number(1.5)));
+    let ctx = ctx_with(vec![("x", Value::Float(5.0))]);
+    assert_eq!(l3_ctx(&Expr::Number(1.5), &ctx), Some(Value::Float(1.5)));
     assert_eq!(l3_ctx(&lit("hi"), &ctx), Some(Value::Str("hi".into())));
     assert_eq!(l3_ctx(&Expr::Bool(false), &ctx), Some(Value::Bool(false)));
-    assert_eq!(l3_ctx(&field("x"), &ctx), Some(Value::Number(5.0)));
+    assert_eq!(l3_ctx(&field("x"), &ctx), Some(Value::Float(5.0)));
     assert_eq!(l3_ctx(&field("missing"), &ctx), None);
     // Neg
     assert_eq!(
         l3_ctx(&Expr::Neg(Box::new(Expr::Number(5.0))), &ctx),
-        Some(Value::Number(-5.0))
+        Some(Value::Float(-5.0))
     );
     assert_eq!(l3_ctx(&Expr::Neg(Box::new(lit("x"))), &ctx), None);
 }
@@ -295,7 +295,7 @@ fn l3_expression_system_and_wfu_vars() {
                 ..YieldMeta::default()
             },
         ),
-        Some(Value::Number(70.0))
+        Some(Value::Float(70.0))
     );
     assert_eq!(l3_ctx(&Expr::SystemVar(SystemVar::Score), &ctx), None);
     // event-first-time system var → millis
@@ -308,7 +308,7 @@ fn l3_expression_system_and_wfu_vars() {
                 ..YieldMeta::default()
             },
         ),
-        Some(Value::Number(1_700_000_000_123.0))
+        Some(Value::Float(1_700_000_000_123.0))
     );
     // emit time system var
     assert_eq!(
@@ -320,7 +320,7 @@ fn l3_expression_system_and_wfu_vars() {
                 ..YieldMeta::default()
             },
         ),
-        Some(Value::Number(1_700_000_000_000.0))
+        Some(Value::Float(1_700_000_000_000.0))
     );
     // first_match_time system var（issue #82）→ 引擎处理墙钟（毫秒）
     assert_eq!(
@@ -332,7 +332,7 @@ fn l3_expression_system_and_wfu_vars() {
                 ..YieldMeta::default()
             },
         ),
-        Some(Value::Number(1_700_000_000_123.0))
+        Some(Value::Float(1_700_000_000_123.0))
     );
     // event 与 evidence 槽独立（issue #82 方案 A）：@evidence_* 读自己的槽，
     // 不再是 @event_* 的别名。
@@ -346,7 +346,7 @@ fn l3_expression_system_and_wfu_vars() {
                 ..YieldMeta::default()
             },
         ),
-        Some(Value::Number(1_700_000_000_500.0))
+        Some(Value::Float(1_700_000_000_500.0))
     );
     assert_eq!(
         eval_expr_with_l3(
@@ -358,7 +358,7 @@ fn l3_expression_system_and_wfu_vars() {
                 ..YieldMeta::default()
             },
         ),
-        Some(Value::Number(1_700_000_000_600.0))
+        Some(Value::Float(1_700_000_000_600.0))
     );
     // 未注入 first_match 墙钟 → None（空值，不参与求值）
     assert_eq!(
@@ -391,7 +391,7 @@ fn l3_expression_system_and_wfu_vars() {
     };
     check(WfuMetaField::Id, Value::Str("wx-1".into()));
     check(WfuMetaField::RuleName, Value::Str("r".into()));
-    check(WfuMetaField::Score, Value::Number(80.0));
+    check(WfuMetaField::Score, Value::Float(80.0));
     check(WfuMetaField::EntityType, Value::Str("ip".into()));
     check(WfuMetaField::EntityId, Value::Str("eid".into()));
     check(WfuMetaField::Origin, Value::Str("origin".into()));
@@ -418,12 +418,12 @@ fn l3_expression_object_array_inlist() {
     let Some(Value::Object(map)) = l3_ctx(&obj, &ctx) else {
         panic!("expected object");
     };
-    assert_eq!(map.get("a"), Some(&Value::Number(1.0)));
-    assert_eq!(map.get("b"), Some(&Value::Number(1.0)));
+    assert_eq!(map.get("a"), Some(&Value::Float(1.0)));
+    assert_eq!(map.get("b"), Some(&Value::Float(1.0)));
     // array literal
     assert_eq!(
         l3_ctx(&Expr::Array(vec![Expr::Number(1.0), lit("x")]), &ctx),
-        Some(arr(vec![Value::Number(1.0), Value::Str("x".into())]))
+        Some(arr(vec![Value::Float(1.0), Value::Str("x".into())]))
     );
     // in-list
     let in_list = |negated: bool| Expr::InList {
@@ -459,23 +459,23 @@ fn l3_expression_arith_and_compare() {
     let num = |v: f64| Expr::Number(v);
     assert_eq!(
         l3_ctx(&binop(BinOp::Add, num(1.0), num(2.0)), &ctx),
-        Some(Value::Number(3.0))
+        Some(Value::Float(3.0))
     );
     assert_eq!(
         l3_ctx(&binop(BinOp::Sub, num(5.0), num(2.0)), &ctx),
-        Some(Value::Number(3.0))
+        Some(Value::Float(3.0))
     );
     assert_eq!(
         l3_ctx(&binop(BinOp::Mul, num(5.0), num(2.0)), &ctx),
-        Some(Value::Number(10.0))
+        Some(Value::Float(10.0))
     );
     assert_eq!(
         l3_ctx(&binop(BinOp::Div, num(6.0), num(2.0)), &ctx),
-        Some(Value::Number(3.0))
+        Some(Value::Float(3.0))
     );
     assert_eq!(
         l3_ctx(&binop(BinOp::Mod, num(5.0), num(2.0)), &ctx),
-        Some(Value::Number(1.0))
+        Some(Value::Float(1.0))
     );
     // div / mod by zero → None
     assert_eq!(l3_ctx(&binop(BinOp::Div, num(1.0), num(0.0)), &ctx), None);
@@ -609,11 +609,11 @@ fn l3_expression_if_then_else() {
     };
     assert_eq!(
         l3_ctx(&ite(Expr::Bool(true)), &ctx),
-        Some(Value::Number(1.0))
+        Some(Value::Float(1.0))
     );
     assert_eq!(
         l3_ctx(&ite(Expr::Bool(false)), &ctx),
-        Some(Value::Number(2.0))
+        Some(Value::Float(2.0))
     );
     // non-bool condition → None
     assert_eq!(l3_ctx(&ite(Expr::Number(1.0)), &ctx), None);
@@ -633,7 +633,7 @@ fn l3_materializes_system_vars_in_func_args() {
                 ..YieldMeta::default()
             },
         ),
-        Some(Value::Number(70.0))
+        Some(Value::Float(70.0))
     );
     // concat with a wfu meta arg
     let expr = call("concat", vec![lit("id="), Expr::WfuMeta(WfuMetaField::Id)]);
@@ -833,17 +833,17 @@ fn builtin_dispatch_entry_points() {
     // direct builtin dispatch
     assert_eq!(
         eval_builtin_func_with_l3("abs", &[Expr::Number(-5.0)], &ctx, YieldMeta::default()),
-        Some(Value::Number(5.0))
+        Some(Value::Float(5.0))
     );
     assert_eq!(
         eval_builtin_func_with_l3("unknown", &[], &ctx, YieldMeta::default()),
         None
     );
     // direct L3 func dispatch
-    let step = step_ctx(vec![Value::Number(1.0), Value::Number(2.0)]);
+    let step = step_ctx(vec![Value::Float(1.0), Value::Float(2.0)]);
     assert_eq!(
         eval_l3_func("collect_list", &[field("e")], &step, YieldMeta::default()),
-        Some(arr(vec![Value::Number(1.0), Value::Number(2.0)]))
+        Some(arr(vec![Value::Float(1.0), Value::Float(2.0)]))
     );
     assert_eq!(
         eval_l3_func("nope", &[field("e")], &step, YieldMeta::default()),
@@ -856,7 +856,7 @@ fn builtin_dispatch_entry_points() {
     // direct aggregate dispatch
     assert_eq!(
         eval_aggregate_func("sum", &[field("e")], &step),
-        Some(Value::Number(6.0))
+        Some(Value::Float(6.0))
     );
     assert_eq!(eval_aggregate_func("nope", &[field("e")], &step), None);
     assert_eq!(
@@ -864,10 +864,10 @@ fn builtin_dispatch_entry_points() {
         None
     );
     // direct stat dispatch
-    let sctx = ctx_with(vec![("_bind_x_count", Value::Number(3.0))]);
+    let sctx = ctx_with(vec![("_bind_x_count", Value::Float(3.0))]);
     assert_eq!(
         eval_stat_func("count", &[call("window_event", vec![field("x")])], &sctx),
-        Some(Value::Number(3.0))
+        Some(Value::Float(3.0))
     );
     // non-selector arg / unknown selector name → None
     assert_eq!(eval_stat_func("count", &[field("x")], &sctx), None);
@@ -963,7 +963,7 @@ fn eval_expr_with_l3_match_branch_time_func() {
         default: Some(Box::new(Expr::Number(0.0))),
     };
     let v = eval_expr_with_l3(&expr, &ctx, YieldMeta::default());
-    let Some(Value::Number(ns)) = v else {
+    let Some(Value::Float(ns)) = v else {
         panic!("now_ns in match branch should evaluate via L3, got {v:?}");
     };
     assert!(

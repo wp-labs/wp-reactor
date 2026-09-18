@@ -58,7 +58,7 @@ fn join_index_maintained_on_append_and_evict() {
 fn join_key_from_value_conversion() {
     use crate::match_engine::EngineHashMap;
     assert_eq!(
-        JoinKey::from_value(&Value::Number(42.0)),
+        JoinKey::from_value(&Value::Float(42.0)),
         Some(JoinKey::Int(42)),
         "number → Int"
     );

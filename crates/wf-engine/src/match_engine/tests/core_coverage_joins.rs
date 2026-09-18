@@ -41,10 +41,10 @@ fn build_eval_context_all_mode_materializes_every_synthetic_field() {
     );
 
     assert_eq!(ctx.fields["sip"], str_val("10.0.0.1"));
-    assert_eq!(ctx.fields["fail"], Value::Number(5.0));
+    assert_eq!(ctx.fields["fail"], Value::Float(5.0));
     assert_eq!(
         ctx.fields["_step_0_values"],
-        Value::Array(vec![Value::Number(1.0), Value::Number(2.0)])
+        Value::Array(vec![Value::Float(1.0), Value::Float(2.0)])
     );
     assert_eq!(
         ctx.fields["_step_0_field_user"],
@@ -55,10 +55,10 @@ fn build_eval_context_all_mode_materializes_every_synthetic_field() {
         str_val("b"),
         "last value wins for bare names"
     );
-    assert_eq!(ctx.fields["_step_0_measure"], Value::Number(5.0));
+    assert_eq!(ctx.fields["_step_0_measure"], Value::Float(5.0));
     assert_eq!(ctx.fields["_step_0_label"], Value::Str("fail".into()));
     assert_eq!(ctx.fields["_step_0_source"], Value::Str("b".into()));
-    assert_eq!(ctx.fields["_bind_w_count"], Value::Number(3.0));
+    assert_eq!(ctx.fields["_bind_w_count"], Value::Float(3.0));
     assert_eq!(
         ctx.fields["_bind_w_field_dport"],
         Value::Array(vec![num(80.0)])
@@ -116,7 +116,7 @@ fn build_eval_context_named_mode_and_trigger_event_precedence() {
         str_val("10.0.0.1"),
         "key wins over trigger"
     );
-    assert_eq!(ctx2.fields["extra"], Value::Number(7.0));
+    assert_eq!(ctx2.fields["extra"], Value::Float(7.0));
     assert_eq!(ctx2.fields["user"], str_val("trigger-user"));
 
     // A step label colliding with a key field is skipped (key priority).
@@ -254,7 +254,7 @@ fn execute_joins_asof_fast_path_hit_miss_and_fallback() {
         &lookup,
         1_000
     ));
-    assert_eq!(ctx.fields["ti.risk"], Value::Number(90.0));
+    assert_eq!(ctx.fields["ti.risk"], Value::Float(90.0));
 
     // Fast-path Miss → keep the event without enrichment.
     let mut ctx = event(vec![("sip", str_val("10.0.0.1"))]);
@@ -304,7 +304,7 @@ fn execute_joins_asof_fast_path_hit_miss_and_fallback() {
     ));
     assert_eq!(
         ctx.fields["ti.risk"],
-        Value::Number(90.0),
+        Value::Float(90.0),
         "latest row ≤ event time"
     );
 
@@ -328,7 +328,7 @@ fn execute_joins_asof_fast_path_hit_miss_and_fallback() {
         ..join_plan(JoinMode::Asof { within: None }, "ti", "sip", "ip")
     };
     assert!(execute_joins(&[within_join], &mut ctx, &lookup, 1_000));
-    assert_eq!(ctx.fields["ti.risk"], Value::Number(90.0));
+    assert_eq!(ctx.fields["ti.risk"], Value::Float(90.0));
 }
 
 #[test]
@@ -379,7 +379,7 @@ fn execute_joins_asof_multi_condition_uses_candidate_scan() {
     assert!(execute_joins(&[multi], &mut ctx, &lookup, 1_000));
     // The zone=8 row (ts=500, newer than zone=7 ts=100) fails the second cond;
     // the newest matching row is ts=900 (zone=7).
-    assert_eq!(ctx.fields["ti.risk"], Value::Number(80.0));
+    assert_eq!(ctx.fields["ti.risk"], Value::Float(80.0));
 }
 
 fn interval_join(mode: JoinMode, window: &str, left: &str, right: &str) -> JoinPlan {
@@ -534,7 +534,7 @@ fn execute_joins_interval_modes_anti_asof_snapshot_and_bound_expression() {
     ));
     assert_eq!(
         ctx.fields["geo.v"],
-        Value::Number(2.0),
+        Value::Float(2.0),
         "interval asof picks latest"
     );
     let mut ctx = event(vec![("sip", str_val("10.0.0.1"))]);
@@ -546,7 +546,7 @@ fn execute_joins_interval_modes_anti_asof_snapshot_and_bound_expression() {
     ));
     assert_eq!(
         ctx.fields["geo.v"],
-        Value::Number(1.0),
+        Value::Float(1.0),
         "interval snapshot picks earliest"
     );
 
@@ -628,7 +628,7 @@ fn eval_expr_resolves_event_fields_for_bound_expressions() {
     let ev = event(vec![("x", num(42.0)), ("s", str_val("ok"))]);
     assert_eq!(
         eval_expr(&Expr::Field(FieldRef::Simple("x".into())), &ev),
-        Some(Value::Number(42.0))
+        Some(Value::Float(42.0))
     );
     assert_eq!(
         eval_expr(
@@ -639,7 +639,7 @@ fn eval_expr_resolves_event_fields_for_bound_expressions() {
             },
             &ev
         ),
-        Some(Value::Number(50.0))
+        Some(Value::Float(50.0))
     );
     assert_eq!(
         eval_expr(&Expr::Field(FieldRef::Simple("missing".into())), &ev),

@@ -18,7 +18,7 @@ use crate::alert::types::{
 use crate::match_engine::{CloseReason, EngineHashMap, Value};
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn str_val(s: &str) -> Value {
@@ -116,7 +116,7 @@ fn data_record_json_chars_object_array_and_time_ip_hex_lanes() {
 #[test]
 fn structured_render_rejects_non_finite_number_nested_in_object() {
     let mut obj = EngineHashMap::default();
-    obj.insert("score".into(), Value::Number(f64::NAN));
+    obj.insert("score".into(), Value::Float(f64::NAN));
     let output = sample_output(AlertOrigin::Event, vec![("ctx".into(), Value::Object(obj))]);
     let mut output = output;
     output.yield_field_types =
@@ -135,7 +135,7 @@ fn structured_render_rejects_non_finite_number_nested_in_object() {
         AlertOrigin::Event,
         vec![(
             "items".into(),
-            Value::Array(vec![num(1.0), Value::Number(f64::INFINITY)]),
+            Value::Array(vec![num(1.0), Value::Float(f64::INFINITY)]),
         )],
     );
     let mut output = output;

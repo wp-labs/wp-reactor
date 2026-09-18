@@ -102,7 +102,7 @@ fn str_lit(s: &str) -> Expr {
 // ===========================================================================
 
 /// 构造侧接入 `Value::Int` 后，所有**消费数值**的内置函数必须能接受 `Int`：
-/// 数值函数按 `i as f64` 归一（返回值仍 `Value::Number`，导出层整值归一为 Digit），
+/// 数值函数按 `i as f64` 归一（返回值仍 `Value::Float`，导出层整值归一为 Digit），
 /// 而**整数索引/长度**走精确 `i64`（不经 f64）。
 #[test]
 fn numeric_builtins_accept_int_inputs() {
@@ -134,7 +134,7 @@ fn numeric_builtins_accept_int_inputs() {
         ev(&call("is_finite", vec![field("n")])),
         Some(Value::Bool(true))
     );
-    // 二元数值函数：`Int` 与 `Number` 混合
+    // 二元数值函数：`Int` 与 `Float` 混合
     assert_eq!(ev(&call("pow", vec![field("n"), n(2.0)])), Some(num(49.0)));
     assert_eq!(
         ev(&call("clamp", vec![field("n"), n(0.0), n(5.0)])),
@@ -163,7 +163,7 @@ fn numeric_builtins_accept_int_inputs() {
 fn plain_path_error_branches_return_none() {
     let mut fields = EngineHashMap::default();
     fields.insert("s".into(), Value::Str("abc".into()));
-    fields.insert("n".into(), Value::Number(5.0));
+    fields.insert("n".into(), Value::Float(5.0));
     fields.insert(
         "arr".into(),
         Value::Array(vec![Value::Str("a".into()), Value::Str("b".into())]),
@@ -590,20 +590,20 @@ fn cmp_arithmetic_overflow_and_div_zero() {
     // 减法/乘法/模
     assert_eq!(
         eval_expr(&binop(BinOp::Sub, n(5.0), n(2.0)), &e),
-        Some(Value::Number(3.0))
+        Some(Value::Float(3.0))
     );
     assert_eq!(
         eval_expr(&binop(BinOp::Mul, n(5.0), n(2.0)), &e),
-        Some(Value::Number(10.0))
+        Some(Value::Float(10.0))
     );
     assert_eq!(
         eval_expr(&binop(BinOp::Mod, n(5.0), n(2.0)), &e),
-        Some(Value::Number(1.0))
+        Some(Value::Float(1.0))
     );
     // 大数值溢出为 inf 仍返回（f64 语义）
     assert!(matches!(
         eval_expr(&binop(BinOp::Mul, n(1e300), n(1e300)), &e),
-        Some(Value::Number(v)) if v.is_infinite()
+        Some(Value::Float(v)) if v.is_infinite()
     ));
 }
 

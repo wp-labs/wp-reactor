@@ -31,8 +31,8 @@ const NOW: i64 = 1_750_000_000_000_000_000;
 /// 右窗候选行：`(ts_nanos, id, price)`。
 fn timed_row(ts: i64, id: f64, price: f64) -> (i64, JoinRow) {
     let mut fields = EngineHashMap::default();
-    fields.insert("id".into(), Value::Number(id));
-    fields.insert("price".into(), Value::Number(price));
+    fields.insert("id".into(), Value::Float(id));
+    fields.insert("price".into(), Value::Float(price));
     (ts, JoinRow::Event(Arc::new(Event { fields })))
 }
 
@@ -128,7 +128,7 @@ fn run_joins(
         fields: EngineHashMap::default(),
     };
     for (k, v) in ctx_fields {
-        base.fields.insert((*k).into(), Value::Number(*v));
+        base.fields.insert((*k).into(), Value::Float(*v));
     }
     let start = Instant::now();
     let mut hits = 0usize;

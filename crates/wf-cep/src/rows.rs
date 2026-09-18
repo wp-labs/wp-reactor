@@ -180,7 +180,7 @@ impl RowFields {
     /// 按字段位置写值（v = None → null）。
     pub fn set(&mut self, i: usize, v: Option<Value>) {
         match (self.layout.slot(i), v) {
-            (RowFieldSlot::Numeric(idx), Some(Value::Number(n))) => {
+            (RowFieldSlot::Numeric(idx), Some(Value::Float(n))) => {
                 self.numeric[idx] = n;
                 self.mask_bit(i, false);
             }
@@ -196,7 +196,7 @@ impl RowFields {
                 self.mask_bit(i, false);
             }
             // 行式（JSON/派生）值喂进整数槽：仅接受 f64 可精确表达的整值。
-            (RowFieldSlot::Int64(idx), Some(Value::Number(n)))
+            (RowFieldSlot::Int64(idx), Some(Value::Float(n)))
                 if n.is_finite() && n.fract() == 0.0 && n.abs() <= i64::MAX as f64 =>
             {
                 self.ints[idx] = n as i64;
@@ -226,7 +226,7 @@ impl RowFields {
             return None;
         }
         match self.layout.slot(i) {
-            RowFieldSlot::Numeric(idx) => Some(Value::Number(self.numeric[idx])),
+            RowFieldSlot::Numeric(idx) => Some(Value::Float(self.numeric[idx])),
             RowFieldSlot::Int64(idx) => Some(Value::Int(self.ints[idx])),
             RowFieldSlot::Str(idx) => Some(Value::Str(self.strings[idx].clone())),
             RowFieldSlot::Other(idx) => self.others[idx].clone(),

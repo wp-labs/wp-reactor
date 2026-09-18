@@ -160,12 +160,12 @@ fn stats_accum_roundtrip_all_variants() {
     let distinct = StatsAccum::Distinct(Box::new(d));
     // Last
     let mut rf = RowFields::empty(std::sync::Arc::clone(&layout));
-    rf.set(0, Some(crate::match_engine::Value::Number(9800.0)));
+    rf.set(0, Some(crate::match_engine::Value::Float(9800.0)));
     rf.set(2, Some(crate::match_engine::Value::Str("Google".into())));
     let last = StatsAccum::Last(Some(std::sync::Arc::new(rf)));
     // Top
     let mut e1 = RowFields::empty(std::sync::Arc::clone(&layout));
-    e1.set(1, Some(crate::match_engine::Value::Number(1.0)));
+    e1.set(1, Some(crate::match_engine::Value::Float(1.0)));
     let top = StatsAccum::Top(vec![TopEntry {
         key: 100.0,
         row: e1,
@@ -207,7 +207,7 @@ fn last_shared_rowfields_dedup_roundtrip_shares_arc() {
     let layout = sample_layout();
     let rf = std::sync::Arc::new({
         let mut r = RowFields::empty(std::sync::Arc::clone(&layout));
-        r.set(0, Some(crate::match_engine::Value::Number(7.0)));
+        r.set(0, Some(crate::match_engine::Value::Float(7.0)));
         r
     });
     // 3 个 last 指向同一 Arc（同桶多 last 共享的场景）
@@ -232,7 +232,7 @@ fn last_shared_rowfields_dedup_roundtrip_shares_arc() {
     // 不同 Arc 的 last 不被误合并（引用索引必须精确匹配）
     let rf2 = std::sync::Arc::new({
         let mut r = RowFields::empty(std::sync::Arc::clone(&layout));
-        r.set(0, Some(crate::match_engine::Value::Number(8.0)));
+        r.set(0, Some(crate::match_engine::Value::Float(8.0)));
         r
     });
     let accs2 = vec![
@@ -275,7 +275,7 @@ fn spill_value_roundtrip_with_layout_mismatch_rejected() {
         )]),
     ));
     let mut rf = RowFields::empty(std::sync::Arc::clone(&layout));
-    rf.set(0, Some(crate::match_engine::Value::Number(1.0)));
+    rf.set(0, Some(crate::match_engine::Value::Float(1.0)));
     let accs2 = vec![StatsAccum::Last(Some(std::sync::Arc::new(rf)))];
     let bytes2 = serialize_accs(&accs2).expect("serialize");
     assert!(matches!(
@@ -361,9 +361,9 @@ fn row_fields_int64_slot_is_exact_and_spills_exactly() {
 
     // 行式路径喂进 i64 槽的整值浮点也按整数落槽（非整值/超 i64 → null）。
     let mut rf2 = RowFields::empty(std::sync::Arc::clone(&layout));
-    rf2.set(0, Some(crate::match_engine::Value::Number(42.0)));
+    rf2.set(0, Some(crate::match_engine::Value::Float(42.0)));
     assert_eq!(rf2.value_at(0), Some(crate::match_engine::Value::Int(42)));
-    rf2.set(0, Some(crate::match_engine::Value::Number(1.5)));
+    rf2.set(0, Some(crate::match_engine::Value::Float(1.5)));
     assert_eq!(rf2.value_at(0), None, "非整值喂整数槽 → null");
 }
 
@@ -441,7 +441,7 @@ fn redb_spill_roundtrip_and_drain() {
         Box::new(ScopeKey::Str("auction".into())),
     );
     let mut rf = RowFields::empty(std::sync::Arc::clone(&layout));
-    rf.set(0, Some(crate::match_engine::Value::Number(9800.0)));
+    rf.set(0, Some(crate::match_engine::Value::Float(9800.0)));
     let accs2 = vec![StatsAccum::Top(vec![TopEntry { key: 1.5, row: rf }])];
     let h2 = spill_hash(&k2);
 

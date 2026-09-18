@@ -18,15 +18,13 @@ pub(super) fn normalize_index(index: i64, len: usize) -> Option<usize> {
 
 pub(super) fn compare_sortable_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => {
-            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        // 数值域统一：`Int` 与 `Number` 同序（与 wf-cep `compare_sortable_values` 同口径）。
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        // 数值域统一：`Int` 与 `Float` 同序（与 wf-cep `compare_sortable_values` 同口径）。
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Int(x), Value::Number(y)) => (*x as f64)
+        (Value::Int(x), Value::Float(y)) => (*x as f64)
             .partial_cmp(y)
             .unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Number(x), Value::Int(y)) => x
+        (Value::Float(x), Value::Int(y)) => x
             .partial_cmp(&(*y as f64))
             .unwrap_or(std::cmp::Ordering::Equal),
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
@@ -86,7 +84,7 @@ pub(super) fn timestamp_nanos_to_utc(timestamp_nanos: i64) -> Option<DateTime<Ut
 }
 
 pub(super) fn time_nanos_to_value(nanos: i64) -> Value {
-    Value::Number(epoch_nanos_to_millis(nanos) as f64)
+    Value::Float(epoch_nanos_to_millis(nanos) as f64)
 }
 
 pub(super) fn time_nanos_to_expr(nanos: i64) -> wf_lang::ast::Expr {
@@ -138,7 +136,7 @@ mod tests {
     use std::cmp::Ordering;
 
     fn num(v: f64) -> Value {
-        Value::Number(v)
+        Value::Float(v)
     }
 
     fn strv(v: &str) -> Value {

@@ -135,7 +135,7 @@ fn empty_entity_pair() -> (String, Option<Value>) {
 
 /// Whether `export_yield_f64` handles the target type natively (no `Value`
 /// fallback), so the entity==yield numeric fast lane can stage the raw number
-/// directly and stay byte-identical to the `Value::Number` coerce+export path.
+/// directly and stay byte-identical to the `Value::Float` coerce+export path.
 #[inline(always)]
 fn is_numeric_yield_type(field_type: Option<&wf_lang::FieldType>) -> bool {
     matches!(

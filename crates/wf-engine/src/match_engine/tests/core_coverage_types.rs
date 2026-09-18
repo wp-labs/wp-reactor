@@ -15,16 +15,16 @@ use super::*;
 fn join_key_from_value_covers_all_value_variants() {
     // Number → Int with the f64 truncation (matches the hash-index key math).
     assert_eq!(
-        JoinKey::from_value(&Value::Number(42.0)),
+        JoinKey::from_value(&Value::Float(42.0)),
         Some(JoinKey::Int(42))
     );
     assert_eq!(
-        JoinKey::from_value(&Value::Number(1.5)),
+        JoinKey::from_value(&Value::Float(1.5)),
         Some(JoinKey::Int(1)),
         "fractional numbers truncate like the join index key"
     );
     assert_eq!(
-        JoinKey::from_value(&Value::Number(-7.9)),
+        JoinKey::from_value(&Value::Float(-7.9)),
         Some(JoinKey::Int(-7))
     );
     assert_eq!(
@@ -120,7 +120,7 @@ fn window_lookup_default_join_lookup_filters_by_key() {
         ],
     };
     let rows = lookup
-        .join_lookup("w", "id", &Value::Number(2.0))
+        .join_lookup("w", "id", &Value::Float(2.0))
         .expect("default join_lookup must scan the snapshot");
     assert_eq!(rows.len(), 2, "default join_lookup is a linear filter");
     // Structured keys never match scalar rows via `values_equal`.
@@ -129,9 +129,7 @@ fn window_lookup_default_join_lookup_filters_by_key() {
         .expect("snapshot exists");
     assert!(none.is_empty());
     // Missing key field on a row → filtered out.
-    let missing = lookup
-        .join_lookup("w", "nope", &Value::Number(1.0))
-        .unwrap();
+    let missing = lookup.join_lookup("w", "nope", &Value::Float(1.0)).unwrap();
     assert!(missing.is_empty());
 }
 
@@ -142,24 +140,24 @@ fn window_lookup_default_asof_and_fast_path_fallbacks() {
     assert!(lookup.snapshot_with_timestamps("w").is_none());
     assert!(
         lookup
-            .asof_candidates("w", "id", &Value::Number(1.0))
+            .asof_candidates("w", "id", &Value::Float(1.0))
             .is_none()
     );
     // Default `asof_lookup_max` is always `Fallback`.
     assert!(matches!(
-        lookup.asof_lookup_max("w", "id", &Value::Number(1.0), 0, None),
+        lookup.asof_lookup_max("w", "id", &Value::Float(1.0), 0, None),
         AsofLookup::Fallback
     ));
 }
 
 #[test]
 fn values_equal_matches_scalars_and_structures() {
-    assert!(values_equal(&Value::Number(1.0), &Value::Number(1.0)));
+    assert!(values_equal(&Value::Float(1.0), &Value::Float(1.0)));
     assert!(values_equal(
-        &Value::Number(1.0),
-        &Value::Number(1.0 + f64::EPSILON / 2.0)
+        &Value::Float(1.0),
+        &Value::Float(1.0 + f64::EPSILON / 2.0)
     ));
-    assert!(!values_equal(&Value::Number(1.0), &Value::Number(1.5)));
+    assert!(!values_equal(&Value::Float(1.0), &Value::Float(1.5)));
     assert!(values_equal(
         &Value::Str("x".into()),
         &Value::Str("x".into())
@@ -171,7 +169,7 @@ fn values_equal_matches_scalars_and_structures() {
     assert!(values_equal(&Value::Bool(true), &Value::Bool(true)));
     assert!(!values_equal(&Value::Bool(true), &Value::Bool(false)));
     // 类型不匹配 → 不等（不声称相等）
-    assert!(!values_equal(&Value::Number(1.0), &Value::Str("1".into())));
+    assert!(!values_equal(&Value::Float(1.0), &Value::Str("1".into())));
     // 结构化值 → **递归结构相等**（回归 2026-09-18：此前恒不等，`obj == obj` 为 false）
     assert!(values_equal(
         &Value::Array(vec![num(1.0)]),
@@ -224,8 +222,8 @@ fn values_equal_matches_scalars_and_structures() {
 /// 仍把两者算作两个值。
 #[test]
 fn epsilon_equality_and_key_identity_are_deliberately_different() {
-    let computed = Value::Number(0.1 + 0.2);
-    let literal = Value::Number(0.3);
+    let computed = Value::Float(0.1 + 0.2);
+    let literal = Value::Float(0.3);
     assert!(
         values_equal(&computed, &literal),
         "比较语义：epsilon 认为二者相等（既有契约）"
@@ -265,10 +263,10 @@ fn epsilon_relation_is_not_transitive() {
     let a = 0.3;
     let b = a + f64::EPSILON / 4.0; // 1 ulp
     let c = a + f64::EPSILON; // 4 ulp
-    assert!(values_equal(&Value::Number(a), &Value::Number(b)), "a ~ b");
-    assert!(values_equal(&Value::Number(b), &Value::Number(c)), "b ~ c");
+    assert!(values_equal(&Value::Float(a), &Value::Float(b)), "a ~ b");
+    assert!(values_equal(&Value::Float(b), &Value::Float(c)), "b ~ c");
     assert!(
-        !values_equal(&Value::Number(a), &Value::Number(c)),
+        !values_equal(&Value::Float(a), &Value::Float(c)),
         "a ≁ c —— epsilon 非传递"
     );
 }
@@ -280,31 +278,28 @@ fn epsilon_relation_is_not_transitive() {
 #[test]
 fn scope_key_from_value_covers_all_value_variants() {
     // Integer-valued numbers → Int (including full-precision < 2^53).
+    assert_eq!(ScopeKey::from_value(&Value::Float(42.0)), ScopeKey::Int(42));
+    assert_eq!(ScopeKey::from_value(&Value::Float(-0.0)), ScopeKey::Int(0));
     assert_eq!(
-        ScopeKey::from_value(&Value::Number(42.0)),
-        ScopeKey::Int(42)
-    );
-    assert_eq!(ScopeKey::from_value(&Value::Number(-0.0)), ScopeKey::Int(0));
-    assert_eq!(
-        ScopeKey::from_value(&Value::Number(TWO_POW_53 - 1.0)),
+        ScopeKey::from_value(&Value::Float(TWO_POW_53 - 1.0)),
         ScopeKey::Int(TWO_POW_53 as i64 - 1)
     );
     // Fractional / huge / non-finite numbers → Float (canonical bits).
     assert!(matches!(
-        ScopeKey::from_value(&Value::Number(1.5)),
+        ScopeKey::from_value(&Value::Float(1.5)),
         ScopeKey::Float(_)
     ));
     assert!(matches!(
-        ScopeKey::from_value(&Value::Number(TWO_POW_53)),
+        ScopeKey::from_value(&Value::Float(TWO_POW_53)),
         ScopeKey::Float(_)
     ));
     assert!(matches!(
-        ScopeKey::from_value(&Value::Number(f64::NAN)),
+        ScopeKey::from_value(&Value::Float(f64::NAN)),
         ScopeKey::Float(_)
     ));
     assert_eq!(
-        ScopeKey::from_value(&Value::Number(1.5)),
-        ScopeKey::from_value(&Value::Number(1.5)),
+        ScopeKey::from_value(&Value::Float(1.5)),
+        ScopeKey::from_value(&Value::Float(1.5)),
         "same float → same canonical bits"
     );
     // Strings / bools / structured values.
@@ -394,16 +389,16 @@ fn scope_key_shard_index_is_bounded_and_deterministic() {
 fn value_key_from_value_canonicalization() {
     // Canonical float keys: -0.0 ≡ +0.0, NaN ≡ NaN.
     assert_eq!(
-        ValueKey::from_value(&Value::Number(-0.0)),
-        ValueKey::from_value(&Value::Number(0.0))
+        ValueKey::from_value(&Value::Float(-0.0)),
+        ValueKey::from_value(&Value::Float(0.0))
     );
     assert_eq!(
-        ValueKey::from_value(&Value::Number(f64::NAN)),
-        ValueKey::from_value(&Value::Number(f64::NAN))
+        ValueKey::from_value(&Value::Float(f64::NAN)),
+        ValueKey::from_value(&Value::Float(f64::NAN))
     );
     assert_ne!(
-        ValueKey::from_value(&Value::Number(1.0)),
-        ValueKey::from_value(&Value::Number(-1.0))
+        ValueKey::from_value(&Value::Float(1.0)),
+        ValueKey::from_value(&Value::Float(-1.0))
     );
     assert_eq!(
         ValueKey::from_value(&Value::Str("a".into())),
@@ -423,8 +418,8 @@ fn value_key_from_value_canonicalization() {
     );
     // Object sorts keys for deterministic keys.
     let mut obj = EngineHashMap::default();
-    obj.insert("b".into(), Value::Number(2.0));
-    obj.insert("a".into(), Value::Number(1.0));
+    obj.insert("b".into(), Value::Float(2.0));
+    obj.insert("a".into(), Value::Float(1.0));
     assert_eq!(
         ValueKey::from_value(&Value::Object(obj)),
         ValueKey::Object(vec![
@@ -481,15 +476,15 @@ fn push_i64_exact_decimal_and_value_to_string_variants() {
     assert_eq!(s, "9007199254740992");
 
     // value_to_string: integer fast path / fractional / exponent / -0.0.
-    assert_eq!(value_to_string(&Value::Number(1.0)), "1");
-    assert_eq!(value_to_string(&Value::Number(-0.0)), "-0");
-    assert_eq!(value_to_string(&Value::Number(1.5)), "1.5");
+    assert_eq!(value_to_string(&Value::Float(1.0)), "1");
+    assert_eq!(value_to_string(&Value::Float(-0.0)), "-0");
+    assert_eq!(value_to_string(&Value::Float(1.5)), "1.5");
     assert_eq!(
-        value_to_string(&Value::Number(1e21)),
+        value_to_string(&Value::Float(1e21)),
         "1000000000000000000000"
     );
     assert_eq!(
-        value_to_string(&Value::Number(TWO_POW_53)),
+        value_to_string(&Value::Float(TWO_POW_53)),
         "9007199254740992"
     );
     assert_eq!(value_to_string(&Value::Str("s".into())), "s");

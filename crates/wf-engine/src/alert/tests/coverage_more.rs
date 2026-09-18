@@ -21,7 +21,7 @@ use crate::alert::types::{AlertOrigin, OutputRecord, export_yield_f64, export_yi
 use crate::match_engine::{CloseReason, EngineHashMap, Value};
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn str_val(s: &str) -> Value {

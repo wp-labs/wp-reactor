@@ -7,9 +7,9 @@ use super::*;
 #[test]
 fn test_first_returns_first_value() {
     let ctx = make_test_event(vec![
-        Value::Number(10.0),
-        Value::Number(20.0),
-        Value::Number(30.0),
+        Value::Float(10.0),
+        Value::Float(20.0),
+        Value::Float(30.0),
     ]);
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -17,15 +17,15 @@ fn test_first_returns_first_value() {
         args: vec![Expr::Field(FieldRef::Simple("value".to_string()))],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    assert_eq!(result, Some(Value::Number(10.0)));
+    assert_eq!(result, Some(Value::Float(10.0)));
 }
 
 #[test]
 fn test_last_returns_last_value() {
     let ctx = make_test_event(vec![
-        Value::Number(10.0),
-        Value::Number(20.0),
-        Value::Number(30.0),
+        Value::Float(10.0),
+        Value::Float(20.0),
+        Value::Float(30.0),
     ]);
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -33,15 +33,15 @@ fn test_last_returns_last_value() {
         args: vec![Expr::Field(FieldRef::Simple("value".to_string()))],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    assert_eq!(result, Some(Value::Number(30.0)));
+    assert_eq!(result, Some(Value::Float(30.0)));
 }
 
 #[test]
 fn test_collect_list_returns_all_values() {
     let ctx = make_test_event(vec![
-        Value::Number(10.0),
-        Value::Number(20.0),
-        Value::Number(30.0),
+        Value::Float(10.0),
+        Value::Float(20.0),
+        Value::Float(30.0),
     ]);
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -52,9 +52,9 @@ fn test_collect_list_returns_all_values() {
     assert_eq!(
         result,
         Some(Value::Array(vec![
-            Value::Number(10.0),
-            Value::Number(20.0),
-            Value::Number(30.0),
+            Value::Float(10.0),
+            Value::Float(20.0),
+            Value::Float(30.0),
         ]))
     );
 }
@@ -88,7 +88,7 @@ fn test_collect_set_qualified_bind_field_missing_does_not_fallback_to_step_value
         Value::Array(vec![Value::Str("10.0.0.1".into())]),
     );
     fields.insert("_step_0_source".into(), Value::Str("s".into()));
-    fields.insert("_bind_s_count".into(), Value::Number(6.0));
+    fields.insert("_bind_s_count".into(), Value::Float(6.0));
     let ctx = Event { fields };
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -106,7 +106,7 @@ fn test_collect_set_qualified_bind_field_missing_does_not_fallback_to_step_value
 #[test]
 fn test_merge_shallow_merges_objects_left_to_right() {
     let mut base = EngineHashMap::default();
-    base.insert("severity".into(), Value::Number(3.0));
+    base.insert("severity".into(), Value::Float(3.0));
     base.insert("existing".into(), Value::Str("kept".into()));
 
     let mut fields = EngineHashMap::default();
@@ -140,7 +140,7 @@ fn test_merge_shallow_merges_objects_left_to_right() {
     };
     assert_eq!(object.get("existing"), Some(&Value::Str("kept".into())));
     assert_eq!(object.get("source"), Some(&Value::Str("wfl".into())));
-    assert_eq!(object.get("severity"), Some(&Value::Number(10.0)));
+    assert_eq!(object.get("severity"), Some(&Value::Float(10.0)));
 }
 
 #[test]
@@ -171,14 +171,14 @@ fn test_merge_fails_when_object_literal_value_is_missing() {
 #[test]
 fn test_stddev_calculation() {
     let ctx = make_test_event(vec![
-        Value::Number(2.0),
-        Value::Number(4.0),
-        Value::Number(4.0),
-        Value::Number(4.0),
-        Value::Number(5.0),
-        Value::Number(5.0),
-        Value::Number(7.0),
-        Value::Number(9.0),
+        Value::Float(2.0),
+        Value::Float(4.0),
+        Value::Float(4.0),
+        Value::Float(4.0),
+        Value::Float(5.0),
+        Value::Float(5.0),
+        Value::Float(7.0),
+        Value::Float(9.0),
     ]);
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -186,7 +186,7 @@ fn test_stddev_calculation() {
         args: vec![Expr::Field(FieldRef::Simple("value".to_string()))],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    if let Some(Value::Number(stddev)) = result {
+    if let Some(Value::Float(stddev)) = result {
         // Population stddev of [2,4,4,4,5,5,7,9] = 2.0
         assert!((stddev - 2.0).abs() < 0.01, "Expected ~2.0, got {}", stddev);
     } else {
@@ -196,23 +196,23 @@ fn test_stddev_calculation() {
 
 #[test]
 fn test_stddev_returns_zero_for_single_value() {
-    let ctx = make_test_event(vec![Value::Number(5.0)]);
+    let ctx = make_test_event(vec![Value::Float(5.0)]);
     let expr = Expr::FuncCall {
         qualifier: None,
         name: "stddev".to_string(),
         args: vec![Expr::Field(FieldRef::Simple("value".to_string()))],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    assert_eq!(result, Some(Value::Number(0.0)));
+    assert_eq!(result, Some(Value::Float(0.0)));
 }
 
 #[test]
 fn test_percentile_calculation() {
     let ctx = make_test_event(vec![
-        Value::Number(1.0),
-        Value::Number(2.0),
-        Value::Number(3.0),
-        Value::Number(4.0),
+        Value::Float(1.0),
+        Value::Float(2.0),
+        Value::Float(3.0),
+        Value::Float(4.0),
     ]);
     // percentile(value, 50) should return median-like value.
     let expr = Expr::FuncCall {
@@ -224,7 +224,7 @@ fn test_percentile_calculation() {
         ],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    if let Some(Value::Number(p)) = result {
+    if let Some(Value::Float(p)) = result {
         // sorted=[1,2,3,4], idx=(3*0.5).round=2, result=3
         assert!((p - 3.0).abs() < 0.01, "Expected ~3.0, got {}", p);
     } else {
@@ -235,9 +235,9 @@ fn test_percentile_calculation() {
 #[test]
 fn test_percentile_zero_returns_min() {
     let ctx = make_test_event(vec![
-        Value::Number(10.0),
-        Value::Number(20.0),
-        Value::Number(30.0),
+        Value::Float(10.0),
+        Value::Float(20.0),
+        Value::Float(30.0),
     ]);
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -248,15 +248,15 @@ fn test_percentile_zero_returns_min() {
         ],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    assert_eq!(result, Some(Value::Number(10.0)));
+    assert_eq!(result, Some(Value::Float(10.0)));
 }
 
 #[test]
 fn test_percentile_one_returns_max() {
     let ctx = make_test_event(vec![
-        Value::Number(10.0),
-        Value::Number(20.0),
-        Value::Number(30.0),
+        Value::Float(10.0),
+        Value::Float(20.0),
+        Value::Float(30.0),
     ]);
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -267,20 +267,20 @@ fn test_percentile_one_returns_max() {
         ],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    assert_eq!(result, Some(Value::Number(30.0)));
+    assert_eq!(result, Some(Value::Float(30.0)));
 }
 
 #[test]
 fn test_nested_l3_in_arithmetic() {
     let ctx = make_test_event(vec![
-        Value::Number(2.0),
-        Value::Number(4.0),
-        Value::Number(4.0),
-        Value::Number(4.0),
-        Value::Number(5.0),
-        Value::Number(5.0),
-        Value::Number(7.0),
-        Value::Number(9.0),
+        Value::Float(2.0),
+        Value::Float(4.0),
+        Value::Float(4.0),
+        Value::Float(4.0),
+        Value::Float(5.0),
+        Value::Float(5.0),
+        Value::Float(7.0),
+        Value::Float(9.0),
     ]);
     let expr = Expr::BinOp {
         op: BinOp::Add,
@@ -295,7 +295,7 @@ fn test_nested_l3_in_arithmetic() {
         right: Box::new(Expr::Number(1.0)),
     };
     let result = eval_yield_expr(&expr, &ctx);
-    if let Some(Value::Number(v)) = result {
+    if let Some(Value::Float(v)) = result {
         assert!((v - 3.0).abs() < 0.01, "Expected ~3.0, got {}", v);
     } else {
         panic!("Expected numeric result, got {:?}", result);
@@ -307,12 +307,12 @@ fn test_qualified_alias_selects_matching_step() {
     let mut fields = EngineHashMap::default();
     fields.insert(
         "_step_0_values".into(),
-        Value::Array(vec![Value::Number(10.0)]),
+        Value::Array(vec![Value::Float(10.0)]),
     );
     fields.insert("_step_0_source".into(), Value::Str("a".into()));
     fields.insert(
         "_step_1_values".into(),
-        Value::Array(vec![Value::Number(99.0)]),
+        Value::Array(vec![Value::Float(99.0)]),
     );
     fields.insert("_step_1_source".into(), Value::Str("b".into()));
     let ctx = Event { fields };
@@ -325,7 +325,7 @@ fn test_qualified_alias_selects_matching_step() {
         ))],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    assert_eq!(result, Some(Value::Number(99.0)));
+    assert_eq!(result, Some(Value::Float(99.0)));
 }
 
 #[test]
@@ -333,7 +333,7 @@ fn test_qualified_alias_without_match_returns_none_for_first() {
     let mut fields = EngineHashMap::default();
     fields.insert(
         "_step_0_values".into(),
-        Value::Array(vec![Value::Number(10.0)]),
+        Value::Array(vec![Value::Float(10.0)]),
     );
     fields.insert("_step_0_source".into(), Value::Str("a".into()));
     let ctx = Event { fields };
@@ -385,7 +385,7 @@ fn test_mvcount_with_collect_set_nested_l3() {
         }],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    assert_eq!(result, Some(Value::Number(2.0)));
+    assert_eq!(result, Some(Value::Float(2.0)));
 }
 
 #[test]
@@ -409,7 +409,7 @@ fn test_blank_functions_work_in_yield_eval() {
     fields.insert("spaces".into(), Value::Str(" \t\n ".into()));
     fields.insert("host".into(), Value::Str("example.org".into()));
     fields.insert("fallback".into(), Value::Str("fallback".into()));
-    fields.insert("n".into(), Value::Number(42.0));
+    fields.insert("n".into(), Value::Float(42.0));
     let ctx = Event { fields };
 
     let is_empty_expr = Expr::FuncCall {

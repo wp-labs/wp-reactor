@@ -68,8 +68,8 @@ fn next_u64(rng: &mut u64) -> u64 {
 
 fn event(auction: f64) -> Event {
     let mut fields: EngineHashMap<smol_str::SmolStr, Value> = EngineHashMap::default();
-    fields.insert("auction".into(), Value::Number(auction));
-    fields.insert("bidder".into(), Value::Number(1.0));
+    fields.insert("auction".into(), Value::Float(auction));
+    fields.insert("bidder".into(), Value::Float(1.0));
     Event { fields }
 }
 
@@ -296,7 +296,7 @@ fn conv_batch(n: usize, tie: bool) -> Vec<CloseOutput> {
         |i: usize| i as f64
     };
     (0..n)
-        .map(|i| make_close(vec![Value::Number((i + 1000) as f64)], m(i)))
+        .map(|i| make_close(vec![Value::Float((i + 1000) as f64)], m(i)))
         .collect()
 }
 
@@ -305,7 +305,7 @@ fn conv_batch_with_ties(n: usize, tie_every: usize) -> Vec<CloseOutput> {
     (0..n)
         .map(|i| {
             make_close(
-                vec![Value::Number((i + 1000) as f64)],
+                vec![Value::Float((i + 1000) as f64)],
                 (i / tie_every) as f64,
             )
         })
@@ -348,7 +348,7 @@ fn bench_hop_key_churn() {
     let start = Instant::now();
     for _ in 0..EVENTS {
         let auction = 1000.0 + (next_u64(&mut rng) % AUCTIONS as u64) as f64;
-        let scope_key = vec![Value::Number(auction)];
+        let scope_key = vec![Value::Float(auction)];
         for w in 0..WINDOWS {
             let k = scope_key.clone();
             let skey = scope_key_from_values(&k);
@@ -361,7 +361,7 @@ fn bench_hop_key_churn() {
     let start = Instant::now();
     for _ in 0..EVENTS {
         let auction = 1000.0 + (next_u64(&mut rng) % AUCTIONS as u64) as f64;
-        let scope_key = vec![Value::Number(auction)];
+        let scope_key = vec![Value::Float(auction)];
         let skey = scope_key_from_values(&scope_key);
         for w in 0..WINDOWS {
             let skey = skey.clone();

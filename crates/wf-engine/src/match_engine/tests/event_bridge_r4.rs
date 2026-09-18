@@ -227,7 +227,7 @@ fn structured_json_failure_lanes() {
     let Value::Object(m) = &events[0].fields["ext"] else {
         panic!("expected object");
     };
-    assert_eq!(m.get("k"), Some(&Value::Number(1.0)));
+    assert_eq!(m.get("k"), Some(&Value::Float(1.0)));
     assert!(m.get("nested").is_some());
 }
 
@@ -330,12 +330,12 @@ fn join_row_event_variant_and_columnar_null_reads() {
     // JoinRow::Event: field_value from the map, field_names from the keys.
     let ev = Arc::new(crate::match_engine::Event {
         fields: crate::match_engine::EngineHashMap::from_iter([
-            ("a".into(), Value::Number(1.0)),
+            ("a".into(), Value::Float(1.0)),
             ("b".into(), Value::Str("x".into())),
         ]),
     });
     let row = JoinRow::Event(ev);
-    assert_eq!(row.field_value("a"), Some(Value::Number(1.0)));
+    assert_eq!(row.field_value("a"), Some(Value::Float(1.0)));
     assert_eq!(row.field_value("missing"), None);
     let mut names = row.field_names();
     names.sort_unstable();

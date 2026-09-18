@@ -463,7 +463,7 @@ fn q12_like_close() -> CloseOutput {
 
     CloseOutput {
         rule_name: "q12_test".to_string(),
-        scope_key: vec![crate::match_engine::cep::Value::Number(42.0)],
+        scope_key: vec![crate::match_engine::cep::Value::Float(42.0)],
         close_reason: CloseReason::Timeout,
         event_ok: true,
         close_ok: true,
@@ -667,7 +667,7 @@ fn columnar_close_general_fmt_columnar_cell_matches_per_record() {
     // 来源；extra 是**未被引用**的字段——不应影响物化/求值。
     close.close_step_data[0]
         .field_values
-        .insert("price".into(), vec![Value::Number(1234.5)]);
+        .insert("price".into(), vec![Value::Float(1234.5)]);
     close.close_step_data[0]
         .field_values
         .insert("extra".into(), vec![Value::Str("x".to_string().into())]);
@@ -717,7 +717,7 @@ fn columnar_close_general_materialize_fail_falls_back_matches_per_record() {
     let mut c1 = q12_like_close();
     c1.close_step_data[0]
         .field_values
-        .insert("v".into(), vec![Value::Number(7.0)]);
+        .insert("v".into(), vec![Value::Float(7.0)]);
     let mut c2 = q12_like_close();
     c2.close_step_data[0]
         .field_values
@@ -924,7 +924,7 @@ fn columnar_close_scope_key_short_falls_back_to_field_values() {
 
     let mut close = q12_like_close();
     // scope_key shorter than keys (truncated zip on the per-record path).
-    close.scope_key = vec![crate::match_engine::cep::Value::Number(42.0)];
+    close.scope_key = vec![crate::match_engine::cep::Value::Float(42.0)];
     close.event_step_data[0].field_values = {
         let mut m = EngineHashMap::default();
         m.insert(

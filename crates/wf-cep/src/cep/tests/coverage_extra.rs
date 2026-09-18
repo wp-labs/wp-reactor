@@ -35,7 +35,7 @@ fn event(fields: Vec<(&str, Value)>) -> Event {
 }
 
 fn num(n: f64) -> Value {
-    Value::Number(n)
+    Value::Float(n)
 }
 
 fn str_val(s: &str) -> Value {
@@ -1222,7 +1222,7 @@ fn window_lookup_default_asof_candidates_with_ts_snapshot() {
         ],
     };
     let candidates = lookup
-        .asof_candidates("w", "id", &Value::Number(2.0))
+        .asof_candidates("w", "id", &Value::Float(2.0))
         .expect("timestamped snapshot exists");
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].0, 20);

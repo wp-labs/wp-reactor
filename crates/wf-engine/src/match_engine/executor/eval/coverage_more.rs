@@ -190,13 +190,13 @@ fn arithmetic_rejects_non_numeric_operands_and_zero_divisor() {
         left: Box::new(Expr::Number(10.0)),
         right: Box::new(Expr::Number(4.0)),
     };
-    assert_eq!(l3(&div_ok, &ctx), Some(Value::Number(2.5)));
+    assert_eq!(l3(&div_ok, &ctx), Some(Value::Float(2.5)));
     let mod_ok = Expr::BinOp {
         op: BinOp::Mod,
         left: Box::new(Expr::Number(10.0)),
         right: Box::new(Expr::Number(3.0)),
     };
-    assert_eq!(l3(&mod_ok, &ctx), Some(Value::Number(1.0)));
+    assert_eq!(l3(&mod_ok, &ctx), Some(Value::Float(1.0)));
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +278,7 @@ fn contains_walkers_cover_binop_neg_object_array_inlist_and_ite() {
 
 #[test]
 fn eval_bool_expr_rejects_non_bool_results() {
-    let ctx = ctx_with(vec![("n", Value::Number(5.0))]);
+    let ctx = ctx_with(vec![("n", Value::Float(5.0))]);
     // Numeric expression → not a Bool → None.
     assert_eq!(eval_bool_expr(&Expr::Number(5.0), &ctx), None);
     // Literal bool works.
@@ -304,7 +304,7 @@ fn eval_yield_expr_falls_back_to_empty_string() {
     // A number literal stays a number (no string coercion on the eval path).
     assert_eq!(
         eval_yield_expr(&Expr::Number(3.0), &ctx),
-        Some(Value::Number(3.0))
+        Some(Value::Float(3.0))
     );
 }
 
@@ -326,7 +326,7 @@ fn system_vars_resolve_through_l3_interpreter() {
     };
     assert_eq!(
         eval_expr_with_l3(&Expr::SystemVar(SystemVar::Score), &ctx, meta),
-        Some(Value::Number(90.0))
+        Some(Value::Float(90.0))
     );
     // Time system vars convert to millis.
     let t = |v: Option<Value>| v;

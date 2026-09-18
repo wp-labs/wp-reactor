@@ -80,7 +80,7 @@ fn scope_key_to_values_all_variants() {
     let bits = 1.25f64.to_bits();
     assert_eq!(
         scope_key_to_values(&ScopeKey::Float(bits)),
-        vec![Value::Number(1.25)]
+        vec![Value::Float(1.25)]
     );
 
     assert_eq!(
@@ -160,7 +160,7 @@ fn build_stats_close_output_expands_row_fields() {
     let row_names = vec!["price".to_string(), "channel".to_string()];
     let layout = std::sync::Arc::new(RowFieldLayout::all_other(&row_names));
     let mut row_a = RowFields::empty(std::sync::Arc::clone(&layout));
-    row_a.set(0, Some(Value::Number(99.0)));
+    row_a.set(0, Some(Value::Float(99.0)));
     row_a.set(1, Some(Value::Str("web".into())));
     let mut row_b = RowFields::empty(layout);
     row_b.set(1, Some(Value::Str("app".into())));
@@ -181,7 +181,7 @@ fn build_stats_close_output_expands_row_fields() {
         true, // All ctx: 每度量独立展开（保 _step_i_field_* 完整性）
     );
     let fv = &close.close_step_data[0].field_values;
-    assert_eq!(fv.get("price"), Some(&vec![Value::Number(99.0)]));
+    assert_eq!(fv.get("price"), Some(&vec![Value::Float(99.0)]));
     assert_eq!(fv.get("channel"), Some(&vec![Value::Str("web".into())]));
     let fv1 = &close.close_step_data[1].field_values;
     // row_b has no price → the key is not injected (empty slot skipped).
@@ -399,7 +399,7 @@ fn build_stats_close_output_named_ctx_expands_first_row_only() {
     let row_names = vec!["price".to_string(), "channel".to_string()];
     let layout = std::sync::Arc::new(RowFieldLayout::all_other(&row_names));
     let mut row_a = RowFields::empty(std::sync::Arc::clone(&layout));
-    row_a.set(0, Some(Value::Number(99.0)));
+    row_a.set(0, Some(Value::Float(99.0)));
     row_a.set(1, Some(Value::Str("web".into())));
     let row_a = std::sync::Arc::new(row_a);
     // 同一 Arc 共享（q18 4 个 last 度量同一行）
@@ -436,7 +436,7 @@ fn build_stats_close_output_named_ctx_expands_first_row_only() {
     let names = close.row_field_names.as_ref().expect("携带列名");
     assert_eq!(
         rf.value_at(names.iter().position(|n| n == "price").unwrap()),
-        Some(Value::Number(99.0))
+        Some(Value::Float(99.0))
     );
     assert_eq!(
         rf.value_at(names.iter().position(|n| n == "channel").unwrap()),
@@ -467,7 +467,7 @@ fn build_stats_close_output_named_ctx_expands_first_row_only() {
     let names2 = close2.row_field_names.as_ref().expect("列名");
     assert_eq!(
         rf2.value_at(names2.iter().position(|n| n == "price").unwrap()),
-        Some(Value::Number(99.0))
+        Some(Value::Float(99.0))
     );
     assert!(close2.close_step_data[2].field_values.is_empty());
 }

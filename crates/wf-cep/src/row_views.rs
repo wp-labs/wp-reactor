@@ -24,7 +24,7 @@ use wf_lang::plan::KeyMapPlan;
 
 /// Read one cell of `col_idx` as the same string `window.has()` membership
 /// uses: the shared [`extract_field_value`] conversion (Int64/Timestamp →
-/// `Number` with the f64 round-trip, Utf8 → `Str`, Boolean → `Bool`), then the
+/// `Float` with the f64 round-trip, Utf8 → `Str`, Boolean → `Bool`), then the
 /// Event-path string form (Str → its text, Number → f64 Display, Bool →
 /// `true`/`false`). Structured values (List / Struct / JSON object-array
 /// columns) → `None`, matching the `Array`/`Object` skip in
@@ -40,7 +40,7 @@ pub fn column_scalar_string(batch: &RecordBatch, col_idx: usize, row: usize) -> 
     let value = extract_field_value(batch.schema_ref().field(col_idx), col.as_ref(), row)?;
     match value {
         Value::Str(s) => Some(s.to_string()),
-        Value::Number(n) => Some(n.to_string()),
+        Value::Float(n) => Some(n.to_string()),
         Value::Int(i) => Some(i.to_string()),
         Value::Bool(b) => Some(b.to_string()),
         Value::Array(_) | Value::Object(_) => None,

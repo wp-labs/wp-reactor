@@ -86,7 +86,7 @@ pub fn eval_expr_ext(
 ) -> Option<Value> {
     let _time_scope = EvalTimeScope::enter();
     match expr {
-        Expr::Number(n) => Some(Value::Number(*n)),
+        Expr::Number(n) => Some(Value::Float(*n)),
         Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
         Expr::Bool(b) => Some(Value::Bool(*b)),
         Expr::Field(fr) => eval_field_value_src(event, fr),
@@ -159,11 +159,11 @@ fn eval_neg(
 ) -> Option<Value> {
     let v = eval_expr_ext(inner, event, windows, baselines)?;
     match v {
-        Value::Number(n) => Some(Value::Number(-n)),
+        Value::Float(n) => Some(Value::Float(-n)),
         // 精确整数取反；`i64::MIN` 取反溢出 i64 → 退回 f64（2^63 可精确表示）。
         Value::Int(i) => Some(match i.checked_neg() {
             Some(neg) => Value::Int(neg),
-            None => Value::Number(-(i as f64)),
+            None => Value::Float(-(i as f64)),
         }),
         _ => None,
     }
@@ -306,7 +306,7 @@ fn eval_baseline(
     baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> Option<Value> {
     let current_val = match eval_expr(&args[0], event)? {
-        Value::Number(n) => n,
+        Value::Float(n) => n,
         Value::Int(i) => i as f64,
         _ => return None,
     };
@@ -328,7 +328,7 @@ fn eval_baseline(
         .or_insert_with(|| RollingStats::new_with_method(method));
     let deviation = stats.deviation(current_val);
     stats.update(current_val);
-    Some(Value::Number(deviation))
+    Some(Value::Float(deviation))
 }
 
 fn eval_binop(
@@ -417,7 +417,7 @@ fn eval_arithmetic(op: BinOp, lv: f64, rv: f64) -> Option<Value> {
         }
         _ => return None,
     };
-    Some(Value::Number(result))
+    Some(Value::Float(result))
 }
 
 /// `Value` 等值判定 —— `==` / `!=` / `in` / 去重共用的**单一语义**。
@@ -453,11 +453,11 @@ fn eval_arithmetic(op: BinOp, lv: f64, rv: f64) -> Option<Value> {
 /// `count(distinct x)` 仍把两者算作两个值。
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => cmp::numeric_eq(*x, *y),
-        // 数值域统一：`Int` 与 `Number` 视为同一值（`|i| < 2^53` 时精确）。
+        (Value::Float(x), Value::Float(y)) => cmp::numeric_eq(*x, *y),
+        // 数值域统一：`Int` 与 `Float` 视为同一值（`|i| < 2^53` 时精确）。
         (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Int(x), Value::Number(y)) => cmp::numeric_eq(*x as f64, *y),
-        (Value::Number(x), Value::Int(y)) => cmp::numeric_eq(*x, *y as f64),
+        (Value::Int(x), Value::Float(y)) => cmp::numeric_eq(*x as f64, *y),
+        (Value::Float(x), Value::Int(y)) => cmp::numeric_eq(*x, *y as f64),
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Array(x), Value::Array(y)) => {
@@ -504,19 +504,19 @@ mod tests {
                 left: Box::new(num(1.0)),
                 right: Box::new(num(2.0)),
             }),
-            Value::Number(3.0)
+            Value::Float(3.0)
         );
         assert_eq!(
             eval_arithmetic(BinOp::Sub, 5.0, 3.0),
-            Some(Value::Number(2.0))
+            Some(Value::Float(2.0))
         );
         assert_eq!(
             eval_arithmetic(BinOp::Mul, 2.0, 4.0),
-            Some(Value::Number(8.0))
+            Some(Value::Float(8.0))
         );
         assert_eq!(
             eval_arithmetic(BinOp::Mod, 5.0, 2.0),
-            Some(Value::Number(1.0))
+            Some(Value::Float(1.0))
         );
         // 除零 / 模零 → None
         assert_eq!(eval_arithmetic(BinOp::Div, 1.0, 0.0), None);
@@ -569,10 +569,10 @@ mod tests {
             then_expr: Box::new(num(1.0)),
             else_expr: Box::new(num(2.0)),
         };
-        assert_eq!(eval_ok(&ite(Expr::Bool(true))), Value::Number(1.0));
-        assert_eq!(eval_ok(&ite(Expr::Bool(false))), Value::Number(2.0));
+        assert_eq!(eval_ok(&ite(Expr::Bool(true))), Value::Float(1.0));
+        assert_eq!(eval_ok(&ite(Expr::Bool(false))), Value::Float(2.0));
         assert_eq!(eval_expr(&ite(num(3.0)), &empty_event()), None); // 非布尔条件
-        assert_eq!(eval_ok(&Expr::Neg(Box::new(num(3.0)))), Value::Number(-3.0));
+        assert_eq!(eval_ok(&Expr::Neg(Box::new(num(3.0)))), Value::Float(-3.0));
         assert_eq!(
             eval_expr(
                 &Expr::Neg(Box::new(Expr::StringLit("x".into()))),
@@ -607,7 +607,7 @@ mod tests {
             Value::Str("two".into())
         );
         // 未命中 → 默认分支
-        assert_eq!(eval_ok(&m(num(9.0), Some(num(0.0)))), Value::Number(0.0));
+        assert_eq!(eval_ok(&m(num(9.0), Some(num(0.0)))), Value::Float(0.0));
         // 未命中且无默认 → None
         assert_eq!(eval_expr(&m(num(9.0), None), &empty_event()), None);
     }
@@ -617,7 +617,7 @@ mod tests {
         let array = Expr::Array(vec![num(1.0), num(2.0)]);
         assert_eq!(
             eval_ok(&array),
-            Value::Array(vec![Value::Number(1.0), Value::Number(2.0)])
+            Value::Array(vec![Value::Float(1.0), Value::Float(2.0)])
         );
         let object = Expr::Object(vec![ObjectItem {
             targets: vec!["a".to_string(), "b".to_string()],
@@ -627,7 +627,7 @@ mod tests {
         let Value::Object(map) = eval_ok(&object) else {
             panic!("expected object");
         };
-        assert_eq!(map.get("a"), Some(&Value::Number(7.0)));
-        assert_eq!(map.get("b"), Some(&Value::Number(7.0)));
+        assert_eq!(map.get("a"), Some(&Value::Float(7.0)));
+        assert_eq!(map.get("b"), Some(&Value::Float(7.0)));
     }
 }

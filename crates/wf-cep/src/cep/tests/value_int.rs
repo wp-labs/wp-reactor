@@ -1,6 +1,6 @@
 //! `Value::Int` 归一语义（2026-09-18 精度修复，第 1 步）。
 //!
-//! 「`Int(i)` ≡ 整值 `Number(i as f64)`（`|i| < 2^53`）」必须在
+//! 「`Int(i)` ≡ 整值 `Float(i as f64)`（`|i| < 2^53`）」必须在
 //! **相等 / 键同一性 / 哈希 / 排序 / 字符串化 / 数值漏斗** 上处处一致。
 //!
 //! 任一处漏改，都会让同一逻辑值在不同路径（行式 vs 列式、比较 vs 去重、
@@ -13,7 +13,7 @@ use wf_lang::ast::BinOp;
 use super::*;
 use crate::value_extract::value_to_f64;
 
-/// `|i| < 2^53`：`i as f64` 精确无损，`Int` 与 `Number` 必须**完全等价**。
+/// `|i| < 2^53`：`i as f64` 精确无损，`Int` 与 `Float` 必须**完全等价**。
 const EXACT_CASES: &[i64] = &[
     0,
     1,
@@ -26,7 +26,7 @@ const EXACT_CASES: &[i64] = &[
     -((1i64 << 53) - 1),
 ];
 
-/// 超出 f64 精确整数域：`Number` 已无法精确表达，`Int` 必须保持精确
+/// 超出 f64 精确整数域：`Float` 已无法精确表达，`Int` 必须保持精确
 /// （这正是 epoch-ns ≈1.77e18 的处境）。
 const BEYOND_F64_CASES: &[i64] = &[
     1i64 << 53,
@@ -42,12 +42,12 @@ fn hash_of<T: Hash>(v: &T) -> u64 {
     h.finish()
 }
 
-/// 相等/比较：`Int(i)` 与整值 `Number` 同值（六个比较关系都走数值域）。
+/// 相等/比较：`Int(i)` 与整值 `Float` 同值（六个比较关系都走数值域）。
 #[test]
 fn int_and_integral_number_compare_as_equal() {
     for &i in EXACT_CASES.iter().chain(BEYOND_F64_CASES) {
         let ints = Value::Int(i);
-        let num = Value::Number(i as f64);
+        let num = Value::Float(i as f64);
         assert!(values_equal(&ints, &num), "values_equal Int({i}) vs Number");
         assert!(values_equal(&num, &ints), "values_equal Number vs Int({i})");
         assert!(
@@ -82,9 +82,9 @@ fn int_comparison_is_exact_beyond_f64_precision() {
     assert!(compare_values(BinOp::Lt, &Value::Int(a), &Value::Int(b)));
     assert!(compare_values(BinOp::Gt, &Value::Int(b), &Value::Int(a)));
 
-    // 与「量化后的 Number」仍等价（`Number` 只能表达量化值）。
-    assert!(values_equal(&Value::Int(a), &Value::Number(a as f64)));
-    assert!(values_equal(&Value::Int(b), &Value::Number(b as f64)));
+    // 与「量化后的 Number」仍等价（`Float` 只能表达量化值）。
+    assert!(values_equal(&Value::Int(a), &Value::Float(a as f64)));
+    assert!(values_equal(&Value::Int(b), &Value::Float(b as f64)));
 }
 
 /// 键同一性 + 哈希：`|i| < 2^53` 时 `ValueKey` / `ScopeKey` / `JoinKey` 都必须把
@@ -93,7 +93,7 @@ fn int_comparison_is_exact_beyond_f64_precision() {
 fn int_and_integral_number_share_identity_key() {
     for &i in EXACT_CASES {
         let ints = Value::Int(i);
-        let num = Value::Number(i as f64);
+        let num = Value::Float(i as f64);
 
         let ki = ValueKey::from_value(&ints);
         let kn = ValueKey::from_value(&num);
@@ -121,7 +121,7 @@ fn int_and_integral_number_share_identity_key() {
     }
 
     // 超出 f64 精确域：`>= 2^53` 的整数**不得**被 `i as f64` 量化 ——
-    // `ValueKey` 落精确 `Int`，而量化后的 `Number` 是另一个逻辑值 → 必须不同键。
+    // `ValueKey` 落精确 `Int`，而量化后的 `Float` 是另一个逻辑值 → 必须不同键。
     for &i in BEYOND_F64_CASES {
         assert_eq!(
             ValueKey::from_value(&Value::Int(i)),
@@ -130,7 +130,7 @@ fn int_and_integral_number_share_identity_key() {
         );
         assert_ne!(
             ValueKey::from_value(&Value::Int(i)),
-            ValueKey::from_value(&Value::Number(i as f64)),
+            ValueKey::from_value(&Value::Float(i as f64)),
             "量化后的 Float 不得与精确 Int({i}) 同键"
         );
     }
@@ -146,15 +146,15 @@ fn int_and_integral_number_share_identity_key() {
     }
 }
 
-/// 字符串化：`Int(i)` 与整值 `Number` 渲染为同一十进制文本（稳定 ID 依赖它）。
+/// 字符串化：`Int(i)` 与整值 `Float` 渲染为同一十进制文本（稳定 ID 依赖它）。
 #[test]
 fn int_and_integral_number_stringify_identically() {
     for &i in EXACT_CASES {
         let expected = i.to_string();
         assert_eq!(value_to_string(&Value::Int(i)), expected);
-        assert_eq!(value_to_string(&Value::Number(i as f64)), expected);
+        assert_eq!(value_to_string(&Value::Float(i as f64)), expected);
     }
-    // `Int` 始终渲染精确十进制（`Number` 在 >2^53 走 f64 Display）。
+    // `Int` 始终渲染精确十进制（`Float` 在 >2^53 走 f64 Display）。
     assert_eq!(
         value_to_string(&Value::Int(1i64 << 53)),
         (1i64 << 53).to_string()
@@ -176,17 +176,13 @@ fn int_and_integral_number_share_numeric_funnel() {
     assert_eq!(value_to_f64(&Value::Bool(true)), None);
 }
 
-/// 排序：`Int` / `Number` 同序（不会双双落到文本比较）。
+/// 排序：`Int` / `Float` 同序（不会双双落到文本比较）。
 #[test]
 fn int_and_integral_number_order_identically() {
     let cases: &[(i64, f64)] = &[(1, 2.0), (-5, -4.0), (0, 0.5)];
     for &(i, f) in cases {
-        assert!(compare_values(BinOp::Lt, &Value::Int(i), &Value::Number(f)));
-        assert!(compare_values(BinOp::Gt, &Value::Number(f), &Value::Int(i)));
-        assert!(!compare_values(
-            BinOp::Lt,
-            &Value::Number(f),
-            &Value::Int(i)
-        ));
+        assert!(compare_values(BinOp::Lt, &Value::Int(i), &Value::Float(f)));
+        assert!(compare_values(BinOp::Gt, &Value::Float(f), &Value::Int(i)));
+        assert!(!compare_values(BinOp::Lt, &Value::Float(f), &Value::Int(i)));
     }
 }
