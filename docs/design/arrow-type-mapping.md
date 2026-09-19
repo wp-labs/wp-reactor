@@ -7,34 +7,47 @@
 >
 > 姊妹文档：[`arrow-tcp-stream-compatibility.md`](./arrow-tcp-stream-compatibility.md)（IPC 帧/framing 口径，已实现）。
 
-## 1. 为什么需要这份表
+## 1. 现状：两张活表 + 一张非生产表
 
-同一份 `wp_model_core::model::DataType` 目前被**三处互不可见的手工映射表**翻译成 Arrow 类型：
+同一份 `wp_model_core::model::DataType` 目前被三处手工映射表翻译成 Arrow 类型，但**只有两处在生产路径上**：
 
-| 角色 | 位置 | 输入类型 | 覆盖 |
-|---|---|---|---|
-| **A. 期望侧（线协议契约）** | `crates/wf-runtime/src/receiver/schema.rs:127` `field_type_to_arrow` / `:142` `base_type_to_arrow` | `wf_lang::FieldType`（WPL 窗口声明） | 7 个 `BaseType` + `Object` / `ArrayAny` / `Array(BaseType)` |
-| **B. sink 侧** | `crates-wp/wp-connector-utils/src/arrow/schema.rs:27` `wp_type_to_arrow`（私有，经 `:73` `infer_schema_from_record` 生效） | `wp_model_core::model::DataType` | **穷尽 37 个变体**（新增变体会编译失败） |
-| **C. 映射 crate** | `wfusion/wp-arrow/src/schema.rs:50` `to_arrow_type` / `:95` `parse_wp_type` | `wp_arrow::schema::WpDataType` | 9 个变体（未覆盖即 `UnsupportedDataType` 运行时错误） |
+| 角色 | 位置 | 输入类型 | 覆盖 | 在线上吗 |
+|---|---|---|---|---|
+| **A. 期望侧（线协议契约）** | `crates/wf-runtime/src/receiver/schema.rs` `field_type_to_arrow` | `wf_lang::FieldType`（WPL 窗口声明） | 7 个 `BaseType` + `Object` / `ArrayAny` / `Array(BaseType)` | ✅ |
+| **B. sink 侧（生产者）** | `crates-wp/wp-connector-utils/src/arrow/schema.rs` `wp_type_to_arrow` | `wp_model_core::model::DataType` | **穷尽 37 个变体**（新增变体会编译失败） | ✅ |
+| **C. `wp-arrow` 的映射 API** | `wfusion/wp-arrow/src/schema.rs` `to_arrow_type` / `parse_wp_type` | `wp_arrow::schema::WpDataType` | 9 个变体 | ❌ **不在线协议路径上** |
 
-三者是**同一语义的三份拷贝**，没有任何编译期或测试期的相互约束 —— 这是「口径静默分叉」的结构性根因。
-本文把差异**显式登记**，并用钉桩测试把「当前行为」钉死，使漂移必然触发测试失败而不是线上静默错误。
+### C 的定性（A-0，2026-09-19 实测）
 
-### 可链接的对拍范围
+`wp_arrow` 在生产代码里**只有 `ipc` 模块被使用**（全家族 30 处：`encode_ipc` / `decode_ipc` / `encode_ipc_frame_multi` 等）；
+`schema` 的使用者是**本仓的契约测试自己**（1 处），`convert`（含 `wp_type_to_model_meta`）是 **0 处**。
 
-A 与 C 都位于 `wfusion` 仓，且 `wf-runtime` 已依赖 crates.io 的 `wp-arrow`（当前解析 `0.3.1`），
-**因此 A ↔ C 可以在同一测试二进制内真实对拍**（见 `receiver/schema.rs` 的 `arrow_contract_matches_wp_arrow_on_overlap`）。
-B 位于 `crates-wp` 仓、且其映射函数为私有，无法与 A 链接 —— 对 B 的约束方式是
-「B 的钉桩测试 + 本文档的同一张表」（`wp-connector-utils/src/arrow/schema.rs` 的 `arrow_contract_full_mapping_is_pinned`）。
+也就是说 `to_arrow_type` / `parse_wp_type` 这套映射虽有完整单测，但**没有任何生产调用方**。
+它保留为「强类型 API」（给外部/未来用），**不参与线协议契约** —— 所以下文的对拍与守卫只把 **A 与 B** 当作契约方，
+涉及 C 的比较仅作参考（防止有人以为它在用；我自己一度就误判过）。
 
-> 注：crates.io 的 `wp-arrow 0.3.1` 与本地 `wfusion/wp-arrow` 的 `schema.rs` 映射逐字相同，故 A↔C 对拍对两者都成立。
->
-> 对拍时两侧各自把 Arrow `DataType` `Debug` 成字符串再比较，而不是直接 `assert_eq!`：
-> `wp-arrow 0.3.1` 依赖 `arrow 59`，而 `wp-reactor` 的 `arrow 60` 升级在途，两边类型不同就根本编不过。
+> `Ip` / `Hex` 等值在 C 里走 `Utf8`、`Array` 走 `List(inner)`、`BigInt` 走 `Decimal256`，都是**它自己的口径**，
+> 与线协议无关。**不要动 `WpDataType::Digit` 这个名字**：它是 `wp-arrow` 自己的 9 变体枚举，
+> 家族那轮 `Digit → Int` 正名刻意没触及它（改它会同时改字段元数据字符串与行为）。
 
-> **不要动 `WpDataType::Digit` 这个名字**：它是 `wp-arrow` 自己的 9 变体枚举，不是 wp-model-core 的 `DataType`。
-> 家族里那轮 `Digit → Int` 正名**刻意没有触及**它（`schema.rs:10`、`schema.rs:101` 的字面串 `"digit"`），
-> 改它会同时改字段元数据字符串与线上行为。两侧的对应关系只在 `convert.rs` 的 `wp_type_to_model_meta` 里显式建立。
+### 收敛方向（A-1）：已完成 2026-09-19
+
+A 与 B 的**输入类型不同**（WPL 类型 vs `wp_model_core::DataType`），所以它们不是重复实现，而是同一契约的两端。
+A-1 把 **B 的表变成唯一实现**，A 改为 `WPL 类型 → wp_model_core::DataType → B 的表`：
+
+```
+WPL FieldType ──(7 臂 + 结构化)──▶ wp_model_core::DataType ──(B：穷尽 37)──▶ Arrow
+```
+
+落地方式：`wp-connector-utils 0.3.2` 公开 `wp_type_to_arrow`（纯新增 API），
+`wf-runtime` 新增直接依赖、让 `field_type_to_arrow` 只做一次转发 —— 两张活表变一张，
+`Hex` 那类分叉**从结构上不可能再发生**（B 一改，A 自动跟随）。
+
+顺带补上一个真实缺口：B 自己的 CI 原先**抓不到**它引入的分叉（契约测试只活在 wp-reactor 那边），
+现在由 `arrow_contract_expected_column_is_pinned`（钉生效口径）加跨仓端到端用例共同兜住。
+
+> A↔C 的比较**保留为参考**（`arrow_contract_matches_wp_arrow_on_overlap`）：C 不在契约里（A-0），
+> 但若将来真有人启用 `wp-arrow` 的映射 API，它能立刻报出口径差异。
 
 ## 2. 线协议兼容性判定规则（A 的收口口径）
 
@@ -58,9 +71,15 @@ B 位于 `crates-wp` 仓、且其映射函数为私有，无法与 A 链接 —�
 
 ## 3. 规格表：`wp_model_core::model::DataType`（37 变体）× 三方
 
-图例：`n/a` = 该侧的表达能力**无法表示**此类型；`⚠` = 与其它侧冲突（见 §4）。
+图例：`n/a` = 该侧的表达能力**无法表示**此类型。
 
-| # | DataType | serde | A 期望侧（WPL） | B wp-connector-utils | C wp-arrow |
+> **A-1 之后（2026-09-19）这张表的读法变了**：
+> **B 列是唯一实现**（`wp_connector_utils::arrow::wp_type_to_arrow`，穷尽 37 变体）；
+> **A 列不再是自己一张表**，而是 `WPL 类型 → wp_model_core::DataType → B` 推导出来的 ——
+> 所以 A 与 B 在 `Base` 与结构化行上**必然一致**（值保留在此仅供核对）。
+> **C 列不参与契约**（§1 的 A-0 定性），列在这里只为对照 `wp-arrow` 的自有口径。
+
+| # | DataType | serde | A 期望侧（WPL，由 B 推导） | B wp-connector-utils（唯一实现） | C wp-arrow（参考） |
 |---:|---|---|---|---|---|
 | 1 | `Bool` | `bool` | `Boolean` | `Boolean` | `Boolean` |
 | 2 | `Chars` | `chars` | `Utf8` | `Utf8` | `Utf8` |
@@ -102,11 +121,39 @@ B 位于 `crates-wp` 仓、且其映射函数为私有，无法与 A 链接 —�
 
 ## 4. 已知差异（DIV）
 
-| 编号 | 类型 | 分歧 | 严重度 | 后果 |
+| 编号 | 类型 | 分歧 | 严重度 | 处置 |
 |---|---|---|---|---|
-| **DIV-2** | `BigInt` | B = `Utf8`（十进制字符串），C = `Decimal256(39,0)`（数值） | P1 · 语义分叉 | 同一字段两种传输语义；A 无此类型故线上不冲突，但数值语义只能靠 C 保留 |
-| **DIV-3** | `Obj` / `Array` | B 给 `Utf8` 且**不带** `wfl_field_type` 元数据；A 给 `Utf8`+meta；C 给 `List(inner)` | P2 · 可容忍 | 接收侧对「`Utf8` 无 meta」返回兼容（`schema.rs:60`），故**能过**；代价是 object/array 语义无法据此校验，静默接受 |
-| **DIV-4** | 覆盖范围 | 7 / 37 / 9 个变体；C 未覆盖是**运行时**报错 | P1 · 结构性 | 三张手工表必然继续漂移；是「统一实现」（任务 A）的动因，但不是任何单个 P0 的成因 |
+| **DIV-2** | `BigInt` | B = `Utf8`（十进制字符串），C = `Decimal256(39,0)`（数值） | 已降为**无影响** | **本轮登记不修**，见下 |
+| **DIV-3** | `Obj` / `Array` | B 给 `Utf8` 且**不带** `wfl_field_type` 元数据；A 给 `Utf8`+meta；C 给 `List(inner)` | 有意设计（“容忍”） | **本轮登记不修**，见下 |
+| **DIV-4** | 覆盖范围 | 7 / 37 / 9 个变体 | 结构性 | 由 **A-1** 收敛为一张活表 |
+
+### DIV-2（`BigInt`）：零生产者，本轮不修
+
+2026-09-19 实测：**家族内没有任何东西在生产 `DataType::BigInt` / `Value::BigUint`** ——
+
+- WPL 无法声明 `bigint`（`wf-lang::BaseType` 只有 7 种，`wp-parse-api` / `wp-core-connectors` 里无 `"bigint"` 类型名）；
+- `wp-connectors/src/dmdb/source.rs` 里的 `DataType::BigInt` 是 **DM 驱动自己的**类型枚举，不是 `wp_model_core` 的（同名不同物）；
+- 生态现有的写出口径一律是**字符串**：doris sink `Value::BigUint(v) => serialize_str(v.to_string())`、
+  `wp-data-fmt/src/json.rs` 同样写 JSON 字符串。
+
+再加上 C 不在线协议路径上（§1），所以这条分叉**当前零影响**。
+若将来真有生产者：建议统一为**十进制字符串**（与生态现有口径一致、且改 C 一行即可），而不是把 B 改成 `Decimal256`
+（后者要给 `wp-connector-utils` 新增 Decimal256 builder，而接收侧根本无法声明 bigint）。
+
+### DIV-3（结构化字段元数据）：容忍是有意设计，本轮不修
+
+接收侧对「`Utf8` 但无 `wfl_field_type` 元数据」返回**兼容**（`structured_field_is_compatible`），
+而且这条路径有**明确的测试祝福**：
+`wf-runtime` 的 `route_projects_plain_utf8_json_into_structured_window_schema` 用的就是一个无元数据的普通 `Utf8` 字段，
+直接投影进 `Object` 窗口 —— 即“JSON 字符串 + 目标窗口声明”就是设计中的传输形态，语义在 coerce 阶段兑现。
+
+**要不要显式化（让 B 附上 `wfl_field_type`）？** 本轮不做，因为：
+
+1. `wp-connector-utils` 必须**硬编码** `"wfl_field_type"` 与 `"object"/"array"` —— 而这些常量现在住在 `wf-engine`
+   （wp-reactor 的 crate）。这等于拿一条**新的跨仓隐式契约**换掉现有的容忍，得先把常量提到共享位置（属 A-1 的后续）；
+2. 它会把行为从“容忍”变“严格”，可能拒掉现在能过的组合（需要先盘点存量）。
+
+代价已知且可接受：schema 层无法校验结构化语义，要等 coerce 解析 JSON 时才知道（错形会落 null）。
 
 ### DIV-1（P0，`Hex`）：已修复（2026-09-19）
 
@@ -145,25 +192,33 @@ B 位于 `crates-wp` 仓、且其映射函数为私有，无法与 A 链接 —�
 
 改动任何一侧的类型映射时，**同一个 PR/提交**内必须完成：
 
-1. 改代码（A / B / C 中受影响的那一处）。
+1. 改代码。**只改 B**（`wp-connector-utils/src/arrow/schema.rs`）—— A 会自动跟随（A-1 同源）。
+   若确实需要动 A，那只能是改 **`WPL 类型 → wp_model_core::DataType` 的降级表**
+   （`wf-runtime/src/receiver/schema.rs` 的 `base_type_to_model` / `field_type_to_model`）。
 2. 更新本文档 §3 对应行、§4 的差异表（差异消失就删除该行，不要留「历史差异」）。
 3. 更新钉桩测试：
-   - A：`crates/wf-runtime/src/receiver/schema.rs` → `arrow_contract_*`
    - B：`crates-wp/wp-connector-utils/src/arrow/schema.rs` → `arrow_contract_full_mapping_is_pinned`
-   - C：`wfusion/wp-arrow/src/schema.rs` → 现有 `arrow_type_*` 全变体测试
-4. 「差异存在」这件事本身由测试表达：能够容忍的差异写 `assert_ne!` 并注明 DIV 编号；
-   不能容忍的差异写「当前会失败」的特征测试（characterization test）并注明修正方向。
+   - A：`crates/wf-runtime/src/receiver/schema.rs` → `arrow_contract_expected_column_is_pinned`
+     与 `arrow_contract_wpl_types_lower_to_model_types`
+   - C（非契约）：`wfusion/wp-arrow/src/schema.rs` → 现有 `arrow_type_*` 全变体测试
+4. **改 B 要过 wp-reactor 的 CI**：B 是已发布 crate，改它需要发 `0.3.x` patch，
+   然后在本仓 `cargo update -p wp-connector-utils`（本仓 `Cargo.lock` 不跟踪，CI 自行解析）。
+   跨仓回归靠 `arrow_contract_sink_inferred_hex_schema_passes_the_receiver`（走真实生产者路径 + 接收侧校验）。
+5. 「差异存在」这件事本身由测试表达：能够容忍的差异写 `assert_ne!` 并注明 DIV 编号。
 
 ## 6. 现状与后续
 
 | 项 | 状态 |
 |---|---|
-| 输出本文档（三方规格表 + 已知差异登记） | ✅ 本次 |
-| A ↔ C 真对拍（同二进制） | ✅ 本次（`receiver/schema.rs`） |
-| B 全 37 变体钉桩 | ✅ 本次（`wp-connector-utils/src/arrow/schema.rs`） |
-| 修 DIV-1（P0，`Hex`） | ✅ 已修复并生效（2026-09-19；`wp-connector-utils` 0.3.1 已发布，本仓 lock 已跟进） |
-| 消 P0-1（IPC 多批次帧只读第 1 批） | ✅ 已修复（2026-09-19，`wf-runtime` `decode_ipc_trusted` 全量解出） |
-| 合并三份表为单一实现 | ⏳ 待定（任务 A；依赖跨仓发布顺序） |
+| 输出本文档（三方规格表 + 已知差异登记） | ✅ 2026-09-19 |
+| B 全 37 变体钉桩 | ✅ `wp-connector-utils/src/arrow/schema.rs` |
+| 修 DIV-1（P0，`Hex`） | ✅ 已修复并生效（`wp-connector-utils` 0.3.1 已发布） |
+| 消 P0-1（IPC 多批次帧只读第 1 批） | ✅ 已修复（`wf-runtime` `decode_ipc_trusted` 全量解出） |
+| **A-0：C 定性为「不在线协议路径上」** | ✅ 2026-09-19（§1；实测 `schema` 1 处使用者=本仓测试，`convert` 0 处） |
+| **A-1：两张活表变一张** | ✅ 2026-09-19（`wp-connector-utils` 0.3.2 公开 `wp_type_to_arrow`；A 改为由 B 推导） |
+| A ↔ C 参考对拍 | ✅ 保留（若将来有人真用 `wp-arrow` 的映射 API，立刻报差异） |
+| DIV-2 `BigInt` | ✅ 结论：零生产者，本轮不修（§4） |
+| DIV-3 结构化元数据 | ✅ 结论：容忍是有意设计，本轮不修（§4） |
 
 ## 相关文件
 

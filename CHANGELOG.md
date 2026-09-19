@@ -14,6 +14,7 @@ All notable changes to wp-reactor will be documented in this file.
     与半衰期加权；周期画像数据源支持 CSV 周期重载或外部事实库（PG）直聚合；
   - 规则侧新增 `baseline_dev` / `sumsq` / `phase_bucket` 内建。
 - **Arrow 列类型契约的规格表与钉桩 / 对拍测试**：新增 `docs/design/arrow-type-mapping.md`，登记期望侧 / `wp-connector-utils` / `wp-arrow` 三方的 37 变体映射与已知差异；`wf-runtime` 侧补期望侧全量钉桩、与 `wp-arrow` 的跨 crate 对拍，以及结构化字段与 `hex` 口径的守卫用例。
+- **Arrow 契约的「非生产表」定性**：实测 `wp-arrow` 的映射 API（`schema` / `convert`）在生产路径上**零使用者**（被使用只有 `ipc`，全家族 30 处），故在规格表中明确它**不参与线协议契约**；`DIV-2`（`BigInt`）登记为「零生产者、本轮不修」，`DIV-3`（结构化字段元数据）登记为「容忍是有意设计、本轮不修」。
 
 ### Changed
 
@@ -25,6 +26,7 @@ All notable changes to wp-reactor will be documented in this file.
 - **值层浮点变体改名 `Value::Number` → `Value::Float`**（源码级重命名，无行为变化）：与既有的 `Value::Int`、`ScopeKey::Float` 命名对齐，消除「`Number` 涵盖所有数字」的误导——整数被 f64 量化正是从这个名字开始的。`Value` 是 `#[non_exhaustive]` 公开枚举，按变体名匹配的下游需同步改名（编译期报错，不会静默）；`serde_json::Value::Number` 与 `wf-lang` 的 `Expr::Number`（AST 浮点字面量）名字不同、不受影响。
 - **依赖对齐**：`arrow` 59 → 60、`wp-arrow` 0.3 → 0.4、`wp-model-core` 0.9 → 0.10、`wp-connector-api` 0.12 → 0.13、`wp-core-connectors` 0.8 → 0.9、`wf-connector-api` 0.2 → 0.3、`wp-knowledge` 0.17 → 0.18。
 - **跟进的类型正名**：`Value::Digit` → `Value::Int`、`DataType::Digit` → `DataType::Int`、`DataType::Array(String)` → `DataType::Array(ArraySubtype)`（源码级改名，无行为变化）。WPL 类型名 `wf-lang::BaseType::Digit` 与 `wp-arrow::WpDataType::Digit` 不在本次范围。
+- **Arrow 列类型映射收敛为单一实现**：接收侧（`wf-runtime`）不再维护自己的 WPL→Arrow 表，改为降到 `wp_model_core::DataType` 后复用 `wp-connector-utils` 的唯一实现（`wp_type_to_arrow`，该 crate 0.3.2 起公开）。**两张手工表变一张**，类似 `hex` 那种口径静默分叉从结构上不再可能发生；行为不变（`wf-lang::BaseType` 新增 `as_str()`，`wf-engine` 原有的同名私有表已删除）。
 
 ### Fixed
 
@@ -42,7 +44,7 @@ All notable changes to wp-reactor will be documented in this file.
 ### Tests
 
 - 新增值层整数通道的性质测试：`Int` 与整值浮点在相等 / 键 / 哈希 / 排序 / 字符串化 / 数值漏斗上一致；`>2^53` 的精确性（不经 `f64` 量化）；行式 / 列式 / 解释三条执行路径输出类型一致；整数经持久化往返逐位精确。
-- 新增 Arrow 列类型契约测试：期望侧全量钉桩、与 `wp-arrow` 的跨 crate 对拍、结构化字段与 `hex` 口径守卫，以及**跨仓端到端**（sink 侧 `wp-connector-utils` 推断出的 `hex` 列必须被接收侧的窗口 schema 接受）。`wf-lang` 1235 / `wf-engine` 1075 / `wf-runtime` 661 / `wf-cep` 409 / `wf-config` 168 / `wf-data` 2 全绿。
+- 新增 Arrow 列类型契约测试：期望侧全量钉桩、WPL→`wp_model_core::DataType` 降级表钉桩、与 `wp-arrow` 的参考对拍、结构化字段与 `hex` 口径守卫，以及**跨仓端到端**（sink 侧 `wp-connector-utils` 推断出的 `hex` 列必须被接收侧的窗口 schema 接受）。`wf-lang` 1235 / `wf-engine` 1075 / `wf-runtime` 662 / `wf-cep` 409 / `wf-config` 168 / `wf-data` 2 全绿。
 
 ## [2.0.24] -- latest
 
