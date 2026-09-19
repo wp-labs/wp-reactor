@@ -375,7 +375,8 @@ impl DistinctKey {
         DistinctKey::Int(v)
     }
     pub fn from_f64(v: f64) -> Self {
-        if v.fract() == 0.0 && v.abs() < 9_007_199_254_740_992.0 {
+        // 2^53 判界常量单一来源（`wf-cep`），本地不再内联。
+        if v.fract() == 0.0 && v.abs() < wf_cep::value::TWO_POW_53 {
             DistinctKey::Int(v as i64)
         } else {
             // 位规范化走**共享实现**（`ValueKey`/`ScopeKey` 同源）——此前这里是

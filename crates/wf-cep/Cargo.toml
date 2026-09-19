@@ -9,6 +9,7 @@ license.workspace = true
 # wf-engine 经 shim 模块重导出，公开路径不变。
 [dependencies]
 wf-lang = { path = "../wf-lang" }
+wf-data = { path = "../wf-data" }
 regex = { workspace = true }
 orion-error = { workspace = true }
 jumo-derive = { workspace = true }

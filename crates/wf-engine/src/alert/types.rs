@@ -359,8 +359,9 @@ fn export_typed_value(base_type: &BaseType, value: &Value) -> CoreResult<(DataTy
     }
 }
 
-/// f64 精确整数域上界（2^53）。
-const UNTYPED_DIGIT_THRESHOLD: f64 = 9_007_199_254_740_992.0;
+/// f64 精确整数域上界（2^53）——数值与 `wf_cep::value::F64_EXACT_INT_LIMIT` 同源
+/// （单一常量，避免两条路径判界漂移）。
+const UNTYPED_DIGIT_THRESHOLD: f64 = wf_cep::value::TWO_POW_53;
 
 /// **未声明类型**的数值导出（唯一口径，行式 `Value` 路径与列式 f64 快车道共用）。
 ///
@@ -381,7 +382,7 @@ fn untyped_numeric_export(n: f64) -> (DataType, ModelValue) {
 
 /// [`untyped_numeric_export`] 的精确整数入口（不经 f64，`>2^53` 逐位保真）。
 fn untyped_int_export(i: i64) -> (DataType, ModelValue) {
-    if i.unsigned_abs() >= (1u64 << 53) {
+    if i.unsigned_abs() >= wf_cep::value::F64_EXACT_INT_LIMIT {
         (DataType::Int, ModelValue::from(i))
     } else {
         (DataType::Float, ModelValue::from(i as f64))

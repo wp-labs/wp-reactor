@@ -16,6 +16,21 @@ use smol_str::SmolStr;
 pub type EngineHashMap<K, V> = HashMap<K, V, FoldRandomState>;
 pub type EngineHashSet<K> = HashSet<K, FoldRandomState>;
 
+/// `f64` 精确整数上限：`|i| < 2^53` 时 `i as f64` 无损（`2^53 == 9007199254740992`）。
+///
+/// **全家族单一来源**：`wf-cep` 的 `ValueKey` / `ScopeKey` / `DistinctKey` 与
+/// `wf-engine` 的列式编译 / stats / alert 导出，整↔浮判界都引用它。此前同一数值
+/// 在生产代码里内联了 8 处，任何一处改漏都会让「同一逻辑值」在不同路径上判成整/浮
+/// 两类 —— 静默分键（distinct 少计、shard 错配）或静默量化（epoch-ns 丢 ~256ns）。
+pub const F64_EXACT_INT_LIMIT: u64 = 1 << 53;
+
+/// [`F64_EXACT_INT_LIMIT`] 的 `f64` 形态，供 `n.abs() < TWO_POW_53` 形式的比较使用
+/// （整数域用 `F64_EXACT_INT_LIMIT`，浮点域用本常量，避免每处 `as f64`）。
+pub const TWO_POW_53: f64 = 9_007_199_254_740_992.0;
+
+// 两个形态必须指同一个边界：改一个漏一个正是上面说的「静默分键」。
+const _: () = assert!(TWO_POW_53 as u64 == F64_EXACT_INT_LIMIT);
+
 /// Field name for machine identifier carried in events and batches
 /// for per-machine metrics labeling.
 pub const MACHINE_ID: &str = "wp_src_ip";
@@ -41,4 +56,22 @@ pub enum Value {
     Bool(bool),
     Array(Vec<Value>),
     Object(EngineHashMap<SmolStr, Value>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 两个常量必须指向同一个边界，且这个边界正是 f64 整数精度的终点。
+    /// （`const _` 断言已锁一致性，这里锁「边界处的行为」。）
+    #[test]
+    fn f64_exact_int_limit_is_where_f64_stops_being_exact() {
+        let limit = F64_EXACT_INT_LIMIT as f64;
+        assert_eq!(limit, TWO_POW_53);
+        let at_limit = F64_EXACT_INT_LIMIT as i64;
+        assert_eq!((limit - 1.0) as i64, at_limit - 1);
+        // 2^53 处 ulp 从 1 跳到 2：+1 不可表示（回落到 2^53），+2 可以。
+        assert_eq!((limit + 1.0) as i64, at_limit);
+        assert_eq!((limit + 2.0) as i64, at_limit + 2);
+    }
 }

@@ -1044,7 +1044,8 @@ fn build_summary_iter<'a>(
 /// `write!(out, "{:.1}", v)`，字节与 std 完全一致（测试逐值对拍锁定）。
 fn write_fixed1(out: &mut String, v: f64) {
     use std::fmt::Write as _;
-    if v.is_finite() && v.fract() == 0.0 && v.abs() <= (1u64 << 53) as f64 {
+    // 2^53 判界常量单一来源（`wf-cep`），本地不再内联。
+    if v.is_finite() && v.fract() == 0.0 && v.abs() <= wf_cep::value::F64_EXACT_INT_LIMIT as f64 {
         if v == 0.0 && v.is_sign_negative() {
             out.push_str("-0.0");
         } else {

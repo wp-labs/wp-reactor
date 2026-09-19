@@ -684,7 +684,8 @@ fn compile_output_func(name: &str, args: &[Expr], view: &ColumnarBatch<'_>) -> O
 /// exact) becomes a native `i64` so `Int % Int` and `Int <op> Int` take the
 /// native path. Non-integer or `>= 2^53` literals stay f64.
 fn number_literal(n: f64) -> CScalar {
-    const TWO_POW_53: f64 = 9_007_199_254_740_992.0;
+    // 2^53 判界常量单一来源（`wf-cep`），本地不再内联。
+    use wf_cep::value::TWO_POW_53;
     if n.fract() == 0.0 && n.abs() < TWO_POW_53 {
         CScalar::Int(n as i64)
     } else {

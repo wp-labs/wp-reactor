@@ -97,23 +97,16 @@ fn non_null_cell<T: arrow::array::Array + ?Sized, V>(
     }
 }
 
-/// f64 → 键叶（与 `ScopeKey::from_value(Number)` 同规范化: 整数 <2^53 → Int,
-/// 否则 Float(规范化位)）。
+/// f64 → 键叶（与 `ScopeKey::from_float` 同规范化: 整数 <2^53 → Int,
+/// 否则 Float(规范化位)）。**单一实现**：委托给 `wf-cep`——本文件此前有一份
+/// 同体副本，改漏即行式/列式两条键路径分叉。
 pub(crate) fn scope_key_from_f64(n: f64) -> ScopeKey {
-    if n.fract() == 0.0 && n.abs() < TWO_POW_53 {
-        ScopeKey::Int(n as i64)
-    } else {
-        ScopeKey::Float(canonical_f64_bits(n))
-    }
+    ScopeKey::from_float(n)
 }
 
-// 值层漏斗：单一实现（`wf-cep`）——本文件此前各有一份同体副本，
-// 改漏即与 `ValueKey`/`ScopeKey` 口径漂移。
-pub(crate) use wf_cep::cep::key::canonical_f64_bits;
+// 数值漏斗：单一实现（`wf-cep`）——`value_to_f64` 此前本文件也有一份同体副本。
+// （`canonical_f64_bits` 现在只被本文件的测试用到，已下移到 tests。）
 pub(crate) use wf_cep::value_extract::value_to_f64;
-
-/// <2^53 的整数可被 f64 精确表示（与 `ScopeKey::from_value` 一致）。
-pub(crate) const TWO_POW_53: f64 = 9_007_199_254_740_992.0;
 
 // ---------------------------------------------------------------------------
 // 复合键扁平哈希（P5+ 优化）
@@ -257,6 +250,9 @@ pub(crate) fn value_to_i128(v: &Value) -> Option<i128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 下面两个仅测试用：实现已全部委托 `wf-cep`（`scope_key_from_f64` 只是薄转发）。
+    use wf_cep::cep::key::canonical_f64_bits;
+    use wf_cep::value::TWO_POW_53;
 
     fn k_int(v: i64) -> ScopeKey {
         ScopeKey::Int(v)
@@ -294,10 +290,16 @@ mod tests {
         // 整数 < 2^53 → Int; 其余 → Float(规范化位)
         assert_eq!(scope_key_from_f64(3.0), k_int(3));
         assert!(matches!(scope_key_from_f64(0.5), ScopeKey::Float(_)));
-        assert!(matches!(
-            scope_key_from_f64(9_007_199_254_740_992.0),
-            ScopeKey::Float(_)
-        )); // == 2^53: 不精确 → Float
+        // 2^53 的两个侧翼都要正确：-1 仍在 f64 精确整数域，== 2^53 已经不在。
+        assert_eq!(
+            scope_key_from_f64(TWO_POW_53 - 1.0),
+            k_int(TWO_POW_53 as i64 - 1)
+        );
+        assert!(matches!(scope_key_from_f64(TWO_POW_53), ScopeKey::Float(_)));
+        // 与 `ScopeKey::from_float` 同源（委托关系锁定：不得再长出第二份实现）
+        for n in [3.0, 0.5, -0.0, TWO_POW_53 - 1.0, TWO_POW_53, f64::NAN] {
+            assert_eq!(scope_key_from_f64(n), ScopeKey::from_float(n), "n={n}");
+        }
     }
 
     #[test]

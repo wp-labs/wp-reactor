@@ -3,6 +3,8 @@ use wf_lang::ast::{Expr, FieldRef, PathSegment};
 
 use super::eval::eval_expr_ext;
 use super::types::{EngineHashMap, FieldSource, RollingStats, Value};
+// 2^53 判界常量的单一来源（本地不再内联）。
+use crate::value::{F64_EXACT_INT_LIMIT, TWO_POW_53};
 
 // ---------------------------------------------------------------------------
 // Value key — typed, hashable key for distinct-like state
@@ -26,9 +28,6 @@ pub enum ValueKey {
     Array(Vec<ValueKey>),
     Object(Vec<(String, ValueKey)>),
 }
-
-/// `|i| < 2^53` 时 `i as f64` 无损（与 `ScopeKey` / `DistinctKey` 同阈值）。
-const F64_EXACT_INT_LIMIT: u64 = 1 << 53;
 
 impl ValueKey {
     /// 值的**同一性**键（精确 canonical 位；`0.0 == -0.0`、NaN 归一；
@@ -120,24 +119,27 @@ pub enum ScopeKey {
     Pair(Box<ScopeKey>, Box<ScopeKey>),
 }
 
-/// <2^53 where every integer is exactly representable as f64 (matches the
-/// existing native-int columnar dispatch / `number_literal`).
-const TWO_POW_53: f64 = 9_007_199_254_740_992.0;
-
 impl ScopeKey {
+    /// Build a [`ScopeKey`] from a bare `f64` (columnar key leaf / row-based float).
+    ///
+    /// 整值且 `<2^53` → `Int`（与列式 `Int64` 列同 variant/同哈希），否则 `Float`
+    /// （canonical 位）。**单一实现**：`from_value` 的 `Value::Float` 臂与
+    /// `wf-engine` 的列式叶快路（`scope_key_from_f64`）都走这里。
+    pub fn from_float(n: f64) -> Self {
+        if n.fract() == 0.0 && n.abs() < TWO_POW_53 {
+            ScopeKey::Int(n as i64)
+        } else {
+            ScopeKey::Float(canonical_f64_bits(n))
+        }
+    }
+
     /// Build a [`ScopeKey`] from a [`Value`] (row-based path). Integer-valued
     /// numbers (and full-precision integers) → `Int`; fractional / huge floats
     /// → `Float`; strings → `Str`. Structured values fall back to their string
     /// form so they still shard deterministically.
     pub fn from_value(value: &Value) -> Self {
         match value {
-            Value::Float(n) => {
-                if n.fract() == 0.0 && n.abs() < TWO_POW_53 {
-                    ScopeKey::Int(*n as i64)
-                } else {
-                    ScopeKey::Float(canonical_f64_bits(*n))
-                }
-            }
+            Value::Float(n) => Self::from_float(*n),
             Value::Str(s) => ScopeKey::Str(s.clone()),
             // 精确整数：直接落 `Int`（`|i| < 2^53` 时与 `Float` 路径同 variant/同哈希）。
             Value::Int(i) => ScopeKey::Int(*i),
@@ -618,7 +620,7 @@ pub fn value_to_string(v: &Value) -> String {
 /// display without a `.0` or exponent, and non-integer / out-of-range / non-
 /// finite values fall through to std's shortest-representation Display.
 fn number_to_string(n: f64) -> String {
-    if n.is_finite() && n.fract() == 0.0 && n.abs() <= (1u64 << 53) as f64 {
+    if n.is_finite() && n.fract() == 0.0 && n.abs() <= F64_EXACT_INT_LIMIT as f64 {
         if n == 0.0 && n.is_sign_negative() {
             // `-0.0` displays as "-0", not "0".
             return "-0".to_string();
@@ -1165,5 +1167,45 @@ mod tests {
         // Spot-check the fast path renders an integer-valued f64 as a plain
         // decimal (no `.0` suffix), matching f64 Display.
         assert_eq!(value_to_string(&Value::Float(421_762.0)), "421762");
+    }
+
+    /// `ScopeKey::from_float` 是「浮点 → 键叶」的**单一实现**：`from_value` 的
+    /// `Float` 臂与 `wf-engine` 的列式叶快路（`scope_key_from_f64`）都委托它。
+    /// 边界两侧（`2^53-1` 仍是精确整数域 / `2^53` 起逐个整数不再可表示）必须
+    /// 分别落 `Int` 与 `Float`——判错即静默分键。
+    #[test]
+    fn scope_key_from_float_owns_the_int_float_boundary() {
+        assert_eq!(ScopeKey::from_float(3.0), ScopeKey::Int(3));
+        assert_eq!(ScopeKey::from_float(-3.0), ScopeKey::Int(-3));
+        // 整值且 < 2^53 → Int（f64 逐个精确）
+        assert_eq!(
+            ScopeKey::from_float(TWO_POW_53 - 1.0),
+            ScopeKey::Int(TWO_POW_53 as i64 - 1)
+        );
+        // 2^53 本身依然精确，但阈值是「< 2^53」→ 落 Float(规范化位)
+        assert_eq!(
+            ScopeKey::from_float(TWO_POW_53),
+            ScopeKey::Float(canonical_f64_bits(TWO_POW_53))
+        );
+        // 非整值 / 非有限 → Float
+        for n in [0.5, -0.5, 0.1, f64::NAN, f64::INFINITY] {
+            assert!(
+                matches!(ScopeKey::from_float(n), ScopeKey::Float(_)),
+                "n={n}"
+            );
+        }
+        // `from_value` 的 Float 臂不得旁路这条规则（口径分叉 = 静默分键）
+        for n in [3.0, -3.0, 0.5, TWO_POW_53 - 1.0, TWO_POW_53, f64::NAN] {
+            assert_eq!(
+                ScopeKey::from_value(&Value::Float(n)),
+                ScopeKey::from_float(n),
+                "n={n}"
+            );
+        }
+        // `Int` 走同一键空间：`|i| < 2^53` 时与整值 `Float` 同 variant/同哈希。
+        assert_eq!(
+            ScopeKey::from_value(&Value::Int(3)),
+            ScopeKey::from_float(3.0)
+        );
     }
 }

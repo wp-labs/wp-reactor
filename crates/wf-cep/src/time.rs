@@ -1,49 +1,25 @@
-pub fn epoch_nanos_to_millis(nanos: i64) -> i64 {
-    nanos.div_euclid(1_000_000)
-}
+//! 时间换算（epoch 归一化等）。
+//!
+//! epoch 归一的**实现**已全部归并到 `wf-data::time`（2026-09-19）：本模块只剩两个
+//! 再导出（保留 `wf-cep` 既有的公开路径与「int / float 双口径」命名）与两个
+//! 本域换算函数（`epoch_nanos_to_millis` / `positive_interval_seconds_to_nanos`）。
+//!
+//! 归并原因：此前 `wf-cep` 与 `wf-data` 各持一份 `normalize_epoch_timestamp_float_nanos`，
+//! 且两份行为**不同**（`wf-cep` 已加「整值走 i128 精确乘」的快路，`wf-data` 还是修复前的
+//! 「一律 f64 乘 + round」）——而 `wf-data` 那份才在生产路径上（`receiver` 的时间解析：
+//! `parse_json_timestamp_nanos` / `parse_timestamp_str_nanos`）。同名两套行为是静默错值的
+//! 高危形态，故收敛为单实现。
 
-pub fn normalize_epoch_timestamp_float_nanos(raw: f64) -> Option<i64> {
-    if !raw.is_finite() {
-        return None;
-    }
-    let abs = raw.abs();
-    let multiplier = match abs as i64 {
-        0..=9_999_999_999 => 1_000_000_000,
-        10_000_000_000..=9_999_999_999_999 => 1_000_000,
-        10_000_000_000_000..=9_999_999_999_999_999 => 1_000,
-        _ => 1,
-    };
-    if raw.fract() == 0.0 && raw >= i64::MIN as f64 && raw <= i64::MAX as f64 {
-        let nanos = i128::from(raw as i64).checked_mul(i128::from(multiplier))?;
-        return i64::try_from(nanos).ok();
-    }
-    let nanos = raw * multiplier as f64;
-    if !nanos.is_finite() || nanos < i64::MIN as f64 || nanos > i64::MAX as f64 {
-        return None;
-    }
-    Some(nanos.round() as i64)
-}
-
-/// 整数版的 epoch 时间戳归一化（单位按量级自动判定，阈值与
+pub use wf_data::time::normalize_epoch_timestamp_float_nanos;
+/// 整数版 epoch 归一化（量级自动判定，阈值与
 /// [`normalize_epoch_timestamp_float_nanos`] 一致）。
 ///
-/// 供**区间界**求值用：纳秒时间戳（≈1.77e18）**超出 f64 的精确整数范围**
-/// （2^53≈9.0e15），任何经 `Value::Float(f64)` 的往返都会把它量化到 ~256ns。
-/// 区间界比较（`>=` / `<`）在「真值相等或相差 <128ns」时会因此随机翻转——
-/// 实测同刻（右行 ts == 区间下界）的跨流配对会丢约一半，且症状是静默的
-/// "规则偶尔不触发"。整数通道全程 i64/i128，无取整。
-pub fn normalize_epoch_timestamp_int_nanos(raw: i64) -> Option<i64> {
-    let abs = raw.unsigned_abs();
-    let multiplier: i64 = if abs <= 9_999_999_999 {
-        1_000_000_000
-    } else if abs <= 9_999_999_999_999 {
-        1_000_000
-    } else if abs <= 9_999_999_999_999_999 {
-        1_000
-    } else {
-        1
-    };
-    i64::try_from(i128::from(raw).checked_mul(i128::from(multiplier))?).ok()
+/// 行为与语义见 `wf_data::time::normalize_epoch_timestamp_nanos`：纳秒时间戳超出 f64
+/// 精确整数范围，经浮点往返会被量化到 ~256ns，区间界比较会随机翻转。
+pub use wf_data::time::normalize_epoch_timestamp_nanos as normalize_epoch_timestamp_int_nanos;
+
+pub fn epoch_nanos_to_millis(nanos: i64) -> i64 {
+    nanos.div_euclid(1_000_000)
 }
 
 pub fn positive_interval_seconds_to_nanos(interval_seconds: f64) -> Option<i64> {
@@ -62,23 +38,21 @@ pub fn positive_interval_seconds_to_nanos(interval_seconds: f64) -> Option<i64> 
 mod tests {
     use super::*;
 
+    /// 再导出不是「又一份实现」：`wf-cep` 与 `wf-data` 两条路径必须解析到同一个函数。
+    /// （归一实现的行为测试集中在 `wf-data::time`，这里只钉住接口不漂移。）
     #[test]
-    fn normalize_epoch_timestamp_accepts_common_units() {
+    fn epoch_normalizers_are_reexported_from_wf_data() {
         assert_eq!(
             normalize_epoch_timestamp_float_nanos(1_700_000_000.0),
+            wf_data::time::normalize_epoch_timestamp_float_nanos(1_700_000_000.0)
+        );
+        assert_eq!(
+            normalize_epoch_timestamp_int_nanos(1_700_000_000),
+            wf_data::time::normalize_epoch_timestamp_nanos(1_700_000_000)
+        );
+        assert_eq!(
+            normalize_epoch_timestamp_int_nanos(1_700_000_000),
             Some(1_700_000_000_000_000_000)
-        );
-        assert_eq!(
-            normalize_epoch_timestamp_float_nanos(1_700_000_000_123.0),
-            Some(1_700_000_000_123_000_000)
-        );
-        assert_eq!(
-            normalize_epoch_timestamp_float_nanos(1_700_000_000_123_456.0),
-            Some(1_700_000_000_123_456_000)
-        );
-        assert_eq!(
-            normalize_epoch_timestamp_float_nanos(1_700_000_000_123_456_789.0),
-            Some(1_700_000_000_123_456_768)
         );
     }
 
@@ -94,35 +68,9 @@ mod tests {
         assert_eq!(positive_interval_seconds_to_nanos(f64::NAN), None);
     }
 
-    /// 整数通道：epoch-ns 超出 f64 的精确整数范围，浮点往返必丢 ~256ns；整数通道不丢。
     #[test]
-    fn int_normalizer_is_exact_for_epoch_nanos() {
-        // 非 256 对齐的纳秒时间戳（2026-01-01T00:00:00.000000001Z 附近）
-        let ns: i64 = 1_767_225_600_000_000_001;
-        assert_eq!(
-            normalize_epoch_timestamp_int_nanos(ns),
-            Some(ns),
-            "整数通道必须精确"
-        );
-        assert_ne!(
-            normalize_epoch_timestamp_float_nanos(ns as f64),
-            Some(ns),
-            "浮点往返在这个量级必然丢精度——精确通道存在的理由（回归锁定）"
-        );
-        // 秒 / 毫秒 / 微秒量级落在 f64 精确区间内，两条通道必须一致。
-        for v in [1_767_225_600i64, 1_767_225_600_000, 1_767_225_600_000_000] {
-            assert_eq!(
-                normalize_epoch_timestamp_int_nanos(v),
-                normalize_epoch_timestamp_float_nanos(v as f64),
-                "v={v} 在 f64 精确区间内，两条通道应一致"
-            );
-        }
-        // 溢出（按秒量级判定 ×1e9 后超 i64）→ None，不静默回绕。
-        assert_eq!(normalize_epoch_timestamp_int_nanos(9_999_999_999), None);
-        // 已是纳秒量级（不再乘）→ 原样返回。
-        assert_eq!(
-            normalize_epoch_timestamp_int_nanos(i64::MAX),
-            Some(i64::MAX)
-        );
+    fn epoch_nanos_to_millis_truncates_toward_negative_infinity() {
+        assert_eq!(epoch_nanos_to_millis(1_000_000_000), 1_000);
+        assert_eq!(epoch_nanos_to_millis(-1), -1);
     }
 }
