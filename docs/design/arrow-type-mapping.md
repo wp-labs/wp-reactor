@@ -134,10 +134,12 @@ B 位于 `crates-wp` 仓、且其映射函数为私有，无法与 A 链接 —�
 - `wp-connector-utils` `arrow/record.rs::hex_column_uses_the_same_string_form_as_wp_arrow`
   —— **值层对拍**：列里写出的字符串必须等于 `format!("{:#X}", 0x1A2Bu128)`。
 
-> **生效前提**：`wp-connector-utils` 是 crates.io 已发布 crate（`wp-reactor` 的 lock 指 `0.3.0`）。
-> 本修复需发一个 `0.3.x` **patch** 版本；因各方依赖写的是 `^0.3`，故无需改动上游 crate 的版本要求，
-> 只用在 `wp-reactor` 里 `cargo update -p wp-connector-utils` 即可摘到。
-> 发布前，本地改动的行为**不会**到达 wp-reactor。
+> **生效路径（已完成）**：`wp-connector-utils` 是 crates.io 已发布 crate，所以本修复必须发一个
+> `0.3.x` **patch** 才能到达 wp-reactor。已发 **0.3.1**（tag `v0.3.1`），并在本仓
+> `cargo update -p wp-connector-utils` 跟进。因各方依赖写的是 `^0.3`，**不需要**改动任何上游
+> crate 的版本要求 —— 跨仓修「已发布 crate 的行为」时这是最省事的一条路径。
+> 跨仓端到端已由 `receiver/schema.rs::arrow_contract_sink_inferred_hex_schema_passes_the_receiver`
+> 钉住（临时回退 lock 到 `0.3.0` 实测会失败于 `Binary` vs `Utf8`）。
 
 ## 5. 修改流程（必读）
 
@@ -159,7 +161,7 @@ B 位于 `crates-wp` 仓、且其映射函数为私有，无法与 A 链接 —�
 | 输出本文档（三方规格表 + 已知差异登记） | ✅ 本次 |
 | A ↔ C 真对拍（同二进制） | ✅ 本次（`receiver/schema.rs`） |
 | B 全 37 变体钉桩 | ✅ 本次（`wp-connector-utils/src/arrow/schema.rs`） |
-| 修 DIV-1（P0，`Hex`） | ✅ 已修复（2026-09-19，待 `wp-connector-utils` 发 `0.3.x` patch 后生效） |
+| 修 DIV-1（P0，`Hex`） | ✅ 已修复并生效（2026-09-19；`wp-connector-utils` 0.3.1 已发布，本仓 lock 已跟进） |
 | 消 P0-1（IPC 多批次帧只读第 1 批） | ✅ 已修复（2026-09-19，`wf-runtime` `decode_ipc_trusted` 全量解出） |
 | 合并三份表为单一实现 | ⏳ 待定（任务 A；依赖跨仓发布顺序） |
 
