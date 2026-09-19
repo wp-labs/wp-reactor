@@ -2,8 +2,8 @@
 //! （实例准入/limits 门 → 实例簿记 → 链语义 → close 累积 → Any/顺序模式发射）。
 //!
 //! 2026-09-18 降复杂度拆分（纯搬移，语义不变）：准入 `admit_new_instance`、内存门
-//! `enforce_memory_limit` + `evict_until_memory_fits`、基础成本 `new_instance_base_cost`
-//! + `account_admission_memory`、链语义 `chain_break_phase`、Any 模式 `advance_any_mode`、
+//! `enforce_memory_limit` + `evict_until_memory_fits`、基础成本 `new_instance_base_cost` +
+//! `account_admission_memory`、链语义 `chain_break_phase`、Any 模式 `advance_any_mode`、
 //! 顺序模式 `step_phase` / `emit_phase` 各自独立；推进期机器侧字段经 [`AdvanceView`]
 //! 借用拆分（`instance` 借自 `machine.instances`，与之不重叠），三处重复的限速门与
 //! `MatchedContext` 构造分别归一到 `AdvanceView::throttle_exceeded` /
