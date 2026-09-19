@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use wf_engine::match_engine::{
     WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY, WFL_FIELD_TYPE_OBJECT,
     wfl_structured_field_kind,
 };
 use wf_lang::{BaseType, FieldType, WindowSchema};
+use wp_model_core::model::{ArraySubtype, DataType as ModelDataType};
 
 use crate::error::{RuntimeReason, RuntimeResult};
 use orion_error::conversion::ToStructError;
@@ -124,10 +125,40 @@ pub(crate) fn field_to_arrow(name: &str, field_type: &FieldType) -> Field {
     }
 }
 
+/// 期望侧的 Arrow 列类型。
+///
+/// **A-1：本函数不再维护自己的映射表。** 先把 WPL 字段类型降到
+/// `wp_model_core::model::DataType`，再复用 sink 侧那张唯一实现
+/// （`wp_connector_utils::arrow::wp_type_to_arrow`）—— 两张活表变一张，
+/// `Hex` 那类口径分叉从结构上不可能再发生（上游一改，这里自动跟随）。
+/// 规格表：`docs/design/arrow-type-mapping.md` §1。
 pub(crate) fn field_type_to_arrow(ft: &FieldType) -> DataType {
+    wp_connector_utils::arrow::wp_type_to_arrow(&field_type_to_model(ft))
+}
+
+/// WPL 基础类型 → `wp_model_core::model::DataType`（7 臂，名字与 serde 名一致）。
+fn base_type_to_model(base: &BaseType) -> ModelDataType {
+    match base {
+        BaseType::Chars => ModelDataType::Chars,
+        BaseType::Digit => ModelDataType::Int,
+        BaseType::Float => ModelDataType::Float,
+        BaseType::Bool => ModelDataType::Bool,
+        BaseType::Time => ModelDataType::Time,
+        BaseType::Ip => ModelDataType::IP,
+        BaseType::Hex => ModelDataType::Hex,
+    }
+}
+
+/// WPL 字段类型 → `wp_model_core::model::DataType`。
+///
+/// 结构化字段落到 `Obj` / `Array(_)`：共享表对两者都返回 `Utf8`，
+/// 结构语义由 `wfl_field_type` 元数据承载（见 `field_to_arrow`）。
+fn field_type_to_model(ft: &FieldType) -> ModelDataType {
     match ft {
-        FieldType::Base(base) => base_type_to_arrow(base),
-        FieldType::ArrayAny | FieldType::Array(_) | FieldType::Object => DataType::Utf8,
+        FieldType::Base(base) => base_type_to_model(base),
+        FieldType::ArrayAny => ModelDataType::Array(ArraySubtype::new("auto")),
+        FieldType::Array(base) => ModelDataType::Array(ArraySubtype::new(base.as_str())),
+        FieldType::Object => ModelDataType::Obj,
     }
 }
 
@@ -139,19 +170,10 @@ fn structured_field_metadata_value(ft: &FieldType) -> Option<&'static str> {
     }
 }
 
-fn base_type_to_arrow(base: &BaseType) -> DataType {
-    match base {
-        BaseType::Chars | BaseType::Ip | BaseType::Hex => DataType::Utf8,
-        BaseType::Digit => DataType::Int64,
-        BaseType::Float => DataType::Float64,
-        BaseType::Bool => DataType::Boolean,
-        BaseType::Time => DataType::Timestamp(TimeUnit::Nanosecond, None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::TimeUnit;
     use wf_lang::FieldDef;
 
     fn field_def(name: &str, field_type: FieldType) -> FieldDef {
@@ -173,9 +195,12 @@ mod tests {
 
     #[test]
     fn type_conversions_and_metadata() {
-        assert_eq!(base_type_to_arrow(&BaseType::Digit), DataType::Int64);
         assert_eq!(
-            base_type_to_arrow(&BaseType::Time),
+            field_type_to_arrow(&FieldType::Base(BaseType::Digit)),
+            DataType::Int64
+        );
+        assert_eq!(
+            field_type_to_arrow(&FieldType::Base(BaseType::Time)),
             DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
         assert_eq!(field_type_to_arrow(&FieldType::Object), DataType::Utf8);
@@ -285,19 +310,48 @@ mod tests {
     // 规格表：wp-reactor/docs/design/arrow-type-mapping.md
     // -----------------------------------------------------------------
 
+    /// A-1 新增的降级表（WPL 类型 → `wp_model_core::DataType`）钉桩。
+    ///
+    /// 它是“两张活表变一张”的桥：降级后的模型类型交给 sink 侧唯一实现去映 Arrow。
+    /// `Array(subtype)` 必须携带**真实元素类型名**（否则中间值就不诚实了）。
+    #[test]
+    fn arrow_contract_wpl_types_lower_to_model_types() {
+        assert_eq!(base_type_to_model(&BaseType::Chars), ModelDataType::Chars);
+        assert_eq!(base_type_to_model(&BaseType::Digit), ModelDataType::Int);
+        assert_eq!(base_type_to_model(&BaseType::Float), ModelDataType::Float);
+        assert_eq!(base_type_to_model(&BaseType::Bool), ModelDataType::Bool);
+        assert_eq!(base_type_to_model(&BaseType::Time), ModelDataType::Time);
+        assert_eq!(base_type_to_model(&BaseType::Ip), ModelDataType::IP);
+        assert_eq!(base_type_to_model(&BaseType::Hex), ModelDataType::Hex);
+
+        assert_eq!(
+            field_type_to_model(&FieldType::Array(BaseType::Hex)),
+            ModelDataType::Array(ArraySubtype::new("hex"))
+        );
+        assert_eq!(
+            field_type_to_model(&FieldType::ArrayAny),
+            ModelDataType::Array(ArraySubtype::new("auto"))
+        );
+        assert_eq!(field_type_to_model(&FieldType::Object), ModelDataType::Obj);
+    }
+
     /// 期望侧（线协议契约 = 规格表 A 列）全量钉桩。
+    ///
+    /// A-1 之后这个值是由 sink 侧唯一实现推导出来的；本测试仍然有意义：
+    /// 它钉的是**生效口径**，共享表一旦变动（不论是本地还是上游发布）都在此暴露。
     #[test]
     fn arrow_contract_expected_column_is_pinned() {
+        let arrow_of = |b: BaseType| field_type_to_arrow(&FieldType::Base(b));
         let ts = DataType::Timestamp(TimeUnit::Nanosecond, None);
         // WPL 可声明的 7 种基础类型
-        assert_eq!(base_type_to_arrow(&BaseType::Chars), DataType::Utf8);
-        assert_eq!(base_type_to_arrow(&BaseType::Digit), DataType::Int64);
-        assert_eq!(base_type_to_arrow(&BaseType::Float), DataType::Float64);
-        assert_eq!(base_type_to_arrow(&BaseType::Bool), DataType::Boolean);
-        assert_eq!(base_type_to_arrow(&BaseType::Time), ts);
-        assert_eq!(base_type_to_arrow(&BaseType::Ip), DataType::Utf8);
-        // 规格表 DIV-1：期望侧 Hex = Utf8（sink 侧当前给 Binary）
-        assert_eq!(base_type_to_arrow(&BaseType::Hex), DataType::Utf8);
+        assert_eq!(arrow_of(BaseType::Chars), DataType::Utf8);
+        assert_eq!(arrow_of(BaseType::Digit), DataType::Int64);
+        assert_eq!(arrow_of(BaseType::Float), DataType::Float64);
+        assert_eq!(arrow_of(BaseType::Bool), DataType::Boolean);
+        assert_eq!(arrow_of(BaseType::Time), ts);
+        assert_eq!(arrow_of(BaseType::Ip), DataType::Utf8);
+        // DIV-1：期望侧 Hex = Utf8，且与 sink 侧唯一实现同源
+        assert_eq!(arrow_of(BaseType::Hex), DataType::Utf8);
 
         // 结构化字段：一律 Utf8 + `wfl_field_type` 元数据
         for (name, ft, kind) in [
@@ -323,15 +377,12 @@ mod tests {
         );
     }
 
-    /// A ↔ C 真对拍：期望侧与 `wp-arrow` 对同一 WPL 类型必须给出同一个 Arrow 口径。
+    /// A ↔ C 参考对拍：期望侧与 `wp-arrow` 对同一 WPL 类型给出同一个 Arrow 口径。
     ///
-    /// `wf-runtime` 依赖 crates.io 的 `wp-arrow`（0.3.x，其 `schema.rs` 映射与
-    /// `wfusion/wp-arrow` 本地版本逐字相同），所以这里调用的是**真实的另一份实现**，
-    /// 而不是把期望值再抄一遍。对应规格表 §3 的 A/C 两列。
-    ///
-    /// 两侧各自 `Debug` 成字符串再比较，而不是直接 `assert_eq!`：`wp-arrow 0.3.1`
-    /// 依赖 `arrow 59`，本 crate 升到 `arrow 60` 后 `DataType` 是另一个类型，
-    /// 根本无法直接相等。重叠面全是标量类型，两种 arrow 的 Debug 文案一致。
+    /// **注意 C 不在线协议路径上**（A-0：全家族 0 个生产使用者，见规格表 §1）。
+    /// 保留此测试是为了：若将来真有人开始用 `wp-arrow` 的映射 API，它能立刻报出口径差异。
+    /// 线协议本身的唯一实现是 sink 侧的 `wp_connector_utils::arrow::wp_type_to_arrow`
+    /// ——A-1 已让期望侧直接复用它（同源，不可能分叉）。
     #[test]
     fn arrow_contract_matches_wp_arrow_on_overlap() {
         use wp_arrow::schema::{WpDataType, to_arrow_type};
@@ -351,7 +402,7 @@ mod tests {
         ];
         for (wpl, wp) in overlap {
             assert_eq!(
-                kind(base_type_to_arrow(&wpl)),
+                kind(field_type_to_arrow(&FieldType::Base(wpl.clone()))),
                 kind(to_arrow_type(&wp)),
                 "WPL {wpl:?} 与 wp-arrow {wp:?} 的 Arrow 口径分叉"
             );
