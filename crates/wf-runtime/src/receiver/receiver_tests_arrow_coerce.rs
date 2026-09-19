@@ -61,6 +61,72 @@ async fn file_arrow_framed_replay_routes_rows() {
     wait_for_rows(&router, 2).await;
 }
 
+/// P0-1 端到端：`arrow_framed` 模式的 file sink 把**整个文件**的所有 batch 写成
+/// 单帧（`wp-core-connectors/src/sinks/file.rs:660` `encode_ipc_frame_multi`），
+/// 回放必须把帧内**所有** batch 都路由进去，而不是只取第 1 批。
+#[tokio::test]
+async fn file_arrow_framed_replay_routes_all_batches_of_a_multi_batch_frame() {
+    use arrow::ipc::writer::StreamWriter;
+
+    let (router, parse_seq) = make_parse_router("events");
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("events.arrow_framed_multi");
+    let schema = test_schema();
+    let batch_a = make_batch(&schema, &[1_000_000_000], &[1]);
+    let batch_b = make_batch(&schema, &[2_000_000_000], &[2]);
+
+    {
+        // 与 `encode_ipc_frame_multi` 字节级一致：
+        // `[4B tag_len BE][tag][一个 IPC stream 内顺序写 N 个 batch]`。
+        let tag = b"events";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(tag.len() as u32).to_be_bytes());
+        payload.extend_from_slice(tag);
+        {
+            let mut writer = StreamWriter::try_new(&mut payload, &schema).unwrap();
+            writer.write(&batch_a).unwrap();
+            writer.write(&batch_b).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("{} ", payload.len()).as_bytes());
+        body.extend_from_slice(&payload);
+        std::fs::write(&file_path, body).unwrap();
+    }
+
+    replay_arrow_framed_file(
+        &file_path,
+        "",
+        "test_source",
+        &[wf_lang::WindowSchema {
+            name: "test_win".to_string(),
+            streams: vec!["events".to_string()],
+            time_field: Some("ts".to_string()),
+            over: Duration::from_secs(3600),
+            fields: vec![
+                wf_lang::FieldDef {
+                    name: "ts".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Time),
+                },
+                wf_lang::FieldDef {
+                    name: "value".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Digit),
+                },
+            ],
+        }],
+        Arc::clone(&router),
+        None,
+        Arc::clone(&parse_seq),
+        CancellationToken::new(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // 修复前：只路由第 1 批 → 这里会超时失败（P0-1 回归）。
+    wait_for_rows(&router, 2).await;
+}
+
 #[tokio::test]
 async fn file_arrow_framed_unknown_tag_is_window_miss() {
     let (router, parse_seq) = make_parse_router("events");

@@ -166,9 +166,13 @@ impl DataSourceBatchSource {
                         }
                     }
                     match crate::receiver::arrow::decode_ipc_trusted(bytes) {
-                        Ok((tag, batch)) => {
-                            self.batch_tags.push_back(Some(tag));
-                            batches.push(ensure_machine_id_column(batch, &self.id));
+                        Ok((tag, decoded)) => {
+                            // 一个帧可含多个 batch（`arrow_framed` file sink 把整个
+                            // 文件写成单帧）——每个 batch 都要带上同一个 tag 入队。
+                            for batch in decoded {
+                                self.batch_tags.push_back(Some(tag.clone()));
+                                batches.push(ensure_machine_id_column(batch, &self.id));
+                            }
                         }
                         Err(e) => {
                             return Err(SourceReason::Decode.err_detail(e.to_string()));

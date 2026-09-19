@@ -30,9 +30,15 @@ use crate::receiver::schema::{
 /// the single-connection ~2.3GB/s byte-rate wall). Structural safety is
 /// unchanged — offsets/lengths are still enforced by the decoder, only the
 /// redundant content re-validation is skipped.
+///
+/// **一个帧可以承载多个 batch，必须全部解出。** `arrow_framed` 模式的 file sink
+/// 会把整个文件的所有 batch 写成单帧
+/// （`wp-core-connectors/src/sinks/file.rs:660` `encode_ipc_frame_multi`），
+/// 并且 `wp-connector-utils::decode_arrow_framed_batches` 是循环全读的。
+/// 这里只取 `reader.next()` 会让第 1 批之后的批次**静默丢失**（P0-1）。
 pub(crate) fn decode_ipc_trusted(
     data: &[u8],
-) -> Result<(String, arrow::array::RecordBatch), arrow::error::ArrowError> {
+) -> Result<(String, Vec<arrow::array::RecordBatch>), arrow::error::ArrowError> {
     use arrow::ipc::reader::StreamReader;
 
     if data.len() < 4 {
@@ -57,10 +63,16 @@ pub(crate) fn decode_ipc_trusted(
     // guaranteed by the generator). Byte-identical output to the validating
     // path for valid input — locked by the round-trip 对拍 test below.
     let mut reader = unsafe { reader.with_skip_validation(true) };
-    let batch = reader.next().ok_or_else(|| {
-        arrow::error::ArrowError::IpcError("no RecordBatch in IPC payload".to_string())
-    })??;
-    Ok((tag, batch))
+    let mut batches = Vec::new();
+    for batch in &mut reader {
+        batches.push(batch?);
+    }
+    if batches.is_empty() {
+        return Err(arrow::error::ArrowError::IpcError(
+            "no RecordBatch in IPC payload".to_string(),
+        ));
+    }
+    Ok((tag, batches))
 }
 
 /// 只读帧头 tag（前 4 字节长度 + tag 字节）——**不解码 body**。perf-diag
@@ -123,12 +135,13 @@ pub(crate) async fn replay_arrow_framed_file(
                     break;
                 };
 
-                let (tag, batch) = decode_ipc_trusted(&payload)
+                let (tag, decoded) = decode_ipc_trusted(&payload)
                     .source_raw_err(
                         RuntimeReason::data_error(),
                         format!("decode arrow frame from {}", path.display()),
                     )?;
                 let stream = stream_override.as_deref().unwrap_or(tag.as_str());
+                let frame_rows: usize = decoded.iter().map(|b| b.num_rows()).sum();
                 if stream_override.is_none()
                     && maybe_resolve_stream_schema(schemas, stream)?.is_none()
                 {
@@ -137,25 +150,29 @@ pub(crate) async fn replay_arrow_framed_file(
                         "file",
                         "wp_arrow_tag",
                         stream,
-                        batch.num_rows(),
+                        frame_rows,
                         metrics.as_ref(),
                         Some(router.as_ref()),
                     );
                     continue;
                 }
-                validate_batch_schema_for_stream(schemas, stream, batch.schema().as_ref())?;
+                // 一个帧可含多个 batch；IPC stream 只写一次 schema，帧内各 batch
+                // 同 schema，所以校验一次即可（避免按 batch 重复校验的成本回退）。
+                validate_batch_schema_for_stream(schemas, stream, decoded[0].schema().as_ref())?;
 
-                total_rows += batch.num_rows();
-                route_and_dispatch(
-                    &parse_seq,
-                    source_name,
-                    stream,
-                    batch,
-                    router.as_ref(),
-                    metrics.as_ref(),
-                    limiter.as_deref(),
-                )
-                .await;
+                total_rows += frame_rows;
+                for batch in decoded {
+                    route_and_dispatch(
+                        &parse_seq,
+                        source_name,
+                        stream,
+                        batch,
+                        router.as_ref(),
+                        metrics.as_ref(),
+                        limiter.as_deref(),
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -354,10 +371,10 @@ mod tests {
         let encoded = wp_arrow::ipc::encode_ipc("test-tag", &batch).unwrap();
         let (tag, decoded) = decode_ipc_trusted(&encoded).unwrap();
         assert_eq!(tag, "test-tag");
-        assert_eq!(decoded, batch);
+        assert_eq!(decoded, vec![batch.clone()]);
         let frame = wp_arrow::ipc::decode_ipc(&encoded).unwrap();
         assert_eq!(frame.tag, tag);
-        assert_eq!(frame.batch, decoded);
+        assert_eq!(frame.batch, batch);
     }
 
     #[test]
@@ -367,7 +384,7 @@ mod tests {
             let encoded = wp_arrow::ipc::encode_ipc(tag, &batch).unwrap();
             let (got, decoded) = decode_ipc_trusted(&encoded).unwrap();
             assert_eq!(got, tag);
-            assert_eq!(decoded, batch);
+            assert_eq!(decoded, vec![batch.clone()]);
         }
     }
 
@@ -377,8 +394,39 @@ mod tests {
         let encoded = wp_arrow::ipc::encode_ipc("large", &batch).unwrap();
         let (tag, decoded) = decode_ipc_trusted(&encoded).unwrap();
         assert_eq!(tag, "large");
-        assert_eq!(decoded.num_rows(), 100_000);
-        assert_eq!(decoded, batch);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].num_rows(), 100_000);
+        assert_eq!(decoded, vec![batch]);
+    }
+
+    /// 与 `wp-connector-utils::arrow::encode_ipc_frame_multi` **字节级一致**的
+    /// 多批次帧：一个 IPC stream 里顺序写 N 个 batch。`arrow_framed` 模式的 file
+    /// sink 在 `stop()` 时就是这么写的（`wp-core-connectors/src/sinks/file.rs:660`）。
+    fn encode_frame_multi(tag: &str, batches: &[RecordBatch]) -> Vec<u8> {
+        use arrow::ipc::writer::StreamWriter;
+
+        let tag_bytes = tag.as_bytes();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(tag_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(tag_bytes);
+        let schema = batches[0].schema();
+        let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref()).unwrap();
+        for batch in batches {
+            writer.write(batch).unwrap();
+        }
+        writer.finish().unwrap();
+        buf
+    }
+
+    /// P0-1 回归：单帧多批次（`arrow_framed` file sink 的产物）必须**全部**解出。
+    /// 修复前只返回第 1 批，其余批次静默丢失。
+    #[test]
+    fn trusted_decode_keeps_all_batches_in_a_multi_batch_frame() {
+        let batches = vec![make_batch(3), make_batch(4), make_batch(5)];
+        let frame = encode_frame_multi("multi", &batches);
+        let (tag, decoded) = decode_ipc_trusted(&frame).unwrap();
+        assert_eq!(tag, "multi");
+        assert_eq!(decoded, batches, "单帧多批次被截断（P0-1 回归）");
     }
 
     #[test]
@@ -401,7 +449,7 @@ mod tests {
             .unwrap()
             .batch
             .num_rows();
-        assert_eq!(decode_ipc_trusted(&payload).unwrap().1.num_rows(), rows);
+        assert_eq!(decode_ipc_trusted(&payload).unwrap().1[0].num_rows(), rows);
         for _ in 0..50 {
             let _ = decode_ipc_trusted(&payload);
         }
