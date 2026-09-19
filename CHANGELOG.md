@@ -41,7 +41,8 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Tests
 
-- 新增值层整数通道的性质测试：`Int` 与整值浮点在相等 / 键 / 哈希 / 排序 / 字符串化 / 数值漏斗上一致；`>2^53` 的精确性（不经 `f64` 量化）；行式 / 列式 / 解释三条执行路径输出类型一致；整数经持久化往返逐位精确。`wf-lang` 1235 / `wf-engine` 1075 / `wf-runtime` 660 / `wf-cep` 409 / `wf-config` 168 / `wf-data` 2 全绿。
+- 新增值层整数通道的性质测试：`Int` 与整值浮点在相等 / 键 / 哈希 / 排序 / 字符串化 / 数值漏斗上一致；`>2^53` 的精确性（不经 `f64` 量化）；行式 / 列式 / 解释三条执行路径输出类型一致；整数经持久化往返逐位精确。
+- 新增 Arrow 列类型契约测试：期望侧全量钉桩、与 `wp-arrow` 的跨 crate 对拍、结构化字段与 `hex` 口径守卫，以及**跨仓端到端**（sink 侧 `wp-connector-utils` 推断出的 `hex` 列必须被接收侧的窗口 schema 接受）。`wf-lang` 1235 / `wf-engine` 1075 / `wf-runtime` 661 / `wf-cep` 409 / `wf-config` 168 / `wf-data` 2 全绿。
 
 ## [2.0.24] -- latest
 

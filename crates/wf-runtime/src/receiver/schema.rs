@@ -393,6 +393,7 @@ mod tests {
     }
 
     /// DIV-1 对齐后的正例：`hex` 按 `Utf8`（期望侧 / wp-arrow / 修复后的 sink 口径）即通过。
+    /// DIV-1 的修正方向：同一字段按 `Utf8`（期望侧 / wp-arrow 口径）即通过。
     #[test]
     fn arrow_contract_hex_utf8_is_accepted() {
         let schemas = vec![window(
@@ -402,6 +403,39 @@ mod tests {
         )];
         let aligned = Schema::new(vec![Field::new("h", DataType::Utf8, true)]);
         assert!(validate_batch_schema_for_stream(&schemas, "s", &aligned).is_ok());
+    }
+
+    /// DIV-1（P0-2）**跨仓端到端**：`hex` 字段按 sink 侧实现（`wp-connector-utils`
+    /// 的 `infer_schema_from_record`，经 `wp-core-connectors` 再导出）推断出的列类型，
+    /// 必须能通过接收侧的窗口 schema 校验。
+    ///
+    /// 这正是 P0-2 的原始症状：`wp-connector-utils` 0.3.0 给 `Binary`（原始大端字节），
+    /// 与期望侧的 `Utf8` 严格比较失败 → 「arrow source schema mismatch」。
+    /// 0.3.1 起对齐为 `Utf8`，本用例把这条跨仓契约钉死。
+    #[test]
+    fn arrow_contract_sink_inferred_hex_schema_passes_the_receiver() {
+        use wp_model_core::model::{DataRecord, Field as ModelField, FieldStorage, HexT};
+
+        let rec = DataRecord::from(vec![FieldStorage::from(ModelField::from_hex(
+            "h",
+            HexT(0x1A2B),
+        ))]);
+        let inferred = wp_core_connectors::sinks::arrow_conv::infer_schema_from_record(&rec);
+        assert_eq!(
+            inferred.field(0).data_type(),
+            &DataType::Utf8,
+            "sink 侧（wp-connector-utils >= 0.3.1）必须把 hex 推断为 Utf8"
+        );
+
+        let schemas = vec![window(
+            "w",
+            &["s"],
+            vec![field_def("h", FieldType::Base(BaseType::Hex))],
+        )];
+        assert!(
+            validate_batch_schema_for_stream(&schemas, "s", &inferred).is_ok(),
+            "跨仓契约：sink 推断出的 hex 列必须被接收侧接受（P0-2 回归）"
+        );
     }
 
     /// 值层兜底口径：`Binary` 源列在 coerce 时不被支持，会整列变 `Null`。
