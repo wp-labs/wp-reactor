@@ -279,4 +279,148 @@ mod tests {
         ];
         assert!(resolve_stream_schema(&dup, "s").is_err());
     }
+
+    // -----------------------------------------------------------------
+    // Arrow 类型契约钉桩 / 跨 crate 对拍
+    // 规格表：wp-reactor/docs/design/arrow-type-mapping.md
+    // -----------------------------------------------------------------
+
+    /// 期望侧（线协议契约 = 规格表 A 列）全量钉桩。
+    #[test]
+    fn arrow_contract_expected_column_is_pinned() {
+        let ts = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        // WPL 可声明的 7 种基础类型
+        assert_eq!(base_type_to_arrow(&BaseType::Chars), DataType::Utf8);
+        assert_eq!(base_type_to_arrow(&BaseType::Digit), DataType::Int64);
+        assert_eq!(base_type_to_arrow(&BaseType::Float), DataType::Float64);
+        assert_eq!(base_type_to_arrow(&BaseType::Bool), DataType::Boolean);
+        assert_eq!(base_type_to_arrow(&BaseType::Time), ts);
+        assert_eq!(base_type_to_arrow(&BaseType::Ip), DataType::Utf8);
+        // 规格表 DIV-1：期望侧 Hex = Utf8（sink 侧当前给 Binary）
+        assert_eq!(base_type_to_arrow(&BaseType::Hex), DataType::Utf8);
+
+        // 结构化字段：一律 Utf8 + `wfl_field_type` 元数据
+        for (name, ft, kind) in [
+            ("o", FieldType::Object, WFL_FIELD_TYPE_OBJECT),
+            ("a", FieldType::ArrayAny, WFL_FIELD_TYPE_ARRAY),
+            ("a", FieldType::Array(BaseType::Digit), WFL_FIELD_TYPE_ARRAY),
+        ] {
+            assert_eq!(field_type_to_arrow(&ft), DataType::Utf8, "{name}");
+            assert_eq!(
+                field_to_arrow(name, &ft)
+                    .metadata()
+                    .get(WFL_FIELD_TYPE_METADATA_KEY)
+                    .map(String::as_str),
+                Some(kind),
+                "{name}"
+            );
+        }
+        // 基础字段不带结构化元数据
+        assert!(
+            field_to_arrow("n", &FieldType::Base(BaseType::Digit))
+                .metadata()
+                .is_empty()
+        );
+    }
+
+    /// A ↔ C 真对拍：期望侧与 `wp-arrow` 对同一 WPL 类型必须给出同一个 Arrow 口径。
+    ///
+    /// `wf-runtime` 依赖 crates.io 的 `wp-arrow`（0.3.x，其 `schema.rs` 映射与
+    /// `wfusion/wp-arrow` 本地版本逐字相同），所以这里调用的是**真实的另一份实现**，
+    /// 而不是把期望值再抄一遍。对应规格表 §3 的 A/C 两列。
+    ///
+    /// 两侧各自 `Debug` 成字符串再比较，而不是直接 `assert_eq!`：`wp-arrow 0.3.1`
+    /// 依赖 `arrow 59`，本 crate 升到 `arrow 60` 后 `DataType` 是另一个类型，
+    /// 根本无法直接相等。重叠面全是标量类型，两种 arrow 的 Debug 文案一致。
+    #[test]
+    fn arrow_contract_matches_wp_arrow_on_overlap() {
+        use wp_arrow::schema::{WpDataType, to_arrow_type};
+
+        fn kind(dt: impl std::fmt::Debug) -> String {
+            format!("{dt:?}")
+        }
+
+        let overlap = [
+            (BaseType::Chars, WpDataType::Chars),
+            (BaseType::Digit, WpDataType::Digit),
+            (BaseType::Float, WpDataType::Float),
+            (BaseType::Bool, WpDataType::Bool),
+            (BaseType::Time, WpDataType::Time),
+            (BaseType::Ip, WpDataType::Ip),
+            (BaseType::Hex, WpDataType::Hex),
+        ];
+        for (wpl, wp) in overlap {
+            assert_eq!(
+                kind(base_type_to_arrow(&wpl)),
+                kind(to_arrow_type(&wp)),
+                "WPL {wpl:?} 与 wp-arrow {wp:?} 的 Arrow 口径分叉"
+            );
+        }
+
+        // 规格表 DIV-3：结构化字段「形态」不同 —— 期望侧统一 Utf8(+kind 元数据)，
+        // wp-arrow 给 List。接收侧靠 kind 元数据判定兼容，故当前可容忍。
+        assert_eq!(
+            kind(field_type_to_arrow(&FieldType::Array(BaseType::Digit))),
+            "Utf8"
+        );
+        let wp_arrow_arr = kind(to_arrow_type(&WpDataType::Array(Box::new(
+            WpDataType::Digit,
+        ))));
+        assert!(
+            wp_arrow_arr.starts_with("List("),
+            "DIV-3 形态差异，见规格表 §4：{wp_arrow_arr}"
+        );
+    }
+
+    /// DIV-1 守卫：期望侧对 `hex` **只**接受 `Utf8`。
+    ///
+    /// 上游（`wp-connector-utils`）曾把这个字段映成 `Binary`（原始大端字节），
+    /// 导致校验硬报错；现已对齐为 `Utf8`。本测试防止**任一侧**退回：
+    /// 接收侧若放宽，会静默接受 `[0x1A, 0x2B]` 这类原始字节（与 `0x1A2B` 字符串
+    /// 语义不同）；上游若回退，这里会再次硬报错。
+    #[test]
+    fn arrow_contract_hex_only_accepts_utf8() {
+        let schemas = vec![window(
+            "w",
+            &["s"],
+            vec![field_def("h", FieldType::Base(BaseType::Hex))],
+        )];
+        let raw_bytes = Schema::new(vec![Field::new("h", DataType::Binary, true)]);
+        assert!(
+            validate_batch_schema_for_stream(&schemas, "s", &raw_bytes).is_err(),
+            "Binary 不被接受（DIV-1）；若此断言失败说明接收侧放宽了口径，请同步规格表 §4"
+        );
+    }
+
+    /// DIV-1 对齐后的正例：`hex` 按 `Utf8`（期望侧 / wp-arrow / 修复后的 sink 口径）即通过。
+    #[test]
+    fn arrow_contract_hex_utf8_is_accepted() {
+        let schemas = vec![window(
+            "w",
+            &["s"],
+            vec![field_def("h", FieldType::Base(BaseType::Hex))],
+        )];
+        let aligned = Schema::new(vec![Field::new("h", DataType::Utf8, true)]);
+        assert!(validate_batch_schema_for_stream(&schemas, "s", &aligned).is_ok());
+    }
+
+    /// 值层兜底口径：`Binary` 源列在 coerce 时不被支持，会整列变 `Null`。
+    /// 这条钉桩说明「绕过 schema 校验也不能救回数据」（规格表 §2）。
+    ///
+    /// 注意断言的是 `Null` **类型**而不是 `null_count()`：arrow 的 `NullArray`
+    /// 没有 validity buffer，`null_count()` 返回 0，容易被误读成「没丢值」。
+    #[test]
+    fn arrow_contract_binary_source_degrades_to_null() {
+        use crate::receiver::route::coerce_column;
+        use arrow::array::{Array as _, ArrayRef, BinaryArray, NullArray};
+
+        let src: ArrayRef = Arc::new(BinaryArray::from(vec![Some(&[0x1Au8, 0x2B][..]), None]));
+        let coerced = coerce_column(&src, &DataType::Utf8, 2);
+        assert_eq!(coerced.len(), 2);
+        assert_eq!(coerced.data_type(), &DataType::Null);
+        assert!(
+            coerced.as_any().downcast_ref::<NullArray>().is_some(),
+            "Binary → Utf8 无转换路径，整列退化为 NullArray"
+        );
+    }
 }
