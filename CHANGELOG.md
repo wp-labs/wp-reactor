@@ -14,7 +14,10 @@ All notable changes to wp-reactor will be documented in this file.
     与半衰期加权；周期画像数据源支持 CSV 周期重载或外部事实库（PG）直聚合；
   - 规则侧新增 `baseline_dev` / `sumsq` / `phase_bucket` 内建。
 - **Arrow 列类型契约的规格表与钉桩 / 对拍测试**：新增 `docs/design/arrow-type-mapping.md`，登记期望侧 / `wp-connector-utils` / `wp-arrow` 三方的 37 变体映射与已知差异；`wf-runtime` 侧补期望侧全量钉桩、与 `wp-arrow` 的跨 crate 对拍，以及结构化字段与 `hex` 口径的守卫用例。
-- **Arrow 契约的「非生产表」定性**：实测 `wp-arrow` 的映射 API（`schema` / `convert`）在生产路径上**零使用者**（被使用只有 `ipc`，全家族 30 处），故在规格表中明确它**不参与线协议契约**；`DIV-2`（`BigInt`）登记为「零生产者、本轮不修」，`DIV-3`（结构化字段元数据）登记为「容忍是有意设计、本轮不修」。
+- **Arrow 契约的归属定位（A-0 / A-2）**：实测 `wp-arrow` 的映射 API（`schema` / `convert`）与 IPC 在家族内**生产调用均为 0 处**（早期记的「被使用只有 `ipc`，全家族 30 处」经复核**不准确**：那 30 处全部位于测试/文档，其中大多数在 `mod tests` 里），所以 A-1 阶段它**不在线协议契约上**；又因契约的语义归属应在 `wp-arrow`（而不是「面向 sink 的 `wp-connector-utils`」），已确定迁移方向 **A-2**：契约表的唯一实现迁往 `wp-arrow`，`wp-connector-utils` 与接收侧改为调用它（分 2a / 2b / 2c 三步，见规格表 §1）。`DIV-2`（`BigInt`）登记为「零生产者、本轮不修」，`DIV-3`（结构化字段元数据）登记为「容忍是有意设计、本轮不修」。
+- **A-2：契约（两层）的落点全部迁到 `wp-arrow`**：`wp-arrow 0.4.1` 新增 `contract::wp_type_to_arrow`（穷尽 `wp_model_core::DataType` 37 变体，自 `wp-connector-utils` 逐字搬迁）+ 钉桩与防呆；`wp-arrow 0.4.2` 再把**值层**（`DataRecord` → 列）迁为 `contract::value`；`wp-connector-utils` 的两处（`arrow::wp_type_to_arrow`、`arrow::record::*`）改为**转发**，公开路径与签名不变、错误文案形状不变（`wp-core-connectors` 的 file/tcp sink 与 `wf-runtime` 均零改动）。
+  **行为不变**，凭据是两份**逐字同构的金标准测试**（全列类型 + 缺字段 + 类型回退 + 结构化 JSON + null）在迁移前/后各一份且同时通过。至此契约的两层（列类型表 + 值编码）只在 `wp-arrow` 一处。
+  （`wp-arrow` 自己的 `schema` / `convert` 是 9 变体**类型化前端**，口径不同且仍 0 生产调用，**故意未合并**。）
 
 ### Changed
 
@@ -30,9 +33,11 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Fixed
 
+- **接收侧列转换（`coerce_column`）的静默丢值**：源类型白名单由 `Utf8` / `Int64` / `Float64` 扩为再加上 `Int32` / `Boolean` / `Timestamp(Ns)`（契约表里实际会出现的全部标量列类型）；未支持组合不再返回 `NullArray`，而是按**目标类型**产全 null 列并 `tracing::warn!`。修掉的是两个真问题：① `NullArray` 的类型是 `DataType::Null`，与目标字段不符 → `RecordBatch::try_new` 失败 → `project_batch_for_stream` 把它吞成「返回未投影的批」→ **整个投影静默作废**；② `NullArray::null_count()` 恒为 0，用 null 计数判断会误读成「没丢值」。投影里的缺字段补全与批构造失败也一并改为留 WARN。
 - **修复刷新与动态 join 配置并发时的偶发 join 退化**（漏命中 / 降级为全表扫描）。
 - **整数精度：`>2^53` 的整数在部分路径上被量化（典型症状为纳秒时间戳）**：epoch 纳秒（≈1.77e18）超出 f64 的精确整数范围，此前经值层往返会被量化到 ~256ns，使「真值相等或相差 <128ns」的区间界比较随机翻转——同刻跨流配对（deferred join）实测丢约一半命中，且症状静默（规则偶尔不触发）。现由精确整数承载：时间戳换算、区间界、join 键、去重键（含 CEP `distinct` 的 `ValueKey`，`>= 2^53` 改用精确整数键）、输出 ID 与输出值全程不再量化；KnowDB 原生行（DDL 类型化的整数列，含 PG / `Digit` 列）也不再经「文本 → 浮点」往返。
 - **`arrow_framed` 文件源静默丢数据**：该模式把整个文件写成**单帧多批次**，接收侧却只解第 1 批，第 2 批起被静默丢弃（TCP 源每帧单批，所以只有 file 源暴露）。现按帧全量解出并逐批路由；`window_miss` 行数按帧内总行数记一次。
+- **小数形式时间戳的精度（上一条的最后一个未收敛入口）**：接收侧浮点时间戳归一（`"1700000000123.0"` 这类带小数点 / 科学计数法的数字与数字字符串）此前走的是修复前的旧实现——一律 `f64` 乘 + 取整，毫秒量级整值会偏 64ns；整数通道同时期已加“整值走精确整数乘”的快路，两份同名实现行为不同。现两条通道共用单一实现（`wf-data::time`，`wf-cep::time` 改为再导出），量级判定与结果不再量化。
 
 ### Removed
 
@@ -44,7 +49,8 @@ All notable changes to wp-reactor will be documented in this file.
 ### Tests
 
 - 新增值层整数通道的性质测试：`Int` 与整值浮点在相等 / 键 / 哈希 / 排序 / 字符串化 / 数值漏斗上一致；`>2^53` 的精确性（不经 `f64` 量化）；行式 / 列式 / 解释三条执行路径输出类型一致；整数经持久化往返逐位精确。
-- 新增 Arrow 列类型契约测试：期望侧全量钉桩、WPL→`wp_model_core::DataType` 降级表钉桩、与 `wp-arrow` 的参考对拍、结构化字段与 `hex` 口径守卫，以及**跨仓端到端**（sink 侧 `wp-connector-utils` 推断出的 `hex` 列必须被接收侧的窗口 schema 接受）。`wf-lang` 1235 / `wf-engine` 1075 / `wf-runtime` 662 / `wf-cep` 409 / `wf-config` 168 / `wf-data` 2 全绿。
+- 新增 Arrow 列类型契约测试：期望侧全量钉桩、WPL→`wp_model_core::DataType` 降级表钉桩、与 `wp-arrow` 的参考对拍、结构化字段与 `hex` 口径守卫，以及**跨仓端到端**（sink 侧 `wp-connector-utils` 推断出的 `hex` 列必须被接收侧的窗口 schema 接受）。`wf-lang` 1235 / `wf-engine` 1075 / `wf-runtime` 664 / `wf-cep` 411 / `wf-config` 168 / `wf-data` 7 全绿。
+- 新增归并与判界的守卫用例：epoch 归一两条通道的量级边界与负值 / 极值、2^53 两侧的键叶归属、`Value` 的整↔浮边界，以及 `wf-cep` 再导出 / `wf-engine` 列式叶快路对单一实现的委托关系锁定。
 
 ## [2.0.24] -- latest
 
