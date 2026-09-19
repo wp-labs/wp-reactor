@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, FixedSizeListArray, Float64Array, Int64Array,
-    LargeListArray, ListArray, NullArray, PrimitiveBuilder, StringArray, StringBuilder,
-    StructArray, TimestampNanosecondArray,
+    LargeListArray, ListArray, PrimitiveBuilder, StringArray, StringBuilder, StructArray,
+    TimestampNanosecondArray,
 };
 use arrow::datatypes::{
-    DataType, Field, Float64Type, Int64Type, TimeUnit, TimestampNanosecondType,
+    DataType, Field, Float64Type, Int32Type, Int64Type, TimeUnit, TimestampNanosecondType,
 };
 use arrow::record_batch::RecordBatch;
 use wf_data::time::parse_timestamp_str_nanos;
@@ -47,8 +47,6 @@ fn project_batch_for_stream(
     batch: &RecordBatch,
     router: &Router,
 ) -> RecordBatch {
-    use arrow::array::NullArray;
-
     let subs = router.registry().subscribers_of(stream_name);
     if subs.is_empty() {
         return batch.clone();
@@ -74,7 +72,19 @@ fn project_batch_for_stream(
         let col = match batch.column_by_name(field.name()) {
             Some(col) if col.data_type() == field.data_type() => col.clone(),
             Some(col) => coerce_column_for_field(col, field, batch.num_rows()),
-            None => Arc::new(NullArray::new(batch.num_rows())),
+            // 缺字段：按**目标类型**补全 null 列。不能用 `NullArray`：它的类型是
+            // `DataType::Null`，与字段类型不符 → `RecordBatch::try_new` 会失败 →
+            // 下面的兜底会把**整个投影**静默作废（退回未投影的批）。
+            None => {
+                tracing::warn!(
+                    stream = stream_name,
+                    field = field.name(),
+                    target_type = %field.data_type(),
+                    rows = batch.num_rows(),
+                    "receiver: 批里缺该字段 → 补全 null 列"
+                );
+                arrow::array::new_null_array(field.data_type(), batch.num_rows())
+            }
         };
         columns.push(col);
     }
@@ -91,8 +101,14 @@ fn project_batch_for_stream(
     }
 
     let schema = arrow::datatypes::Schema::new(fields);
-    arrow::record_batch::RecordBatch::try_new(Arc::new(schema), columns)
-        .unwrap_or_else(|_| batch.clone())
+    arrow::record_batch::RecordBatch::try_new(Arc::new(schema), columns).unwrap_or_else(|e| {
+        tracing::warn!(
+            stream = stream_name,
+            error = %e,
+            "receiver: 投影后的批构造失败 → 回退到未投影的批（该流的窗口将拿到与自身 schema 不符的列）"
+        );
+        batch.clone()
+    })
 }
 
 fn needs_projection_for_stream(stream_name: &str, batch: &RecordBatch, router: &Router) -> bool {
@@ -118,7 +134,7 @@ fn needs_projection_for_stream(stream_name: &str, batch: &RecordBatch, router: &
     })
 }
 
-/// Coerce a column to the target Arrow type. Falls back to nulls if coercion fails.
+/// Coerce a column to the target Arrow type. Falls back to **typed all-null** if coercion fails.
 pub(crate) fn coerce_column(col: &ArrayRef, target: &DataType, num_rows: usize) -> ArrayRef {
     if col.data_type() == target {
         // Same type — direct clone (should be handled by caller, but safe)
@@ -127,12 +143,34 @@ pub(crate) fn coerce_column(col: &ArrayRef, target: &DataType, num_rows: usize) 
     match col.data_type() {
         // Utf8 → numeric / boolean / timestamp
         DataType::Utf8 => coerce_utf8_to_target(col, target, num_rows),
-        // Numeric → numeric / Utf8
+        // Numeric / boolean / timestamp → other scalar
         DataType::Int64 => coerce_int64_to_target(col, target, num_rows),
+        DataType::Int32 => coerce_int32_to_target(col, target, num_rows),
         DataType::Float64 => coerce_float64_to_target(col, target, num_rows),
-        // Fallback — nulls
-        _ => Arc::new(NullArray::new(num_rows)),
+        DataType::Boolean => coerce_boolean_to_target(col, target, num_rows),
+        // 时间戳列（契约里 Time → `Timestamp(Ns)`）：原始 epoch-ns
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            coerce_timestamp_ns_to_target(col, target, num_rows)
+        }
+        // 其余（Binary / List / Struct / Decimal …）：留日志的整列 null
+        _ => nulls_with_warning(col, target, num_rows),
     }
+}
+
+/// 列级兜底：按**目标类型**产全 null 列，并留下 WARN。
+///
+/// 为什么不能用 `NullArray`：它类型是 `DataType::Null`，与目标字段类型不符 →
+/// `RecordBatch::try_new` 直接失败，而调用方会把失败吞成「返回未投影的原始批」
+/// （整个投影静默作废）；且 `NullArray::null_count()` 恒为 **0**，用 null 计数
+/// 判断会误读成「没丢值」。`new_null_array(target, ..)` 两个问题都没有。
+fn nulls_with_warning(col: &ArrayRef, target: &DataType, num_rows: usize) -> ArrayRef {
+    tracing::warn!(
+        source_type = %col.data_type(),
+        target_type = %target,
+        rows = num_rows,
+        "receiver: 列类型无法转换 → 整列置 null（该列的值会丢失）"
+    );
+    arrow::array::new_null_array(target, num_rows)
 }
 
 /// Coerce a Utf8 column toward `target`; unparseable values become nulls and
@@ -155,11 +193,11 @@ fn coerce_utf8_to_target(col: &ArrayRef, target: &DataType, num_rows: usize) -> 
                 parse_timestamp_str_nanos(strings.value(i))
             })
         }
-        _ => Arc::new(NullArray::new(num_rows)),
+        _ => nulls_with_warning(col, target, num_rows),
     }
 }
 
-/// Coerce an Int64 column toward `target`; unsupported targets degrade to nulls.
+/// Coerce an Int64 column toward `target`; unsupported targets become typed nulls.
 fn coerce_int64_to_target(col: &ArrayRef, target: &DataType, num_rows: usize) -> ArrayRef {
     let ints = as_primitive_array::<Int64Type>(col);
     match target {
@@ -167,11 +205,73 @@ fn coerce_int64_to_target(col: &ArrayRef, target: &DataType, num_rows: usize) ->
             fill_primitive::<Float64Type, _>(num_rows, |i| Some(ints.value(i) as f64))
         }
         DataType::Utf8 => fill_utf8(num_rows, num_rows * 8, |i| ints.value(i).to_string()),
-        _ => Arc::new(NullArray::new(num_rows)),
+        _ => nulls_with_warning(col, target, num_rows),
     }
 }
 
-/// Coerce a Float64 column toward `target`; unsupported targets degrade to nulls.
+/// Coerce an Int32 column toward `target`（加宽：Int64 / Float64 / Utf8）。
+fn coerce_int32_to_target(col: &ArrayRef, target: &DataType, num_rows: usize) -> ArrayRef {
+    let ints = as_primitive_array::<Int32Type>(col);
+    match target {
+        DataType::Int64 => {
+            fill_primitive::<Int64Type, _>(num_rows, |i| Some(i64::from(ints.value(i))))
+        }
+        DataType::Float64 => {
+            fill_primitive::<Float64Type, _>(num_rows, |i| Some(f64::from(ints.value(i))))
+        }
+        DataType::Utf8 => fill_utf8(num_rows, num_rows * 8, |i| ints.value(i).to_string()),
+        _ => nulls_with_warning(col, target, num_rows),
+    }
+}
+
+/// Coerce a Boolean column toward `target`（Utf8 用 `true`/`false`，与反向读回同形）。
+fn coerce_boolean_to_target(col: &ArrayRef, target: &DataType, num_rows: usize) -> ArrayRef {
+    let bools = as_boolean_array(col);
+    match target {
+        DataType::Utf8 => fill_utf8(num_rows, num_rows * 5, |i| {
+            if bools.value(i) { "true" } else { "false" }.to_string()
+        }),
+        DataType::Int64 => {
+            fill_primitive::<Int64Type, _>(num_rows, |i| Some(if bools.value(i) { 1 } else { 0 }))
+        }
+        DataType::Float64 => fill_primitive::<Float64Type, _>(num_rows, |i| {
+            Some(if bools.value(i) { 1.0 } else { 0.0 })
+        }),
+        _ => nulls_with_warning(col, target, num_rows),
+    }
+}
+
+/// Coerce a `Timestamp(Ns)` column toward `target`：Int64（原始 epoch-ns）/ Utf8（ns 十进制）。
+///
+/// 与家族口径一致：时间列在引擎侧就是 `Value::Int`（epoch-ns），文本形态即它的十进制。
+fn coerce_timestamp_ns_to_target(col: &ArrayRef, target: &DataType, num_rows: usize) -> ArrayRef {
+    let Some(ts) = col.as_any().downcast_ref::<TimestampNanosecondArray>() else {
+        return nulls_with_warning(col, target, num_rows);
+    };
+    match target {
+        DataType::Int64 => fill_primitive::<Int64Type, _>(num_rows, |i| {
+            if ts.is_null(i) {
+                None
+            } else {
+                Some(ts.value(i))
+            }
+        }),
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 20);
+            for i in 0..num_rows {
+                if ts.is_null(i) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(ts.value(i).to_string());
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        _ => nulls_with_warning(col, target, num_rows),
+    }
+}
+
+/// Coerce a Float64 column toward `target`; unsupported targets become typed nulls.
 fn coerce_float64_to_target(col: &ArrayRef, target: &DataType, num_rows: usize) -> ArrayRef {
     let floats = as_primitive_array::<Float64Type>(col);
     match target {
@@ -179,7 +279,7 @@ fn coerce_float64_to_target(col: &ArrayRef, target: &DataType, num_rows: usize) 
             fill_primitive::<Int64Type, _>(num_rows, |i| Some(floats.value(i) as i64))
         }
         DataType::Utf8 => fill_utf8(num_rows, num_rows * 16, |i| floats.value(i).to_string()),
-        _ => Arc::new(NullArray::new(num_rows)),
+        _ => nulls_with_warning(col, target, num_rows),
     }
 }
 
@@ -349,6 +449,12 @@ fn as_string_array(col: &ArrayRef) -> &arrow::array::StringArray {
         .expect("expected StringArray")
 }
 
+fn as_boolean_array(col: &ArrayRef) -> &arrow::array::BooleanArray {
+    col.as_any()
+        .downcast_ref::<arrow::array::BooleanArray>()
+        .expect("expected BooleanArray")
+}
+
 #[allow(dead_code)]
 fn as_primitive_array<T: arrow::datatypes::ArrowPrimitiveType>(
     col: &ArrayRef,
@@ -361,6 +467,67 @@ fn as_primitive_array<T: arrow::datatypes::ArrowPrimitiveType>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::NullArray;
+
+    #[test]
+    fn boolean_int32_and_timestamp_sources_are_coerced() {
+        // Boolean → Utf8 / Int64 / Float64（此前这三种全是「整列 null」）
+        let bools: ArrayRef = Arc::new(BooleanArray::from(vec![true, false]));
+        let text = coerce_column(&bools, &DataType::Utf8, 2);
+        let text = text.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!((text.value(0), text.value(1)), ("true", "false"));
+        let ints = coerce_column(&bools, &DataType::Int64, 2);
+        let ints = ints.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!((ints.value(0), ints.value(1)), (1, 0));
+        let floats = coerce_column(&bools, &DataType::Float64, 2);
+        let floats = floats.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!((floats.value(0), floats.value(1)), (1.0, 0.0));
+
+        // Int32（契约里的 `Port`）→ Int64 / Float64 / Utf8
+        let i32s: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![70000, -3]));
+        let widened = coerce_column(&i32s, &DataType::Int64, 2);
+        let widened = widened.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!((widened.value(0), widened.value(1)), (70_000, -3));
+        let text = coerce_column(&i32s, &DataType::Utf8, 2);
+        let text = text.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!((text.value(0), text.value(1)), ("70000", "-3"));
+
+        // Timestamp(Ns) → Int64（原始 ns）/ Utf8（ns 十进制）
+        let ns = 1_700_000_000_000_000_001i64;
+        let ts: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![ns]));
+        let as_int = coerce_column(&ts, &DataType::Int64, 1);
+        let as_int = as_int.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(as_int.value(0), ns);
+        let as_text = coerce_column(&ts, &DataType::Utf8, 1);
+        let as_text = as_text.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(as_text.value(0), ns.to_string());
+    }
+
+    /// 回归（本次修复）：不支持的列对必须产**目标类型的全 null 列**，且可检测。
+    ///
+    /// 旧实现返回 `NullArray`：
+    /// ① 类型是 `DataType::Null` → `RecordBatch::try_new` 失败 → 调用方
+    ///    （`project_batch_for_stream`）把失败吞成「返回未投影的批」→ 整个投影**静默作废**；
+    /// ② `NullArray::null_count()` 恒为 0 → 用 null 计数判断会误读成「没丢值」。
+    #[test]
+    fn unsupported_pair_yields_typed_nulls_and_is_detectable() {
+        use arrow::array::BinaryArray;
+
+        // Binary → Utf8：契约里不存在的组合（防御路径）
+        let bin: ArrayRef = Arc::new(BinaryArray::from(vec![&b"x"[..], &b"y"[..]]));
+        let out = coerce_column(&bin, &DataType::Utf8, 2);
+        assert_eq!(out.data_type(), &DataType::Utf8, "必须是目标类型的列");
+        assert_eq!(out.null_count(), 2, "null 计数必须如实反映丢值");
+
+        // 关键：这一列现在能建出批（旧实现会失败 → 投影被静默丢弃）
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "c",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![out]);
+        assert!(batch.is_ok(), "目标类型的 null 列必须能被 try_new 接受");
+    }
 
     #[test]
     fn coerce_float64_to_utf8_and_bad_timestamp_null() {

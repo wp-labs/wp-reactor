@@ -132,6 +132,10 @@ pub(crate) fn field_to_arrow(name: &str, field_type: &FieldType) -> Field {
 /// （`wp_connector_utils::arrow::wp_type_to_arrow`）—— 两张活表变一张，
 /// `Hex` 那类口径分叉从结构上不可能再发生（上游一改，这里自动跟随）。
 /// 规格表：`docs/design/arrow-type-mapping.md` §1。
+///
+/// 注：sink 侧那张表是**当前**的唯一实现（A-1 过渡态）；
+/// 目标态（A-2）会把唯一实现搬到 `wp-arrow`，届时本函数改为调 `wp_arrow` 的同一条入口 ——
+/// 本函数是纯转发，所以两种落点下行为一致。详见规格表 §1「收敛步骤 2」。
 pub(crate) fn field_type_to_arrow(ft: &FieldType) -> DataType {
     wp_connector_utils::arrow::wp_type_to_arrow(&field_type_to_model(ft))
 }
@@ -379,10 +383,11 @@ mod tests {
 
     /// A ↔ C 参考对拍：期望侧与 `wp-arrow` 对同一 WPL 类型给出同一个 Arrow 口径。
     ///
-    /// **注意 C 不在线协议路径上**（A-0：全家族 0 个生产使用者，见规格表 §1）。
+    /// **注意 C 当前不在线协议路径上**（A-0：全家族生产调用 0 处，见规格表 §1）。
     /// 保留此测试是为了：若将来真有人开始用 `wp-arrow` 的映射 API，它能立刻报出口径差异。
-    /// 线协议本身的唯一实现是 sink 侧的 `wp_connector_utils::arrow::wp_type_to_arrow`
-    /// ——A-1 已让期望侧直接复用它（同源，不可能分叉）。
+    /// 当前线协议的唯一实现是 sink 侧的 `wp_connector_utils::arrow::wp_type_to_arrow`
+    /// ——A-1 已让期望侧直接复用它（同源，不可能分叉）；
+    /// 目标态（A-2）把这个唯一实现搬到 `wp-arrow`，此对拍届时升级为「契约口径自洽」检查。
     #[test]
     fn arrow_contract_matches_wp_arrow_on_overlap() {
         use wp_arrow::schema::{WpDataType, to_arrow_type};
@@ -489,23 +494,34 @@ mod tests {
         );
     }
 
-    /// 值层兜底口径：`Binary` 源列在 coerce 时不被支持，会整列变 `Null`。
-    /// 这条钉桩说明「绕过 schema 校验也不能救回数据」（规格表 §2）。
+    /// 值层兜底口径（2026-09-19 改）：`Binary` 源列没有转换路径 → **整列置 null，
+    /// 但列类型是目标类型**（`Utf8`），且 `null_count()` 如实反映丢值。
     ///
-    /// 注意断言的是 `Null` **类型**而不是 `null_count()`：arrow 的 `NullArray`
-    /// 没有 validity buffer，`null_count()` 返回 0，容易被误读成「没丢值」。
+    /// 为什么不返回 `NullArray`（旧行为，已改）：
+    /// 1. `NullArray` 的类型是 `DataType::Null`，与目标字段不符 → `RecordBatch::try_new`
+    ///    失败 → `project_batch_for_stream` 把失败吞成「返回未投影的批」→ **整个投影静默作废**；
+    /// 2. `NullArray::null_count()` 恒为 0 → 用 null 计数判断会误读成「没丢值」。
+    ///
+    /// 丢值这件事现在由 `tracing::warn!`（`receiver: 列类型无法转换 …`）暴露。
+    /// 结论不变：**绕过 schema 校验也救不回数据**（规格表 §2），但失败不再静默。
     #[test]
-    fn arrow_contract_binary_source_degrades_to_null() {
+    fn arrow_contract_binary_source_becomes_typed_nulls() {
         use crate::receiver::route::coerce_column;
-        use arrow::array::{Array as _, ArrayRef, BinaryArray, NullArray};
+        use arrow::array::{Array as _, ArrayRef, BinaryArray};
 
         let src: ArrayRef = Arc::new(BinaryArray::from(vec![Some(&[0x1Au8, 0x2B][..]), None]));
         let coerced = coerce_column(&src, &DataType::Utf8, 2);
         assert_eq!(coerced.len(), 2);
-        assert_eq!(coerced.data_type(), &DataType::Null);
+        assert_eq!(coerced.data_type(), &DataType::Utf8, "必须是目标类型");
+        assert_eq!(coerced.null_count(), 2, "丢值必须可检测（旧实现恒为 0）");
+
+        // 关键：这一列**能建出批**（旧实现返回 NullArray 时 try_new 会失败 → 投影静默作废）
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("h", DataType::Utf8, true),
+        ]));
         assert!(
-            coerced.as_any().downcast_ref::<NullArray>().is_some(),
-            "Binary → Utf8 无转换路径，整列退化为 NullArray"
+            arrow::record_batch::RecordBatch::try_new(schema, vec![coerced]).is_ok(),
+            "目标类型的 null 列必须能被 try_new 接受"
         );
     }
 }
