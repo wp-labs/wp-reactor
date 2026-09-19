@@ -91,17 +91,17 @@ fn untyped_integral_export_switches_to_digit_at_f64_precision_limit() {
     // >2^53：`Int` 逐位保真 → Digit
     let big = 1_767_225_600_000_000_001_i64;
     let (meta, value) = export_yield_value(&Value::Int(big), None).unwrap();
-    assert_eq!(meta, DataType::Digit);
+    assert_eq!(meta, DataType::Int);
     assert_eq!(value, ModelValue::from(big), "不经 f64，逐位保真");
     // 边界：2^53 与 2^53+1 都 ≥ 阈值 → Digit（行式 `Int` 与列式量化 f64 同判）
     let (meta, _) = export_yield_value(&Value::Int(9_007_199_254_740_992), None).unwrap();
-    assert_eq!(meta, DataType::Digit);
+    assert_eq!(meta, DataType::Int);
     let (meta, _) = export_yield_value(&Value::Int(9_007_199_254_740_993), None).unwrap();
-    assert_eq!(meta, DataType::Digit);
+    assert_eq!(meta, DataType::Int);
     // 声明 digit 的目标不受阈值影响（恒 Digit）
     let ft = FieldType::Base(BaseType::Digit);
     let (meta, _) = export_yield_value(&Value::Int(443), Some(&ft)).unwrap();
-    assert_eq!(meta, DataType::Digit);
+    assert_eq!(meta, DataType::Int);
 }
 
 #[test]
@@ -109,7 +109,7 @@ fn export_yield_f64_fast_lanes_and_fallbacks() {
     use wp_model_core::model::DataType;
     // Digit: integer-valued finite → i64 digit.
     let (meta, value) = export_yield_f64(42.0, Some(&FieldType::Base(BaseType::Digit))).unwrap();
-    assert_eq!(meta, DataType::Digit);
+    assert_eq!(meta, DataType::Int);
     assert_eq!(value, ModelValue::from(42_i64));
     // Float: finite → f64 float.
     let (meta, value) = export_yield_f64(1.5, Some(&FieldType::Base(BaseType::Float))).unwrap();
@@ -125,10 +125,10 @@ fn export_yield_f64_fast_lanes_and_fallbacks() {
     assert_eq!(value, ModelValue::from(2.0));
     // Untyped: `|v| >= 2^53` 起 f64 无法精确表达 → Digit（否则量化）。
     let (meta, value) = export_yield_f64(9_007_199_254_740_992.0, None).unwrap(); // 2^53
-    assert_eq!(meta, DataType::Digit);
+    assert_eq!(meta, DataType::Int);
     assert_eq!(value, ModelValue::from(9_007_199_254_740_992_i64));
     let (meta, value) = export_yield_f64(1_767_225_600_000_000_000.0, None).unwrap();
-    assert_eq!(meta, DataType::Digit);
+    assert_eq!(meta, DataType::Int);
     assert_eq!(value, ModelValue::from(1_767_225_600_000_000_000_i64));
     // Fractional digit → falls back to the Value path → error.
     assert!(export_yield_f64(1.5, Some(&FieldType::Base(BaseType::Digit))).is_err());
@@ -284,32 +284,32 @@ fn typed_array_element_lanes_for_each_base_type() {
         (
             BaseType::Digit,
             Value::Float(7.0),
-            DataType::Array("digit".to_string()),
+            DataType::Array("digit".into()),
         ),
         (
             BaseType::Float,
             Value::Float(1.5),
-            DataType::Array("float".to_string()),
+            DataType::Array("float".into()),
         ),
         (
             BaseType::Bool,
             Value::Bool(true),
-            DataType::Array("bool".to_string()),
+            DataType::Array("bool".into()),
         ),
         (
             BaseType::Time,
             Value::Float(1_710_115_200_000_000_000.0),
-            DataType::Array("time".to_string()),
+            DataType::Array("time".into()),
         ),
         (
             BaseType::Ip,
             Value::Str("10.0.0.1".into()),
-            DataType::Array("ip".to_string()),
+            DataType::Array("ip".into()),
         ),
         (
             BaseType::Hex,
             Value::Float(1.0),
-            DataType::Array("hex".to_string()),
+            DataType::Array("hex".into()),
         ),
     ] {
         let (meta, value) = export_yield_value(
@@ -333,7 +333,7 @@ fn typed_array_element_lanes_for_each_base_type() {
         Some(&FieldType::ArrayAny),
     )
     .unwrap();
-    assert_eq!(meta, DataType::Array("auto".to_string()));
+    assert_eq!(meta, DataType::Array("auto".into()));
 }
 
 #[test]
@@ -350,7 +350,7 @@ fn untyped_object_with_digit_bool_and_string_members() {
     let ModelValue::Obj(object) = value else {
         panic!("expected object");
     };
-    assert_eq!(object.get("n").unwrap().get_meta(), &DataType::Digit);
+    assert_eq!(object.get("n").unwrap().get_meta(), &DataType::Int);
     assert_eq!(object.get("f").unwrap().get_meta(), &DataType::Float);
     assert_eq!(object.get("b").unwrap().get_meta(), &DataType::Bool);
     assert_eq!(object.get("s").unwrap().get_meta(), &DataType::Chars);
@@ -366,7 +366,7 @@ fn data_record_json_null_and_digit_lanes() {
         ModelValue::Null,
     )));
     record.push(FieldStorage::from_owned(Field::new(
-        DataType::Digit,
+        DataType::Int,
         "count",
         ModelValue::from(7_i64),
     )));
@@ -594,7 +594,7 @@ fn stage_yield_cell_f64_fast_slow_and_error_lanes() {
     let rows: Vec<_> = batch.iter_data_records().collect();
     assert_eq!(
         rows[0].as_ref().unwrap().field("n").unwrap().get_meta(),
-        &DataType::Digit
+        &DataType::Int
     );
     assert_eq!(
         rows[1].as_ref().unwrap().field("n").unwrap().get_value(),

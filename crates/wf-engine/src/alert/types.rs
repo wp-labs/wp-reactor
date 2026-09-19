@@ -286,7 +286,7 @@ pub(crate) fn export_yield_f64(
 ) -> CoreResult<(DataType, ModelValue)> {
     match field_type {
         Some(FieldType::Base(BaseType::Digit)) if n.is_finite() && n.fract() == 0.0 => {
-            Ok((DataType::Digit, ModelValue::from(n as i64)))
+            Ok((DataType::Int, ModelValue::from(n as i64)))
         }
         Some(FieldType::Base(BaseType::Float)) if n.is_finite() => {
             Ok((DataType::Float, ModelValue::from(n)))
@@ -310,10 +310,10 @@ fn export_typed_value(base_type: &BaseType, value: &Value) -> CoreResult<(DataTy
     match base_type {
         BaseType::Digit => match value {
             Value::Float(n) if n.is_finite() && n.fract() == 0.0 => {
-                Ok((DataType::Digit, ModelValue::from(*n as i64)))
+                Ok((DataType::Int, ModelValue::from(*n as i64)))
             }
-            // 精确整数：不经 f64（>2^53 保持精确 Digit）。
-            Value::Int(i) => Ok((DataType::Digit, ModelValue::from(*i))),
+            // 精确整数：不经 f64（>2^53 保持精确 Int）。
+            Value::Int(i) => Ok((DataType::Int, ModelValue::from(*i))),
             _ => CoreReason::DataFormat
                 .to_err()
                 .with_detail("digit field requires an integer-compatible number")
@@ -366,14 +366,14 @@ const UNTYPED_DIGIT_THRESHOLD: f64 = 9_007_199_254_740_992.0;
 ///
 /// 取舍（2026-09-18 第 2 步）：`|v| < 2^53` 时 f64 能精确表达该整数，沿用既有
 /// `Float`（零兼容破坏）；`|v| >= 2^53` 起 f64 会把它量化（epoch-ns ≈1.77e18
-/// 的 ulp ≈256ns），必须用 `Digit` 承载才不丢精度。两条执行路径（行式/列式）与
+/// 的 ulp ≈256ns），必须用 `Int` 承载才不丢精度。两条执行路径（行式/列式）与
 /// 三种载体（`Int` / 整值 `Float` / 量化后的 f64）在同一逻辑值上必须得出一致结果。
 ///
-/// 注：声明了 `digit` 的目标不受影响（`export_typed_value` 恒为 `Digit`）。
+/// 注：声明了 `digit` 的目标不受影响（`export_typed_value` 恒为 `Int`）。
 fn untyped_numeric_export(n: f64) -> (DataType, ModelValue) {
     let representable_as_i64 = n.abs() <= i64::MAX as f64;
     if n.fract() == 0.0 && n.abs() >= UNTYPED_DIGIT_THRESHOLD && representable_as_i64 {
-        (DataType::Digit, ModelValue::from(n as i64))
+        (DataType::Int, ModelValue::from(n as i64))
     } else {
         (DataType::Float, ModelValue::from(n))
     }
@@ -382,7 +382,7 @@ fn untyped_numeric_export(n: f64) -> (DataType, ModelValue) {
 /// [`untyped_numeric_export`] 的精确整数入口（不经 f64，`>2^53` 逐位保真）。
 fn untyped_int_export(i: i64) -> (DataType, ModelValue) {
     if i.unsigned_abs() >= (1u64 << 53) {
-        (DataType::Digit, ModelValue::from(i))
+        (DataType::Int, ModelValue::from(i))
     } else {
         (DataType::Float, ModelValue::from(i as f64))
     }
@@ -421,7 +421,7 @@ fn render_value_as_string(value: &Value) -> CoreResult<String> {
 fn export_array_value(value: &Value, item_type: &str) -> CoreResult<(DataType, ModelValue)> {
     match value {
         Value::Array(items) => Ok((
-            DataType::Array(item_type.to_string()),
+            DataType::Array(item_type.into()),
             ModelValue::Array(
                 items
                     .iter()
@@ -442,7 +442,7 @@ fn export_typed_array_value(
 ) -> CoreResult<(DataType, ModelValue)> {
     match value {
         Value::Array(items) => Ok((
-            DataType::Array(base_type_name(base_type).to_string()),
+            DataType::Array(base_type_name(base_type).into()),
             ModelValue::Array(
                 items
                     .iter()
@@ -523,15 +523,15 @@ fn export_typed_array_item_value(
 fn rule_value_to_model_value(value: &Value) -> CoreResult<(DataType, ModelValue)> {
     match value {
         Value::Float(n) if n.is_finite() && n.fract() == 0.0 => {
-            Ok((DataType::Digit, ModelValue::from(*n as i64)))
+            Ok((DataType::Int, ModelValue::from(*n as i64)))
         }
-        // 精确整数：不经 f64（>2^53 保持精确 Digit）。
-        Value::Int(i) => Ok((DataType::Digit, ModelValue::from(*i))),
+        // 精确整数：不经 f64（>2^53 保持精确 Int）。
+        Value::Int(i) => Ok((DataType::Int, ModelValue::from(*i))),
         Value::Float(n) if n.is_finite() => Ok((DataType::Float, ModelValue::from(*n))),
         Value::Str(s) => Ok((DataType::Chars, ModelValue::from(s.as_str()))),
         Value::Bool(b) => Ok((DataType::Bool, ModelValue::from(*b))),
         Value::Array(items) => Ok((
-            DataType::Array("auto".to_string()),
+            DataType::Array("auto".into()),
             ModelValue::Array(
                 items
                     .iter()
@@ -603,7 +603,7 @@ fn model_value_to_json(value: &ModelValue) -> serde_json::Value {
         ModelValue::Bool(v) => serde_json::Value::from(*v),
         ModelValue::Chars(v) => serde_json::Value::from(v.to_string()),
         ModelValue::Float(v) => serde_json::Value::from(*v),
-        ModelValue::Digit(v) => serde_json::Value::from(*v),
+        ModelValue::Int(v) => serde_json::Value::from(*v),
         ModelValue::Obj(v) => serde_json::Value::Object(
             v.iter()
                 .map(|(key, field)| (key.to_string(), model_value_to_json(field.get_value())))

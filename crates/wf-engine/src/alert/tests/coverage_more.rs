@@ -44,12 +44,12 @@ fn untyped_export_lanes() {
         None,
     )
     .unwrap();
-    assert_eq!(meta, DataType::Array("auto".to_string()));
+    assert_eq!(meta, DataType::Array("auto".into()));
     let ModelValue::Array(items) = value else {
         panic!("expected array");
     };
     assert_eq!(items.len(), 3);
-    assert_eq!(items[0].get_meta(), &DataType::Digit);
+    assert_eq!(items[0].get_meta(), &DataType::Int);
     assert_eq!(items[1].get_meta(), &DataType::Chars);
     assert_eq!(items[2].get_meta(), &DataType::Bool);
     // Untyped Object → Obj.
@@ -204,12 +204,12 @@ fn to_data_record_untyped_yield_lanes() {
     assert_eq!(record.field("b").unwrap().get_meta(), &DataType::Bool);
     assert_eq!(
         record.field("arr").unwrap().get_meta(),
-        &DataType::Array("auto".to_string())
+        &DataType::Array("auto".into())
     );
     assert_eq!(record.field("o").unwrap().get_meta(), &DataType::Obj);
     // Object member of an untyped object is auto-typed: 2.0 → Digit.
     let ModelValue::Obj(object) = record.field("o").unwrap().get_value() else {
         panic!("expected object");
     };
-    assert_eq!(object.get("k").unwrap().get_meta(), &DataType::Digit);
+    assert_eq!(object.get("k").unwrap().get_meta(), &DataType::Int);
 }

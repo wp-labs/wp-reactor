@@ -45,7 +45,7 @@ fn assert_records_equal(a: &DataRecord, b: &DataRecord) {
         assert_eq!(fa.get_meta(), fb.get_meta());
         match (fa.get_value(), fb.get_value()) {
             (ModelValue::Float(x), ModelValue::Float(y)) => assert_eq!(x, y),
-            (ModelValue::Digit(x), ModelValue::Digit(y)) => assert_eq!(x, y),
+            (ModelValue::Int(x), ModelValue::Int(y)) => assert_eq!(x, y),
             _ => assert_eq!(fa.get_value(), fb.get_value()),
         }
     }

@@ -758,7 +758,7 @@ fn write_derived_knowdb_assets(root: &Path, tables: &[CsvTable]) -> RuntimeResul
 
 /// 单个 KnowDB 原生值 → 引擎 `Value`。
 ///
-/// **DDL 类型化的数字按类型映射**（`Digit(i64)` → [`EngineValue::Int`]、
+/// **DDL 类型化的数字按类型映射**（`Int(i64)` → [`EngineValue::Int`]、
 /// `Float(f64)` → [`EngineValue::Float`]）：这是**可靠类型信号**（列声明），
 /// 与箭头 `Int64`/`Timestamp` 列同口径 —— 不经「Display 文本 → f64」往返，
 /// 否则 `≥2^53` 的整数（epoch-ns 量级）会被量化到 ~256ns，用作 join 键或区间
@@ -770,7 +770,7 @@ fn engine_value_from_knowdb_value(v: &wp_model_core::model::Value) -> EngineValu
     match v {
         wp_model_core::model::Value::Null => EngineValue::Str(String::new().into()),
         wp_model_core::model::Value::Bool(b) => EngineValue::Bool(*b),
-        wp_model_core::model::Value::Digit(d) => EngineValue::Int(*d),
+        wp_model_core::model::Value::Int(d) => EngineValue::Int(*d),
         wp_model_core::model::Value::Float(f) => EngineValue::Float(*f),
         other => infer_knowledge_value(&other.to_string()),
     }
@@ -1095,7 +1095,7 @@ mod tests {
         );
 
         assert_eq!(
-            engine_value_from_knowdb_value(&ModelValue::Digit(epoch_ns)),
+            engine_value_from_knowdb_value(&ModelValue::Int(epoch_ns)),
             EngineValue::Int(epoch_ns),
             "整数列（Digit）→ Int，逐位保真"
         );

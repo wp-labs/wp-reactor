@@ -13,6 +13,7 @@ All notable changes to wp-reactor will be documented in this file.
   - 基线由窗口收盘聚合为 `n/sum/sum_sq` 可加三元组（新增 `sumsq`），支持启动历史 warm
     与半衰期加权；周期画像数据源支持 CSV 周期重载或外部事实库（PG）直聚合；
   - 规则侧新增 `baseline_dev` / `sumsq` / `phase_bucket` 内建。
+- **Arrow 列类型契约的规格表与钉桩 / 对拍测试**：新增 `docs/design/arrow-type-mapping.md`，登记期望侧 / `wp-connector-utils` / `wp-arrow` 三方的 37 变体映射与已知差异；`wf-runtime` 侧补期望侧全量钉桩、与 `wp-arrow` 的跨 crate 对拍，以及结构化字段与 `hex` 口径的守卫用例。
 
 ### Changed
 
@@ -22,11 +23,14 @@ All notable changes to wp-reactor will be documented in this file.
 - **供给 SQL 变量（VEL）配置错误改为启动即报错**，不再推迟到首次刷新时才失败。
 - **未声明类型的整数字段输出类型**：`|v| >= 2^53`（f64 已无法精确表达）由浮点改为整数（精确）；`|v| < 2^53` 与声明了类型的字段（`digit` / `float` 等）均不变。若某列下游按固定浮点模式消费，需要相应放宽。
 - **值层浮点变体改名 `Value::Number` → `Value::Float`**（源码级重命名，无行为变化）：与既有的 `Value::Int`、`ScopeKey::Float` 命名对齐，消除「`Number` 涵盖所有数字」的误导——整数被 f64 量化正是从这个名字开始的。`Value` 是 `#[non_exhaustive]` 公开枚举，按变体名匹配的下游需同步改名（编译期报错，不会静默）；`serde_json::Value::Number` 与 `wf-lang` 的 `Expr::Number`（AST 浮点字面量）名字不同、不受影响。
+- **依赖对齐**：`arrow` 59 → 60、`wp-arrow` 0.3 → 0.4、`wp-model-core` 0.9 → 0.10、`wp-connector-api` 0.12 → 0.13、`wp-core-connectors` 0.8 → 0.9、`wf-connector-api` 0.2 → 0.3、`wp-knowledge` 0.17 → 0.18。
+- **跟进的类型正名**：`Value::Digit` → `Value::Int`、`DataType::Digit` → `DataType::Int`、`DataType::Array(String)` → `DataType::Array(ArraySubtype)`（源码级改名，无行为变化）。WPL 类型名 `wf-lang::BaseType::Digit` 与 `wp-arrow::WpDataType::Digit` 不在本次范围。
 
 ### Fixed
 
 - **修复刷新与动态 join 配置并发时的偶发 join 退化**（漏命中 / 降级为全表扫描）。
 - **整数精度：`>2^53` 的整数在部分路径上被量化（典型症状为纳秒时间戳）**：epoch 纳秒（≈1.77e18）超出 f64 的精确整数范围，此前经值层往返会被量化到 ~256ns，使「真值相等或相差 <128ns」的区间界比较随机翻转——同刻跨流配对（deferred join）实测丢约一半命中，且症状静默（规则偶尔不触发）。现由精确整数承载：时间戳换算、区间界、join 键、去重键（含 CEP `distinct` 的 `ValueKey`，`>= 2^53` 改用精确整数键）、输出 ID 与输出值全程不再量化；KnowDB 原生行（DDL 类型化的整数列，含 PG / `Digit` 列）也不再经「文本 → 浮点」往返。
+- **`arrow_framed` 文件源静默丢数据**：该模式把整个文件写成**单帧多批次**，接收侧却只解第 1 批，第 2 批起被静默丢弃（TCP 源每帧单批，所以只有 file 源暴露）。现按帧全量解出并逐批路由；`window_miss` 行数按帧内总行数记一次。
 
 ### Removed
 
@@ -37,7 +41,7 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Tests
 
-- 新增值层整数通道的性质测试：`Int` 与整值浮点在相等 / 键 / 哈希 / 排序 / 字符串化 / 数值漏斗上一致；`>2^53` 的精确性（不经 `f64` 量化）；行式 / 列式 / 解释三条执行路径输出类型一致；整数经持久化往返逐位精确。`wf-lang` 1235 / `wf-engine` 1075 / `wf-runtime` 653 / `wf-cep` 409 / `wf-config` 168 / `wf-data` 2 全绿。
+- 新增值层整数通道的性质测试：`Int` 与整值浮点在相等 / 键 / 哈希 / 排序 / 字符串化 / 数值漏斗上一致；`>2^53` 的精确性（不经 `f64` 量化）；行式 / 列式 / 解释三条执行路径输出类型一致；整数经持久化往返逐位精确。`wf-lang` 1235 / `wf-engine` 1075 / `wf-runtime` 660 / `wf-cep` 409 / `wf-config` 168 / `wf-data` 2 全绿。
 
 ## [2.0.24] -- latest
 

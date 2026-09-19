@@ -61,7 +61,7 @@ fn data_record_json_chars_object_array_and_time_ip_hex_lanes() {
     let mut obj = wp_model_core::model::types::value::ObjectValue::new();
     obj.insert(
         "k",
-        FieldStorage::from_owned(Field::new(DataType::Digit, "k", ModelValue::from(3_i64))),
+        FieldStorage::from_owned(Field::new(DataType::Int, "k", ModelValue::from(3_i64))),
     );
     record.push(FieldStorage::from_owned(Field::new(
         DataType::Obj,
@@ -69,7 +69,7 @@ fn data_record_json_chars_object_array_and_time_ip_hex_lanes() {
         ModelValue::Obj(obj),
     )));
     record.push(FieldStorage::from_owned(Field::new(
-        DataType::Array("chars".to_string()),
+        DataType::Array("chars".into()),
         "tags",
         ModelValue::Array(vec![
             FieldStorage::from_owned(Field::new(DataType::Chars, "item", ModelValue::from("a"))),
