@@ -13,6 +13,24 @@ pub enum BaseType {
     Hex,
 }
 
+impl BaseType {
+    /// WPL 类型名（与 `wp_model_core::model::DataType` 的 serde 名一致）。
+    ///
+    /// 用于把 WPL 类型降级成 `wp_model_core::DataType` 的场景：构造
+    /// `DataType::Array(subtype)`、以及接收侧推导 Arrow 列类型。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BaseType::Chars => "chars",
+            BaseType::Digit => "digit",
+            BaseType::Float => "float",
+            BaseType::Bool => "bool",
+            BaseType::Time => "time",
+            BaseType::Ip => "ip",
+            BaseType::Hex => "hex",
+        }
+    }
+}
+
 /// A field type: either a base type, a typed array, or a structured value.
 #[derive(::jumo_derive::Jumo, Debug, Clone, PartialEq, Eq)]
 #[jumo(kind = "state", domain = "Lang", module = "Lang.LangSchema")]

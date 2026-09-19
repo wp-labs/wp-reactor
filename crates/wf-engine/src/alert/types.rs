@@ -442,7 +442,7 @@ fn export_typed_array_value(
 ) -> CoreResult<(DataType, ModelValue)> {
     match value {
         Value::Array(items) => Ok((
-            DataType::Array(base_type_name(base_type).into()),
+            DataType::Array(base_type.as_str().into()),
             ModelValue::Array(
                 items
                     .iter()
@@ -616,18 +616,6 @@ fn model_value_to_json(value: &ModelValue) -> serde_json::Value {
                 .collect(),
         ),
         other => serde_json::Value::from(other.to_string()),
-    }
-}
-
-fn base_type_name(base_type: &BaseType) -> &'static str {
-    match base_type {
-        BaseType::Digit => "digit",
-        BaseType::Float => "float",
-        BaseType::Bool => "bool",
-        BaseType::Chars => "chars",
-        BaseType::Time => "time",
-        BaseType::Ip => "ip",
-        BaseType::Hex => "hex",
     }
 }
 
