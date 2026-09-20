@@ -8,7 +8,6 @@
 [![License: Elastic-2.0](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](https://github.com/wp-labs/wp-reactor/blob/main/LICENSE)
 [![Test matrix](https://img.shields.io/badge/test%20matrix-linux%20%C2%B7%20macOS%20%C2%B7%20stable%20%26%20beta-informational)](https://github.com/wp-labs/wp-reactor/blob/main/.github/workflows/ci.yml)
 [![Rust: edition 2024](https://img.shields.io/badge/rust-edition%202024-dea584.svg?logo=rust&logoColor=white)](https://doc.rust-lang.org/edition-guide/rust-2024/)
-[![wf-cep: sync-only](https://img.shields.io/badge/wf--cep-sync--only%20%C2%B7%20no%20tokio-informational)](https://github.com/wp-labs/wp-reactor/blob/main/.github/workflows/ci.yml)
 
 WarpFusion Reactor 是一个基于 Rust 构建的安全事件流处理引擎，专注于实时关联检测、告警归并与实体行为分析。
 
