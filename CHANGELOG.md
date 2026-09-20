@@ -2,7 +2,38 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [2.1.0] -- latest
+本文件记录面向使用者的变更（行为、DSL、公开 API、配置）；内部实现细节与测试计数不在此展开。段标题 = 版本号 + 发布日期，`-- latest` 仅用于尚未发布的版本。
+
+## [2.3.0] -- latest
+
+### Added
+
+- **列类型映射收敛为单一实现**：接收侧不再维护自己的 WPL→Arrow 表，与连接器侧共用同一实现（公开路径与签名不变）。此前两张手工表可能静默分叉的那类问题，从结构上不再可能发生。
+
+### Changed
+
+- **未声明类型的整数字段**：`|v| >= 2^53`（f64 无法精确表达）由浮点改为整数输出；`|v| < 2^53` 与声明了类型的字段（`digit` / `float` 等）不变。
+- **公开 API 改名**（源码级，无行为变化）：`Value::Number` → `Value::Float`、`Value::Digit` → `Value::Int`、`DataType::Digit` → `DataType::Int`、`DataType::Array(String)` → `DataType::Array(ArraySubtype)`。按变体名匹配的下游需同步改名（编译期报错，不会静默）。
+- **依赖升级**：`arrow` 59→60、`wp-arrow` 0.3→0.4、`wp-model-core` 0.9→0.10、`wp-connector-api` 0.12→0.13、`wp-core-connectors` 0.8→0.9、`wf-connector-api` 0.2→0.3、`wp-knowledge` 0.17→0.18。自建 workspace 需一并升级。
+
+### Fixed
+
+- **规则里「能编译、永远不生效」的函数组合现改为编译期报错（warp-fusion#101 同类位置）**：集合/统计函数（`first` / `last` / `collect_set` / `collect_list` / `stddev` / `percentile`）、`window.has(...)`、`baseline(...)` 此前写进缺乏对应上下文的位置能通过编译，而运行期静默求值为空——规则不触发、事件被静默过滤、告警缺失且全程无报错。现按位置拒绝并提示可用位置：
+  - `window.has(...)`：仅 `events` 的 `&&` 过滤与分支 guard；
+  - `baseline(...)`：仅事件 guard（`baseline_dev(...)` 不受限）；
+  - 集合 / 统计函数：仅 `score` / `entity` / `yield`，以及 `match` / `close` 规则的规则级 `let` 与 post-join `where`。
+- **无限定 `has(...)` 现编译期报错**：`has` 是窗口方法，必须写成 `<window>.has(field)`；无限定写法在所有求值器里都没有实现（恒为空）。
+- **stats 桶键（`group by`）限定为字段、`bucket(field, 'day'|'hour'|'minute'|'second')` 或 `tier(field, b1, …)`**：其它写法（字段算术、任意函数）会让整行被跳过、桶永远为空且无告警，现编译期报错。
+- **`>2^53` 的整数不再被量化**：纳秒时间戳等大整数此前经值层往返会丢精度，使「相差 <128ns」的区间比较随机翻转、同刻跨流配对丢约一半命中，且症状静默（规则偶尔不触发）。现全程由精确整数承载。
+- **`arrow_framed` 文件源不再丢批**：单文件里超过 1 批的数据此前从第 2 批起被静默丢弃（仅文件源暴露，TCP 源不受影响）。
+- **小数形式的时间戳不再偏 64ns**：`"1700000000123.0"` 这类带小数点的数字与数字字符串，现与整数通道同口径。
+- **接收侧列转换不再静默丢值**：未支持的源类型组合此前会让整个投影作废（字段全缺失却无报错），现按目标类型产出空值列并留 WARN。
+
+### Tests
+
+- 新增回归覆盖：值层整数与 `2^53` 判界、列类型契约（含跨仓端到端）、位置依赖函数的拒绝 / 放行位置矩阵。
+
+## [2.1.0] — 2026-09-17
 
 ### Added
 
@@ -13,11 +44,6 @@ All notable changes to wp-reactor will be documented in this file.
   - 基线由窗口收盘聚合为 `n/sum/sum_sq` 可加三元组（新增 `sumsq`），支持启动历史 warm
     与半衰期加权；周期画像数据源支持 CSV 周期重载或外部事实库（PG）直聚合；
   - 规则侧新增 `baseline_dev` / `sumsq` / `phase_bucket` 内建。
-- **Arrow 列类型契约的规格表与钉桩 / 对拍测试**：新增 `docs/design/arrow-type-mapping.md`，登记期望侧 / `wp-connector-utils` / `wp-arrow` 三方的 37 变体映射与已知差异；`wf-runtime` 侧补期望侧全量钉桩、与 `wp-arrow` 的跨 crate 对拍，以及结构化字段与 `hex` 口径的守卫用例。
-- **Arrow 契约的归属定位（A-0 / A-2）**：实测 `wp-arrow` 的映射 API（`schema` / `convert`）与 IPC 在家族内**生产调用均为 0 处**（早期记的「被使用只有 `ipc`，全家族 30 处」经复核**不准确**：那 30 处全部位于测试/文档，其中大多数在 `mod tests` 里），所以 A-1 阶段它**不在线协议契约上**；又因契约的语义归属应在 `wp-arrow`（而不是「面向 sink 的 `wp-connector-utils`」），已确定迁移方向 **A-2**：契约表的唯一实现迁往 `wp-arrow`，`wp-connector-utils` 与接收侧改为调用它（分 2a / 2b / 2c 三步，见规格表 §1）。`DIV-2`（`BigInt`）登记为「零生产者、本轮不修」，`DIV-3`（结构化字段元数据）登记为「容忍是有意设计、本轮不修」。
-- **A-2：契约（两层）的落点全部迁到 `wp-arrow`**：`wp-arrow 0.4.1` 新增 `contract::wp_type_to_arrow`（穷尽 `wp_model_core::DataType` 37 变体，自 `wp-connector-utils` 逐字搬迁）+ 钉桩与防呆；`wp-arrow 0.4.2` 再把**值层**（`DataRecord` → 列）迁为 `contract::value`；`wp-connector-utils` 的两处（`arrow::wp_type_to_arrow`、`arrow::record::*`）改为**转发**，公开路径与签名不变、错误文案形状不变（`wp-core-connectors` 的 file/tcp sink 与 `wf-runtime` 均零改动）。
-  **行为不变**，凭据是两份**逐字同构的金标准测试**（全列类型 + 缺字段 + 类型回退 + 结构化 JSON + null）在迁移前/后各一份且同时通过。至此契约的两层（列类型表 + 值编码）只在 `wp-arrow` 一处。
-  （`wp-arrow` 自己的 `schema` / `convert` 是 9 变体**类型化前端**，口径不同且仍 0 生产调用，**故意未合并**。）
 
 ### Changed
 
@@ -25,26 +51,10 @@ All notable changes to wp-reactor will be documented in this file.
   刷新对查询性能的影响更小。**配置与使用方式不变**（`knowdb.toml` / `refresh` / VEL `code`
   写法、日志锚点均不变）。
 - **供给 SQL 变量（VEL）配置错误改为启动即报错**，不再推迟到首次刷新时才失败。
-- **未声明类型的整数字段输出类型**：`|v| >= 2^53`（f64 已无法精确表达）由浮点改为整数（精确）；`|v| < 2^53` 与声明了类型的字段（`digit` / `float` 等）均不变。若某列下游按固定浮点模式消费，需要相应放宽。
-- **值层浮点变体改名 `Value::Number` → `Value::Float`**（源码级重命名，无行为变化）：与既有的 `Value::Int`、`ScopeKey::Float` 命名对齐，消除「`Number` 涵盖所有数字」的误导——整数被 f64 量化正是从这个名字开始的。`Value` 是 `#[non_exhaustive]` 公开枚举，按变体名匹配的下游需同步改名（编译期报错，不会静默）；`serde_json::Value::Number` 与 `wf-lang` 的 `Expr::Number`（AST 浮点字面量）名字不同、不受影响。
-- **依赖对齐**：`arrow` 59 → 60、`wp-arrow` 0.3 → 0.4、`wp-model-core` 0.9 → 0.10、`wp-connector-api` 0.12 → 0.13、`wp-core-connectors` 0.8 → 0.9、`wf-connector-api` 0.2 → 0.3、`wp-knowledge` 0.17 → 0.18。
-- **跟进的类型正名**：`Value::Digit` → `Value::Int`、`DataType::Digit` → `DataType::Int`、`DataType::Array(String)` → `DataType::Array(ArraySubtype)`（源码级改名，无行为变化）。WPL 类型名 `wf-lang::BaseType::Digit` 与 `wp-arrow::WpDataType::Digit` 不在本次范围。
-- **Arrow 列类型映射收敛为单一实现**：接收侧（`wf-runtime`）不再维护自己的 WPL→Arrow 表，改为降到 `wp_model_core::DataType` 后复用 `wp-connector-utils` 的唯一实现（`wp_type_to_arrow`，该 crate 0.3.2 起公开）。**两张手工表变一张**，类似 `hex` 那种口径静默分叉从结构上不再可能发生；行为不变（`wf-lang::BaseType` 新增 `as_str()`，`wf-engine` 原有的同名私有表已删除）。
 
 ### Fixed
 
-- **无限定 `has(...)` 编译期拒绝**：`has` 是窗口方法调用（`<window>.has(field)`）——只有 wf-cep 在 `qualifier = Some(window)` 时落到 `eval_window_has`，引擎分派表也没有 `has` 条目，因此无限定 `has(...)` 在**所有**求值器里都恒返回 `None`（静默失效，与 #101 同类），此前语义检查只校验参数个数/字面量、直接放行。现编译期报错并提示写成 `<window>.has(field)`。
-- **位置依赖函数出现在逐事件 / 逐行求值位置导致规则静默不触发（warp-fusion#101 同类位置）**：以下函数依赖某项运行期上下文，此前只有 guard / key 表达式 / `on each` 表达式 / 阈值拒绝这类写法，而 `events` bind filter（`&&`）、`join ... within` 的表达式界、`emit at`、`on each` 的 `where` filter，以及 `on each` 规则的规则级 `let` / post-join `where` 仍走「允许」的检查入口：编译通过，运行期求值为空 → 规则静默不触发 / 事件被静默过滤 / deferred 不挂起，全程无报错。现语义检查按位置直接拒绝并给出可读提示：
-  - `first` / `last` / `collect_set` / `collect_list` / `stddev` / `percentile`（需 instance 收集序列；wf-cep 侧是恒 `None` 的占位，逐事件上下文没有 `_step_*` 序列）；
-  - `window.has(...)`（需窗口表；只有 `events` 的 `&&` 条件与分支 guard 带窗口表求值）；
-  - `baseline(...)`（滚动状态只在 event guard 上跨事件累积，其它位置每次从空表起步 → `deviation()` 恒 `0.0`，**是常数而不是 `None`**；`baseline_dev(...)` 走全局基线库不受限）。
-  受限位置：`events` bind filter（`&&`）、`join ... within` 的表达式界、`emit at`、stats 度量 `where`（引擎 `stats_exec` 逐行求值）、`conv` 链的 `sort` / `dedup` / `where`（wf-cep 在收口批上按 output 逐行求值，ctx 只含 key 与 step label）、`on each` 的 `where` filter / score / entity / yield / 规则级 `let` / post-join `where`，以及 **match/close 规则的 score / entity / yield / 规则级 `let` / post-join `where`**（引擎 instance 求值：L3 可用——有实例序列——但该路径不传窗口表与滚动状态表）。也就是说 `window.has` 只剩 bind filter / guard，`baseline` 只剩 guard；L3 在 instance 位置继续可用（新增端到端用例锁定其真实取值）。`on each` 的 `where` 此前是个真漏网点：限定 `window.has` 既不在这份闸门里、也不在 `on each` 名单里 → 编译通过、运行期 `None` 把**每个事件**滤掉（实测 2 条输入 0 条输出）；现 `check_each_clause` 接入同一闸门，并把 `on each` 名单里的 L3 / `baseline` 交给闸门（单一事实源，消掉两份名单的漂移），score / entity / yield 改用 `rule_expr_position`（`on each` 规则不再被当成 instance 上下文）。
-- **stats 桶键（`group by` / `tier`）编译期白名单**：引擎的桶键求值只实现 `Field` / `bucket(field, 'day'|'hour'|'minute'|'second')` / `tier(field, b1, …)`（`stats_exec/eval/rowkey.rs`），其它表达式恒返回 `None`，而 `exec.rs` 遇 `None` 直接 `continue` → 整行被跳过、桶恒空、无任何告警（warp-fusion#101 同类）。此前 checker 只校验度量、桶键完全不看：字段算术（`group by (b.price + 1)`，连函数都没有）、`group by (first(...))` 都能过编译。现新增 `check_stats_keys`：字段引用需可解析，`bucket` 单位限白名单、`tier` 边界必须是数值字面量，其余表达式编译期报错（仓库内既有的 `group by` 全为纯字段，零回归）。
-- **接收侧列转换（`coerce_column`）的静默丢值**：源类型白名单由 `Utf8` / `Int64` / `Float64` 扩为再加上 `Int32` / `Boolean` / `Timestamp(Ns)`（契约表里实际会出现的全部标量列类型）；未支持组合不再返回 `NullArray`，而是按**目标类型**产全 null 列并 `tracing::warn!`。修掉的是两个真问题：① `NullArray` 的类型是 `DataType::Null`，与目标字段不符 → `RecordBatch::try_new` 失败 → `project_batch_for_stream` 把它吞成「返回未投影的批」→ **整个投影静默作废**；② `NullArray::null_count()` 恒为 0，用 null 计数判断会误读成「没丢值」。投影里的缺字段补全与批构造失败也一并改为留 WARN。
 - **修复刷新与动态 join 配置并发时的偶发 join 退化**（漏命中 / 降级为全表扫描）。
-- **整数精度：`>2^53` 的整数在部分路径上被量化（典型症状为纳秒时间戳）**：epoch 纳秒（≈1.77e18）超出 f64 的精确整数范围，此前经值层往返会被量化到 ~256ns，使「真值相等或相差 <128ns」的区间界比较随机翻转——同刻跨流配对（deferred join）实测丢约一半命中，且症状静默（规则偶尔不触发）。现由精确整数承载：时间戳换算、区间界、join 键、去重键（含 CEP `distinct` 的 `ValueKey`，`>= 2^53` 改用精确整数键）、输出 ID 与输出值全程不再量化；KnowDB 原生行（DDL 类型化的整数列，含 PG / `Digit` 列）也不再经「文本 → 浮点」往返。
-- **`arrow_framed` 文件源静默丢数据**：该模式把整个文件写成**单帧多批次**，接收侧却只解第 1 批，第 2 批起被静默丢弃（TCP 源每帧单批，所以只有 file 源暴露）。现按帧全量解出并逐批路由；`window_miss` 行数按帧内总行数记一次。
-- **小数形式时间戳的精度（上一条的最后一个未收敛入口）**：接收侧浮点时间戳归一（`"1700000000123.0"` 这类带小数点 / 科学计数法的数字与数字字符串）此前走的是修复前的旧实现——一律 `f64` 乘 + 取整，毫秒量级整值会偏 64ns；整数通道同时期已加“整值走精确整数乘”的快路，两份同名实现行为不同。现两条通道共用单一实现（`wf-data::time`，`wf-cep::time` 改为再导出），量级判定与结果不再量化。
 
 ### Removed
 
@@ -53,30 +63,19 @@ All notable changes to wp-reactor will be documented in this file.
   旧注入语法；为避免两份语法继续分叉，场景语法统一归口 `wfgen`。原先借它校验场景模板的 `wfadm`
   已改用 `wfgen` 的解析器；引擎（wf-engine / wf-cep / wf-runtime）不受影响。
 
-### Tests
-
-- 新增值层整数通道的性质测试：`Int` 与整值浮点在相等 / 键 / 哈希 / 排序 / 字符串化 / 数值漏斗上一致；`>2^53` 的精确性（不经 `f64` 量化）；行式 / 列式 / 解释三条执行路径输出类型一致；整数经持久化往返逐位精确。
-- 新增 Arrow 列类型契约测试：期望侧全量钉桩、WPL→`wp_model_core::DataType` 降级表钉桩、与 `wp-arrow` 的参考对拍、结构化字段与 `hex` 口径守卫，以及**跨仓端到端**（sink 侧 `wp-connector-utils` 推断出的 `hex` 列必须被接收侧的窗口 schema 接受）。`wf-lang` 1235 / `wf-engine` 1075 / `wf-runtime` 664 / `wf-cep` 411 / `wf-config` 168 / `wf-data` 7 全绿。
-- 新增归并与判界的守卫用例：epoch 归一两条通道的量级边界与负值 / 极值、2^53 两侧的键叶归属、`Value` 的整↔浮边界，以及 `wf-cep` 再导出 / `wf-engine` 列式叶快路对单一实现的委托关系锁定。
-- 新增位置依赖函数的拒绝 / 放行用例：`wf-lang` checker 覆盖 bind filter / `within` 界 / `emit at` / `on each`（`where` filter · `let` · `where` · score · entity · yield）/ stats 度量 `where` / `conv` 链（`sort`·`dedup`·`where`）/ instance 位置（score·yield·`let`·post-join `where`）× L3 集合函数、`window.has`、`baseline`，含嵌套于 `if…then…else` / 数组字面量的遍历覆盖；放行对照覆盖 `window.has` 在 bind filter、`baseline` 在分支 guard、`baseline_dev` 在 on-each `where` 与 bind filter、`now*` 在 `emit at`、非 L3 函数在 bind filter / `within` 界 / stats `where` / `conv` / on-each `where`、以及 L3 在全部 instance 位置（score·entity·yield·`let`·post-join `where`）；原有两处“合形但运行期恒空”的 `valid_usage` 断言（yield 里的 `baseline` / `has`）改为 guard 位置的正例 + instance 位置的 rejection 用例。并新增无限定 `has(...)` 的拒绝用例（bind filter / guard / on-each `where`）与限定形态在 guard 的正例；受影响的既有参数校验用例改用 `<window>.has(...)` 限定形态。位置用例矩阵进一步补齐：instance 位置的 `window.has`（yield / `let` / post-join `where`）、conv 的 `window.has`（`where` / `dedup`）与 `baseline`（`sort` 键）、on-each 的 `window.has`（`where` / `let`）与 `baseline`（post-join `where`）、遍历分支（`in(...)` / `not`）、“一条表达式多处命中只报一次”、`compile_wfl` 同样拒绝；放行对照补 `baseline` 在 guard、`baseline_dev` / `now*` 在 instance 位置。stats 桶键新增白名单用例（拒绝 `first(...)` / 字段算术 / `window.has(...)` / 未知 `bucket` 单位 / 非数值 `tier` 边界 / 未知字段；放行字段·`bucket`·`tier`）。`wf-engine` 端到端锁定 match 规则 `let first(e.count)` 实际取到 instance 首个值。`wf-lang` 1309 / `wf-engine` 1076 / `wf-cep` 411 全绿。
-
-## [2.0.24] -- latest
+## [2.0.24] — 2026-09-17
 
 ### Fixed
 
-- **`first(field)` 超过字段历史上限后漂移（warp-fusion#100）**：实例内字段样本此前只保留最近 1024 个，超过上限后最早样本被丢弃，`first(field)` 由“最早事件的值”退化为“当前保留样本的首个值”并随窗口继续变化；用它组成聚合唯一键或 `alert_id` 的规则，同一实例会输出多个唯一键，下游按唯一键 upsert 时形成多条逻辑记录。现已修复：最早样本始终保留，`first(field)` 在整个实例周期内稳定；`last(field)` / `count(alias)` / `stat.count(window_event(alias))` 语义不变。样本上界 1024→1025（首个样本 + 最近最多 1024 个），因此 `collect_set` / `collect_list` / `stddev` / `percentile` 与 `min` / `max` / `sum` / `avg(alias.field)` 会包含最早样本。
-- **阈值表达式必须是编译期常量（warp-fusion#101）**：阈值位置的语义检查此前漏检——字段引用、规则级 `let` 引用、函数调用（`first` / `collect_set` / `stddev` / `now*` / `baseline` 等）以及“除零 / 模零”这类折叠不出结果的退化常量都能通过编译，而运行期该分支永不满足且没有任何报错（静默不触发）；现编译期拒绝并给出可读提示。同时规则级**常量** `let`（如 `let THRESHOLD = 3`，含常量算术）在编译期内联为字面量，这种命名常量可直接用作阈值（非常量 `let` 引用仍拒绝）。
+- **`first(field)` 不再漂移（warp-fusion#100）**：实例内字段样本此前只保留最近 1024 个，超过上限后 `first(field)` 从「最早事件的值」退化为「当前样本的首个值」并随窗口变化——用它做聚合唯一键或 `alert_id` 的规则会输出多个唯一键，下游按唯一键 upsert 时形成多条记录。现最早样本始终保留，`first(field)` 在整个实例周期内稳定；`last(field)` / `count(alias)` / `stat.count(window_event(alias))` 不变。
+- **阈值必须是编译期常量（warp-fusion#101）**：阈值位置此前允许字段引用、`let` 引用、函数调用以及折叠不出结果的退化常量（如除零），编译通过但分支永不满足且无报错；现编译期拒绝并给出改写提示。规则级**常量** `let`（`let THRESHOLD = 3`，含常量算术）可直接用作阈值，非常量 `let` 引用仍拒绝。
 
 ### Changed
 
-- **规则级 `let` 前向引用改为明确报错（warp-fusion#101 审查）**：`let a = b` 而 `b` 声明在后时，此前报“字段 `b` 在任何事件源中都不存在”（方向指向 window schema，容易带偏）；现直接提示按声明顺序解析。仅改错误文案，判定结果与可接受的规则集不变。
-- **新增输入复杂度硬限制，取代此前的进程 abort**：表达式嵌套分组 ≤ 5 层、同一分组内算子链 ≤ 16 层（分组重置计数 ⇒ 长 `in (...)` 列表与长实参列表不受影响）、规则级 `let` 引用链 ≤ 5 层（成环一并报错）。此前约 200 层括号的规则、约 200 层 `let` 链或数千项算子链会让编译进程栈溢出直接 abort（CI 只报 `signal: 6`、无位置信息）。算子链需单独设限：它在解析器里不递归、不吃解析栈，却会构造出与项数同阶的**左深表达式树**，下游按结构递归的遍历同样打爆栈。
+- **规则级 `let` 前向引用改为明确报错**：`let a = b` 而 `b` 声明在后时，此前报「字段 `b` 不存在」容易带偏；现直接提示按声明顺序解析（判定结果与可接受的规则集不变）。
+- **输入复杂度硬限制取代进程 abort**：表达式嵌套分组 ≤ 5 层、同一分组内算子链 ≤ 16 层（长 `in (...)` 与长实参列表不受影响）、规则级 `let` 引用链 ≤ 5 层（成环报错）。此前约 200 层括号、200 层 `let` 链或数千项算子链会让编译进程栈溢出直接崩掉（无位置信息）。
 
-### Tests
-
-- 覆盖 issue #100（1024 / 1025 / 2000 条事件下 `alert_id` 与 `first_seen` 逐条核对漂移起点、close 步骤、`on event<accu>`、周期重置不残留、限定字段聚合含最早样本）与 issue #101（阈值拒绝位置矩阵 + 常量正例 + 常量 `let` 内联一致性 + 语言侧↔运行期折叠规则守卫），以及嵌套 / 链深硬限制的正反用例（200 层括号、5000 与 20000 项链、200 层 `let` 链均快速失败不崩；长 `in (...)` 列表不受影响；最深合法形状能走完解析 / 语义检查 / 编译）。`wf-lang` 1240 / `wf-engine` 1053 / `wf-cep` 369 / `wf-runtime` 639 / `wf-config` 168 / `wf-data` 2 全绿。
-
-## [2.0.23] -- latest
+## [2.0.23] — 2026-09-14
 
 ### Fixed
 
@@ -86,7 +85,7 @@ All notable changes to wp-reactor will be documented in this file.
 
 - 补充 issue #99 回归用例（let 内 L3、close 路径、pipeline 与 `on each` 场景）；`wf-lang` 1182 / `wf-cep` 361 / `wf-engine` 1043 全绿。
 
-## [2.0.22] -- latest
+## [2.0.22] — 2026-09-14
 
 ### Changed
 
@@ -96,17 +95,17 @@ All notable changes to wp-reactor will be documented in this file.
 
 - `@first_match_time` 覆盖补全：hop/滚动窗口与 session 窗口（wf-cep；含收口墙钟、同会话保持与新会话重置）；`on each` 引擎路径（首次满足=系统墙钟≠输入事件时间、`time_to_ms` 可写数字）；惰性墙钟注入与乱序迟到事件不覆盖；yield-only 静态门与列式门排除断言（`SystemVar`）——`wf-lang` 1174 / `wf-cep` 361 / `wf-engine` 1041 全绿。
 
-## [2.0.20] -- latest
+## [2.0.20] — 2026-09-07
 
 ### Added
 
-- **wf-lang: 规则级字符串字面量 let 可在 `events` 条件复用正则（issue #90）**——`regex_match` 的 pattern 可用规则级常量字符串 `let` 按名引用（同一正则可复用于 URI / 请求头 / 请求体等多个字段）；`let` 声明可位于 `events` 块之前或之后；编译期把常量引用内联为字面量，行/列求值路径与手写内联正则一致，pattern 仍编译期校验；非字面量 let 与未声明名在静态检查报错并带变量名。配套 parser/checker/compiler 11 项用例与语言参考文档小节。
+- **规则级字符串常量 `let` 可在 `events` 条件里复用正则（issue #90）**：`regex_match` 的 pattern 可按名引用规则级常量字符串（同一正则可复用于 URI / 请求头 / 请求体等多个字段）；`let` 可声明在 `events` 之前或之后；常量引用在编译期内联为字面量，行为与手写内联正则一致，pattern 仍编译期校验；非字面量 `let` 与未声明名报错。
 
 ### Changed
 
-- **建模工具链 moju → jumo 更名（公开 API 与行为不变）**：注解宏依赖 `moju-derive`（git `dayu-sec/moju-derive`）迁移为 crates.io `jumo-derive 0.1`——5 个 crate manifest 与全部 383 对类型注解（`#[moju(kind/domain/module)]` + `::moju_derive::MoJu`）更名为 `#[jumo(...)]` + `::jumo_derive::Jumo`（元数据语义不变）；`Cargo.lock` 同步重解析；代码注释同步；验证：workspace check、全量单测（wf-cep 357 / wf-engine 1040+73 ignored / wf-lang 1162 / wf-runtime 639 等全绿）与 fmt 0。
+- **建模工具链 `moju` → `jumo` 更名（公开 API 与行为不变）**：注解宏依赖由 `moju-derive` 迁移到 crates.io 的 `jumo-derive`，`#[moju(...)]` / `::moju_derive::MoJu` 更名为 `#[jumo(...)]` / `::jumo_derive::Jumo`（元数据语义不变）。
 
-## [2.0.19] -- latest
+## [2.0.19] — 2026-09-06
 
 ### Fixed
 
@@ -120,7 +119,7 @@ All notable changes to wp-reactor will be documented in this file.
   - `wf-cep`：`eval/funcs.rs`（1384 行）按内置函数族拆 `funcs_{str,num,misc,time}.rs`（分派表瘦身，handler 逐字搬移）；`eval/cmp.rs` 常量折叠提取 `fold_f64_binop`（max CC 13→8）；
   - 验证：`wf-engine` 1040 / `wf-lang` 1162 / `wf-cep` 357 全绿；双 clippy（all-targets + lib `unreachable_pub`）与 fmt 0；workspace check 通过（jumo/moju code-quality 报告同步重算）。
 
-## [2.0.18] -- latest
+## [2.0.18] — 2026-09-06
 
 ### Changed
 
@@ -137,7 +136,7 @@ All notable changes to wp-reactor will be documented in this file.
 
 - **验证**：`wf-cep` 341 / `wf-engine` 1002（+73 ignored）/ `wf-runtime` 606（+15）/ `wf-lang` 1051 全绿；双 clippy（all-targets + lib `unreachable_pub`）与 fmt 0；`wf-cep` 依赖墙保持（无 tokio / async / IO）。跨仓 warp-fusion 升依赖验证见发布流程。
 
-## [2.0.17] -- latest
+## [2.0.17] — 2026-09-03
 
 ### Changed
 
@@ -149,7 +148,7 @@ All notable changes to wp-reactor will be documented in this file.
 
 - **验证**：`wf-engine` 1338 / `wf-runtime` 606 / 跨仓 warp-fusion 364 项全绿（含 oracle 对拍 e2e）；双 clippy（all-targets + lib `unreachable_pub`）与 `wf-cep` 依赖墙 0 告警。
 
-## [2.0.16] -- latest
+## [2.0.16] — 2026-09-03
 
 ### Changed
 
@@ -160,7 +159,7 @@ All notable changes to wp-reactor will be documented in this file.
   - 新增 `wf-cep` crate：沉淀纯逻辑单元（time / 缓存 / error / Value 层 / external / 行字段存储），`wf-engine` 公开路径经 shim 重导出保持不变；
 - **测试/CI**：黑盒契约测试移至 crate 级集成测试；`wf-cep` 依赖墙（禁 tokio，允许 arrow 数据面）。
 
-## [2.0.15] -- latest
+## [2.0.15] — 2026-09-03
 
 ### Added
 
@@ -173,14 +172,14 @@ All notable changes to wp-reactor will be documented in this file.
 
 - **wf-engine: 异步落盘等待看门狗**——`flush` / 背压等待超时（60s）快速失败并输出诊断，不再无限挂起。
 
-## [2.0.14]
+## [2.0.14] — 2026-09-02
 
 ### Added
 
-- **wf-lang / wf-engine: `match` 分组 key 支持 let 派生字段与多层嵌套路径（issue #83）**——`match<attacker_ip:1d:fixed>`（引用 `let` 派生）与 `match<s.extensions_obj.obj.id:1d:fixed>`（多层嵌套路径）均可作为窗口分组 key，事件按派生叶值进入实例；直接嵌套路径与等价 `let` key 聚合结果一致；缺失/为空/路径漏写段（叶仍为结构化值）与现有 key 缺失行为一致，该事件不进入任何实例；
-  - v1 边界：派生 key 仅支持纯字段路径形态的 `let`、单事件源规则；与 `rule_shards > 1` 分片、`conv`、pipeline stage 组合暂不支持；
+- **`match` 分组 key 支持 `let` 派生字段与多层嵌套路径（issue #83）**：`match<attacker_ip:1d:fixed>`（引用 `let` 派生）与 `match<s.extensions_obj.obj.id:1d:fixed>`（多层嵌套路径）均可作为分组 key，聚合结果与等价写法一致；缺失 / 为空 / 路径漏写段的事件与现有 key 缺失行为一致（不进入任何实例）。
+  - v1 边界：派生 key 仅支持纯字段路径形态的 `let`、单事件源规则；与 `rule_shards > 1` 分片、`conv`、pipeline stage 的组合暂不支持。
 
-## [2.0.13]
+## [2.0.13] — 2026-09-02
 
 ### Added
 
@@ -191,7 +190,7 @@ All notable changes to wp-reactor will be documented in this file.
 
 - **docs: 时间系统变量语义更新**——区分事件 / 证据 / 窗口 / 处理时钟四类时间。
 
-## [2.0.12]
+## [2.0.12] — 2026-09-01
 
 ### Added
 
@@ -209,13 +208,13 @@ All notable changes to wp-reactor will be documented in this file.
 - **wf-engine: 单 key 字符串规则列式直读 ScopeKey**——免 Value/Vec 物化，advance −10.8%。
 - **wf-engine: limits 内存检查摊还 + branch_guard_masks 视图惰性化**——advance −2.9%。
 
-## [2.0.11]
+## [2.0.11] — 2026-08-31
 
 ### Changed
 
 - **Dependencies**: `foldhash` 0.1 → 0.2、`toml` 1.0 → 1.1、`sha1` 0.10 → 0.11、`wp-arrow` 0.2 → 0.3。
 
-## [2.0.10]
+## [2.0.10] — 2026-08-30
 
 ### Fixed
 
@@ -273,88 +272,52 @@ All notable changes to wp-reactor will be documented in this file.
 
 ## [1.1.0] — 2026-08-18
 
-### Added
-
-- **wf-lang**: Added `expr_is_columnar` — a static, conservative columnar-expression gate. It classifies the pure field-arithmetic / comparison / constant subset (literals, flat `Simple`/`Qualified`/`Bracketed` field refs, `!`, and arithmetic / comparison / logic binary ops) as columnar; nested `FieldRef::Path`, `FuncCall`, structured literals, `InList`, `IfThenElse`, and meta/system/preset vars fall back to the interpreted path. It is a pure AST predicate (no per-row work), evaluated against a rule's immutable expressions.
-- **wf-lang**: Added `defer_materialization` to the window field-usage analysis — a window is marked deferable only when every rule bound to it has a **columnar** bind filter.
-- **wf-engine**: Added the columnar guard evaluator (`ColumnarBatch`, precompiled `ColumnExpr`, `eval_guard_columnar`, `GuardMasks`, `mask_to_indices`) — reads native Arrow columns directly (no per-row `HashMap`/`Value` materialization) and produces one boolean per row. `%` and comparison over two `Int64`/`Timestamp(Ns)` operands use native `i64`; `+ - * /` and any mixed `i64`/`f64` operand stay f64 (matching interpreted). `==`/`!=` over floats keep the interpreted epsilon comparison. Null / missing / non-boolean rows are emitted as **null slots**, so two-valued (`must be true`) and three-valued (`permissive`) consumers both get correct semantics.
-- **wf-engine**: Added `RuleExecutor::branch_guard_masks` — precomputes columnar branch-guard masks for **event steps, close steps, and seq negation steps** keyed by `(step, branch)`, consumed by `advance_at_with_masks`.
-- **wf-engine**: Added L2 deferred-materialization primitives — `materialize_rows` / `materialize_rows_filtered` (materialize only the listed row indices) and `batch_time_col_index` / `batch_event_time_nanos_at` / `batch_event_time_nanos` (read event time straight from the time column with the same f64 round-trip as the interpreted `extract_event_time` path).
-- **wf-engine**: Added `ColumnarEvent` — a per-row view reading field values straight from Arrow columns, byte-identical to the eager `Event{HashMap}` because it shares the same `extract_field_value` conversion (Int64/Timestamp → f64 display round-trip, null → field missing). Added `sorted_fields_for` — the batch-level pre-sorted field table that the on-each hash renderer reuses instead of collecting + sorting per event.
-- **wf-engine**: Added `each_plan_columnar_safe` + `execute_each_direct_batch_columnar` — the on-each columnar batch executor (gated to constant score / entity field-or-literal / flat yield fields / absent-or-columnar bind filters). It renders `wfx_id` straight from the pre-sorted field table + column bytes (`write_flat_column_scratch`) with zero `Value` construction and zero string clones; fired_at / score / emit share the eager implementations.
-
 ### Changed
 
-- **wf-engine / wf-runtime**: End-to-end L2 deferred materialization. `route_parse` broadcasts the raw `RecordBatch` (zero-copy) for deferable non-sharded windows instead of always materializing `Vec<Event>`; `RuleTask::process_batch` scans the time column over **every** row (watermark / expiry) but materializes only the bind-filter hit rows and advances only those — preserving the per-row scan-then-advance interleaving for short windows that expire within a batch. Deferral applies to state-machine rules (bind-filter hit rows only) and `on each` rules (raw-batch broadcast; the rule task materializes the field whitelist itself) with debug detail logging off; sharded windows keep the eager path.
-- **wf-engine**: `RulePush.events` is now `Option<Arc<Vec<Arc<Event>>>>`, `RulePush` carries the window's `materialize_fields` whitelist so a deferred rule task can rebuild the same field set as the eager path, and `RuleFanout` gains `broadcast_batch_only` (raw-batch broadcast; sharded subscriptions whose row indices no longer match the whole batch are excluded). `WindowParams` / `Window` carry `defer_materialization`.
-- **wf-engine**: Columnar `Int64` / `Timestamp(Ns)` `%` and comparison are now native `i64` — **more precise than the interpreted f64 path for `>2^53` integers and nanosecond timestamps** (e.g. `2^53 == 2^53+1` is now `false`). This is a documented semantic divergence (§3.4 of the design doc), not a regression; below `2^53` the two paths are bit-for-bit identical.
-- **wf-runtime**: `columnar_each` fast path in `RuleTask::process_batch` — for stateless `on each` rules with a columnar-safe plan, hit rows come from the (absent-or-columnar) bind-filter masks and execute straight off the columns, skipping `materialize_rows` (Q1 materializes 100% of rows) and the per-row event loop. Independent of `defer_materialize` (which requires a state machine).
-- **wf-engine**: `content_bytes` for `Utf8` / `Binary` columns is now O(1) per batch (offsets difference) instead of summing `str::len` per row.
-- **wf-config**: `HumanDuration` now accepts an `ms` suffix (previously integer seconds only) — unblocks sub-second metrics export intervals (`report_interval = "100ms"`).
+- **Config**: `HumanDuration` accepts an `ms` suffix (previously integer seconds only), unblocking sub-second intervals such as `report_interval = "100ms"`.
+- **Semantics (documented divergence)**: columnar `%` and comparisons over `Int64` / `Timestamp(Ns)` are evaluated as native `i64`, which is **more precise than the interpreted path above `2^53`** (e.g. `2^53 == 2^53 + 1` is now `false`); below `2^53` both paths are identical.
+- **Alert ids (`wfx_id`)**: on the `on each` path the id now hashes rule name + event time (+ origin) only — fields no longer take part. Match rules keep the scope-key path.
 
 ### Performance
 
-- **wf-engine**: Columnar guard evaluation is ~15× faster than interpreted per-event (14.3 ns/event vs 216.9 ns/event on the `guard_bench` micro-benchmark, release, 1M rows). End-to-end Q2 EPS is unchanged (the throughput gate is the window-actor single-writer wall, not guard cost), so the gain is per-event CPU, not EPS.
-- **wf-engine**: Q1 `on each` fully columnar — end-to-end EPS **10M → 12.1M (+20%)**, three rounds stable under load 8.7–13.3. Bisection attribution (§15 of `q1-throughput-bisection.md`): builder output fill is **~63% of per-row work** (cut C upper bound 12.1M → 32.3M for the L3 output columnarization); wfx_id hashing ~1–2%, fired_at formatting ~2–5%, entity stringification ~0–2% — all already near-optimal.
-- **wf-config / bench tooling**: Fixed metrics exporter quantization — the 43/55/84M plateaus were 1s export-interval aliasing of a ~95M true ingress (verified byte-identical CPU work across plateau rounds); with `report_interval = "100ms"` + 0.1s polling the stable reading is ~95M (88–108M band).
-- **wf-engine**: `wfx_id` on the on-each path now hashes **rule name + event time (+ origin) only** — fields no longer participate (semantic change: real streams cannot produce two events in the same nanosecond). Per-row cost 249.6 → 30.1 ns (micro-bench, -88%); single-thread baseline -44%. Match rules keep the scope-key path.
-- **wf-runtime**: `AlertColumnBuilder` is now **resident** across flushes (only the sealed columns leave the pending slot; layout cache re-resolved on the reused builder's first row) and `ALERT_BATCH_SIZE` raised 256 → 4096 (flush frequency ÷16) — the ~390k builder new/finish/drop cycles per 100M rows are gone.
-- **wf-engine**: **Batch-level constant-yield caching** — literal yield fields (`alert_type = "..."`, `request_count = 1`) are coerced/exported once per batch and registered via `register_yield_column` (`YieldCol.const_value`); the per-row loop skips their staging and `fill_row_gaps` fills the constant. Micro-bench baseline 275.1 → 215.3 ns/row (single-thread total **621.6 → 215.3 ns, -65%** since the columnar landing).
-
-### Documentation
-
-- **Design**: Added `docs/design/columnar-execution-design.md` (overall columnar execution plan, L0–L5 layering, type-mapping / semantic-equivalence contract) and `docs/design/columnar-execution-progress.md` (step-by-step implementation log, guard coverage 85.3%, Q2 baseline and re-test data).
-- **Design**: `docs/design/q1-throughput-bisection.md` extended to §15 — the cut-by-cut bisection map (recv → parse → dispatch → window actor → broadcast → rule `process_batch` → sink), the tool-fix evidence (§12), the on-each columnar landing (§14), and the Q1 per-row budget attribution (§15: output fill 63% / wfx_id 2% / fired_at 3% / entity 0% / diffuse 30%).
-- **Design**: `docs/design/q1-throughput-bisection.md` §16–§21 — micro-benchmark methodology (`each_bench`, real-shape data + 10-thread concurrency simulation), parallelism scans (r=2/6/10, 6:6:6 — total throughput is near-linear in workers, 10:10:8 optimal), wfx_id semantic change, builder residency, constant-yield caching, and the CPU-over-subscription analysis (22+ engine threads on ~12–13 usable cores).
+- **Columnar execution** landed for guards and stateless `on each` rules: per-event guard cost ~15× lower, Q1 end-to-end EPS 10M → 12.1M, and per-row work in the on-each path is down ~65% (constant yield fields are coerced once per batch; `wfx_id` per-row cost −88%).
 
 ## [1.0.2] — 2026-08-17
 
 ### Changed
 
-- **wf-runtime / wf-config**: The preread parse budget (`parse_buffer_bytes`) now charges a batch's **content** bytes — `wf_engine::window::content_bytes`, ≈ wire size, Arrow buffer padding excluded — instead of `get_array_memory_size`. Arrow IPC decode structurally over-counts the latter ~10× (measured 2026-08-17: a bid-like batch of 71 B/row wire content accounts as ~718 B/row, independent of field width — IPC reader buffer-view sharing), which starved the source → parse → commit pipeline to a handful of slots (the first wall) even though the real in-flight footprint is wire-sized. Charging content aligns the budget with the window mailbox accounting (`content_bytes + events_bytes`). Applies to `push_decoded_batch` and the Arrow IPC file-replay path. NB the budget now bounds *content* bytes in flight — decoded RSS under a downstream stall can approach ~10× the configured value.
-- **wf-config**: Default `parse_buffer_bytes` lowered 256 MiB → 128 MiB (≈ 18 slots for 8 MiB frames). Under content accounting, 256 MiB (~36 slots) lifts q1 100M EPS to 6.25–6.66M but raises RSS to 12–14.5 GB (from 4.4 GB under the old decoded-accounting default), while 128 MiB lands at 6.13M / 5.88 GB — a small throughput gain at a modest RSS step-up, short of the plateau. Raise explicitly for more throughput (256 MiB ≈ 6.3–6.7M / 12–14 GB, 512 MiB ≈ 7.0M, 1–2 GiB ≈ 7.5M+; 4 GiB over-deepens and regresses).
+- **Preread parse budget now charges content bytes**: a batch is charged its wire-sized content instead of the decoded Arrow allocation, which over-counted ~10× and starved the source → parse pipeline to a handful of slots. Note the budget now bounds *content* in flight — decoded RSS under a downstream stall can approach ~10× the configured value.
+- **Default `parse_buffer_bytes` lowered 256 MiB → 128 MiB** (≈ 18 slots for 8 MiB frames). Raising it buys a little throughput at a large RSS step-up (256 MiB ≈ 12–14 GB RSS; 1–2 GiB ≈ 7.5M EPS); 4 GiB over-deepens and regresses.
 
 ### Fixed
 
-- **wf-runtime**: The preread budget charged decoded Arrow allocation size rather than content bytes, structurally under-admitting batches by ~10× and collapsing the default budget to ~2 slots (P0-② first wall). A batch whose inflated accounting exceeds the whole (floored) budget but whose content fits is now admitted when exactly its content is free (regression: `preread_budget_charges_content_bytes_not_decoded_inflation`).
-
-### Documentation
-
-- **Design**: Reworked `docs/design/concurrency-scaling.md` around the stable double-wall model — P0-② resolves the first wall (decoded-size accounting) and recasts the budget as a pipeline-depth throttle (1–2 GiB content sweet spot; 4 GiB over-deepens window reorder and regresses to ~5.9M); corrected the decode-inflation coefficient (40× → ~15× for 100k frames: ~7.7 MB wire → ~116 MB decoded; ~10× per-batch accounting over-count); reclassified the pure-copy 18.2M probe as sustained-rate but non-steady-state; settled C-UCP=4 / W-RDP=4 with 100m resource curves and the 30m accounting trap; recorded the q1 100M stable baseline (EPS 5.93M ± 0.01M / RSS 4.4 GB / CPU 714–723%); showed balanced sharding is orthogonal to EPS (overturning the s0-straggler hypothesis); merged P0-① into P0-② in the priority table.
-- **Design**: Added the P0-② experiment record to `docs/design/preread-budget-design.md` §6 (content-accounting budget curves: 256 MiB → 6.25–6.66M, 512 MiB → 7.02M, 1 GiB → 7.56M, 2 GiB → 7.58M q1 / 7.23M q2 (RSS 7.6 GB, half the old 14.8 GB), 4 GiB → 5.9M overshoot) and the 256 → 128 MiB default decision.
+- **Preread budget under-admitted batches** (it charged the decoded allocation instead of content), collapsing the default budget to ~2 slots; a batch whose content fits is now admitted when exactly its content is free.
 
 ## [1.0.1] — 2026-08-17
 
 ### Fixed
 
-- **wf-runtime**: Fixed a shutdown flush race in the alert/sink pipeline. `run_sink_consumer` previously exited after a single `try_recv` drain when the cancel token fired, dropping alerts emitted by rule tasks during the shutdown flush — rule tasks evaluate closes and emit their final alerts as part of graceful shutdown, after the sink consumer had already stopped. The sink consumer now keeps consuming the alert channel until all producers drop it (channel closed) or the `SINK_DRAIN_BUDGET` (1s) expires, so alerts produced by the shutdown flush reach the sinks. Reproducible with TCP source + manual shutdown (the previous `e2e_mvp`-style run lost the close alert while the same rule fired via window timeout in file+batch mode).
-- **wf-runtime**: Fixed the same shutdown flush race in the sharded conv stage. `ConvStageTask`'s cancel path called `drain_and_drop` (a single `try_recv` drain) and exited before shards flushed their final `ConvCloseBatch`, losing complete buckets for rules with `conv_window` (rule-sharding P2c). The cancel path now consumes the close channel until all shard senders drop it (channel closed) or `CONV_DRAIN_BUDGET` (1s) expires, then drops still-unsealed (partial) buckets as before — P2④ semantics are preserved (partial top(N)/sort results are never emitted).
+- **Alerts produced during the shutdown flush are no longer dropped**: the sink consumer previously exited after a single drain when cancellation fired, losing the final alerts (rule tasks evaluate closes and emit their last alerts as part of graceful shutdown, after the consumer had stopped). It now keeps consuming until all producers drop the channel or a 1s drain budget expires.
+- **Same fix for the sharded `conv` stage**: the cancel path exited before shards flushed their final buckets, losing complete buckets for rules with `conv_window`. It now consumes until all shard senders drop or the drain budget expires, then drops still-unsealed (partial) buckets as before — partial top(N) / sort results are never emitted.
 
 ## [1.0.0] — 2026-08-17
 
 ### Added
 
-- **wf-lang / wf-engine**: Added multi-level nested field extraction from `object` / `array` fields in yield expressions (`s.roles_obj.source.process.uid`, `s.roles_obj.related[0].process.name`). A `FieldRef::Path` validates the root field statically and walks nested members / integer indices at runtime; any missing member, out-of-bounds index, or intermediate type mismatch yields an omitted yield field (chars targets degrade to the empty string) without failing the record. Nested paths work inside structured `object { }` / `array [ ]` yield members in match/close rules too (their root fields are tracked into the eval context). Match keys and join conditions stay single-level — nested paths there are rejected by the checker, and `count` / `sum` / `avg` / `min` / `max` / `first` / `last` / `collect_*` reject nested paths as arguments (no column to aggregate); `window.has(nested.path)` infers the lookup column from the leaf member. (wp-labs/warp-fusion#64)
-- **wf-lang / wf-engine**: Added `on event<accu>` — within-window accumulation. After the block fires, count and evidence keep accumulating without reset, and each subsequent qualifying event re-fires with the running cumulative values (`count 2, 3, 4, 5 …` with full evidence), until the window expires. Orthogonal to `seq` / `any`; scoped to a single `on event` step with no close block (the checker rejects `accu` with `on close` / `and close`, `on event seq` chain syntax, or multiple steps). A `max_throttle`-suppressed re-fire drops the alert but keeps the running accumulation (it does not reset the count). `wfl explain` renders the block as `on event<accu>`. (wp-labs/warp-fusion#65)
-- **wf-engine**: Added cross-shard rate-limit / budget atomics (`SharedLimits`) for rule sharding (rule-sharding design P2b): a sharded rule's `max_throttle`, `max_instances`, and `max_memory_bytes` are enforced **collectively** across all shards via shared `Arc<Atomic…>` state — a shared sliding-window throttle (collective emits ≤ `count` per window), an exact CAS instance reservation, and a rule-wide fail-rule latch — instead of per-shard limits that multiplied the budget by the shard count. `CepStateMachine::with_limits_shared` builds a shard sharing one `SharedLimits`; `with_limits` / `new` are unchanged so `shards=1` keeps the exact per-machine path. `rule_instances` is now a delta-summed gauge across shards.
-- **wf-lang**: Fixed-window `conv` rules now compile a `RulePlan.conv_window` (`ConvWindowPlan` — fixed bucket length `over` + scope keys), marking them shardable; sliding/session conv stays inline and non-shardable. (rule-sharding P2c)
-- **wf-engine / wf-runtime**: Sharded `conv` rules aggregate raw close outputs **across shards** in a new `ConvStageTask` (transform operator): each shard routes raw qualifying closes (one aggregated batch per processed batch, max event-time watermark barrier) to the stage; the stage buckets by the fixed window `over`, seals a bucket only once every shard's watermark passes its end (a slow shard never loses closes), applies `apply_conv` over the merged batch (global top-N / sort), applies the shared rate limit, and emits to the sink. EOS / drained flush is the correct exit for complete data; cancel drops unsealed (partial) buckets instead of emitting wrong top(N)/sort results; a stalled barrier (30s without advance) drops stuck buckets with a warning to bound memory after a panicked shard. `close_is_qualified` / `apply_conv` are exported for the stage. (rule-sharding P2c)
+- **Nested field extraction in yield expressions** (`object` / `array` fields): `s.roles_obj.source.process.uid`, `s.roles_obj.related[0].process.name`. Missing members, out-of-range indices and intermediate type mismatches omit the yield field (chars targets degrade to the empty string) instead of failing the record, and nested paths also work inside structured `object { }` / `array [ ]` yield members. Match keys and join conditions stay single-level (nested paths are rejected there), as do aggregation arguments; `window.has(nested.path)` infers the column from the leaf member. (warp-fusion#64)
+- **`on event<accu>` — within-window accumulation**: count and evidence keep accumulating after the block fires, and each further qualifying event re-fires with running cumulative values until the window expires. Only for a single `on event` step with no close block; a throttle-suppressed re-fire keeps the accumulation. `wfl explain` renders it as `on event<accu>`. (warp-fusion#65)
+- **Rule sharding**: `max_throttle` / `max_instances` / `max_memory_bytes` are enforced **collectively across a rule's shards** (shared sliding-window throttle, exact CAS instance reservation, rule-wide fail latch) instead of per shard; `rule_instances` sums across shards.
+- **Sharded `conv` rules (fixed windows)**: shards route their raw close outputs to a conv stage that buckets by the fixed window, seals a bucket only once every shard's watermark has passed its end, then applies the global top-N / sort and the shared rate limit — a slow shard never loses closes. On cancel, unsealed (partial) buckets are dropped instead of emitting wrong top-N results.
 
 ### Fixed
 
-- **wf-engine**: `max_instances` under sharding is now exact — admission uses a CAS reservation (`try_reserve_instance`) instead of a read-then-act check that could overshoot by up to `shard_count-1`; `DropOldest` evicts the local oldest and re-reserves, rejecting new keys when the shared budget is held by other shards. `max_memory_bytes` stays approximate under sharding (documented: memory grows non-atomically).
-- **wf-runtime**: The conv stage now honors `on_exceed` when the shared throttle is exceeded — `FailRule` latches the shared rule (previously it silently degraded to Throttle), and a failed rule stops emitting.
-- **wf-runtime**: The `rule_instances` gauge now sums across a rule's shards via delta reports (previously last-writer-wins) and reconciles to zero on drain.
+- **Sharded limits are exact**: instance admission uses a CAS reservation (previously it could overshoot by up to `shard_count - 1`); `max_memory_bytes` stays approximate under sharding (memory grows non-atomically).
+- **The shared throttle honors `on_exceed = fail_rule`** in the conv stage (previously it silently degraded to throttle).
+- **`rule_instances`** sums across a rule's shards via delta reports (previously last-writer-wins) and reconciles to zero on drain.
 
-### Performance
+### Dependencies
 
-- **wf-runtime**: Conv-sink shards send one aggregated `ConvCloseBatch` per processed batch (max event-time watermark) instead of one per event — removing a per-event bounded(32) channel send + `.await` from the hot path.
-
-### Chore
-
-- **Tests**: Added SharedLimits unit + cross-shard integration coverage (collective `max_instances` / throttle / FailRule latch, exact DropOldest paths), conv-stage regression tests (FailRule, per-batch send, cancel-drops-unsealed, barrier watermark), and rule_instances delta-gauge coverage.
-- **Clippy**: Workspace now passes `cargo clippy --all-targets --all-features -- -D warnings` (cleared pre-existing toolchain-version lints; intentional `Box`ed instance-state collections are `#[allow]`ed).
-- **Dependencies**: Restored the `[patch.crates-io] wp-knowledge = { path = "../../wparse/wp-knowledge" }` override (it had been dropped) and bumped the `wp-knowledge` requirement to `0.16` so the local crate — which carries the `[fun.<name>]` named-query layer and requires `lru ^0.18` — is actually used. This resolves lru 0.16.4 → **0.18.2** and clears `cargo audit` RUSTSEC-2026-0253 (`LruCache::pop()` panic safety); `cargo audit` is now clean (0 vulnerabilities / 0 warnings).
+- Restored the `wp-knowledge` local override and bumped its requirement to `0.16`, which resolves `lru` 0.18.2 and clears `cargo audit` RUSTSEC-2026-0253; the audit is now clean.
 
 ## [0.3.0] — 2026-08-05
 
@@ -364,43 +327,32 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Fixed
 
-- **wf-engine**: A yield field that references an optional input field missing from the event no longer fails the whole output record. Missing passthrough fields previously evaluated to the empty-string fallback and were rejected by type coercion (e.g. `yield security_alerts (attacker_latitude = s.attacker_latitude)` errored with "yield field ... expects a finite number" when the input had no `attacker_latitude`). Such fields are now omitted from the output (the column renders as null in Arrow / is absent in JSON), while other fields of the same record still emit. Explicit NaN / Infinity / type mismatches remain hard errors. Applies to `on each`, match, and close yield paths. (wp-labs/warp-fusion#62)
+- **wf-engine**: a yield field that references an optional input field missing from the event no longer fails the whole record. Such a field previously fell back to the empty string, failed type coercion (e.g. `yield security_alerts (attacker_latitude = s.attacker_latitude)` errored with "expects a finite number" when the field was absent) and dropped the record; it is now omitted (null column in Arrow / absent in JSON) while the other fields still emit. Explicit NaN / Infinity / type mismatches remain hard errors. Applies to `on each`, match and close yield paths. (warp-fusion#62)
 
 ### Documentation
 
-- **Language reference**: Documented the `join ... anti` mode (whitelist exclusion) alongside `snapshot` / `asof` / `asof within` — e.g. `join blocked_list anti on sip == blocked_list.ip` — including multi-condition joins (`&&`).
+- **Language reference**: documented `join ... anti` (whitelist exclusion) alongside `snapshot` / `asof` / `asof within`, including multi-condition joins (`&&`).
 
 ## [0.1.41] — 2026-08-02
 
 ### Added
 
-- **wf-config / wf-runtime**: Added `[metrics] console_output` (default `true`) and gated the periodic `res`-domain metrics summary (`metrics snapshot`, interval table, and shutdown run-summary table) behind it. Previously `MetricsConfig` had no `console_output` field, so `console_output = false` was silently dropped by serde and the statistics log could not be disabled. Prometheus export, monitor-channel snapshots, and Top-N collection run regardless of the flag. (wp-labs/warp-fusion#61)
-- **wf-lang / wf-engine / tree-sitter-wfl**: Added `on event seq { ... }` and `on event any { ... }` match bodies for ordered and unordered event correlation:
-  - `on event seq { ... }` — ordered event chains for attack-chain detection. The engine's existing `current_step` progression enforces order; the `seq` mode adds per-step `within <dur>` time gaps, `not has <alias> within <dur>` negation steps, and `consec` strict-adjacency / `skip = past_last|to_next` modifiers (`to_next` deferred to L3).
-  - `on event any { ... }` — unordered co-occurrence: all steps are evaluated in parallel and the rule fires once every step has satisfied its threshold, regardless of arrival order (a parallel-eval path in the state machine).
-  - Bare `on event { ... }` defaults to `seq`, preserving backward compatibility; `has <alias>` (implicit `count >= 1`) is accepted in `seq`, `any`, and bare `on event` steps.
-  - This replaces the earlier `chain { ... }` block syntax (removed). The tree-sitter grammar grew `on_event_mode_block` / `seq_rule_step`.
-- **wf-lang**: Added `MatchMode::{Seq, Any}` to the AST and `MatchPlan.match_mode`; seq-mode `within`/`not`/`consec`/`skip` compile into `SeqPlan`, and `on event any` steps compile into the parallel-evaluated `event_steps`.
-- **wf-lang**: Seq-mode step labels now register with the `stat.*` label registry, so a labeled seq step (e.g. `spam: a | count >= 5;`) can be referenced by `match_event(spam)` in yield.
-- **wf-lang**: Checker rejects `on event seq`/`any` in pipeline stages (intermediate stage output schemas derive from `on event` steps only) and rejects `not` steps that reference a field aggregation (unsupported); `skip = to_next` warns that it is deferred to L3.
+- **`[metrics] console_output`** (default `true`): the periodic `res`-domain metrics summary can now be disabled — previously the field did not exist and `console_output = false` was silently dropped by serde. Prometheus export and monitor-channel snapshots are unaffected. (warp-fusion#61)
+- **`on event seq { ... }` / `on event any { ... }`** replace the old `chain { ... }` block (removed) for ordered and unordered correlation:
+  - `seq` — ordered chains with per-step `within <dur>` gaps, `not has <alias> within <dur>` negation, and `consec` / `skip = past_last|to_next` (`to_next` deferred to L3);
+  - `any` — unordered co-occurrence: all steps are evaluated in parallel and the rule fires once every step has met its threshold, regardless of arrival order;
+  - bare `on event { ... }` defaults to `seq`; labeled seq steps register with `stat.*` (e.g. `match_event(spam)`); `on event seq` / `any` are rejected in pipeline stages.
 
 ### Fixed
 
-- **wf-engine**: Negation windows are active only after the preceding use-step completes — an event arriving before it no longer counts as a violation.
-- **wf-engine**: A negative `within` gap (an out-of-order completion where a step completes before its predecessor) is now treated as a violation.
-- **wf-engine**: `consec`-break and `within`-violation resets preserve the negation-violation flag, so an in-window violation cannot be wiped and the chain re-fire.
-- **wf-engine**: `on event any` throttle handling now honors `on_exceed = fail_rule` (previously it was silently downgraded to throttle).
-- **wf-runtime**: The periodic timeout scan now advances the effective watermark by the wall-clock time elapsed since the last event was processed (`watermark + idle wall time`). Instances therefore expire per their window TTL even when input is completely idle, instead of lingering until a new event advances the watermark (conforms to the window's time-based semantics).
-- **wf-lang**: The unused-alias lint now counts `on event seq { ... }` step sources (`seq.steps[].branch.source`) as used, fixing a false-positive W001 when a rule referenced an alias only from seq-mode steps.
-
-### Performance
-
-- **wf-engine**: `RuleExecutor::event_matches_alias` uses a precomputed alias→filter map for rules with more than 24 binds, eliminating the O(binds) linear scan per (event × alias); rules with ≤24 binds keep the faster linear scan. The crossover was measured at ~24 binds (24: 5.1M vs 5.8M q/s; 16: linear still 1.3x faster).
+- **Negation windows** are active only after the preceding step completes; a negative `within` gap (an out-of-order completion) counts as a violation, and `consec` / `within` resets no longer wipe an in-window violation flag.
+- **`on event any` honors `on_exceed = fail_rule`** (previously silently downgraded to throttle).
+- **Idle windows expire on time**: the periodic timeout scan advances the effective watermark by the wall-clock time elapsed since the last event, so instances expire by their window TTL even with no input at all.
+- **Unused-alias lint** now counts aliases referenced only from seq-mode steps.
 
 ### Documentation
 
-- **User guide**: Aligned `docs/user-guide` with the implementation — `.wfs` window subscription uses `stream_tag`; window defaults/overrides moved to an external `windows.toml` (the `windows` field is now required in `wfusion.toml`); TCP sources use `connect = "tcp_src"` with `addr`/`port`; file sources document the `csv` format; the removed `wfusion run` / `wfusion config` subcommands are replaced by `wfusion daemon` / `wfusion batch` and `wfadm conf diff`; metrics are documented as monitor-sink NDJSON records instead of a Prometheus HTTP endpoint.
-- **Examples**: Updated all examples to load with the current code — `.wfs` files switched from `stream` to `stream_tag`, `wfusion.toml` gained the required `windows = "windows.toml"` field with window config externalized, TCP sources use `connect = "tcp_src"`, and example READMEs (sinks / file_input) reflect the current sink-routing and CLI format.
+- **User guide / examples aligned with the current code**: `.wfs` uses `stream_tag`; window config lives in a required external `windows.toml`; TCP sources use `connect = "tcp_src"` with `addr` / `port`; file sources document the `csv` format; `wfusion run` / `wfusion config` are replaced by `wfusion daemon` / `wfusion batch` and `wfadm conf diff`; metrics are documented as monitor-sink NDJSON records instead of a Prometheus HTTP endpoint.
 
 ## [0.1.39] — 2026-07-30
 
@@ -432,18 +384,17 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Added
 
-- **wf-engine / docs**: Documented evidence output using `stat.count(window_event(alias))` with `collect_set(alias.event_id)`, keeping alias field collection bounded by the recent 1024-value cap.
-- **wf-lang / wf-engine**: Added WFL string helper functions `sha1_n(text, length)`, `join(value, ...)`, and `join_by(separator, value, ...)`; `join` concatenates scalar values without intervention, while `join_by` inserts the explicit separator without trimming, case folding, or escaping; missing field value arguments are treated as empty string segments, while non-field expression failures still fail the function.
+- **wf-lang / wf-engine**: new string helpers `sha1_n(text, length)`, `join(value, ...)` and `join_by(separator, value, ...)` — `join` concatenates scalar values as-is, `join_by` inserts the explicit separator without trimming / case folding / escaping; missing field arguments become empty segments, while other failed expressions still fail the call.
 
 ## [0.1.35] — 2026-07-23
 
 ### Added
 
-- **wf-runtime**: Added the `_global.wfl` project prelude convention for rule directories, automatically loading project-level `yield preset` declarations while excluding the prelude from ordinary rule compilation; duplicate preset names inside the prelude or between prelude and rule files are rejected during rule loading.
+- **wf-runtime**: new `_global.wfl` project prelude convention — project-level `yield preset` declarations are loaded automatically and the prelude is excluded from ordinary rule compilation; duplicate preset names (inside the prelude, or between the prelude and rule files) are rejected.
 
 ### Fixed
 
-- **wf-runtime**: Improved `_global.wfl` prelude diagnostics so preset field and expression errors point at the prelude source instead of the rule file that references the preset.
+- **wf-runtime**: `_global.wfl` preset diagnostics now point at the prelude source instead of the rule file that references the preset.
 
 ## [0.1.34] — 2026-07-22
 
@@ -604,21 +555,15 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Added
 
-- **External window config** (`windows.toml`): Window configurations (`[window.xxx]`) can now be defined in a separate `windows.toml` file instead of inline in `wfusion.toml`. The loader reads `windows = "conf/windows.toml"` (configurable path) and merges it with inline window configs. This enables cleaner separation of window topology from runtime/rule configuration.
+- **External window config** (`windows.toml`): window configurations (`[window.xxx]`) can live in a separate file instead of inline in `wfusion.toml` — the loader reads the configurable path (`windows = "conf/windows.toml"`) and merges it with inline configs.
 
 ### Changed
 
-- **Config loader refactored**: `FusionConfigLoader` internals restructured to support the external windows file. `load_raw()` / `load_expanded_raw()` now correctly track origins for windows defined in external files, preserving reload diff accuracy.
-
-### Fixed
-
-- **Test adaptations**: `hot_reload` and `lifecycle` tests updated to work with the new external windows.toml config path, ensuring reload scenarios are tested against the same config layout used in production.
+- **Config loader**: origins are now tracked for windows defined in external files, so reload diffs stay accurate.
 
 ### Chore
 
-- **Cargo audit**: Added ignore for RUSTSEC-2023-0071 (`rsa` Marvin Attack) — deep transitive dependency via `sqlx-mysql` → `sqlx` → `wp-knowledge`. No patched version available; attack requires network-level timing observation not applicable to our Redis usage.
-
----
+- **cargo audit**: ignored RUSTSEC-2023-0071 (`rsa` Marvin Attack) — a deep transitive dependency via `wp-knowledge`; no patched version available, and the attack needs network-level timing observation that does not apply to this usage.
 
 ## [0.1.24] — 2026-07-01
 
@@ -713,7 +658,7 @@ All notable changes to wp-reactor will be documented in this file.
   metrics) and marked `not(...) within(...)` as parser-supported but not yet
   datagen-supported.
 
-## [0.1.17]
+## [0.1.17] — 2026-06-21
 
 ### Added
 
@@ -885,7 +830,7 @@ All notable changes to wp-reactor will be documented in this file.
 - **Docs**: Updated the error-handling design notes to describe the structured error boundaries across `wf-core`, `wf-runtime`, `wf-config`, `wf-lang`, `wf-vars`, and `wf-engine`.
 - **Docs**: Updated configuration variable resolution examples and dependency notes to use `ConfigResult`, `VarsError`, and `orion-error`.
 
-## 0.1.0
+## [0.1.0]
 
 ### Added
 
