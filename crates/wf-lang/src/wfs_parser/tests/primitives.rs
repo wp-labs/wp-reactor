@@ -58,6 +58,28 @@ fn parse_duration_zero_with_millisecond_suffix() {
     assert_eq!(d, Duration::ZERO);
 }
 
+/// 回归：时长字面量的数字部分是任意 u64 字面量，`num * 倍数` 溢出必须**报错**，
+/// 而不是 debug panic / release 静默回绕（旧实现 `num * suffix` 在此 debug panic）。
+#[test]
+fn parse_duration_overflowing_literal_is_rejected() {
+    assert!(duration_value.parse("18446744073709551615d").is_err());
+    assert!(duration_value.parse("18446744073709551615h").is_err());
+}
+
+/// 边界对照：`u64::MAX / 86400 == 213_503_982_334_601`，恰好不溢出仍应通过。
+#[test]
+fn parse_duration_day_multiplier_boundary() {
+    assert!(duration_value.parse("213503982334601d").is_ok());
+    assert!(duration_value.parse("213503982334602d").is_err());
+}
+
+/// `s` 后缀倍数为 1，`u64::MAX` 秒本身是合法时长（不参与乘法）。
+#[test]
+fn parse_duration_max_seconds_is_accepted() {
+    let d = duration_value.parse("18446744073709551615s").unwrap();
+    assert_eq!(d, Duration::from_secs(u64::MAX));
+}
+
 #[test]
 fn parse_base_types() {
     assert_eq!(base_type_parser.parse("chars").unwrap(), BaseType::Chars);

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use winnow::ascii::multispace0;
 use winnow::combinator::{alt, opt};
-use winnow::error::{ContextError, ErrMode, StrContext, StrContextValue};
+use winnow::error::{AddContext, ContextError, ErrMode, StrContext, StrContextValue};
 use winnow::prelude::*;
 use winnow::token::{literal, take_while};
 
@@ -71,7 +71,19 @@ pub fn duration_value(input: &mut &str) -> ModalResult<Duration> {
     if suffix == 0 {
         Ok(Duration::from_millis(num))
     } else {
-        Ok(Duration::from_secs(num * suffix))
+        // 数字部分是任意 u64 字面量，`18446744073709551615d` 这类值会让 `num * suffix`
+        // 溢出：debug 下 panic、release 下静默回绕成一个语义完全错误的时长（例如
+        // 一天）。在字面量处显式拒绝，避免上层拿到错的 Duration。
+        let secs = num.checked_mul(suffix).ok_or_else(|| {
+            ErrMode::Cut(ContextError::new().add_context(
+                input,
+                &input.checkpoint(),
+                StrContext::Expected(StrContextValue::Description(
+                    "duration literal that fits in u64 seconds",
+                )),
+            ))
+        })?;
+        Ok(Duration::from_secs(secs))
     }
 }
 
