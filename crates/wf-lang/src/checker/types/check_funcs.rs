@@ -100,12 +100,20 @@ pub(crate) fn check_func_call(
         return;
     }
 
-    if !allow_l3_funcs
-        && matches!(
-            name,
-            "collect_set" | "collect_list" | "first" | "last" | "stddev" | "percentile"
-        )
-    {
+    // `has(...)` 是**窗口方法调用**，必须带 window 限定名（`<window>.has(field)`）。
+    // 无限定的 `has(...)` 在任何求值器里都没有实现——wf-cep 只在 `qualifier =
+    // Some(window)` 时落到 `eval_window_has`（`wf-cep/cep/eval/mod.rs`），引擎分派表
+    // 也没有 `has` 条目，两边都恒返回 `None`（静默失效；warp-fusion#101 同类）。
+    if qualifier.is_none() && name == "has" {
+        errors.push(rule_error(
+            rule_name,
+            "has() requires a window qualifier: write `<window>.has(field)` (unqualified has() is not implemented)"
+                .to_string(),
+        ));
+        return;
+    }
+
+    if !allow_l3_funcs && super::is_l3_instance_func(name) {
         errors.push(rule_error(
             rule_name,
             format!(

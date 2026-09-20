@@ -6,6 +6,7 @@ mod coverage_more2;
 mod coverage_r4;
 mod edge_cases;
 mod func_params;
+mod func_positions;
 mod joins_family;
 mod keys;
 mod labels;

@@ -142,6 +142,10 @@ async fn run_push_loop(
             // End-of-stream: input sources reported the stream ended. Flush the
             // trailing instances but keep running so a daemon can accept a
             // subsequent finite input.
+            //
+            // 注意 reason 仍是 `close:flush`（`flush()` 固定该值）：运行时只在
+            // “输入完结/停机收尾”时刷写尾部，且不区分二者；期望侧（wfgen）
+            // 已按同一口径对齐，否则按 `origin` 分组的对拍在尾部窗口上配不上。
             _ = eos.changed() => {
                 if *eos.borrow() > 0 {
                     task.drain_push_channel(&mut rx).await;
@@ -196,6 +200,8 @@ async fn run_pull_loop(
             // trailing instances (EOS-driven finalization) but keep running so a
             // daemon can accept a subsequent finite input. The counter is
             // incremented per EOS event; 0 means no EOS yet.
+            //
+            // reason 仍是 `close:flush`（见 push 循环同名注释）。
             _ = eos.changed() => {
                 if *eos.borrow() > 0 {
                     task.pull_and_advance().await;

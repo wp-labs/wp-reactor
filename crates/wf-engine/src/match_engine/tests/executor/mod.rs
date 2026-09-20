@@ -3,6 +3,7 @@ mod direct_tests;
 mod helpers;
 mod l3;
 mod l3_first_history;
+mod let_l3_instance_ctx;
 mod match_tests;
 mod misc;
 mod threshold_const_let;

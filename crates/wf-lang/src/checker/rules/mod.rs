@@ -16,7 +16,9 @@ use crate::ast::{
     StatsAgg, StatsClause,
 };
 use crate::checker::scope::{Scope, StatLabelInfo, StatLabelStage};
-use crate::checker::types::{ValType, check_expr_type, infer_type};
+use crate::checker::types::{
+    ExprPosition, ValType, check_expr_position, check_expr_type, infer_type, rule_expr_position,
+};
 use crate::schema::{BaseType, FieldDef, FieldType, WindowSchema};
 use crate::wfu_meta::WFU_PREFIX;
 
@@ -74,6 +76,7 @@ pub(crate) fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut
             });
         }
         populate_stats_measure_labels(&mut base_scope, stats);
+        check_stats_keys(stats, &base_scope, name, errors);
         check_stats_measures(stats, &base_scope, name, errors);
     }
 
@@ -143,6 +146,10 @@ pub(crate) fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut
                 });
             }
             check_expr_type(w, &base_scope, name, errors);
+            // post-join `where` 的运行期求值位置：on each 规则在单事件上下文（L3
+            // 恒为空 → 严格语义下静默丢输出），match/close 规则在 instance 上下文
+            // （L3 可用，但 `window.has` / `baseline` 不可用）。
+            check_expr_position(w, rule_expr_position(rule), name, errors);
             if let Some(t) = infer_type(w, &base_scope)
                 && t != ValType::Bool
             {
@@ -346,6 +353,82 @@ fn populate_stats_measure_labels(scope: &mut Scope<'_>, stats: &StatsClause) {
     }
 }
 
+/// stats 桶键（`group by` / `tier`）编译期白名单。
+///
+/// 引擎的桶键求值只实现三种形态（`stats_exec/eval/rowkey.rs::eval_row_bucket_key`）：
+/// `Field` / `bucket(field, 'day'|'hour'|'minute'|'second')` / `tier(field, b1, b2, …)`；
+/// 其它表达式（字段算术、任意函数、L3 集合函数、`window.has`、`baseline`…）在行式
+/// 路径恒返回 `None`，而 `exec.rs` 遇到 `None` 直接 `continue` —— **整行被跳过、桶永远
+/// 为空、全程无告警**（warp-fusion#101 同类：编译放行 + 运行期静默无输出）。
+/// 此前 checker 只校验度量（`check_stats_measures`），桶键完全不看。
+fn check_stats_keys(
+    stats: &StatsClause,
+    scope: &Scope<'_>,
+    rule_name: &str,
+    errors: &mut Vec<CheckError>,
+) {
+    let mut err = |msg: String| {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: msg,
+        });
+    };
+    for key in &stats.keys {
+        match key {
+            Expr::Field(fr) => {
+                if let Err(e) = scope.resolve_field_ref(fr) {
+                    err(format!("stats bucket key: {e}"));
+                }
+            }
+            Expr::FuncCall {
+                qualifier: None,
+                name,
+                args,
+            } if name == "bucket" || name == "tier" => {
+                // 首参：`bucket` 只认字段，`tier` 认字段或常量（对齐引擎 `field_value_of`）
+                let first_ok = matches!(args.first(), Some(Expr::Field(_)))
+                    || (name == "tier" && matches!(args.first(), Some(Expr::Number(_))));
+                if !first_ok {
+                    err(format!(
+                        "stats bucket key `{name}(...)`: the first argument must be a field reference"
+                    ));
+                    continue;
+                }
+                if name == "bucket" {
+                    // 单位白名单：未知单位 → 引擎 `bucket_unit_nanos` 返回 None → 整行被跳过
+                    let unit_ok = matches!(
+                        args.get(1),
+                        Some(Expr::StringLit(u))
+                            if matches!(u.as_str(), "day" | "hour" | "minute" | "second")
+                    );
+                    if !unit_ok {
+                        err(
+                            "stats bucket key `bucket(...)`: second argument must be one of \
+                             'day' / 'hour' / 'minute' / 'second'"
+                                .to_string(),
+                        );
+                    }
+                } else if !args[1..].iter().all(|b| matches!(b, Expr::Number(_))) {
+                    // 边界非数值 → 引擎侧 `collect::<Option<_>>()` 得 None → 整行被跳过
+                    err(
+                        "stats bucket key `tier(...)`: bounds after the field must be numeric
+                         literals (ascending)"
+                            .to_string(),
+                    );
+                }
+            }
+            _ => err(
+                "stats bucket key must be a plain field or `bucket(field, '<unit>')` / \
+                 `tier(field, b1, …)`: any other expression evaluates to `None` in the engine's \
+                 bucket-key evaluator, which silently skips every row (the bucket stays empty)"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
 /// stats 度量校验: source alias 存在 + field 引用可解析 + where 为 bool 表达式。
 ///
 /// checker 原不感知 stats_clause——度量里的字段拼写错误会在运行时静默失效
@@ -393,6 +476,10 @@ fn check_stats_measures(
                 }
             }
             check_expr_type(w, scope, rule_name, errors);
+            // stats 度量 `where` 由引擎逐行求值（stats_exec 每行建 ctx 后
+            // `eval_bool_expr`）：无实例序列 / 窗口表 / 滚动状态，位置依赖函数
+            // 在此恒求值为空 → 度量静默不累计（issue #101 同类位置）。
+            check_expr_position(w, ExprPosition::StatsWhere, rule_name, errors);
             if let Some(t) = infer_type(w, scope)
                 && t != ValType::Bool
             {
@@ -664,6 +751,13 @@ fn check_each_clause(
 
     if let Some(filter) = &each_clause.filter {
         check_expr_type(filter, scope, rule_name, errors);
+        // filter 由引擎逐事件求值（`each_exec`：`eval_bool_expr(filter)`），该路径
+        // **没有**窗口表 / 实例收集序列 / 滚动基线状态 → 位置依赖函数（`window.has`
+        // / L3 集合函数 / `baseline`）在此恒求值不下 → 每个事件被静默滤掉（规则永不
+        // 触发，无任何报错）。此前 L3 / `baseline` 由 `is_disallowed_on_each_func`
+        // 顺带拦住，**`window.has` 不在该名单里** → 限定形态可编译通过（warp-fusion#101
+        // 同类位置）。
+        check_expr_position(filter, ExprPosition::OnEach, rule_name, errors);
         if let Some(t) = infer_type(filter, scope)
             && t != ValType::Bool
         {
@@ -770,6 +864,13 @@ fn check_on_each_expr(
     }
 }
 
+/// `on each` 上下文里不可用的函数。
+///
+/// 只收 **`on each` 特有的窗口/实例状态访问器**。依赖三类运行期上下文的那批
+/// （L3 集合函数 / `baseline` / `window.has`）**不在这里**——它们由 `position_gate`
+/// （`ExprPosition::OnEach`）统一拒绝，单一事实源是 `is_l3_instance_func` +
+/// `required_capability`；两份名单各写一遍会漂移（新加一个 L3 函数时，只有闸门
+/// 会拦住它，而 `on each` 的这份名单会腐成漏网）。
 fn is_disallowed_on_each_func(qualifier: Option<&str>, name: &str) -> bool {
     (qualifier == Some("stat") && matches!(name, "count" | "value"))
         || (qualifier.is_none()
@@ -781,13 +882,6 @@ fn is_disallowed_on_each_func(qualifier: Option<&str>, name: &str) -> bool {
                     | "min"
                     | "max"
                     | "distinct"
-                    | "baseline"
-                    | "collect_set"
-                    | "collect_list"
-                    | "first"
-                    | "last"
-                    | "stddev"
-                    | "percentile"
                     | "window_event"
                     | "match_event"
                     | "match_distinct"

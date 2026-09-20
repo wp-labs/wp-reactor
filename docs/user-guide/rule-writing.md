@@ -601,6 +601,15 @@ evidences = collect_set(s.event_id)
 
 `collect_set(s.event_id)` 与 `stat.count(window_event(s))` 基于同一个 rule instance 内的 `s` 事件集合；`collect_set` 对字段值去重并保留首次出现顺序。
 
+注意这些集合函数依赖「本 rule instance 收集到的事件序列」，只能写在 **score / entity / yield、match/close 规则的规则级 `let` 与 post-join `where`** 里。放进 `events` 的 `&&` 过滤、`join ... within` 的表达式界、`emit at`、`on each` 的 `where` filter / score / entity / yield / `let` / post-join `where`、stats 度量的 `where`、或 `conv` 链表达式里时，运行期取不到序列（恒为空）→ 规则静默不触发，语义检查会直接报错（issue #101 同类位置）。
+
+同属位置依赖的还有两个函数：
+
+- `window.has(...)` 必须带窗口限定名（无限定 `has(...)` 未实现，编译期报错），并且需要窗口查找——只有 `events` 的 `&&` 过滤和分支 guard 可以正常用；`within` 表达式界、`emit at`、`on each`（`where` filter 与 score / entity / yield / `let` / post-join `where`）、stats 度量 `where`、`conv`，以及 score / entity / yield、规则级 `let`、post-join `where`（引擎 instance 求值不传窗口表）都会被拒绝。
+- `baseline(...)` 的滚动状态只在**事件 guard** 上跨事件累积——除 guard 外所有位置（含 score / entity / yield、规则级 `let`、post-join `where`）都会从空状态起步（`deviation()` 恒 `0.0`，是常数而非空值），一律拒绝；`baseline_dev(...)` 走全局基线库，不受限。
+
+stats 的桶键（`group by`）另有一层白名单：只能是纯字段、`bucket(field, 'day'|'hour'|'minute'|'second')` 或 `tier(field, b1, b2, …)`（边界数值字面量）——引擎只实现这三种，其它表达式会让**整行被跳过、桶恒空**且无告警。
+
 ---
 
 ## 9. 规则编写 Checklist

@@ -4,7 +4,7 @@ use crate::ast::{BoundVal, Expr, FieldRef, JoinMode, ReduceMeasure};
 use crate::schema::{FieldType, WindowSchema};
 
 use crate::checker::scope::Scope;
-use crate::checker::types::check_expr_type;
+use crate::checker::types::{ExprPosition, check_expr_position, check_expr_type};
 use crate::checker::{CheckError, Severity};
 
 pub(crate) fn check_joins_list(
@@ -357,6 +357,10 @@ fn check_within(
     for bound in [&wspec.lo, &wspec.hi] {
         if let BoundVal::Expr(e) = &bound.val {
             check_expr_type(e, scope, rule_name, errors);
+            // 界表达式由 wf-cep 的 `eval_expr` 求值（`eval_interval_bound`）：该求值器
+            // 里 L3 集合函数是硬编码的 `None`（不读 `_step_*`）→ 界求值失败 → inner join
+            // 丢事件 / deferred 不挂起（issue #101 同类位置）。
+            check_expr_position(e, ExprPosition::JoinBound, rule_name, errors);
             check_expr_driver_aliases_only(e, join, "within 界表达式", scope, rule_name, errors);
         }
     }
@@ -376,6 +380,9 @@ fn check_emit_at(
         return;
     };
     check_expr_type(emit_at, scope, rule_name, errors);
+    // `emit at` 同样由 wf-cep 逐行求值；求值不出结果 → 不挂起 → 静默无输出
+    // （issue #101 同类位置）。
+    check_expr_position(emit_at, ExprPosition::EmitAt, rule_name, errors);
     // 触发点是左行绝对时间（设计 §2.2）——不能引用 join 右窗
     check_expr_driver_aliases_only(emit_at, join, "`emit at` 表达式", scope, rule_name, errors);
 

@@ -1016,7 +1016,13 @@ fmt("{} failed {} times from {}", fail.username, count(fail), fail.sip)
 - 哈希 / 编码：`md5`、`sha1`、`sha1_n`、`sha256`、`hex`、`stable_id`
 - 窗口集合：`collect_set`、`collect_list`、`first`、`last`、`stddev`、`percentile`
 - 画像 / 回看：`baseline`
-- 方法调用：`window.has(...)`
+- 方法调用：`window.has(...)`——**必须带窗口限定名**；无限定的 `has(...)` 在任何求值器里都没有实现（恒求值为空），编译期直接拒绝
+
+**位置相关的函数约束**（issue #101 同类位置）：下列函数依赖某项运行期上下文，写进缺乏该上下文的位置时恒求值为空 → 规则静默不触发 / 输出失真，因此语义检查直接报错：
+
+- `collect_set` / `collect_list` / `first` / `last` / `stddev` / `percentile` 依赖「本 rule instance 收集到的事件序列」，只在 **score / entity / yield、match/close 规则的规则级 `let` 与 post-join `where`** 中可用；写进 `events` bind filter（`&&`）、`join ... within` 的表达式界、`emit at`、`on each` 的 `where` filter / score / entity / yield / `let` / post-join `where`、stats 度量的 `where`、`conv` 链表达式时被拒绝。
+- `window.has(...)`（必须带窗口限定名）依赖窗口查找：只有 `events` 的 `&&` 条件与分支 guard 带窗口表求值；`within` 表达式界、`emit at`、`on each` 全部位置、stats 度量 `where`、`conv` 表达式，以及 **score / entity / yield、match/close 规则的规则级 `let` 与 post-join `where`**（引擎 instance 求值不传窗口表）都会恒为空，一律被拒绝。注意 `on each` 的 `where` filter 属逐事件求值（既无窗口表、也无实例序列）——限定形态同样拒绝。
+- `baseline(...)` 的滚动状态只在**事件 guard** 上跨事件累积：除 guard 外的所有位置（含 score / entity / yield、规则级 `let`、post-join `where`）都会从空状态起步（`deviation()` 恒 `0.0`，是常数而非空值），一律被拒绝（`baseline_dev(...)` 走全局基线库，不受此限）。
 
 示例：
 
@@ -1287,6 +1293,7 @@ Events 约束：
 - 别名唯一
 - window 必须存在
 - 过滤字段必须存在于对应 window 中
+- 过滤表达式（`&&`）不得使用窗口集合函数（`first` / `last` / `collect_set` / `collect_list` / `stddev` / `percentile`）与 `baseline(...)`——绑定阶段逐事件求值，取不到 rule instance 序列 / 滚动基线状态（issue #101 同类位置）；`window.has(...)` 在此可用（带窗口表求值）
 
 Match 约束：
 
@@ -1299,6 +1306,8 @@ Match 约束：
 - `match` 与 `on each` 互斥
 - `conv` 仅允许与 fixed / hop 窗口搭配（sliding/session 拒绝）；`top_ties` 要求同 chain 前导 `sort`
 - `emit at`（deferred join）仅支持 `on each` 驱动形态
+- 窗口集合函数（`first` / `last` / `collect_set` / `collect_list` / `stddev` / `percentile`）只可在 score / entity / yield、match/close 规则的规则级 `let` 与 post-join `where` 中使用；写进 `join ... within` 的表达式界或 `emit at` 编译期拒绝（逐行求值取不到实例序列，issue #101 同类位置）；同理，`window.has(...)` 与 `baseline(...)` 也不得写进这两处（无窗口表 / 无滚动状态）
+- `window.has(...)` / `baseline(...)` 在 score / entity / yield、规则级 `let`、post-join `where` 同样编译期拒绝（instance 求值路径不传窗口表 / 滚动状态表）；`window.has` 请用 bind filter（`&&`）或分支 guard，`baseline` 请用分支 guard
 - session 窗口的 gap 与 `asof within` 的时长必须 `> 0`（当前检查器不强制 `match` 滑动/固定窗口的 `duration > 0`，`match<sip:0>` 可通过解析）
 
 Seq / Any 约束：
@@ -1316,7 +1325,7 @@ On Each 约束：
 - `alias` 必须来自 `events`
 - `where` 必须返回 `bool`
 - 不支持 `close_reason`
-- 不支持集合函数和窗口状态函数
+- 不支持集合函数（`first` / `last` / `collect_set` / `collect_list` / `stddev` / `percentile`）与窗口状态函数（`window.has(...)` / `baseline(...)`），含 `where` filter、score / entity / yield、规则级 `let` 与 post-join `where`；`on each` 没有 window instance、窗口表与滚动状态（`baseline_dev(...)` 走全局基线库，可用）
 - 当前不支持与 pipeline stages 混用
 
 Yield 约束：
@@ -1325,3 +1334,9 @@ Yield 约束：
 - 字段须为目标 window 的子集
 - 禁止手工赋值系统字段
 - 中间目标图必须无环
+
+Stats / Conv 约束：
+
+- stats 桶键（`group by`）只能是**纯字段**、`bucket(field, 'day'|'hour'|'minute'|'second')` 或 `tier(field, b1, b2, …)`（边界为数值字面量）——引擎的桶键求值只实现这三种形态，其它表达式（字段算术、任意函数、L3、`window.has`、`baseline`…）恒返回 `None`，该**整行被跳过**、桶恒为空且无告警，因此编译期直接拒绝。
+- stats 度量的 `where` 不得使用 L3 集合函数、`window.has(...)` 或 `baseline(...)`——该条件由引擎逐行求值（每行单事件上下文，无实例序列 / 窗口表 / 滚动状态），写了会静默不累计（issue #101 同类位置）；`baseline_dev(...)` 可用
+- `conv` 链的 `sort` / `dedup` / `where` 同理：wf-cep 在收口批上按 output 逐行求值，只注入 key 与 step label，上述函数一律编译期拒绝

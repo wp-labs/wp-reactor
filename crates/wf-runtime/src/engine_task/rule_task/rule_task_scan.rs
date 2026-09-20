@@ -572,7 +572,12 @@ impl RuleTask {
         self.flush_pipes().await;
     }
 
-    /// Close all active instances (shutdown flush) and emit alerts.
+    /// Close all active instances (shutdown/EOS flush) and emit alerts.
+    ///
+    /// reason 固定 `CloseReason::Flush`（`close:flush`）：运行时只在“输入完结/停机收尾”
+    /// 时刷写尾部实例，`CloseReason::Eos` 在运行时没有生产路径；期望侧也已按同一
+    /// 口径对齐（wfgen 的尾部收口同样用 `Flush`），否则按 `origin` 分组的
+    /// 对拍在尾部窗口上永远配不上。
     pub(crate) async fn flush(&mut self) {
         // P3：deferred join 规则——EOS/关闭时触发剩余挂起实例
         // （reason=deferred）。按最终事件时间 watermark 到期扫描（与 oracle 一致）：

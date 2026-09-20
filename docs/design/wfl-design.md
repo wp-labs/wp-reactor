@@ -249,6 +249,25 @@ runtime: runtime/wfusion.toml
 的值；大窗口或重复字段值场景下，`collect_set(alias.field)` 的数组长度可能小于
 `stat.count(window_event(alias))`。
 
+位置约束（issue #101 同类位置）：这组函数只对 instance 收集序列求值，仅 yield/derive
+上下文（score/entity/yield、match/close 规则的规则级 `let` 与 post-join `where`）提供该
+序列；写进 wf-cep 逐事件/逐行求值的位置（`events` bind filter、`join ... within` 表达式界、
+`emit at`）、`on each` 的 `where` filter / score / entity / yield / `let` / post-join `where`，
+或 stats 度量 `where` / `conv` 表达式时恒求值为空 → 静默不触发，checker 直接拒绝。
+
+同一闸门还覆盖另外两项动态上下文：`window.has(...)` 需要窗口查找（只有 bind filter 与
+分支 guard 带窗口表可用；instance 位置 score/entity/yield·`let`·post-join `where`、`within`
+界 / `emit at` / `on each` 全部位置 / stats 度量 `where` / `conv` 表达式均拒绝），
+`baseline(...)` 的滚动状态只在 event guard 上跨事件累积（除 guard 外一律拒绝；其它位置
+每次从空表起步 → `deviation()` 恒 `0.0`，是**常数**而非空值；`baseline_dev` 走全局 store
+不受限）。位置能力矩阵：instance 上下文提供实例序列（L3 可用），bind filter 额外提供窗口
+查找；逐行求值、三项能力皆无的位置还有 stats 度量 `where`（`stats_exec` 每行建 ctx）与
+`conv` 链 `sort`/`dedup`/`where`（收口批按 output 逐行，ctx 只含 key 与 step label）。
+
+注意分支 guard 的**两处求值**：累积阶段带窗口表与滚动状态；窗口收口时按 permissive 语义
+重估（只把**显式 `false`** 当拦截），而重估用的合成事件只带 `close_reason`——因此引用事件
+字段的 guard 在重估时得 `None`（不拦截），与累积阶段不会互相矛盾。
+
 **会话窗口**：`match<key:session(gap)>`
 - 按活动间隔自动分割会话：相邻事件时间差超过 `gap` 即切分新窗口。
 - 与滑动窗口（固定时长）和 fixed（固定间隔）互补；适用于用户登录会话、操作序列等不规则时间跨度场景。

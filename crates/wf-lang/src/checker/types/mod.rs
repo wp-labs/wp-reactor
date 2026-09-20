@@ -2,10 +2,14 @@ mod check_expr;
 mod check_funcs;
 mod infer;
 mod pipe;
+mod position_gate;
 
 pub(crate) use check_expr::{check_expr_type, check_yield_expr_type_with_system_vars, format_type};
 pub(crate) use infer::infer_type;
 pub(crate) use pipe::check_pipe_chain;
+pub(crate) use position_gate::{
+    ExprPosition, check_expr_position, is_l3_instance_func, rule_expr_position,
+};
 
 use crate::schema::BaseType;
 

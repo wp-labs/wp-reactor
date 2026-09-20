@@ -3,7 +3,8 @@ use crate::schema::WindowSchema;
 
 use crate::checker::scope::{self, Scope};
 use crate::checker::types::{
-    ValType, check_yield_expr_type_with_system_vars, infer_type, yield_assignable,
+    ValType, check_expr_position, check_yield_expr_type_with_system_vars, infer_type,
+    rule_expr_position, yield_assignable,
 };
 use crate::checker::{CheckError, Severity};
 
@@ -132,6 +133,11 @@ pub(crate) fn check_yield(
                     Some(fd) => {
                         // T10: type must match
                         check_yield_expr_type_with_system_vars(&arg.value, scope, name, errors);
+                        // yield 的运行期位置：match/close 规则在 instance 上下文（L3 可用
+                        // ——instance 序列由 `build_eval_context` 注入，但无窗口表 / 滚动
+                        // 状态）；`on each` 规则逐事件求值（三项能力皆无）。写死 `Instance`
+                        // 会让 `on each` 的 L3 静默通过（运行期恒为空）。
+                        check_expr_position(&arg.value, rule_expr_position(rule), name, errors);
                         let expected = scope::field_type_to_val(&fd.field_type);
                         check_yield_assignable(
                             &arg.name, &arg.value, &expected, scope, name, errors,

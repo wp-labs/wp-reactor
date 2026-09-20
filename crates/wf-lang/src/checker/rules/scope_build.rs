@@ -4,7 +4,9 @@ use crate::ast::RuleDecl;
 use crate::schema::WindowSchema;
 
 use crate::checker::scope::Scope;
-use crate::checker::types::check_expr_type;
+use crate::checker::types::{
+    ExprPosition, check_expr_position, check_expr_type, rule_expr_position,
+};
 use crate::checker::{CheckError, Severity};
 
 pub(crate) fn build_scope<'a>(
@@ -71,6 +73,9 @@ pub(crate) fn build_scope<'a>(
                 continue;
             }
             check_expr_type(&inlined, &scope, rule_name, errors);
+            // 绑定阶段由 wf-cep 逐事件求值：L3 集合函数在此恒求值为空（issue #101
+            // 同类位置——编译放行则规则静默不触发）。
+            check_expr_position(&inlined, ExprPosition::BindFilter, rule_name, errors);
         }
     }
 
@@ -85,6 +90,10 @@ pub(crate) fn build_scope<'a>(
             scope.let_types.insert(l.name.clone(), t);
         }
         crate::checker::types::check_expr_type(&l.expr, &scope, rule_name, errors);
+        // `on each`（含 deferred）规则的 `let` 在单事件上求值（无任何动态上下文）；
+        // match/close 规则的 `let` 在 instance 上下文求值——L3 可用，但
+        // `window.has` / `baseline` 仍不可用（该求值路径不传窗口表 / 滚动状态）。
+        check_expr_position(&l.expr, rule_expr_position(rule), rule_name, errors);
         // 前向引用（`let a = b` 而 `b` 声明在后）在表达式类型检查里表现为
         // 「字段 `b` 不存在」——那只是名字没能解析成字段，指向的是 window schema，
         // 会把用户带偏。若该名字确实是本规则中**声明在后**的 `let`，就把这条消息

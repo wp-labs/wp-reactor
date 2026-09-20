@@ -179,12 +179,14 @@ rule r {
 
 #[test]
 fn func_has_arg_validation() {
+    // `has` 必须带窗口限定名（无限定 has 未实现，另一条错误）；这里用限定形态
+    // 单独锁定参数校验。
     let zero = r#"
 rule r {
     events { e : auth_events }
     match<:5m> { on event { e | count >= 1; } } -> score(50.0)
     entity(ip, e.sip)
-    yield out (b = has())
+    yield out (b = threat_list.has())
 }
 "#;
     assert_has_error(
@@ -198,7 +200,7 @@ rule r {
     events { e : auth_events }
     match<:5m> { on event { e | count >= 1; } } -> score(50.0)
     entity(ip, e.sip)
-    yield out (b = has(e, e, e))
+    yield out (b = threat_list.has(e, e, e))
 }
 "#;
     assert_has_error(
@@ -212,7 +214,7 @@ rule r {
     events { e : auth_events }
     match<:5m> { on event { e | count >= 1; } } -> score(50.0)
     entity(ip, e.sip)
-    yield out (b = has(e, e.sip))
+    yield out (b = threat_list.has(e, e.sip))
 }
 "#;
     assert_has_error(

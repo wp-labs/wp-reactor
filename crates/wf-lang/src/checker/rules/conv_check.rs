@@ -1,5 +1,6 @@
-use crate::ast::{FieldRef, RuleDecl, WindowMode};
+use crate::ast::{ConvStep, FieldRef, RuleDecl, WindowMode};
 
+use crate::checker::types::{ExprPosition, check_expr_position};
 use crate::checker::{CheckError, Severity};
 
 pub(crate) fn check_conv(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckError>) {
@@ -36,14 +37,30 @@ pub(crate) fn check_conv(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<Chec
                 .to_string(),
         });
     }
-    // top_ties（并列全输出）要求同一 chain 内有前导 sort 提供并列判定键。
+    // top_ties（并列全输出）要求同一 chain 内有前导 sort 提供并列判定键；
+    // 同时做位置依赖函数闸门：conv 表达式由 wf-cep 在收口批上逐行求值，ctx 只含
+    // key 与 step label（无实例序列 / 窗口表 / 滚动状态）——L3 / `window.has` /
+    // `baseline` 写在这里恒求值为空 → 整批被静默过滤（issue #101 同类位置）。
     if let Some(conv) = &rule.conv {
         for chain in &conv.chains {
             let mut has_sort = false;
             for step in &chain.steps {
                 match step {
-                    crate::ast::ConvStep::Sort(_) => has_sort = true,
-                    crate::ast::ConvStep::TopTies(_) if !has_sort => errors.push(CheckError {
+                    ConvStep::Sort(keys) => {
+                        has_sort = true;
+                        for key in keys {
+                            check_expr_position(
+                                &key.expr,
+                                ExprPosition::ConvExpr,
+                                rule_name,
+                                errors,
+                            );
+                        }
+                    }
+                    ConvStep::Dedup(expr) | ConvStep::Where(expr) => {
+                        check_expr_position(expr, ExprPosition::ConvExpr, rule_name, errors);
+                    }
+                    ConvStep::TopTies(_) if !has_sort => errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
                         test: None,

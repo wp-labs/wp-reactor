@@ -130,19 +130,19 @@ rule r {
 
 #[test]
 fn baseline_with_method_valid() {
-    let out = make_output_window(
-        "out",
-        vec![("x", bt(BaseType::Ip)), ("base", bt(BaseType::Float))],
-    );
+    // 合形的 3 参 `baseline(...)` 在 guard 位置受支持（滚动状态在 event guard 上
+    // 跨事件累积）；yield 等 instance 上下文不传滚动状态表 → 另见 rejection 用例。
     let input = r#"
 rule r {
     events { e : auth_events }
-    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    match<sip:5m> {
+        on event { e && baseline(e.count, 86400, "ewma") > 3 | count >= 1; }
+    } -> score(50.0)
     entity(ip, e.sip)
-    yield out (base = baseline(count(e), 86400, "ewma"))
+    yield out (x = e.sip)
 }
 "#;
-    assert_no_errors(input, &[auth_events_window(), out]);
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
 }
 
 #[test]

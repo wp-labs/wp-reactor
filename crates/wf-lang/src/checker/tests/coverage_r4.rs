@@ -818,7 +818,8 @@ rule r {
         b7 = isnotnull(e.sip),
         b8 = is_blank(e.action),
         b9 = is_finite(e.count),
-        b10 = has(e, "action"),
+        // `window.has(...)` 需要窗口表：yield 是 instance 上下文（引擎求值不传
+        // 窗口表）→ 编译期拒绝；受支持写法见 bind filter / guard。
         s0 = substr(e.action, 0, 3),
         s1 = replace(e.action, "a", "b"),
         s2 = replace_plain(e.action, "a", "b"),
@@ -875,8 +876,9 @@ rule r {
         f10 = time_diff(e.event_time, e.event_time),
         f11 = avg(e.count),
         f12 = stddev(e.count),
-        f13 = percentile(e.count, 50),
-        f14 = baseline(e.count, 10, "mean")
+        f13 = percentile(e.count, 50)
+        // `baseline(...)` 只在 event guard 上跨事件累积滚动状态，yield（instance
+        // 上下文）会从空状态起步 → 编译期拒绝。
     )
 }
 "#;
@@ -1052,7 +1054,7 @@ fn builtin_wrong_arg_count_rejected() {
             "percentile() requires exactly 2 arguments",
         ),
         ("baseline(e.count)", "baseline() requires 2 or 3 arguments"),
-        ("has()", "has() expects 1 or 2 arguments"),
+        ("threat_list.has()", "has() expects 1 or 2 arguments"),
     ];
     for (expr, msg) in cases {
         let src = format!(
