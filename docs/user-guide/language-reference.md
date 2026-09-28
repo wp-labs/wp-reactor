@@ -360,6 +360,7 @@ on each e where e.action == "failed" -> score(70.0)
 - 不支持 `on close`
 - 不支持 `close_reason`
 - 适合上游 enrichment 和逐条风险打分
+- 逐条点查外部维表用 `external("服务名", 参数)`，只能写在 `on each ... where`；详见 [外部维表点查](./external-lookup.md)
 - 当前 checker 不支持 `on each` 与 pipeline stages 组合
 - 如果上游已有 OML/投影层，纯逐条语义映射优先放 OML，WFL 保留窗口聚合与告警逻辑
 
@@ -1015,6 +1016,7 @@ fmt("{} failed {} times from {}", fail.username, count(fail), fail.sip)
 - 当前引擎时间：`now`、`now_s`、`now_ms`、`now_us`、`now_ns`；时间值转换：`time_to_s`、`time_to_ms`
 - 哈希 / 编码：`md5`、`sha1`、`sha1_n`、`sha256`、`hex`、`stable_id`
 - 窗口集合：`collect_set`、`collect_list`、`first`、`last`、`stddev`、`percentile`
+- 外部维表：`external("服务名", 参数)`——按事件逐条点查外部存储，只能写在 `on each ... where`；布尔查询用于判定，值查询用于 `yield` 富化。详见 [外部维表点查](./external-lookup.md)
 - 画像 / 回看：`baseline`
 - 方法调用：`window.has(...)`——**必须带窗口限定名**；无限定的 `has(...)` 在任何求值器里都没有实现（恒求值为空），编译期直接拒绝
 

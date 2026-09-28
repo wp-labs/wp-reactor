@@ -10,6 +10,7 @@
 - [核心概念与处理过程](./core-concepts.md)
 - [规则编写指南](./rule-writing.md)
 - [On Each 与逐条打分](./on-each.md)
+- [外部维表点查（external）](./external-lookup.md)
 - [语言参考](./language-reference.md)
 - [运行时配置](./runtime-config.md)
 - [性能诊断模式（perf-diag）](./perf-diag.md)
@@ -21,9 +22,10 @@
 2. 读 [核心概念与处理过程](./core-concepts.md)，理解 window、match、OutputRecord 和 sink 路由。
 3. 按 [规则编写指南](./rule-writing.md) 学习常见检测规则写法，包括 yield 时间变量、稳定统计上下文和结构化 `object` / `array` 输出。
 4. 如果要做逐条评分、语义事件 enrichment、上游评分下游聚合，读 [On Each 与逐条打分](./on-each.md)。
-5. 再读 [运行时配置](./runtime-config.md)，完成 `wfusion` 的 source / sink / runtime 配置。
-6. 编写规则时查阅 [语言参考](./language-reference.md)，其中包含 WFS 字段类型、WFL 时间变量、统计上下文、结构化字面量和函数行为。
-7. 做本地验证、回放和数据生成时查阅 [开发与测试工具](./tooling.md)。
+5. 如果需要按事件逐条点查外部维表（情报库、白名单等），读 [外部维表点查](./external-lookup.md)。
+6. 再读 [运行时配置](./runtime-config.md)，完成 `wfusion` 的 source / sink / runtime 配置。
+7. 编写规则时查阅 [语言参考](./language-reference.md)，其中包含 WFS 字段类型、WFL 时间变量、统计上下文、结构化字面量和函数行为。
+8. 做本地验证、回放和数据生成时查阅 [开发与测试工具](./tooling.md)。
 
 ## 核心概念
 

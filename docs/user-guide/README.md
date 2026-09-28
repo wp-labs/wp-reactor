@@ -11,6 +11,7 @@
 | [rule-writing.md](./rule-writing.md) | 编写检测规则，学习常见场景、yield 时间变量、稳定统计上下文和结构化输出 |
 | [language-reference.md](./language-reference.md) | 查语法和函数，包括 WFS 字段类型、WFL 表达式、时间变量、统计上下文和结构化字面量 |
 | [on-each.md](./on-each.md) | 做逐条评分、语义事件 enrichment、上游评分下游聚合 |
+| [external-lookup.md](./external-lookup.md) | 按事件逐条点查外部维表（大情报库 / 白名单），含 `knowdb.toml` 配置与黑白名单碰撞处理 |
 | [runtime-config.md](./runtime-config.md) | 配置 source、sink、window 默认值、运行时参数和输出字段 |
 | [operations.md](./operations.md) | 运行、热加载、指标、日志和排障 |
 | [tooling.md](./tooling.md) | 使用 `wfl` / `wfgen` / replay / explain 等开发验证工具 |
@@ -21,8 +22,9 @@
 2. 读 [核心概念与处理过程](./core-concepts.md)，理解固定执行链 `EVENTS -> SCOPE(match) -> JOIN -> ENTITY -> YIELD`。
 3. 按 [规则编写指南](./rule-writing.md) 学习常见检测规则写法。
 4. 写规则时查 [语言参考](./language-reference.md)，尤其是 `yield`、时间变量、统计上下文和函数行为。
-5. 接入真实链路时读 [运行时配置](./runtime-config.md) 和 [运维指南](./operations.md)。
-6. 需要本地生成数据、回放、解释执行计划时读 [开发与测试工具](./tooling.md)。
+5. 需要查询外部维表（情报库、白名单等）时读 [外部维表点查](./external-lookup.md)。
+6. 接入真实链路时读 [运行时配置](./runtime-config.md) 和 [运维指南](./operations.md)。
+7. 需要本地生成数据、回放、解释执行计划时读 [开发与测试工具](./tooling.md)。
 
 ## 当前重点能力
 
