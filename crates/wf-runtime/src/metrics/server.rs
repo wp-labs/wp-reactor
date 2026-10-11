@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::error::RuntimeResult;
-use crate::metrics::{MonSend, RunSummary, RuntimeMetrics, TotalCounts};
+use crate::metrics::{MonSend, MonitorFilter, RunSummary, RuntimeMetrics, TotalCounts};
 use tokio_util::sync::CancellationToken;
 use wf_config::MetricsConfig;
 use wf_engine::window::Router;
@@ -22,6 +22,20 @@ pub async fn run_metrics_task(
     );
 
     metrics.sample_windows(&router);
+    // 编译 [metrics.monitor] 筛选规则（#115）：在进入 monitor 通道前剔除被排除
+    // 的记录——不会影响规则处理/告警输出，只裁剪 monitor fan-out。
+    let monitor_filter = MonitorFilter::from_config(&config.monitor);
+    // 告警（非拒绝）：若排除了 bench/诊断脚本会回读的指标，提示可能误配——
+    // 这些指标的静默丢失会让相关校验读不到数据。
+    for (stage, name) in monitor_filter.excluded_external_metrics() {
+        wf_warn!(
+            res,
+            stage,
+            name,
+            "[metrics.monitor] 排除了被 bench/诊断脚本回读的指标；\
+             相关校验（emitted_total/append_total/acked_lag 等）会读不到该指标"
+        );
+    }
     let mut tick = tokio::time::interval(config.report_interval.as_duration());
     tick.tick().await;
     let task_started = Instant::now();
@@ -49,7 +63,8 @@ pub async fn run_metrics_task(
 
                 if let Some(ref sender) = mon_send {
                     let snap = metrics.snapshot();
-                    let records = snap.to_records();
+                    let mut records = snap.to_records();
+                    monitor_filter.retain_allowed(&mut records);
                     // Backpressure instead of drop: `snapshot()` above already
                     // drained (swap(0)) every counter, so a `try_send` on a full
                     // channel would silently lose that drained increment — the
