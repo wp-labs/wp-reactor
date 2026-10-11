@@ -6,6 +6,7 @@ use orion_error::conversion::SourceErr;
 
 use crate::config_loader::fusion::{FusionConfig, FusionMode};
 use crate::error::{ConfigReason, ConfigResult};
+use crate::logging_metrics::MetricsMonitorConfig;
 use crate::output::OutputTimeZone;
 use crate::window::WindowConfig;
 
@@ -168,6 +169,32 @@ pub(crate) fn validate(config: &FusionConfig) -> ConfigResult<()> {
         }
     }
 
+    validate_monitor_filter(&config.metrics.monitor)?;
+
+    Ok(())
+}
+
+/// Validate `[metrics.monitor]` rules: a pattern explicitly set to an empty
+/// string is almost always a typo, so reject it rather than silently matching
+/// nothing (or, for `target`, everything-but-labelled records).
+fn validate_monitor_filter(monitor: &MetricsMonitorConfig) -> ConfigResult<()> {
+    for (kind, rules) in [("include", &monitor.include), ("exclude", &monitor.exclude)] {
+        for (idx, rule) in rules.iter().enumerate() {
+            for (field, value) in [
+                ("stage", &rule.stage),
+                ("name", &rule.name),
+                ("target", &rule.target),
+            ] {
+                if let Some(value) = value
+                    && value.trim().is_empty()
+                {
+                    return ConfigReason::Validation.fail(format!(
+                        "metrics.monitor.{kind}[{idx}].{field} must be non-empty when set"
+                    ));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -649,5 +676,78 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.rule_shards, 1);
         assert_eq!(cfg.parse_parallelism, 1); // 默认 1：无并行 parse 活时多 worker 是纯开销
+    }
+
+    #[test]
+    fn monitor_filter_accepts_valid_rules() {
+        let mut cfg = make_config(FusionMode::Daemon, vec![src_enabled("kafka")]);
+        cfg.metrics.monitor.exclude.push(crate::MetricsMonitorRule {
+            stage: Some("rule".into()),
+            name: Some("flush_seconds_*".into()),
+            target: Some("*".into()),
+        });
+        cfg.metrics.monitor.exclude.push(crate::MetricsMonitorRule {
+            stage: Some("receiver".into()),
+            name: Some("decode_seconds_*".into()),
+            target: None,
+        });
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn monitor_filter_rejects_empty_pattern() {
+        let mut cfg = make_config(FusionMode::Daemon, vec![src_enabled("kafka")]);
+        cfg.metrics.monitor.exclude.push(crate::MetricsMonitorRule {
+            stage: Some("rule".into()),
+            name: Some(String::new()),
+            target: None,
+        });
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("metrics.monitor.exclude[0].name"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn monitor_filter_rejects_empty_target() {
+        let mut cfg = make_config(FusionMode::Daemon, vec![src_enabled("kafka")]);
+        cfg.metrics.monitor.include.push(crate::MetricsMonitorRule {
+            stage: Some("alert".into()),
+            name: Some("emitted_total".into()),
+            target: Some(String::new()),
+        });
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("metrics.monitor.include[0].target"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn monitor_filter_accepts_name_only_rule() {
+        let mut cfg = make_config(FusionMode::Daemon, vec![src_enabled("kafka")]);
+        cfg.metrics.monitor.exclude.push(crate::MetricsMonitorRule {
+            stage: None,
+            name: Some("flush_seconds_*".into()),
+            target: Some("*".into()),
+        });
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn monitor_filter_rejects_empty_stage() {
+        let mut cfg = make_config(FusionMode::Daemon, vec![src_enabled("kafka")]);
+        cfg.metrics.monitor.exclude.push(crate::MetricsMonitorRule {
+            stage: Some(String::new()),
+            name: Some("events_total".into()),
+            target: Some("*".into()),
+        });
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("metrics.monitor.exclude[0].stage"),
+            "got: {err}"
+        );
     }
 }

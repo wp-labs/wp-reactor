@@ -357,6 +357,50 @@ kind = "prometheus"
 endpoint = "http://vm:8428/api/v1/write"
 ```
 
+### monitor 指标筛选（`[metrics.monitor]`，warp-fusion#115）
+
+默认情况下每个 `report_interval` 的**全部**记录都会发往 monitor sink（文件 NDJSON +
+VM/Prometheus）。高频部署下（如同秒数千行、按规则展开的 `flush_seconds_p50/p99`）会产生
+可观的落盘/传输量。`[metrics.monitor]` 允许按记录元数据（`stage` / `name` / `label`）
+筛选哪些记录发往 monitor sink——筛选只裁剪 monitor fan-out，不影响规则处理、告警输出或
+计数本身。
+
+```toml
+# wfusion.toml — 主配置
+[metrics]
+enabled = true
+report_interval = "30s"
+
+[metrics.monitor]
+default = "include"            # 未命中任何规则时的默认动作：include | exclude
+
+[[metrics.monitor.exclude]]    # 按规则排除：排除优先于 include
+stage = "rule"
+name = "flush_seconds_*"       # 指标名通配（支持 * 与 ?）
+target = "*"                   # 目标（label）通配；"*" = 任意目标
+
+[[metrics.monitor.exclude]]
+stage = "receiver"
+name = "decode_seconds_*"      # 省略 target → 只匹配全局（无 label）指标
+```
+
+匹配语义：
+
+| 字段 | 说明 |
+|------|------|
+| `stage` | 阶段通配（`receiver`/`router`/`rule`/`alert`/`window`/…）；省略 = `*` |
+| `name` | 指标名通配（如 `flush_seconds_*`）；省略 = `*` |
+| `target` | 记录 `label` 的通配；省略 = 仅匹配全局记录（无 `label`）；`"*"` = 任意目标 |
+
+优先级：**exclude > include > default**。未配置任何规则时 `default = "include"`，行为与引入筛选前完全一致（升级零变更）。
+
+筛选分两层落地：
+
+1. **注册期（启动）**：仅 monitor 读、不被 console 汇总复用的指标族（`flush_seconds` / `scan_timeout_seconds` 直方图、`events_total`、`rule.memory_bytes`、窗口计量、按源/按机行的计量等），被排除的键**连计数器都不注册** —— 热路径 `inc`/`observe` 命中未注册即 no-op，也不再进快照/构件记录。这样“每秒数千条白生成”的开销从源头消除。
+2. **输出期**：console 汇总复用的族（`matches_total` / `instances` / `emitted_total` / `memory_bytes`）与所有标量指标仍全量采集（保证 console 的 `matches=` / `alerts=` / `rules/s` / `memory` 列不变），其被排除的记录在 `snapshot → dispatch_to_monitor` 之间丢弃。
+
+两层都只影响 monitor 输出，不改规则处理/告警/ console 汇总。`[metrics.monitor]` 在启动期确定；改它在 reload 时直接阻断（metrics 任务在 `tail_watchers`，不可重载）。
+
 ### snapshot 驱动循环
 
 保留 `run_metrics_task()` 的 tokio interval 循环，改动输出目标：

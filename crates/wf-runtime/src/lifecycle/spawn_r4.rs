@@ -15,10 +15,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use arrow::datatypes::{DataType, Field as ArrowField, Schema, SchemaRef};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use wf_config::{ConfigVarContext, DistMode, EvictPolicy, FusionConfig, LatePolicy, WindowConfig};
+use wf_config::{
+    ConfigVarContext, DistMode, EvictPolicy, FusionConfig, LatePolicy, MetricsConfig,
+    MetricsMonitorConfig, MetricsMonitorRule, MonitorDefault, WindowConfig,
+};
 use wf_engine::match_engine::RuleExecutor;
 use wf_engine::sink::SinkDispatcher;
 use wf_engine::window::WindowDef;
@@ -576,7 +579,13 @@ async fn final_metrics_export_writes_tail_of_stream_emitted_total() {
     m.inc_alert_emitted_total("r4_rule");
 
     let router = router_with_window();
-    crate::lifecycle::export_final_metrics(&Some(m), &router, &Some(dispatcher.clone())).await;
+    crate::lifecycle::export_final_metrics(
+        &Some(m),
+        &router,
+        &Some(dispatcher.clone()),
+        &Default::default(),
+    )
+    .await;
     // 与 Reactor::wait 一致：导出后停 monitor sink（sync_all 落盘）。
     dispatcher.stop_monitor_sinks().await;
 
@@ -604,7 +613,13 @@ async fn final_metrics_export_noop_without_monitor_sink() {
     let m = metrics();
     m.inc_alert_emitted_total("r4_rule");
     let router = router_with_window();
-    crate::lifecycle::export_final_metrics(&Some(m), &router, &Some(dispatcher)).await;
+    crate::lifecycle::export_final_metrics(
+        &Some(m),
+        &router,
+        &Some(dispatcher),
+        &Default::default(),
+    )
+    .await;
     // 无 monitor sink：不应写任何文件，也不 panic
 }
 
@@ -614,7 +629,7 @@ async fn final_metrics_export_noop_without_dispatcher() {
     let m = metrics();
     m.inc_alert_emitted_total("r4_rule");
     let router = router_with_window();
-    crate::lifecycle::export_final_metrics(&Some(m), &router, &None).await;
+    crate::lifecycle::export_final_metrics(&Some(m), &router, &None, &Default::default()).await;
 }
 
 /// 最终导出 **drain** 计数器：第二次导出不再重复写 emitted_total 增量
@@ -630,9 +645,20 @@ async fn final_metrics_export_drains_counters_once() {
     m.inc_alert_emitted_total("r4_rule");
     let router = router_with_window();
 
-    crate::lifecycle::export_final_metrics(&Some(m.clone()), &router, &Some(dispatcher.clone()))
-        .await;
-    crate::lifecycle::export_final_metrics(&Some(m), &router, &Some(dispatcher.clone())).await;
+    crate::lifecycle::export_final_metrics(
+        &Some(m.clone()),
+        &router,
+        &Some(dispatcher.clone()),
+        &Default::default(),
+    )
+    .await;
+    crate::lifecycle::export_final_metrics(
+        &Some(m),
+        &router,
+        &Some(dispatcher.clone()),
+        &Default::default(),
+    )
+    .await;
     dispatcher.stop_monitor_sinks().await;
 
     let path = dir.path().join("data/out_dat/monitor.jsonl");
@@ -669,7 +695,13 @@ async fn final_metrics_export_captures_multiple_rules() {
     m.inc_alert_emitted_total("q8_rule");
     m.inc_alert_emitted_total("q8_rule");
     let router = router_with_window();
-    crate::lifecycle::export_final_metrics(&Some(m), &router, &Some(dispatcher.clone())).await;
+    crate::lifecycle::export_final_metrics(
+        &Some(m),
+        &router,
+        &Some(dispatcher.clone()),
+        &Default::default(),
+    )
+    .await;
     dispatcher.stop_monitor_sinks().await;
 
     let path = dir.path().join("data/out_dat/monitor.jsonl");
@@ -777,5 +809,158 @@ fn collect_order_sensitive_targets_covers_match_and_last_top_stats() {
         hits,
         HashSet::from(["mid".to_string()]),
         "Match 与 stats last/top 消费者命中；count stats / each 不命中"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// [metrics.monitor] 筛选（warp-fusion#115）
+// ---------------------------------------------------------------------------
+
+fn monitor_rule(
+    stage: Option<&str>,
+    name: Option<&str>,
+    target: Option<&str>,
+) -> MetricsMonitorRule {
+    MetricsMonitorRule {
+        stage: stage.map(str::to_string),
+        name: name.map(str::to_string),
+        target: target.map(str::to_string),
+    }
+}
+
+/// 被 exclude 的记录不写入文件 monitor sink，其余记录不受影响。
+#[tokio::test]
+async fn export_final_metrics_applies_monitor_exclude_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    write_monitor_sink_layout(dir.path());
+    let dispatcher = build_dispatcher(dir.path()).await;
+    let m = metrics();
+    m.inc_alert_emitted_total("r4_rule");
+    let router = router_with_window();
+
+    let monitor = MetricsMonitorConfig {
+        default: MonitorDefault::Include,
+        include: vec![],
+        exclude: vec![
+            monitor_rule(Some("rule"), Some("events_total"), Some("*")),
+            monitor_rule(Some("receiver"), Some("decode_seconds_*"), None),
+        ],
+    };
+    crate::lifecycle::export_final_metrics(&Some(m), &router, &Some(dispatcher.clone()), &monitor)
+        .await;
+    dispatcher.stop_monitor_sinks().await;
+
+    let path = dir.path().join("data/out_dat/monitor.jsonl");
+    let data = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !data.contains("events_total"),
+        "excluded per-rule events_total must not reach the monitor sink: {data}"
+    );
+    assert!(
+        !data.contains("decode_seconds"),
+        "excluded global decode_seconds must not reach the monitor sink: {data}"
+    );
+    // 未排除的记录仍照常输出（只裁剪 monitor fan-out，不影响其它指标）。
+    assert!(
+        data.lines()
+            .any(|l| l.contains("emitted_total") && l.contains("r4_rule")),
+        "non-excluded emitted_total must still be exported: {data}"
+    );
+    assert!(
+        data.contains("route_calls_total"),
+        "non-excluded global counters must still be exported: {data}"
+    );
+}
+
+/// default=exclude + include 列表：只有被 include 的记录写入 monitor sink。
+#[tokio::test]
+async fn export_final_metrics_default_exclude_keeps_only_included() {
+    let dir = tempfile::tempdir().unwrap();
+    write_monitor_sink_layout(dir.path());
+    let dispatcher = build_dispatcher(dir.path()).await;
+    let m = metrics();
+    m.inc_alert_emitted_total("r4_rule");
+    let router = router_with_window();
+
+    let monitor = MetricsMonitorConfig {
+        default: MonitorDefault::Exclude,
+        include: vec![monitor_rule(
+            Some("alert"),
+            Some("emitted_total"),
+            Some("*"),
+        )],
+        exclude: vec![],
+    };
+    crate::lifecycle::export_final_metrics(&Some(m), &router, &Some(dispatcher.clone()), &monitor)
+        .await;
+    dispatcher.stop_monitor_sinks().await;
+
+    let path = dir.path().join("data/out_dat/monitor.jsonl");
+    let data = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        data.lines()
+            .any(|l| l.contains("emitted_total") && l.contains("r4_rule")),
+        "included emitted_total must be exported: {data}"
+    );
+    assert!(
+        !data.contains("events_total"),
+        "not-included records must be dropped under default=exclude: {data}"
+    );
+    assert!(
+        !data.contains("route_calls_total"),
+        "not-included global counters must be dropped under default=exclude: {data}"
+    );
+}
+
+/// 周期性 metrics 任务在写入 monitor 通道之前应用 `[metrics.monitor]` 筛选
+/// （与 shutdown 尾部导出共用同一过滤器）。
+#[tokio::test]
+async fn run_metrics_task_applies_monitor_filter_to_batches() {
+    let m = metrics();
+    let router = router_with_window();
+    let cancel = CancellationToken::new();
+
+    let config = MetricsConfig {
+        enabled: true,
+        console_output: false,
+        report_interval: "50ms".parse().unwrap(),
+        monitor: MetricsMonitorConfig {
+            exclude: vec![monitor_rule(Some("rule"), Some("events_total"), Some("*"))],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let (tx, mut rx) = mpsc::channel::<Vec<crate::metrics::MetricsRecord>>(8);
+    let handle = tokio::spawn(async move {
+        crate::metrics::run_metrics_task(m, config, router, cancel, Some(tx)).await
+    });
+
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("metrics tick within timeout")
+        .expect("batch");
+    handle.abort();
+
+    assert!(
+        !batch
+            .iter()
+            .any(|r| r.field_value("name") == Some("events_total")),
+        "excluded events_total must not reach the monitor channel"
+    );
+    assert!(
+        batch
+            .iter()
+            .any(|r| r.field_value("name") == Some("route_calls_total")),
+        "non-excluded counters must still be emitted to the monitor channel"
+    );
+    // `events_total` shares the `rule` stage with `matches_total`; the latter
+    // being present proves the absence of `events_total` is the filter at work,
+    // not the rule stage simply producing no records.
+    assert!(
+        batch
+            .iter()
+            .any(|r| r.field_value("name") == Some("matches_total")),
+        "other rule-stage records must survive the filter"
     );
 }

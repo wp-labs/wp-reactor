@@ -976,6 +976,39 @@ queue_capacity = 8192
 }
 
 #[test]
+fn load_with_metrics_monitor_filter() {
+    let toml = format!(
+        r#"{}
+[metrics]
+enabled = true
+report_interval = "5s"
+prometheus_listen = "127.0.0.1:19002"
+
+[metrics.monitor]
+default = "include"
+
+[[metrics.monitor.exclude]]
+stage = "rule"
+name = "flush_seconds_*"
+target = "*"
+
+[[metrics.monitor.exclude]]
+stage = "receiver"
+name = "decode_seconds_*"
+"#,
+        FULL_TOML
+    );
+    let cfg: FusionConfig = load_with_windows(&toml, WINDOWS_TOML);
+    assert_eq!(cfg.metrics.monitor.default, crate::MonitorDefault::Include);
+    assert_eq!(cfg.metrics.monitor.exclude.len(), 2);
+    assert_eq!(
+        cfg.metrics.monitor.exclude[0].name.as_deref(),
+        Some("flush_seconds_*")
+    );
+    assert_eq!(cfg.metrics.monitor.exclude[1].target, None);
+}
+
+#[test]
 fn reject_invalid_metrics_listen() {
     let toml = format!(
         r#"{}

@@ -91,49 +91,108 @@ impl RuntimeMetrics {
         source_names: &[String],
         source_types: BTreeMap<String, String>,
     ) -> Self {
-        let make_rule_map = || {
+        Self::new_monitored(
+            rule_names,
+            window_names,
+            source_names,
+            source_types,
+            &MonitorFilter::allow_all(),
+        )
+    }
+
+    /// Like [`new`](Self::new) but, for metric families that **only the monitor
+    /// export reads** (not the console summary), skips registering keys that
+    /// `[metrics.monitor]` excludes — such a (family, key) is never registered,
+    /// so the hot path skips the `inc`/`observe` entirely and no snapshot entry
+    /// or record is ever built (warp-fusion#115 follow-up).
+    ///
+    /// Families read by the console summary (`matches_total`, `instances`,
+    /// `emitted_total`, `memory_bytes`) and all scalar metrics keep every slot,
+    /// so the console is unaffected; their excluded records are dropped on the
+    /// output side instead.
+    pub(crate) fn new_monitored(
+        rule_names: &[String],
+        window_names: &[String],
+        source_names: &[String],
+        source_types: BTreeMap<String, String>,
+        monitor: &MonitorFilter,
+    ) -> Self {
+        let rule_map = |stage: &str, name: &str| -> BTreeMap<String, AtomicU64> {
+            rule_names
+                .iter()
+                .filter(|n| monitor.allows_metric(stage, name, Some(n)))
+                .map(|n| (n.clone(), AtomicU64::new(0)))
+                .collect()
+        };
+        let rule_map_all = |_: &str, _: &str| -> BTreeMap<String, AtomicU64> {
             rule_names
                 .iter()
                 .map(|name| (name.clone(), AtomicU64::new(0)))
-                .collect::<BTreeMap<_, _>>()
+                .collect()
         };
-        // Signed gauge map for `rule_instances` (sum across shards, P2b).
-        let make_rule_map_i64 = || {
+        let rule_map_i64 = |stage: &str, name: &str| -> BTreeMap<String, AtomicI64> {
+            rule_names
+                .iter()
+                .filter(|n| monitor.allows_metric(stage, name, Some(n)))
+                .map(|n| (n.clone(), AtomicI64::new(0)))
+                .collect()
+        };
+        let rule_map_i64_all = |_: &str, _: &str| -> BTreeMap<String, AtomicI64> {
             rule_names
                 .iter()
                 .map(|name| (name.clone(), AtomicI64::new(0)))
-                .collect::<BTreeMap<_, _>>()
+                .collect()
         };
-        let make_rule_hist_map = || {
+        // A rule histogram emits both `_p50` and `_p99`; keep the histogram when
+        // either is allowed (the disallowed one is dropped at output time).
+        let rule_hist_map = |stage: &str, base: &str| -> BTreeMap<String, Histogram> {
+            let p50 = format!("{base}_p50");
+            let p99 = format!("{base}_p99");
             rule_names
                 .iter()
-                .map(|name| {
+                .filter(|n| {
+                    monitor.allows_metric(stage, &p50, Some(n))
+                        || monitor.allows_metric(stage, &p99, Some(n))
+                })
+                .map(|n| {
                     (
-                        name.clone(),
+                        n.clone(),
                         Histogram::from_seconds_bounds(DEFAULT_HISTOGRAM_BUCKETS_SECONDS),
                     )
                 })
-                .collect::<BTreeMap<_, _>>()
+                .collect()
         };
-        let make_window_map = || {
+        let window_map = |stage: &str, name: &str| -> BTreeMap<String, AtomicU64> {
+            window_names
+                .iter()
+                .filter(|n| monitor.allows_metric(stage, name, Some(n)))
+                .map(|n| (n.clone(), AtomicU64::new(0)))
+                .collect()
+        };
+        let window_map_all = |_: &str, _: &str| -> BTreeMap<String, AtomicU64> {
             window_names
                 .iter()
                 .map(|name| (name.clone(), AtomicU64::new(0)))
-                .collect::<BTreeMap<_, _>>()
+                .collect()
         };
-        let make_source_map = || {
+        let source_map = |stage: &str, name: &str| -> BTreeMap<String, AtomicU64> {
             source_names
                 .iter()
-                .map(|name| (name.clone(), AtomicU64::new(0)))
-                .collect::<BTreeMap<_, _>>()
+                .filter(|n| monitor.allows_metric(stage, name, Some(n)))
+                .map(|n| (n.clone(), AtomicU64::new(0)))
+                .collect()
         };
+        // `cursor_gap_total` carries `rule`/`window` fields but no `label`, so
+        // the filter decision is key-independent — include or drop the whole map.
         let mut gap_map = BTreeMap::new();
-        for rule in rule_names {
-            let mut by_window = BTreeMap::new();
-            for window in window_names {
-                by_window.insert(window.clone(), AtomicU64::new(0));
+        if monitor.allows_metric("rule", "cursor_gap_total", None) {
+            for rule in rule_names {
+                let mut by_window = BTreeMap::new();
+                for window in window_names {
+                    by_window.insert(window.clone(), AtomicU64::new(0));
+                }
+                gap_map.insert(rule.clone(), by_window);
             }
-            gap_map.insert(rule.clone(), by_window);
         }
 
         Self {
@@ -143,23 +202,23 @@ impl RuntimeMetrics {
             receiver_decode_errors_total: AtomicU64::new(0),
             receiver_read_errors_total: AtomicU64::new(0),
             source_types,
-            receiver_source_rows_total: make_source_map(),
+            receiver_source_rows_total: source_map("receiver", "rows_total"),
             receiver_source_machine_rows: Mutex::new(BTreeMap::new()),
-            receiver_source_decode_errors_total: make_source_map(),
-            receiver_source_read_errors_total: make_source_map(),
+            receiver_source_decode_errors_total: source_map("receiver", "decode_errors_total"),
+            receiver_source_read_errors_total: source_map("receiver", "read_errors_total"),
             receiver_window_miss_total: Mutex::new(BTreeMap::new()),
             router_route_calls_total: AtomicU64::new(0),
             router_delivered_total: AtomicU64::new(0),
             router_dropped_late_total: AtomicU64::new(0),
             router_skipped_non_local_total: AtomicU64::new(0),
-            router_source_route_errors_total: make_source_map(),
-            rule_events_total: make_rule_map(),
-            rule_matches_total: make_rule_map(),
-            rule_instances: make_rule_map_i64(),
-            rule_memory_bytes: make_rule_map_i64(),
+            router_source_route_errors_total: source_map("router", "route_errors_total"),
+            rule_events_total: rule_map("rule", "events_total"),
+            rule_matches_total: rule_map_all("rule", "matches_total"),
+            rule_instances: rule_map_i64_all("rule", "instances"),
+            rule_memory_bytes: rule_map_i64("rule", "memory_bytes"),
             rule_cursor_gap_total: gap_map,
-            rule_stats_over_limit_total: make_rule_map(),
-            alert_emitted_total: make_rule_map(),
+            rule_stats_over_limit_total: rule_map("rule", "stats_over_limit_total"),
+            alert_emitted_total: rule_map_all("alert", "emitted_total"),
             alert_emitted_detail_shards: (0..ALERT_DETAIL_SHARDS)
                 .map(|_| Mutex::new(BTreeMap::new()))
                 .collect(),
@@ -176,19 +235,19 @@ impl RuntimeMetrics {
             evictor_sweeps_total: AtomicU64::new(0),
             evictor_time_evicted_total: AtomicU64::new(0),
             evictor_memory_evicted_total: AtomicU64::new(0),
-            window_memory_bytes: make_window_map(),
-            window_allocated_bytes: make_window_map(),
-            window_fanout_queued: make_window_map(),
-            window_fanout_capacity: make_window_map(),
-            window_mailbox_inflight: make_window_map(),
-            window_mailbox_budget: make_window_map(),
-            window_capacity_bytes: make_window_map(),
-            window_rows: make_window_map(),
-            window_batches: make_window_map(),
-            window_acked_lag: make_window_map(),
-            window_append_total: make_window_map(),
-            window_evict_total: make_window_map(),
-            window_late_total: make_window_map(),
+            window_memory_bytes: window_map_all("window", "memory_bytes"),
+            window_allocated_bytes: window_map("window", "allocated_bytes"),
+            window_fanout_queued: window_map("window", "fanout_queued_batches"),
+            window_fanout_capacity: window_map("window", "fanout_capacity_batches"),
+            window_mailbox_inflight: window_map("window", "mailbox_inflight_bytes"),
+            window_mailbox_budget: window_map("window", "mailbox_budget_bytes"),
+            window_capacity_bytes: window_map("window", "window_capacity_bytes"),
+            window_rows: window_map("window", "rows"),
+            window_batches: window_map("window", "batches"),
+            window_acked_lag: window_map("window", "acked_lag"),
+            window_append_total: window_map("window", "append_total"),
+            window_evict_total: window_map("window", "evict_total"),
+            window_late_total: window_map("window", "late_total"),
             receiver_decode_seconds: Histogram::from_seconds_bounds(
                 DEFAULT_HISTOGRAM_BUCKETS_SECONDS,
             ),
@@ -198,8 +257,8 @@ impl RuntimeMetrics {
             event_e2e_latency_seconds: Histogram::from_seconds_bounds(
                 DEFAULT_HISTOGRAM_BUCKETS_SECONDS,
             ),
-            rule_scan_timeout_seconds: make_rule_hist_map(),
-            rule_flush_seconds: make_rule_hist_map(),
+            rule_scan_timeout_seconds: rule_hist_map("rule", "scan_timeout_seconds"),
+            rule_flush_seconds: rule_hist_map("rule", "flush_seconds"),
         }
     }
 
@@ -686,9 +745,236 @@ impl RuntimeMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wf_config::{MetricsMonitorConfig, MetricsMonitorRule, MonitorDefault};
 
     fn metrics() -> RuntimeMetrics {
         RuntimeMetrics::new(&[], &[], &[], BTreeMap::new())
+    }
+
+    fn mon_rule(stage: &str, name: &str) -> MetricsMonitorRule {
+        MetricsMonitorRule {
+            stage: Some(stage.to_string()),
+            name: Some(name.to_string()),
+            target: Some("*".to_string()),
+        }
+    }
+
+    fn filter_excluding(rules: Vec<MetricsMonitorRule>) -> MonitorFilter {
+        MonitorFilter::from_config(&MetricsMonitorConfig {
+            default: MonitorDefault::Include,
+            include: vec![],
+            exclude: rules,
+        })
+    }
+
+    #[test]
+    fn monitored_registration_prunes_excluded_monitor_only_families() {
+        let filter = filter_excluding(vec![
+            mon_rule("rule", "events_total"),
+            mon_rule("rule", "flush_seconds_*"),
+            mon_rule("window", "rows"),
+            mon_rule("receiver", "decode_errors_total"),
+        ]);
+        let m = RuntimeMetrics::new_monitored(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &["s1".to_string()],
+            BTreeMap::new(),
+            &filter,
+        );
+        // 仅 monitor 读的 family：被排除的键不注册。
+        assert!(m.rule_events_total.is_empty(), "events_total pruned");
+        assert!(m.rule_flush_seconds.is_empty(), "flush_seconds pruned");
+        assert!(m.window_rows.is_empty(), "window rows pruned");
+        assert!(
+            m.receiver_source_decode_errors_total.is_empty(),
+            "source decode_errors pruned"
+        );
+        // 热路径对未注册键是 no-op（不 panic、不入表）。
+        m.add_rule_events("r1", 3);
+        m.observe_rule_flush("r1", Duration::from_millis(1));
+        m.inc_receiver_source_decode_error("s1");
+        assert!(m.rule_events_total.is_empty());
+        assert!(m.rule_flush_seconds.is_empty());
+        assert!(m.receiver_source_decode_errors_total.is_empty());
+    }
+
+    #[test]
+    fn monitored_registration_keeps_console_shared_families() {
+        // 这些 family 被 console 汇总复用（summary_line / interval_snapshot），
+        // 即使被 monitor 排除也必须保留注册，否则 console 输出会变化。
+        let filter = filter_excluding(vec![
+            mon_rule("rule", "matches_total"),
+            mon_rule("rule", "instances"),
+            mon_rule("alert", "emitted_total"),
+            mon_rule("window", "memory_bytes"),
+        ]);
+        let m = RuntimeMetrics::new_monitored(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &[],
+            BTreeMap::new(),
+            &filter,
+        );
+        assert_eq!(m.rule_matches_total.len(), 1);
+        assert_eq!(m.rule_instances.len(), 1);
+        assert_eq!(m.alert_emitted_total.len(), 1);
+        assert_eq!(m.window_memory_bytes.len(), 1);
+        // 仍正常计数（console 的 rules/s、out/s、memory 列依赖它们）。
+        m.inc_rule_match("r1");
+        m.inc_alert_emitted_total("r1");
+        assert_eq!(m.total_rule_matches(), 1);
+        let alerts: u64 = m
+            .alert_emitted_total
+            .values()
+            .map(|v| v.load(Ordering::Relaxed))
+            .sum();
+        assert_eq!(alerts, 1);
+    }
+
+    #[test]
+    fn monitored_registration_prunes_cursor_gap_when_excluded() {
+        let filter = filter_excluding(vec![mon_rule("rule", "cursor_gap_total")]);
+        let m = RuntimeMetrics::new_monitored(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &[],
+            BTreeMap::new(),
+            &filter,
+        );
+        assert!(m.rule_cursor_gap_total.is_empty());
+        m.inc_rule_cursor_gap("r1", "w1");
+        assert!(m.rule_cursor_gap_total.is_empty());
+    }
+
+    #[test]
+    fn monitored_registration_keep_p50_only_family_when_p99_excluded() {
+        // 只排除 _p99：直方图仍需注册（因为 _p50 要输出）。
+        let filter = filter_excluding(vec![mon_rule("rule", "flush_seconds_p99")]);
+        let m =
+            RuntimeMetrics::new_monitored(&["r1".to_string()], &[], &[], BTreeMap::new(), &filter);
+        assert_eq!(m.rule_flush_seconds.len(), 1);
+        // 两个都排除 → 不注册。
+        let filter2 = filter_excluding(vec![mon_rule("rule", "flush_seconds_p*")]);
+        let m2 =
+            RuntimeMetrics::new_monitored(&["r1".to_string()], &[], &[], BTreeMap::new(), &filter2);
+        assert!(m2.rule_flush_seconds.is_empty());
+    }
+
+    fn record_fields(records: &[MetricsRecord]) -> Vec<Vec<(String, String)>> {
+        records.iter().map(|r| r.fields.clone()).collect()
+    }
+
+    /// Registration pruning must be exactly equivalent to filtering the full
+    /// metric set on the output side: `retain(to_records(pruned))` ==
+    /// `retain(to_records(full))`. This is the core safety property of the
+    /// startup-time optimization.
+    #[test]
+    fn monitored_registration_is_equivalent_to_output_filtering() {
+        let filter = filter_excluding(vec![
+            mon_rule("rule", "events_total"),
+            mon_rule("rule", "flush_seconds_*"),
+            mon_rule("window", "rows"),
+            // console-shared*: kept registered, dropped only at output
+            mon_rule("alert", "emitted_total"),
+            mon_rule("receiver", "rows_total"),
+            mon_rule("alert", "emitted_detail"),
+        ]);
+        let full = RuntimeMetrics::new(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &["s1".to_string()],
+            BTreeMap::new(),
+        );
+        let pruned = RuntimeMetrics::new_monitored(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &["s1".to_string()],
+            BTreeMap::new(),
+            &filter,
+        );
+        for m in [&full, &pruned] {
+            m.add_rule_events("r1", 2);
+            m.inc_rule_match("r1");
+            m.observe_rule_flush("r1", Duration::from_millis(1));
+            m.inc_alert_emitted_total("r1");
+            m.inc_alert_emitted_detail("r1", "m1", "s1");
+            m.inc_receiver_source_decode_error("s1");
+            m.add_receiver_source_frame("s1", 3);
+            m.add_window_append("w1", 1);
+        }
+        let mut out_full = full.snapshot().to_records();
+        let mut out_pruned = pruned.snapshot().to_records();
+        filter.retain_allowed(&mut out_full);
+        filter.retain_allowed(&mut out_pruned);
+        assert_eq!(
+            record_fields(&out_pruned),
+            record_fields(&out_full),
+            "pruned registration must match output-side filtering"
+        );
+    }
+
+    #[test]
+    fn new_equals_new_monitored_allow_all() {
+        let a = RuntimeMetrics::new(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &["s1".to_string()],
+            BTreeMap::new(),
+        );
+        let b = RuntimeMetrics::new_monitored(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &["s1".to_string()],
+            BTreeMap::new(),
+            &MonitorFilter::allow_all(),
+        );
+        assert_eq!(a.rule_events_total.len(), b.rule_events_total.len());
+        assert_eq!(a.rule_flush_seconds.len(), b.rule_flush_seconds.len());
+        assert_eq!(a.window_rows.len(), b.window_rows.len());
+        assert_eq!(
+            record_fields(&a.snapshot().to_records()),
+            record_fields(&b.snapshot().to_records())
+        );
+    }
+
+    /// Guard against typos in `EXTERNAL_CONSUMER_METRICS`: every entry we can
+    /// drive via the public counters must actually appear in the emitted
+    /// records. (`window.memory_bytes` / `window.acked_lag` are gauges set by
+    /// `sample_windows`, which needs a router, so they are skipped here.)
+    #[test]
+    fn external_consumer_metric_names_are_actually_emitted() {
+        use std::collections::HashSet;
+        let m = RuntimeMetrics::new(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &["s1".to_string()],
+            BTreeMap::new(),
+        );
+        m.add_rule_events("r1", 1);
+        m.inc_rule_match("r1");
+        m.inc_alert_emitted_total("r1");
+        m.inc_alert_dispatch();
+        m.add_window_append("w1", 1);
+        m.add_window_evict("w1", 1);
+        m.add_receiver_source_frame("s1", 1);
+        m.inc_receiver_source_decode_error("s1");
+        let records = m.snapshot().to_records();
+        let pairs: HashSet<(&str, &str)> = records
+            .iter()
+            .filter_map(|r| Some((r.field_value("stage")?, r.field_value("name")?)))
+            .collect();
+        for &(stage, name, _) in super::filter::EXTERNAL_CONSUMER_METRICS {
+            if (stage, name) == ("window", "memory_bytes")
+                || (stage, name) == ("window", "acked_lag")
+            {
+                continue;
+            }
+            assert!(
+                pairs.contains(&(stage, name)),
+                "EXTERNAL_CONSUMER_METRICS entry {stage}.{name} is never emitted (typo?)"
+            );
+        }
     }
 
     #[test]

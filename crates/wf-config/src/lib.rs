@@ -23,7 +23,10 @@ pub use config_loader::{
     ResolvedConfigVar, RuntimeConfig, resolve_glob, validate_over_vs_over_cap,
 };
 pub use error::{ConfigError, ConfigReason, ConfigResult};
-pub use logging_metrics::{LogFormat, LoggingConfig, MetricsConfig, MetricsTopNConfig};
+pub use logging_metrics::{
+    LogFormat, LoggingConfig, MetricsConfig, MetricsMonitorConfig, MetricsMonitorRule,
+    MetricsTopNConfig, MonitorDefault,
+};
 pub use output::{DEFAULT_OUTPUT_TIME_FORMAT, OutputConfig, OutputTimeZone};
 pub use perf::{PerfConfig, PerfStage};
 pub use project::{load_schemas, load_wfl, load_wfl_with_context, parse_vars};

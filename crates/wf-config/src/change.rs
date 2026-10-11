@@ -533,4 +533,19 @@ flag = true
 
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn classify_metrics_monitor_requires_restart() {
+        // `[metrics.monitor]` filtering is part of the metrics task config and
+        // is not hot-reloadable — a change must require a restart.
+        for path in ["metrics", "metrics.monitor", "metrics.monitor.exclude"] {
+            let (kind, disposition, _) = classify_path(path);
+            assert_eq!(kind, FusionChangeKind::Metrics, "path={path}");
+            assert_eq!(
+                disposition,
+                FusionReloadDisposition::RequiresRestart,
+                "path={path}"
+            );
+        }
+    }
 }

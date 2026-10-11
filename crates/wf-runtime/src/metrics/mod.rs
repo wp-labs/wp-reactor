@@ -24,8 +24,12 @@ mod tests;
 // server/测试与新子模块）经 `use super::*` 复用私有字段与方法（可见性只向下流）。
 #[path = "counters.rs"]
 mod counters;
+#[path = "filter.rs"]
+mod filter;
 #[path = "records.rs"]
 mod records;
+
+pub(crate) use self::filter::MonitorFilter;
 
 // Re-export pub items that were originally at crate::metrics::* level
 pub use self::server::run_metrics_task;
@@ -127,6 +131,16 @@ struct HistogramSnapshot {
 #[jumo(kind = "struct", domain = "Runtime", module = "Runtime.Metrics")]
 pub struct MetricsRecord {
     pub fields: Vec<(String, String)>,
+}
+
+impl MetricsRecord {
+    /// Value of the first field with the given key, if present.
+    pub(crate) fn field_value(&self, key: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 #[derive(::jumo_derive::Jumo)]
@@ -548,10 +562,15 @@ pub fn maybe_build_metrics(
     if !config.enabled {
         return None;
     }
-    Some(Arc::new(RuntimeMetrics::new(
+    // 启动期把 [metrics.monitor] 交给注册：被排除的「仅 monitor 读」指标连
+    // 计数器都不注册（热路径 inc/observe 成为 no-op）。reload 不会重建 metrics，
+    // 且改 [metrics] 会被 reload 直接阻断，所以此处定死是安全的。
+    let monitor = MonitorFilter::from_config(&config.monitor);
+    Some(Arc::new(RuntimeMetrics::new_monitored(
         rule_names,
         window_names,
         source_names,
         source_types,
+        &monitor,
     )))
 }

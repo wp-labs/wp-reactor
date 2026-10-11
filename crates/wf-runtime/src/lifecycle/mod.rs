@@ -22,12 +22,12 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use wf_config::{FusionConfig, FusionReloadPlan, RawFusionConfigTree};
+use wf_config::{FusionConfig, FusionReloadPlan, MetricsMonitorConfig, RawFusionConfigTree};
 use wf_engine::sink::SinkDispatcher;
 use wf_engine::window::{EvictionGate, Router};
 
 use crate::error::{RuntimeReason, RuntimeResult};
-use crate::metrics::{RuntimeMetrics, maybe_build_metrics};
+use crate::metrics::{MonitorFilter, RuntimeMetrics, maybe_build_metrics};
 
 // Re-export public API
 pub use crate::hot_reload::{PreparedRuleReload, ReloadPreparation, prepare_reload};
@@ -752,7 +752,13 @@ impl Reactor {
     /// export is exact and never double-counts (the metrics task drained its
     /// share on its last tick).
     async fn export_final_metrics(&self, dispatcher: &Option<Arc<SinkDispatcher>>) {
-        export_final_metrics(&self.metrics, &self.router, dispatcher).await
+        export_final_metrics(
+            &self.metrics,
+            &self.router,
+            dispatcher,
+            &self.current_config.metrics.monitor,
+        )
+        .await
     }
 }
 
@@ -764,6 +770,7 @@ pub(crate) async fn export_final_metrics(
     metrics: &Option<Arc<RuntimeMetrics>>,
     router: &Arc<Router>,
     dispatcher: &Option<Arc<SinkDispatcher>>,
+    monitor: &MetricsMonitorConfig,
 ) {
     let (Some(metrics), Some(dispatcher)) = (metrics, dispatcher) else {
         return;
@@ -773,7 +780,8 @@ pub(crate) async fn export_final_metrics(
     }
     metrics.sample_windows(router);
     let snap = metrics.snapshot();
-    let records = snap.to_records();
+    let mut records = snap.to_records();
+    MonitorFilter::from_config(monitor).retain_allowed(&mut records);
     if records.is_empty() {
         return;
     }

@@ -8,6 +8,13 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Added
 
+- **monitor 指标可按配置筛选（warp-fusion#115）**：新增 `[metrics.monitor]` 段，可按 `stage` / `name`（指标名）/ `target`（标签）的通配规则选择哪些运行指标发往 monitor sink（文件 NDJSON、VM/Prometheus 等）。支持 `include` / `exclude`（`exclude` 优先）与 `default = "include" | "exclude"`。
+  - 被排除的记录不再写入文件 monitor sink，也不发往 VM 等其他 monitor sink；筛选只裁剪 monitor 输出，不影响规则处理、告警输出与计数本身。
+  - 未配置筛选规则时保持原有行为（全部输出），升级后现有 monitor 输出不变。
+  - **启动期即生效**：仅 monitor 读、不被 console 汇总复用的指标族（如 `flush_seconds` / `scan_timeout` 直方图、`events_total`、窗口计量等），被排除的键**连计数器都不注册**——热路径 `inc`/`observe` 直接跳过，也不再构造快照与记录，消除“每秒数千条白生成”的导出开销。console 汇总复用的族（`matches_total` / `instances` / `emitted_total` / `memory_bytes`）保留注册，只在输出侧剔除，console 输出不受影响。
+  - **误配提示（WARN，不拒绝）**：若排除了仓库 bench / 诊断脚本会从 `metrics.ndjson` 回读的指标（`emitted_total` / `append_total` / `acked_lag` / `evict_total` / `memory_bytes` / `dispatch_total` / `matches_total` / `events_total` / `rows_total` / `decode_errors_total`），启动时打一条 `WARN [res]` 点名，避免相关校验静默读不到数据。
+  - 由于 metrics 任务不可热重载，改动 `[metrics.monitor]` 会在 reload 时被阻断并提示需重启（配置在启动期确定）。
+
 - **列类型映射收敛为单一实现**：接收侧不再维护自己的 WPL→Arrow 表，与连接器侧共用同一实现（公开路径与签名不变）。此前两张手工表可能静默分叉的那类问题，从结构上不再可能发生。
 
 ### Changed
