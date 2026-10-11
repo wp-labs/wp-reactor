@@ -596,7 +596,7 @@ impl RuleExecutor {
                 // 单参数恒等——列式 join 富化路径读字段后按 fmt 语义渲染
                 // （Str 透传 / 非 Str value_to_string），双侧门控校验字段限定。
                 other if !self.live_joins.is_empty() => {
-                    fmt_identity_field(other).is_some_and(&out_shape_ok)
+                    fmt_identity_field(other).is_some_and(out_shape_ok)
                 }
                 other => wf_lang::columnar::columnar_output_expr(other),
             })

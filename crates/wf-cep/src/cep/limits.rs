@@ -127,7 +127,7 @@ impl SharedLimits {
             return;
         }
         self.estimated_memory_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 let next = if delta >= 0 {
                     cur.saturating_add(delta as usize)
                 } else {
