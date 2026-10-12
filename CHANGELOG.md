@@ -4,6 +4,12 @@ All notable changes to wp-reactor will be documented in this file.
 
 本文件记录面向使用者的变更（行为、DSL、公开 API、配置）；内部实现细节与测试计数不在此展开。段标题 = 版本号 + 发布日期，`-- latest` 仅用于尚未发布的版本。
 
+## [2.5.1] — 2026-10-12
+
+### Changed
+
+- **`wf-connector-api` 0.3 → 0.4**（并随之对齐 `wp-core-connectors` 0.10.0 → 0.10.1）。上游把 `orion-error` 0.9 的对齐放在 `wf-connector-api 0.4` 发布，`wp-core-connectors 0.10.1` 也改为 `^0.4`；引擎同步到 `^0.4`，避免依赖图里同时出现 `wf-connector-api` 的 0.3 与 0.4 两份（会造成 `SourceReason` / `StructError` 类型分裂）。无源码改动。
+
 ## [2.5.0] — 2026-10-12
 
 ### Changed
