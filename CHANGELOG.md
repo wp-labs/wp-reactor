@@ -4,6 +4,15 @@ All notable changes to wp-reactor will be documented in this file.
 
 本文件记录面向使用者的变更（行为、DSL、公开 API、配置）；内部实现细节与测试计数不在此展开。段标题 = 版本号 + 发布日期，`-- latest` 仅用于尚未发布的版本。
 
+## [2.5.0] — 2026-10-12
+
+### Changed
+
+- **错误栈对齐 `orion-error` 0.9**（`orion-error` 0.8 → 0.9、`orion-variate` 0.13 → 0.14）。消除依赖图中 0.8 与 0.9 两个互不互通的 `StructError` 类型。
+- **连接器依赖对齐 0.9 线**：`wp-connector-api` 0.13 → 0.14、`wp-connector-utils` 0.3 → 0.5、`wp-core-connectors` 0.9 → 0.10、`wp-knowledge` 0.18 → 0.19、`wf-connector-api` 0.3（→ 0.3.1）。
+  - 此前引擎（0.9）与仍在 0.8 线的连接器混用，跨 crate 传递 `StructError` 会因两个不互通的结构化错误类型而无法编译。本次统一为单一 `orion-error 0.9`。
+  - 无源码改动，行为不变。
+
 ## [2.4.0] — 2026-10-12
 
 ### Added
