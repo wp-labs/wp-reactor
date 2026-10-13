@@ -188,6 +188,7 @@ fn infer_func_call(
         "coalesce" => args.first().and_then(|a| infer_type(a, scope)),
         "merge" => Some(ValType::Object),
         "len" => Some(ValType::Base(BaseType::Digit)),
+        "to_int" => Some(ValType::Base(BaseType::Digit)),
         "time_bucket" | "bucket_end" => Some(ValType::Base(BaseType::Time)),
         "phase_bucket" => Some(ValType::Base(BaseType::Digit)),
         "mvsort" | "mvreverse" => args.first().and_then(|a| match infer_type(a, scope) {

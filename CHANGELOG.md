@@ -4,6 +4,16 @@ All notable changes to wp-reactor will be documented in this file.
 
 本文件记录面向使用者的变更（行为、DSL、公开 API、配置）；内部实现细节与测试计数不在此展开。段标题 = 版本号 + 发布日期，`-- latest` 仅用于尚未发布的版本。
 
+## [2.6.0] — 2026-10-13
+
+### Added
+
+- **WFL 新增 `to_int(x)`：数字字符串转精确整数（warp-fusion#109）**：把数字字符串字段（如 `"6"`、`"1036"`）转成整数，可直接用于数值比较与运算（`to_int(s.count) >= 3`），不必再用 `regex_match` 模拟数值范围。空串 / 非数字 / 非整值（`"6.5"`）/ 缺失 → null（条件不成立）；参数已是整数或整值浮点则转换。guard、`yield` 等位置均可用；两个求值器（CEP / 引擎）与 checker 均已接入。
+
+### Fixed
+
+- **WFL `case` 的 subject 缺失或为 `null` 时改走 `_` 默认分支（warp-fusion#110）**：此前 subject 求值为 null（字段缺失或显式 null）会直接短路成空值，导致 `case e.severity { "high" => "HIGH", ..., _ => "UNKNOWN" }` 在 severity 缺失时得 `""` 而非 `"UNKNOWN"`。现将「subject 缺失/为 null」视为所有模式均不命中，落入 `_` 默认分支；未写 `_` 时仍得 null（guard / where 位置等价条件不通过）。CEP 与引擎（L3 yield 路径）两个求值器同步修正。
+
 ## [2.5.1] — 2026-10-12
 
 ### Changed

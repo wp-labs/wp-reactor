@@ -203,6 +203,7 @@ pub(crate) fn check_func_call(
             | "lower"
             | "upper"
             | "len"
+            | "to_int"
     ) {
         check_str_func(&ctx, name, args, errors);
     } else if matches!(
@@ -1006,6 +1007,25 @@ fn check_str_func(
                 errors.push(rule_error(
                     rule_name,
                     format!("len() argument must be chars, got {:?}", t),
+                ));
+            }
+        }
+        "to_int" => {
+            // to_int(x)：数字字符串 → 精确整数；已是整数/整值浮点则取整数；
+            // 空串、非数字、非整值（如 "6.5"）运行时得 null（返回 None）。
+            if args.len() != 1 {
+                errors.push(rule_error(
+                    rule_name,
+                    "to_int() requires exactly 1 argument".to_string(),
+                ));
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !(compatible(&t, &ValType::Base(BaseType::Chars))
+                    || compatible(&t, &ValType::Base(BaseType::Digit))
+                    || compatible(&t, &ValType::Base(BaseType::Float)))
+            {
+                errors.push(rule_error(
+                    rule_name,
+                    format!("to_int() argument must be chars or a number, got {:?}", t),
                 ));
             }
         }

@@ -126,6 +126,46 @@ fn blank_functions_work() {
 }
 
 #[test]
+fn to_int_parses_integers_and_rejects_non_integers() {
+    use crate::cep::{Event, eval_expr};
+
+    let mut fields = EngineHashMap::default();
+    fields.insert("n".into(), Value::Str("6".into()));
+    fields.insert("big".into(), Value::Str("1036".into()));
+    fields.insert("pad".into(), Value::Str(" 42 ".into()));
+    fields.insert("neg".into(), Value::Str("-7".into()));
+    fields.insert("frac".into(), Value::Str("6.5".into()));
+    fields.insert("blank".into(), Value::Str(String::new().into()));
+    fields.insert("word".into(), Value::Str("abc".into()));
+    fields.insert("i".into(), Value::Int(9));
+    fields.insert("f".into(), Value::Float(6.0));
+    fields.insert("under".into(), Value::Str("-9223372036854775809".into()));
+    fields.insert("inf".into(), Value::Str("inf".into()));
+    let event = Event { fields };
+
+    let call = |field: &str| Expr::FuncCall {
+        qualifier: None,
+        name: "to_int".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple(field.to_string()))],
+    };
+
+    // 数字字符串 / 已数字段 → 精确整数。
+    assert_eq!(eval_expr(&call("n"), &event), Some(Value::Int(6)));
+    assert_eq!(eval_expr(&call("big"), &event), Some(Value::Int(1036)));
+    assert_eq!(eval_expr(&call("pad"), &event), Some(Value::Int(42)));
+    assert_eq!(eval_expr(&call("neg"), &event), Some(Value::Int(-7)));
+    assert_eq!(eval_expr(&call("i"), &event), Some(Value::Int(9)));
+    assert_eq!(eval_expr(&call("f"), &event), Some(Value::Int(6)));
+    // 空串 / 非数字 / 非整值 / 缺失 → null。
+    assert_eq!(eval_expr(&call("frac"), &event), None);
+    assert_eq!(eval_expr(&call("blank"), &event), None);
+    assert_eq!(eval_expr(&call("word"), &event), None);
+    assert_eq!(eval_expr(&call("under"), &event), None);
+    assert_eq!(eval_expr(&call("inf"), &event), None);
+    assert_eq!(eval_expr(&call("missing"), &event), None);
+}
+
+#[test]
 fn merge_shallow_merges_objects_in_l2_eval() {
     use crate::cep::{Event, eval_expr};
 

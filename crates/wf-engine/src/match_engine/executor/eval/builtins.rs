@@ -289,6 +289,7 @@ fn builtin_handler(name: &str) -> Option<BuiltinHandler> {
         map.insert("lower", handlers::builtin_lower);
         map.insert("upper", handlers::builtin_upper);
         map.insert("len", handlers::builtin_len);
+        map.insert("to_int", handlers::builtin_to_int);
         map.insert("mvcount", handlers::builtin_mvcount);
         map.insert("mvjoin", handlers::builtin_mvjoin);
         map.insert("mvindex", handlers::builtin_mvindex);

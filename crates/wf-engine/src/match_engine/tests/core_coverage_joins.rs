@@ -692,3 +692,25 @@ fn eval_expr_l1_match_expression() {
     let ev3 = event(vec![("n", num(9.0))]);
     assert_eq!(eval_expr(&no_default, &ev3), None, "无默认且未命中 → None");
 }
+
+/// issue #110：`case` subject 缺失/为 null（求值 None）→ 落默认分支；无默认
+/// → None。L1 求值器（guard/where 路径）。
+#[test]
+fn eval_expr_l1_match_none_subject_uses_default() {
+    use wf_lang::ast::MatchArm;
+    let m = |default: Option<Expr>| Expr::Match {
+        expr: Box::new(Expr::Field(FieldRef::Simple("missing".into()))),
+        arms: vec![MatchArm {
+            patterns: vec![Expr::StringLit("high".into())],
+            value: Expr::StringLit("HIGH".into()),
+        }],
+        default: default.map(Box::new),
+    };
+    let ev = event(vec![("other", str_val("x"))]);
+    assert_eq!(
+        eval_expr(&m(Some(Expr::StringLit("UNKNOWN".into()))), &ev),
+        Some(Value::Str("UNKNOWN".into())),
+        "subject 缺失时默认分支生效"
+    );
+    assert_eq!(eval_expr(&m(None), &ev), None, "无默认时仍为 None");
+}

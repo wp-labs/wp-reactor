@@ -39,6 +39,7 @@ fn eval_handler(name: &str) -> Option<FuncHandler> {
         map.insert("lower", eval_func_lower);
         map.insert("upper", eval_func_upper);
         map.insert("len", eval_func_len);
+        map.insert("to_int", eval_func_to_int);
         map.insert("mvcount", eval_func_mvcount);
         map.insert("mvjoin", eval_func_mvjoin);
         map.insert("mvindex", eval_func_mvindex);
@@ -119,6 +120,10 @@ mod tests {
     fn handler_table_covers_families_and_rejects_unknown() {
         // 分派表覆盖四个族 + 回退校验（funcs.rs 拆分后表仍完整）
         assert!(eval_handler("substr").is_some(), "str 族");
+        assert!(
+            eval_handler("to_int").is_some(),
+            "str 族（数字字符串→整数）"
+        );
         assert!(eval_handler("mvindex").is_some(), "mv 族");
         assert!(eval_handler("round").is_some(), "num 族");
         assert!(eval_handler("merge").is_some(), "misc 族");

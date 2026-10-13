@@ -262,6 +262,60 @@ fn eval_yield_expr_falls_back_to_empty_string() {
     );
 }
 
+/// issue #110（端到端 yield 路径）：`case` subject 缺失/为 null / 值不在列表
+/// 时，yield 取 `_` 默认分支，而非被「None→空串」兜底吞成空值。
+#[test]
+fn eval_yield_case_none_subject_yields_default() {
+    use wf_lang::ast::{FieldRef, MatchArm};
+    let case = || Expr::Match {
+        expr: Box::new(Expr::Field(FieldRef::Simple("severity".into()))),
+        arms: vec![
+            MatchArm {
+                patterns: vec![lit("high")],
+                value: lit("HIGH"),
+            },
+            MatchArm {
+                patterns: vec![lit("low")],
+                value: lit("LOW"),
+            },
+        ],
+        default: Some(Box::new(lit("UNKNOWN"))),
+    };
+    // subject 缺失 → 默认分支（不是空串）
+    let missing = ctx_with(vec![]);
+    assert_eq!(
+        eval_yield_expr(&case(), &missing),
+        Some(Value::Str("UNKNOWN".into())),
+        "缺失字段应取默认分支"
+    );
+    // subject 命中分支
+    let hit = ctx_with(vec![("severity", Value::Str("high".into()))]);
+    assert_eq!(
+        eval_yield_expr(&case(), &hit),
+        Some(Value::Str("HIGH".into()))
+    );
+    // subject 有值但不在列表 → 默认分支
+    let miss = ctx_with(vec![("severity", Value::Str("nope".into()))]);
+    assert_eq!(
+        eval_yield_expr(&case(), &miss),
+        Some(Value::Str("UNKNOWN".into()))
+    );
+    // 无 `_` 默认且 subject 缺失 → yield 仍兜底空串（基线行为不变）
+    let no_default = Expr::Match {
+        expr: Box::new(Expr::Field(FieldRef::Simple("severity".into()))),
+        arms: vec![MatchArm {
+            patterns: vec![lit("high")],
+            value: lit("HIGH"),
+        }],
+        default: None,
+    };
+    assert_eq!(
+        eval_yield_expr(&no_default, &missing),
+        Some(Value::Str(String::new().into())),
+        "无默认 + subject 缺失应得空串"
+    );
+}
+
 // ===========================================================================
 // executor/eval/mod.rs — eval_expr_with_l3 expression branches
 // ===========================================================================
@@ -969,5 +1023,63 @@ fn eval_expr_with_l3_match_branch_time_func() {
     assert!(
         ns > 1_700_000_000_000_000_000.0,
         "now_ns 应为当前墙钟（ns）"
+    );
+}
+
+/// issue #110：`case`（Match）在 L3 求值器（yield 路径）里，subject 缺失/
+/// 为 null → 默认分支；subject 命中时分支值优先于默认。
+#[test]
+fn eval_expr_with_l3_match_none_subject_uses_default() {
+    use wf_lang::ast::MatchArm;
+    let expr = |subject_field: &str| Expr::Match {
+        expr: Box::new(field(subject_field)),
+        arms: vec![MatchArm {
+            patterns: vec![lit("high")],
+            value: lit("HIGH"),
+        }],
+        default: Some(Box::new(lit("UNKNOWN"))),
+    };
+    // subject 缺失 → 默认分支
+    let missing = ctx_with(vec![("other", Value::Str("x".into()))]);
+    assert_eq!(
+        eval_expr_with_l3(&expr("sev"), &missing, YieldMeta::default()),
+        Some(Value::Str("UNKNOWN".into()))
+    );
+    // subject 命中 → 分支值优先
+    let present = ctx_with(vec![("sev", Value::Str("high".into()))]);
+    assert_eq!(
+        eval_expr_with_l3(&expr("sev"), &present, YieldMeta::default()),
+        Some(Value::Str("HIGH".into()))
+    );
+}
+
+/// issue #110 回归：L3 路径下 subject 缺失且无 `_` 默认 → None（不误落他支）；
+/// 仅 `_` 分支（arms 为空）→ 总是取默认。
+#[test]
+fn eval_expr_with_l3_match_none_subject_no_default_and_only_default() {
+    use wf_lang::ast::MatchArm;
+    let ctx = ctx_with(vec![]);
+    // 无默认 + subject 缺失 → None
+    let no_default = Expr::Match {
+        expr: Box::new(field("missing")),
+        arms: vec![MatchArm {
+            patterns: vec![lit("high")],
+            value: lit("HIGH"),
+        }],
+        default: None,
+    };
+    assert_eq!(
+        eval_expr_with_l3(&no_default, &ctx, YieldMeta::default()),
+        None
+    );
+    // 仅 `_` 分支（arms 为空）→ 取默认
+    let only_default = Expr::Match {
+        expr: Box::new(field("missing")),
+        arms: vec![],
+        default: Some(Box::new(lit("D"))),
+    };
+    assert_eq!(
+        eval_expr_with_l3(&only_default, &ctx, YieldMeta::default()),
+        Some(Value::Str("D".into()))
     );
 }

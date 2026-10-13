@@ -56,6 +56,116 @@ fn not_guard_negates_condition() {
     );
 }
 
+/// Guard `to_int(count) >= 3`：数字字符串字段经 `to_int` 转整数后参与比较
+/// （warp-fusion#109）——命中、不达标、非数字三种情形。
+#[test]
+fn to_int_guard_gates_matches() {
+    use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, Measure};
+    use wf_lang::plan::{AggPlan, BranchPlan};
+
+    let guard = Expr::BinOp {
+        op: BinOp::Ge,
+        left: Box::new(Expr::FuncCall {
+            qualifier: None,
+            name: "to_int".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("count".to_string()))],
+        }),
+        right: Box::new(Expr::Number(3.0)),
+    };
+
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![BranchPlan {
+            label: None,
+            source: "fail".to_string(),
+            field: None,
+            guard: Some(guard),
+            agg: AggPlan {
+                transforms: vec![],
+                measure: Measure::Count,
+                cmp: CmpOp::Ge,
+                threshold: Expr::Number(1.0),
+            },
+        }])],
+    );
+    let mut sm = CepStateMachine::new("to_int_guard".into(), plan, None);
+
+    // count="5" → 5 >= 3 命中。
+    let e = event(vec![("sip", str_val("10.0.0.1")), ("count", str_val("5"))]);
+    assert!(
+        matches!(sm.advance_with("fail", &e, None), StepResult::Matched(_)),
+        "to_int(\"5\") >= 3 应命中"
+    );
+
+    // count="1" → 1 >= 3 不成立 → 仅累积。
+    let e2 = event(vec![("sip", str_val("10.0.0.2")), ("count", str_val("1"))]);
+    assert!(
+        matches!(sm.advance_with("fail", &e2, None), StepResult::Accumulate),
+        "to_int(\"1\") >= 3 应过滤"
+    );
+
+    // count="abc" → null → 比较不成立 → 仅累积。
+    let e3 = event(vec![
+        ("sip", str_val("10.0.0.3")),
+        ("count", str_val("abc")),
+    ]);
+    assert!(
+        matches!(sm.advance_with("fail", &e3, None), StepResult::Accumulate),
+        "to_int(\"abc\") 为 null，应过滤"
+    );
+}
+
+/// Guard `case sev { "crit" => false, _ => true }`（warp-fusion#110）：subject
+/// 缺失/为 null 时应落 `_` 默认分支（→ true 匹配），而不是因 subject=None
+/// 直接短路成过滤器不通过；subject 命中则按分支值。
+#[test]
+fn case_guard_none_subject_falls_to_default() {
+    use wf_lang::ast::{CmpOp, Expr, FieldRef, MatchArm, Measure};
+    use wf_lang::plan::{AggPlan, BranchPlan};
+
+    let make_guard = || Expr::Match {
+        expr: Box::new(Expr::Field(FieldRef::Simple("sev".to_string()))),
+        arms: vec![MatchArm {
+            patterns: vec![Expr::StringLit("crit".to_string())],
+            value: Expr::Bool(false),
+        }],
+        default: Some(Box::new(Expr::Bool(true))),
+    };
+    let make_plan = |guard: Expr| {
+        simple_plan(
+            vec![simple_key("sip")],
+            vec![step(vec![BranchPlan {
+                label: None,
+                source: "fail".to_string(),
+                field: None,
+                guard: Some(guard),
+                agg: AggPlan {
+                    transforms: vec![],
+                    measure: Measure::Count,
+                    cmp: CmpOp::Ge,
+                    threshold: Expr::Number(1.0),
+                },
+            }])],
+        )
+    };
+
+    // sev 缺失 → 默认 true → 匹配。
+    let mut sm = CepStateMachine::new("case_none".into(), make_plan(make_guard()), None);
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    assert!(
+        matches!(sm.advance_with("fail", &e, None), StepResult::Matched(_)),
+        "case 默认分支为 true，subject 缺失时应匹配"
+    );
+
+    // sev=crit → 分支值 false → 过滤。
+    let mut sm2 = CepStateMachine::new("case_crit".into(), make_plan(make_guard()), None);
+    let e2 = event(vec![("sip", str_val("10.0.0.2")), ("sev", str_val("crit"))]);
+    assert!(
+        matches!(sm2.advance_with("fail", &e2, None), StepResult::Accumulate),
+        "case 命中分支值为 false，应过滤"
+    );
+}
+
 /// window.has() inside `a && window.has(...)` must work (not lose context).
 #[test]
 fn compound_expr_and_window_has() {

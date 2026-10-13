@@ -229,6 +229,61 @@ pub(super) fn eval_func_len(
         _ => None,
     }
 }
+
+/// `to_int(x)`：数字字符串 → 精确整数（`i64`）。
+///
+/// 语义（warp-fusion#109）：`"6"`→6、`"1036"`→1036、`"0"`→0；空串 / 非数字 /
+/// 非整值（如 `"6.5"`）→ `None`（即 null）；`Int` 原样返回；`Float` 仅在其为整值
+/// （如 `6.0`）时转换。转换结果进入整数域，避免大整数经 f64 被量化。
+pub(super) fn eval_func_to_int(
+    args: &[Expr],
+    event: &dyn FieldSource,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
+) -> Option<Value> {
+    if args.len() != 1 {
+        return None;
+    }
+    to_int_value(eval_expr_ext(&args[0], event, windows, baselines)?)
+}
+
+/// 整值上界（不含）：2^63；下界含 −2^63。用于 f64 → i64 的安全转换。
+const I64_MIN_F: f64 = -9_223_372_036_854_775_808.0;
+const I64_MAX_EXCL_F: f64 = 9_223_372_036_854_775_808.0;
+
+/// `f64` → `i64`，仅在为**整值**且在范围内时成功（不截断 `6.5`，避免静默丢数据）。
+fn float_to_exact_i64(f: f64) -> Option<i64> {
+    (f.is_finite() && f.fract() == 0.0 && (I64_MIN_F..I64_MAX_EXCL_F).contains(&f))
+        .then_some(f as i64)
+}
+
+/// 字符串 → 精确整数（仅接受整值；裁剪空白；越界/非整值视为不可转换）。
+fn parse_int_str(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Ok(i) = t.parse::<i64>() {
+        return Some(i);
+    }
+    // 仅对「含小数点 / 指数」的浮点写法回退 f64；纯整数字面量越界即视为不可转换——
+    // 否则 f64 会把 `-9223372036854775809` 四舍五入回 `-2^63` 造成静默错值。
+    if t.bytes().any(|b| matches!(b, b'.' | b'e' | b'E')) {
+        float_to_exact_i64(t.parse::<f64>().ok()?)
+    } else {
+        None
+    }
+}
+
+/// `to_int` 的共享语义（wf-engine 侧同名 helper 保持一致）。
+fn to_int_value(value: Value) -> Option<Value> {
+    match value {
+        Value::Int(i) => Some(Value::Int(i)),
+        Value::Float(f) => float_to_exact_i64(f).map(Value::Int),
+        Value::Str(s) => parse_int_str(&s).map(Value::Int),
+        _ => None,
+    }
+}
 pub(super) fn eval_func_mvcount(
     args: &[Expr],
     event: &dyn FieldSource,

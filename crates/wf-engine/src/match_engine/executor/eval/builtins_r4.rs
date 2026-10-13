@@ -1293,3 +1293,80 @@ fn aggregate_over_numbers_and_values_helpers() {
     );
     assert_eq!(sum_numeric_values(&[num(1.0), str_val("x"), num(2.0)]), 3.0);
 }
+
+// ---------------------------------------------------------------------------
+// to_int: string → exact integer (warp-fusion#109)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn to_int_parses_integers_and_rejects_non_integers() {
+    let ctx = ctx_with(vec![
+        ("n", str_val("6")),
+        ("big", str_val("1036")),
+        ("zero", str_val("0")),
+        ("pad", str_val(" 42 ")),
+        ("neg", str_val("-7")),
+        ("frac", str_val("6.5")),
+        ("intfloat", str_val("6.0")),
+        ("blank", str_val("")),
+        ("word", str_val("abc")),
+        ("i", Value::Int(9)),
+        ("f", Value::Float(6.0)),
+        ("ff", Value::Float(6.5)),
+        ("plus", str_val("+6")),
+        ("imax", str_val("9223372036854775807")),
+        ("imin", str_val("-9223372036854775808")),
+        ("over", str_val("9223372036854775808")),
+        ("under", str_val("-9223372036854775809")),
+        ("inf", str_val("inf")),
+        ("nan", str_val("NaN")),
+        ("hex", str_val("0x10")),
+        ("finf", Value::Float(f64::INFINITY)),
+        ("arr", arr(vec![num(1.0)])),
+    ]);
+
+    // 数字字符串 → 精确整数。
+    assert_eq!(eval("to_int", &[field("n")], &ctx), Some(Value::Int(6)));
+    assert_eq!(
+        eval("to_int", &[field("big")], &ctx),
+        Some(Value::Int(1036))
+    );
+    assert_eq!(eval("to_int", &[field("zero")], &ctx), Some(Value::Int(0)));
+    assert_eq!(eval("to_int", &[field("pad")], &ctx), Some(Value::Int(42)));
+    assert_eq!(eval("to_int", &[field("neg")], &ctx), Some(Value::Int(-7)));
+    assert_eq!(
+        eval("to_int", &[field("intfloat")], &ctx),
+        Some(Value::Int(6))
+    );
+    // 已是整数 / 整值浮点 / 前导正号。
+    assert_eq!(eval("to_int", &[field("i")], &ctx), Some(Value::Int(9)));
+    assert_eq!(eval("to_int", &[field("f")], &ctx), Some(Value::Int(6)));
+    assert_eq!(eval("to_int", &[field("plus")], &ctx), Some(Value::Int(6)));
+    // i64 边界可取，越界一律 null（不得经 f64 回绕）。
+    assert_eq!(
+        eval("to_int", &[field("imax")], &ctx),
+        Some(Value::Int(i64::MAX))
+    );
+    assert_eq!(
+        eval("to_int", &[field("imin")], &ctx),
+        Some(Value::Int(i64::MIN))
+    );
+    assert_eq!(eval("to_int", &[field("over")], &ctx), None);
+    assert_eq!(eval("to_int", &[field("under")], &ctx), None);
+
+    // 空串 / 非数字 / 非整值 / 非有限 / 十六进制 / 非标量 / 缺失 → null。
+    assert_eq!(eval("to_int", &[field("frac")], &ctx), None);
+    assert_eq!(eval("to_int", &[field("blank")], &ctx), None);
+    assert_eq!(eval("to_int", &[field("word")], &ctx), None);
+    assert_eq!(eval("to_int", &[field("ff")], &ctx), None);
+    assert_eq!(eval("to_int", &[field("inf")], &ctx), None);
+    assert_eq!(eval("to_int", &[field("nan")], &ctx), None);
+    assert_eq!(eval("to_int", &[field("hex")], &ctx), None);
+    assert_eq!(eval("to_int", &[field("finf")], &ctx), None);
+    assert_eq!(eval("to_int", &[field("arr")], &ctx), None);
+    assert_eq!(eval("to_int", &[field("missing")], &ctx), None);
+
+    // 参数个数。
+    assert_eq!(eval("to_int", &[], &ctx), None);
+    assert_eq!(eval("to_int", &[field("n"), field("n")], &ctx), None);
+}

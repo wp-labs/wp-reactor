@@ -973,9 +973,34 @@ rule q12_bidder_10s_window_count {
 - 比较与布尔运算：`== != < > <= >= && ||`
 - 集合判断：`in` / `not in`
 - 条件表达式：`if cond then a else b`
+- 模式匹配：`case subject { pat1 | pat2 => v1, ..., _ => default }`
 - 普通函数调用：`fmt(...)`、`contains(...)`
 - 方法调用：`window.has(...)`
 - 字段访问：`e.sip`、`e["detail.sha256"]`
+
+#### 模式匹配（`case`）
+
+`case <subject> { <pat1> | <pat2> => <值>, ..., _ => <默认值> }` 按分支顺序短路匹配：
+subject 与某个模式**值相等**即取该分支的值，全都不命中时取 `_` 默认分支的值。
+`|` 在同一分支持有多个模式；不写 `_` 默认分支时，未命中一律得 null。
+
+关键语义（issue #110）：**当 subject 缺失或为 `null` 时，所有模式均不命中，直接走
+`_` 默认分支**（不再返回空值）。因此下面的 `severity` 在字段缺失、为 null、或取值
+不在列表时都得到 `"UNKNOWN"`：
+
+```wfl
+yield out (
+    severity = case e.severity {
+        "high" => "HIGH",
+        "medium" => "MEDIUM",
+        "low" => "LOW",
+        _ => "UNKNOWN",
+    }
+)
+```
+
+在校验规则（guard / where）位置，未命中（含 subject 缺失/为 null）且无 `_` 分支时
+求值为 null，等价于「条件不通过」。
 
 ### 常用聚合 /集合函数
 
@@ -1007,7 +1032,7 @@ fmt("{} failed {} times from {}", fail.username, count(fail), fail.sip)
 
 当前代码里已接入并有 checker 支持的常见函数包括：
 
-- 字符串：`contains`、`regex_match`、`startswith`、`endswith`、`startswith_any`、`endswith_any`、`lower`、`upper`、`len`、`substr`、`indexof`、`count_char`、`trim`、`ltrim`、`rtrim`、`replace`、`replace_plain`、`concat`、`join`、`join_by`
+- 字符串：`contains`、`regex_match`、`startswith`、`endswith`、`startswith_any`、`endswith_any`、`lower`、`upper`、`len`、`substr`、`indexof`、`count_char`、`trim`、`ltrim`、`rtrim`、`replace`、`replace_plain`、`concat`、`join`、`join_by`、`to_int`
 - 数值：`round`、`abs`、`ceil`、`floor`、`sqrt`、`pow`、`log`、`exp`、`clamp`、`sign`、`trunc`、`is_finite`
 - 空值 / 空白处理：`coalesce`、`isnull`、`isnotnull`、`is_blank`、`null_if_blank`、`default_if_blank`
 - 结构化对象：`merge`
@@ -1064,6 +1089,17 @@ yield out (
 ```
 
 `coalesce(...)` 会跳过缺失字段、空字符串和全空白字符串；其他类型的可求值参数视为非空，直接作为 `yield` 字段赋值表达式时可继续按目标字段类型转换。`is_blank`、`null_if_blank`、`default_if_blank` 的参数必须是 `chars`。
+
+#### 字符串 → 整数（`to_int`）
+
+| 函数 | 返回类型 | 说明 |
+|------|----------|------|
+| `to_int(x)` | `digit` 或 null | 把数字字符串转成精确整数：`"6"`→`6`、`"1036"`→`1036`、`"0"`→`0`、`" 42 "`→`42`（裁剪首尾空白）。空串、非数字串（`"abc"`）、非整值（`"6.5"`）与缺失值一律得 null（条件不成立）。参数已是整数（`digit`）时原样返回，整值浮点（如 `6.0`）转为整数。结果可直接参与数值比较与运算。 |
+
+```wfl
+yield out (n = to_int(e.count))   # 输出端口计数为整数
+match<:5m> { on event { e && to_int(e.count) >= 3 | count >= 1; } } -> score(50.0)
+```
 
 #### 当前引擎时间
 

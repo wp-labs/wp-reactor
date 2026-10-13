@@ -896,6 +896,50 @@ fn columnar_close_missing_yield_field_falls_back_to_empty() {
     assert_records_equal_ignoring_emit_time(&record.to_data_record().unwrap(), &rows[0]);
 }
 
+/// issue #110 端到端：yield 字段是 `case`，subject 缺失 → `_` 默认分支。
+/// 该形状被 `yield_general_columnar_safe` 放行（flat 字段的 Match），但列式编译面
+/// （`compile_expr`）未实现 Match → cvec 槽位 None → 逐行回退解释求值器。
+/// 逐行与列式两条路径必须都得默认值（不是空串）。
+#[test]
+fn close_yield_case_missing_subject_uses_default_both_paths() {
+    use wf_lang::ast::MatchArm;
+    let mut plan = q12_like_plan();
+    plan.yield_plan.fields[0].value = Expr::Match {
+        expr: Box::new(Expr::Field(FieldRef::Simple("absent".to_string()))),
+        arms: vec![MatchArm {
+            patterns: vec![Expr::StringLit("high".to_string())],
+            value: Expr::StringLit("HIGH".to_string()),
+        }],
+        default: Some(Box::new(Expr::StringLit("UNKNOWN".to_string()))),
+    };
+    let exec = RuleExecutor::new(plan);
+    assert!(exec.close_plan_columnar_safe());
+    let close = q12_like_close();
+
+    let record = exec.execute_close(&close).unwrap().unwrap();
+    let (_, value) = record
+        .yield_fields
+        .iter()
+        .find(|(n, _)| &**n == "id")
+        .expect("id yield present");
+    assert_eq!(
+        value,
+        &crate::match_engine::cep::Value::Str("UNKNOWN".into()),
+        "subject 缺失的 case 应取默认值"
+    );
+
+    let mut builder = crate::alert::AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
+    let stats = exec.execute_close_direct_batch_columnar(&[close], &mut builder, 1_700_000_000_000);
+    assert_eq!(stats.appended, 1);
+    assert_eq!(stats.failed, 0);
+    let batch = builder.finish();
+    let rows: Vec<_> = batch
+        .iter_data_records()
+        .collect::<crate::error::CoreResult<Vec<_>>>()
+        .unwrap();
+    assert_records_equal_ignoring_emit_time(&record.to_data_record().unwrap(), &rows[0]);
+}
+
 #[test]
 fn close_plan_columnar_safe_rejects_synthetic_field_refs() {
     // `_step_*` / `_bind_*` ctx fields can't be resolved columnarly — the

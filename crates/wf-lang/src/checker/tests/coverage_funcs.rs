@@ -40,6 +40,53 @@ rule r {
 }
 
 #[test]
+fn func_to_int_arg_count_and_type() {
+    // 参数个数不对。
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (n = to_int())
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), wide_output_window()],
+        "to_int() requires exactly 1 argument",
+    );
+
+    // 不可转换的类型（ip）。
+    let input2 = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (n = to_int(e.sip))
+}
+"#;
+    assert_has_error(
+        input2,
+        &[auth_events_window(), wide_output_window()],
+        "to_int() argument must be chars or a number",
+    );
+}
+
+#[test]
+fn func_to_int_accepts_chars_and_numbers() {
+    // 数字字符串（chars）与已是整数的字段都可转换，且在 guard / yield 里均可用。
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e && to_int(e.count) >= 3 | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (n = to_int(e.action))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), wide_output_window()]);
+}
+
+#[test]
 fn func_concat_requires_arguments() {
     let input = r#"
 rule r {

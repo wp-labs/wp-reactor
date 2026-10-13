@@ -407,15 +407,18 @@ fn eval_match_expr_with_l3(
     ctx: &dyn FieldSource,
     score: YieldMeta,
 ) -> Option<Value> {
-    let subject = eval_expr_with_l3(expr, ctx, score)?;
-    for arm in arms {
-        let hit = arm.patterns.iter().any(|pattern| {
-            eval_expr_with_l3(pattern, ctx, score)
-                .map(|v| values_equal(&subject, &v))
-                .unwrap_or(false)
-        });
-        if hit {
-            return eval_expr_with_l3(&arm.value, ctx, score);
+    // issue #110：subject 求值为 None（字段缺失或显式 null）时不短路成 None，
+    // 而是视为所有 pattern 均未命中 → 落到 `_` 默认分支（无默认时仍为 None）。
+    if let Some(subject) = eval_expr_with_l3(expr, ctx, score) {
+        for arm in arms {
+            let hit = arm.patterns.iter().any(|pattern| {
+                eval_expr_with_l3(pattern, ctx, score)
+                    .map(|v| values_equal(&subject, &v))
+                    .unwrap_or(false)
+            });
+            if hit {
+                return eval_expr_with_l3(&arm.value, ctx, score);
+            }
         }
     }
     match default {

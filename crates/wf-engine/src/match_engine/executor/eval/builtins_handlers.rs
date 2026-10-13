@@ -214,6 +214,57 @@ pub(super) fn builtin_len(
         _ => None,
     }
 }
+
+/// `to_int(x)`：数字字符串 → 精确整数（`i64`）。语义与 wf-cep 侧 `eval_func_to_int`
+/// 保持一致（warp-fusion#109）：`"6"`→6；空串 / 非数字 / `"6.5"` → `None`（null）；
+/// `Int` 原样；`Float` 仅整值时转换。
+pub(super) fn builtin_to_int(
+    _name: &str,
+    args: &[wf_lang::ast::Expr],
+    ctx: &dyn FieldSource,
+    score: YieldMeta<'_>,
+) -> Option<Value> {
+    if args.len() != 1 {
+        return None;
+    }
+    to_int_value(eval_expr_with_l3(&args[0], ctx, score)?)
+}
+
+/// 整值上界（不含）：2^63；下界含 −2^63。
+const I64_MIN_F: f64 = -9_223_372_036_854_775_808.0;
+const I64_MAX_EXCL_F: f64 = 9_223_372_036_854_775_808.0;
+
+/// `f64` → `i64`，仅在为整值且在范围内时成功（不截断 `6.5`）。
+fn float_to_exact_i64(f: f64) -> Option<i64> {
+    (f.is_finite() && f.fract() == 0.0 && (I64_MIN_F..I64_MAX_EXCL_F).contains(&f))
+        .then_some(f as i64)
+}
+
+/// 字符串 → 精确整数（仅接受整值；裁剪空白；越界/非整值视为不可转换）。
+fn parse_int_str(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Ok(i) = t.parse::<i64>() {
+        return Some(i);
+    }
+    // 仅对含小数点 / 指数的浮点写法回退 f64；纯整数字面量越界即不可转换。
+    if t.bytes().any(|b| matches!(b, b'.' | b'e' | b'E')) {
+        float_to_exact_i64(t.parse::<f64>().ok()?)
+    } else {
+        None
+    }
+}
+
+fn to_int_value(value: Value) -> Option<Value> {
+    match value {
+        Value::Int(i) => Some(Value::Int(i)),
+        Value::Float(f) => float_to_exact_i64(f).map(Value::Int),
+        Value::Str(s) => parse_int_str(&s).map(Value::Int),
+        _ => None,
+    }
+}
 pub(super) fn builtin_mvcount(
     _name: &str,
     args: &[wf_lang::ast::Expr],

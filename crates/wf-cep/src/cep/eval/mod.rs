@@ -250,15 +250,18 @@ fn eval_match_expr(
     windows: Option<&dyn WindowLookup>,
     baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> Option<Value> {
-    let subject = eval_expr_ext(expr, event, windows, baselines)?;
-    for arm in arms {
-        let hit = arm.patterns.iter().any(|pattern| {
-            eval_expr_ext(pattern, event, windows, baselines)
-                .map(|v| values_equal(&subject, &v))
-                .unwrap_or(false)
-        });
-        if hit {
-            return eval_expr_ext(&arm.value, event, windows, baselines);
+    // issue #110：subject 求值为 None（字段缺失或显式 null）时不短路成 None，
+    // 而是视为所有 pattern 均未命中 → 落到 `_` 默认分支（无默认时仍为 None）。
+    if let Some(subject) = eval_expr_ext(expr, event, windows, baselines) {
+        for arm in arms {
+            let hit = arm.patterns.iter().any(|pattern| {
+                eval_expr_ext(pattern, event, windows, baselines)
+                    .map(|v| values_equal(&subject, &v))
+                    .unwrap_or(false)
+            });
+            if hit {
+                return eval_expr_ext(&arm.value, event, windows, baselines);
+            }
         }
     }
     match default {
@@ -610,6 +613,110 @@ mod tests {
         assert_eq!(eval_ok(&m(num(9.0), Some(num(0.0)))), Value::Float(0.0));
         // 未命中且无默认 → None
         assert_eq!(eval_expr(&m(num(9.0), None), &empty_event()), None);
+    }
+
+    #[test]
+    fn match_expr_none_subject_falls_to_default() {
+        // issue #110：subject 求值为 None（字段缺失或显式 null）时不直接短路成
+        // None，而应落到 `_` 默认分支。
+        let arms = vec![MatchArm {
+            patterns: vec![Expr::StringLit("high".into())],
+            value: Expr::StringLit("HIGH".into()),
+        }];
+        let m = |subject: Expr, default: Option<Expr>| Expr::Match {
+            expr: Box::new(subject),
+            arms: arms.clone(),
+            default: default.map(Box::new),
+        };
+        // 缺失字段 + 默认分支 → 默认值
+        assert_eq!(
+            eval_ok(&m(
+                field("missing"),
+                Some(Expr::StringLit("UNKNOWN".into()))
+            )),
+            Value::Str("UNKNOWN".into())
+        );
+        // 缺失字段 + 无默认 → None（保持 guard 语义：过滤不通过）
+        assert_eq!(eval_expr(&m(field("missing"), None), &empty_event()), None);
+    }
+
+    #[test]
+    fn match_expr_none_subject_default_integration() {
+        // 仅 `_` 分支（arms 为空）：无论 subject 是否有值都取默认。
+        let only_default = Expr::Match {
+            expr: Box::new(field("missing")),
+            arms: vec![],
+            default: Some(Box::new(Expr::StringLit("D".into()))),
+        };
+        assert_eq!(eval_ok(&only_default), Value::Str("D".into()));
+
+        // 函数求值为 null 的 subject（to_int("abc") → null）也落默认。
+        let null_fn = Expr::Match {
+            expr: Box::new(Expr::FuncCall {
+                qualifier: None,
+                name: "to_int".into(),
+                args: vec![Expr::StringLit("abc".into())],
+            }),
+            arms: vec![MatchArm {
+                patterns: vec![num(1.0)],
+                value: Expr::StringLit("one".into()),
+            }],
+            default: Some(Box::new(Expr::StringLit("other".into()))),
+        };
+        assert_eq!(eval_ok(&null_fn), Value::Str("other".into()));
+
+        // 多模式分支（`a | b`）+ subject 缺失 → 默认。
+        let multi = Expr::Match {
+            expr: Box::new(field("missing")),
+            arms: vec![MatchArm {
+                patterns: vec![Expr::StringLit("a".into()), Expr::StringLit("b".into())],
+                value: Expr::StringLit("AB".into()),
+            }],
+            default: Some(Box::new(Expr::StringLit("Z".into()))),
+        };
+        assert_eq!(eval_ok(&multi), Value::Str("Z".into()));
+
+        // 嵌套 case：内层 subject 缺失各自落默认。
+        let nested = Expr::Match {
+            expr: Box::new(field("outer")),
+            arms: vec![],
+            default: Some(Box::new(Expr::Match {
+                expr: Box::new(field("inner")),
+                arms: vec![MatchArm {
+                    patterns: vec![Expr::StringLit("x".into())],
+                    value: Expr::StringLit("X".into()),
+                }],
+                default: Some(Box::new(Expr::StringLit("NESTED".into()))),
+            })),
+        };
+        assert_eq!(eval_ok(&nested), Value::Str("NESTED".into()));
+    }
+
+    #[test]
+    fn match_expr_default_visible_to_isnull_and_coalesce() {
+        // issue #110 的规避写法：case 现在会返回默认值（非 null），因此
+        // isnull 为 false、coalesce 取到 case 的默认值而非后续参数。
+        let case = || Expr::Match {
+            expr: Box::new(field("severity")),
+            arms: vec![MatchArm {
+                patterns: vec![Expr::StringLit("high".into())],
+                value: Expr::StringLit("HIGH".into()),
+            }],
+            default: Some(Box::new(Expr::StringLit("UNKNOWN".into()))),
+        };
+        let coalesced = Expr::FuncCall {
+            qualifier: None,
+            name: "coalesce".into(),
+            args: vec![case(), Expr::StringLit("FB".into())],
+        };
+        assert_eq!(eval_ok(&coalesced), Value::Str("UNKNOWN".into()));
+
+        let isnull = Expr::FuncCall {
+            qualifier: None,
+            name: "isnull".into(),
+            args: vec![case()],
+        };
+        assert_eq!(eval_ok(&isnull), Value::Bool(false));
     }
 
     #[test]
