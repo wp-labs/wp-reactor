@@ -27,7 +27,7 @@ wildmatch = "2"
 tokio = { version = "1", features = ["sync"] }
 async-broadcast = "0.7"
 wp-connector-api =  "0.14"
-wp-core-connectors = "0.10"
+wp-core-connectors = "0.11"
 wp-connector-utils = "0.5"
 wp-model-core = "0.10"
 wf-connector-api = "0.4"
