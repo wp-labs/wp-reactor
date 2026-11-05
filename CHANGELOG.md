@@ -4,6 +4,12 @@ All notable changes to wp-reactor will be documented in this file.
 
 本文件记录面向使用者的变更（行为、DSL、公开 API、配置）；内部实现细节与测试计数不在此展开。段标题 = 版本号 + 发布日期，`-- latest` 仅用于尚未发布的版本。
 
+## [2.6.1] — 2026-11-05
+
+### Changed
+
+- **`wp-core-connectors` 0.10 → 0.11**：接入上游文件 sink 的容量滚动与历史归档压缩（`max_size` / `max_rolls` / `roll_compress`，仅文本协议 `protocol = "txt"` 生效），并随之升级 `zip` 9.x / `zstd` 0.14，消除 RUSTSEC-2026-0367 / 0368 / 0369 与 0391 / 0398 / 0403。`max_size` / `max_rolls` / `roll_compress` 随 connector 参数透传到引擎内置的 file sink，无需引擎侧改动。
+
 ## [2.6.0] — 2026-10-13
 
 ### Added
