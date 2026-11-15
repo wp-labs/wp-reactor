@@ -125,6 +125,7 @@ pub(super) fn compile_match(
         }),
         tracked_bind_aliases: HashSet::new(),
         tracked_bind_fields: std::collections::HashMap::new(),
+        field_modes: Default::default(),
         tracked_plain_fields: HashSet::new(),
         accu: mc.accu,
         needs_field_history: false, // set by the caller after binds/joins/yield are known

@@ -309,6 +309,7 @@ fn q4_q6_plan(fixed: bool) -> MatchPlan {
             m
         },
         tracked_plain_fields: HashSet::new(),
+        field_modes: Default::default(),
         seq: None,
         match_mode: MatchMode::Seq,
         accu: false,
@@ -363,6 +364,7 @@ fn q5_q7_plan(max_measure: bool) -> MatchPlan {
             m
         },
         tracked_plain_fields: HashSet::new(),
+        field_modes: Default::default(),
         seq: None,
         match_mode: MatchMode::Seq,
         accu: false,
@@ -409,6 +411,7 @@ fn q11_q12_plan(session: bool) -> MatchPlan {
             m
         },
         tracked_plain_fields: HashSet::new(),
+        field_modes: Default::default(),
         seq: None,
         match_mode: MatchMode::Seq,
         accu: false,
@@ -440,6 +443,7 @@ fn q13_rule() -> RulePlan {
             close_mode: CloseMode::Or,
             tracked_bind_aliases: HashSet::from(["b".to_string()]),
             tracked_bind_fields: std::collections::HashMap::new(),
+            field_modes: Default::default(),
             tracked_plain_fields: HashSet::new(),
             seq: None,
             match_mode: MatchMode::Seq,
@@ -673,6 +677,7 @@ fn q16_plan() -> MatchPlan {
             m
         },
         tracked_plain_fields: HashSet::new(),
+        field_modes: Default::default(),
         seq: None,
         match_mode: MatchMode::Seq,
         accu: false,
@@ -740,6 +745,7 @@ fn q17_plan() -> MatchPlan {
             m
         },
         tracked_plain_fields: HashSet::new(),
+        field_modes: Default::default(),
         seq: None,
         match_mode: MatchMode::Seq,
         accu: false,
@@ -788,6 +794,7 @@ fn q18_plan() -> MatchPlan {
             m
         },
         tracked_plain_fields: HashSet::new(),
+        field_modes: Default::default(),
         seq: None,
         match_mode: MatchMode::Seq,
         accu: false,

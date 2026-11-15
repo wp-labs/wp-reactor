@@ -157,6 +157,7 @@ fn make_hop_task(
         close_mode: CloseMode::And,
         tracked_bind_aliases: HashSet::from(["c".to_string()]),
         tracked_bind_fields: empty_tracked_bind_fields(),
+        field_modes: Default::default(),
         tracked_plain_fields: empty_tracked_plain_fields(),
         seq: None,
         match_mode: MatchMode::Seq,

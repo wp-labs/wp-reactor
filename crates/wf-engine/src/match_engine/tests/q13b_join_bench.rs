@@ -46,6 +46,7 @@ fn simple_match_plan() -> MatchPlan {
         close_mode: wf_lang::ast::CloseMode::Or,
         tracked_bind_aliases: HashSet::new(),
         tracked_bind_fields: HashMap::new(),
+        field_modes: Default::default(),
         tracked_plain_fields: HashSet::new(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,

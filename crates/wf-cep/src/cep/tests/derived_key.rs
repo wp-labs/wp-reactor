@@ -66,6 +66,7 @@ fn counting_plan(keys: Vec<FieldRef>, key_exprs: Vec<Option<Expr>>) -> MatchPlan
         close_mode: CloseMode::Or,
         tracked_bind_aliases: HashSet::new(),
         tracked_bind_fields: std::collections::HashMap::new(),
+        field_modes: Default::default(),
         tracked_plain_fields: HashSet::new(),
         seq: None,
         match_mode: MatchMode::Any,

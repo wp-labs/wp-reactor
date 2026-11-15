@@ -147,6 +147,7 @@ fn base_plan(name: &str) -> RulePlan {
             seq: None,
             tracked_bind_aliases: HashSet::new(),
             tracked_bind_fields: HashMap::new(),
+            field_modes: Default::default(),
             tracked_plain_fields: HashSet::new(),
             needs_field_history: false,
             trigger_event_needed: false,

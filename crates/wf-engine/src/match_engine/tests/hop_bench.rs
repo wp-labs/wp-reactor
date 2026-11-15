@@ -136,6 +136,7 @@ fn q5_plan(window_spec: WindowSpec) -> MatchPlan {
         close_mode: CloseMode::And,
         tracked_bind_aliases: std::collections::HashSet::new(),
         tracked_bind_fields: std::collections::HashMap::new(),
+        field_modes: Default::default(),
         tracked_plain_fields: std::collections::HashSet::new(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,

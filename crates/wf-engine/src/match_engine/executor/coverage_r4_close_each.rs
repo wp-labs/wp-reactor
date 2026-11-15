@@ -27,6 +27,7 @@ fn plan_with_close(
         close_mode: CloseMode::And,
         tracked_bind_aliases: HashSet::new(),
         tracked_bind_fields: HashMap::new(),
+        field_modes: Default::default(),
         tracked_plain_fields: HashSet::new(),
         seq: None,
         match_mode: MatchMode::Seq,

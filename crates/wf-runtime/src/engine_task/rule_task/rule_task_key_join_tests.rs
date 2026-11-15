@@ -96,6 +96,7 @@ fn q4_key_join_plan() -> _Plan {
         close_mode: CloseMode::Or,
         tracked_bind_aliases: std::collections::HashSet::new(),
         tracked_bind_fields: empty_tracked_bind_fields(),
+        field_modes: Default::default(),
         tracked_plain_fields: empty_tracked_plain_fields(),
         seq: None,
         match_mode: MatchMode::Seq,

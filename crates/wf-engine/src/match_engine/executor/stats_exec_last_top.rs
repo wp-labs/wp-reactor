@@ -769,6 +769,7 @@ fn stats_close_columnar_resolves_key_fields_in_entity_and_yield() {
             seq: None,
             tracked_bind_aliases: HashSet::new(),
             tracked_bind_fields: HashMap::new(),
+            field_modes: Default::default(),
             tracked_plain_fields: HashSet::new(),
             needs_field_history: false,
             trigger_event_needed: false,
