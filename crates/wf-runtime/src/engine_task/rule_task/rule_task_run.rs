@@ -187,6 +187,7 @@ impl RuleTask {
             emit_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
             append_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
             last_reported_instances: AtomicI64::new(0),
+            last_reported_rejections: AtomicI64::new(0),
             last_reported_memory: AtomicI64::new(0),
             pending_alerts: std::sync::Mutex::new(PendingAlertColumns::default()),
             pipe_state: std::sync::Mutex::new(PipeState::Uninit),
@@ -1050,6 +1051,23 @@ impl RuleTask {
             let mem_delta = cur_mem - last_mem;
             if mem_delta != 0 {
                 metrics.adjust_rule_memory_bytes(rule_name, mem_delta);
+            }
+            // 被 limits 拒收的新 key（静默丢检测的唯一信号；见 wf-cep limits.rs）。
+            //
+            // ① 用**本 shard** 的计数（`local_rejections`）：共享总量在每个 shard
+            //    读到的是同一个值，按增量上报会变成 N 倍。
+            // ② 只报正增量：drain/EOS 后 `machine` 可能被丢弃，此时 cur 回落为 0，
+            //    但从 0 回退不是计数器的语义（会让 VM 的 rate() 出现假重置）。
+            let cur_rej = match &self.machine {
+                Some(machine) => machine.local_rejections() as i64,
+                None => self.last_reported_rejections.load(Ordering::Relaxed),
+            };
+            let last_rej = self
+                .last_reported_rejections
+                .swap(cur_rej, Ordering::Relaxed);
+            let rej_delta = (cur_rej - last_rej).max(0);
+            if rej_delta > 0 {
+                metrics.adjust_rule_instances_rejected(rule_name, rej_delta);
             }
         }
     }

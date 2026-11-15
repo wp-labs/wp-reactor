@@ -484,6 +484,8 @@ pub(super) struct RuleTask {
     /// across a rule's shards, so each shard reports the delta since its last
     /// report (P2b).
     last_reported_instances: AtomicI64,
+    /// Last reported `max_instances`/`max_memory` rejection count（同上按 shard 报 delta）。
+    last_reported_rejections: AtomicI64,
     /// Last value reported to the `rule_memory_bytes` gauge（同 delta 语义：
     /// 内存可增可减 + recalibrate 校正，收口时最后一次上报对冲归零）。
     last_reported_memory: AtomicI64,

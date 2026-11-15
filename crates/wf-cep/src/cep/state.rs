@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use wf_lang::plan::MatchPlan;
 
 use super::key::ValueKey;
-use super::step::push_capped;
+use super::step::{MAX_TRACKED_FIELD_BYTES, MAX_TRACKED_FIELD_VALUES};
 use super::types::{BindData, EngineHashMap, EngineHashSet, FieldSource, RollingStats, Value};
 
 // ---------------------------------------------------------------------------
@@ -38,12 +38,18 @@ pub(super) struct BranchState {
     // q15 每事件 8 branch 收集 → 每事件 8×32KB memmove，实测占 q15 88% CPU（sample）。
     #[allow(clippy::box_collection)] // intentional per-instance memory saving (wp-reactor#19)
     pub(super) collected_values: Option<Box<VecDeque<Value>>>,
+    /// `collected_values` 的运行字节合计（`MAX_TRACKED_FIELD_BYTES` 预算；与字段序列对称）。
+    pub(super) collected_bytes: usize,
     /// Per-field value history for yield / L3 collection. Lazy, boxed — a
     /// count rule never allocates this.
     /// 值类型 VecDeque（环形）：push_capped 维护最近 MAX 个值时 O(1)；旧 Vec::drain
     /// 每 push 一次 memmove 整个数组（q15 88% CPU 的根因，见 push_capped 注释）。
     #[allow(clippy::box_collection)] // intentional per-instance memory saving (wp-reactor#19)
     pub(super) field_values: Option<Box<EngineHashMap<String, VecDeque<Value>>>>,
+    /// Per-field byte accounting for `Series`-mode fields（`MAX_TRACKED_FIELD_BYTES`
+    /// 字节上限）。`First`/`Last` 单槽不需要，只在真正是序列时分配。
+    #[allow(clippy::box_collection)] // intentional per-instance memory saving
+    pub(super) field_bytes: Option<Box<EngineHashMap<String, usize>>>,
     /// 被环形裁剪丢弃的最早值（warp-fusion#100）。Lazy, boxed — 只有事件数
     /// 超过 `MAX_TRACKED_FIELD_VALUES` 的实例才分配。
     pub(super) pinned_first: Option<Box<PinnedFirst>>,
@@ -80,34 +86,67 @@ impl BranchState {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: None,
+            collected_bytes: 0,
             field_values: None,
+            field_bytes: None,
             pinned_first: None,
         }
     }
 
-    /// Mutable access to the L3 collected-values list, allocating lazily.
-    /// VecDeque 环形（push_back/pop_front O(1)，见 push_capped 注释）。
+    /// 追加 branch 的 L3 收集值：条数（1024）+ 字节（`MAX_TRACKED_FIELD_BYTES`）
+    /// 双上限，并钉扎首个被裁剪的值。
     ///
-    /// 仅本模块内部使用：所有写入必须经 [`Self::push_collected`]，否则会绕过
-    /// 首值钉扎（warp-fusion#100）。
-    fn collected_values_mut(&mut self) -> &mut VecDeque<Value> {
-        self.collected_values
-            .get_or_insert_with(|| Box::new(VecDeque::new()))
-    }
-
-    /// 追加 branch 的 L3 收集值：维护 1024 上限，并钉扎首个被裁剪的值。
+    /// 字节上限与字段序列对称：`collect_list(b.body)` 这类大值收集若只按条数封顶，
+    /// 单序列仍可涨到几十 MB。
     pub(super) fn push_collected(&mut self, value: Value) {
-        let dropped = push_capped(self.collected_values_mut(), value);
+        let added = val_estimated_bytes(&value);
+        // 直接字段访问（不经 `&mut self` 方法）以便与 `collected_bytes` 并存借用。
+        let dq = self
+            .collected_values
+            .get_or_insert_with(|| Box::new(VecDeque::new()));
+        dq.push_back(value);
+        self.collected_bytes = self.collected_bytes.saturating_add(added);
+        let mut dropped = None;
+        loop {
+            let over_count = dq.len() > MAX_TRACKED_FIELD_VALUES;
+            let over_bytes = self.collected_bytes > MAX_TRACKED_FIELD_BYTES && dq.len() > 1;
+            if !over_count && !over_bytes {
+                break;
+            }
+            let Some(front) = dq.pop_front() else {
+                break;
+            };
+            self.collected_bytes = self
+                .collected_bytes
+                .saturating_sub(val_estimated_bytes(&front));
+            if dropped.is_none() {
+                dropped = Some(front);
+            }
+        }
         pin_dropped_collected(&mut self.pinned_first, dropped);
     }
 
-    /// 追加某字段的历史值：维护 1024 上限，并钉扎该字段首个被裁剪的值。
+    /// 追加某字段的历史值（旧路径，等价 `FieldMode::Series`；保留给测试/兼容调用）。
+    #[allow(dead_code)]
     pub(super) fn push_field_value(&mut self, field_name: &str, value: Value) {
+        self.push_field_value_mode(field_name, value, wf_lang::plan::FieldMode::Series);
+    }
+
+    /// 按字段存储模式追加值：`Series` = 有界序列（计数 + 字节上限，首值钉扎）；
+    /// `First` = 只写首个值；`Last` = 只保留最新值（单槽覆盖）。
+    pub(super) fn push_field_value_mode(
+        &mut self,
+        field_name: &str,
+        value: Value,
+        mode: wf_lang::plan::FieldMode,
+    ) {
         push_capped_field(
             &mut self.field_values,
+            &mut self.field_bytes,
             &mut self.pinned_first,
             field_name,
             value,
+            mode,
         );
     }
 
@@ -137,6 +176,9 @@ pub(super) struct AliasState {
     pub(super) count: u64,
     /// Lazy, boxed — only aliases with tracked bind fields allocate.
     pub(super) field_values: Option<Box<EngineHashMap<String, VecDeque<Value>>>>,
+    /// 见 [`BranchState::field_bytes`]（仅 `Series` 字段）。
+    #[allow(clippy::box_collection)]
+    pub(super) field_bytes: Option<Box<EngineHashMap<String, usize>>>,
     /// 被环形裁剪丢弃的最早值（warp-fusion#100，见 [`PinnedFirst`]）。
     pub(super) pinned_first: Option<Box<PinnedFirst>>,
 }
@@ -146,17 +188,31 @@ impl AliasState {
         Self {
             count: 0,
             field_values: None,
+            field_bytes: None,
             pinned_first: None,
         }
     }
 
-    /// 追加某字段的历史值：维护 1024 上限，并钉扎该字段首个被裁剪的值。
+    /// 追加某字段的历史值（旧路径，等价 `FieldMode::Series`；保留给测试/兼容调用）。
+    #[allow(dead_code)]
     pub(super) fn push_field_value(&mut self, field_name: &str, value: Value) {
+        self.push_field_value_mode(field_name, value, wf_lang::plan::FieldMode::Series);
+    }
+
+    /// 按字段存储模式追加值（语义见 [`BranchState::push_field_value_mode`]）。
+    pub(super) fn push_field_value_mode(
+        &mut self,
+        field_name: &str,
+        value: Value,
+        mode: wf_lang::plan::FieldMode,
+    ) {
         push_capped_field(
             &mut self.field_values,
+            &mut self.field_bytes,
             &mut self.pinned_first,
             field_name,
             value,
+            mode,
         );
     }
 
@@ -522,16 +578,69 @@ fn field_series_with_first(
 /// 只有**首次**裁剪才分配字段名。
 fn push_capped_field(
     field_values: &mut Option<Box<EngineHashMap<String, VecDeque<Value>>>>,
+    field_bytes: &mut Option<Box<EngineHashMap<String, usize>>>,
     pinned_first: &mut Option<Box<PinnedFirst>>,
     field_name: &str,
     value: Value,
+    mode: wf_lang::plan::FieldMode,
 ) {
+    // First/Last 只占一个槽：不建序列、不钉首值；单槽覆盖。
+    // （2026-11 线上 OOM：普通投影字段原本也按 1024 条序列存储，单实例 59.4 KB）
+    if matches!(
+        mode,
+        wf_lang::plan::FieldMode::First | wf_lang::plan::FieldMode::Last
+    ) {
+        let fvm = field_values.get_or_insert_with(|| Box::new(EngineHashMap::default()));
+        match fvm.get_mut(field_name) {
+            Some(slot) if !slot.is_empty() => {
+                if matches!(mode, wf_lang::plan::FieldMode::Last) {
+                    *slot.back_mut().expect("non-empty") = value;
+                }
+                // First：已有首值，丢弃新值。
+            }
+            Some(slot) => slot.push_back(value),
+            None => {
+                let mut slot = VecDeque::with_capacity(1);
+                slot.push_back(value);
+                fvm.insert(field_name.to_string(), slot);
+            }
+        }
+        return;
+    }
+
     let dropped = {
         let fvm = field_values.get_or_insert_with(|| Box::new(EngineHashMap::default()));
         if !fvm.contains_key(field_name) {
             fvm.insert(field_name.to_string(), VecDeque::new());
         }
-        push_capped(fvm.get_mut(field_name).expect("just inserted"), value)
+        let dq = fvm.get_mut(field_name).expect("just inserted");
+        let added = val_estimated_bytes(&value);
+        dq.push_back(value);
+        // 字节预算（④）：条数上限之外再按字节封顶，避免大字段（请求体/object）
+        // 用满 1024 条。至少保留 1 个值。
+        // 热路径：已存在的字段名不重复分配 String（与 field_values 同一写法）。
+        let fb = field_bytes.get_or_insert_with(|| Box::new(EngineHashMap::default()));
+        if !fb.contains_key(field_name) {
+            fb.insert(field_name.to_string(), 0);
+        }
+        let total = fb.get_mut(field_name).expect("just inserted");
+        *total = total.saturating_add(added);
+        let mut dropped = None;
+        loop {
+            let over_count = dq.len() > MAX_TRACKED_FIELD_VALUES;
+            let over_bytes = *total > MAX_TRACKED_FIELD_BYTES && dq.len() > 1;
+            if !over_count && !over_bytes {
+                break;
+            }
+            let Some(front) = dq.pop_front() else {
+                break;
+            };
+            *total = total.saturating_sub(val_estimated_bytes(&front));
+            if dropped.is_none() {
+                dropped = Some(front);
+            }
+        }
+        dropped
     };
     let Some(dropped) = dropped else {
         return;
@@ -606,5 +715,121 @@ fn estimated_tracked_event_fields_bytes<E: FieldSource>(
                     .map(|value| field.len() + 24 + val_estimated_bytes(&value))
             })
             .sum(),
+    }
+}
+
+#[cfg(test)]
+mod field_mode_tests {
+    use super::*;
+    use wf_lang::plan::FieldMode;
+
+    type Slots = (
+        Option<Box<EngineHashMap<String, VecDeque<Value>>>>,
+        Option<Box<EngineHashMap<String, usize>>>,
+        Option<Box<PinnedFirst>>,
+    );
+
+    fn push_series(mode: FieldMode, values: Vec<Value>) -> Slots {
+        let mut fv = None;
+        let mut fb = None;
+        let mut pin = None;
+        for v in values {
+            push_capped_field(&mut fv, &mut fb, &mut pin, "f", v, mode);
+        }
+        (fv, fb, pin)
+    }
+
+    /// `Last` = 单槽覆盖：只保留最新值（普通投影的语义）。
+    #[test]
+    fn last_mode_keeps_only_latest_value() {
+        let (fv, _, pin) = push_series(
+            FieldMode::Last,
+            vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)],
+        );
+        let q = fv.as_ref().unwrap().get("f").unwrap();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.back(), Some(&Value::Float(3.0)));
+        assert!(pin.is_none(), "单槽不做首值钉扎");
+    }
+
+    /// `First` = 单槽：只写首个值，后续丢弃（first() 语义不变）。
+    #[test]
+    fn first_mode_keeps_earliest_value() {
+        let (fv, _, pin) = push_series(
+            FieldMode::First,
+            vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)],
+        );
+        let q = fv.as_ref().unwrap().get("f").unwrap();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.front(), Some(&Value::Float(1.0)));
+        assert_eq!(q.back(), Some(&Value::Float(1.0)));
+        assert!(pin.is_none(), "单槽不做首值钉扎");
+    }
+
+    /// `Series` = 有界序列：条数上限 + 首值钉扎（旧行为不变）。
+    #[test]
+    fn series_mode_caps_count_and_pins_first() {
+        let vals = (0..1100).map(|i| Value::Float(i as f64)).collect();
+        let (fv, _, pin) = push_series(FieldMode::Series, vals);
+        let q = fv.as_ref().unwrap().get("f").unwrap();
+        assert_eq!(q.len(), MAX_TRACKED_FIELD_VALUES);
+        assert_eq!(q.front(), Some(&Value::Float(76.0)));
+        assert_eq!(q.back(), Some(&Value::Float(1099.0)));
+        assert_eq!(
+            pin.as_ref().and_then(|p| p.fields.get("f")),
+            Some(&Value::Float(0.0)),
+            "被裁掉的首值必须钉扎"
+        );
+    }
+
+    /// `Series` + 字节预算：大值字段不再靠 1024 条撑出几十 MB。
+    #[test]
+    fn series_mode_trims_on_byte_budget() {
+        let big = "x".repeat(8 * 1024);
+        let vals = (0..40).map(|_| Value::Str(big.clone().into())).collect();
+        let (fv, fb, _) = push_series(FieldMode::Series, vals);
+        let q = fv.as_ref().unwrap().get("f").unwrap();
+        let bytes = *fb.as_ref().unwrap().get("f").unwrap();
+        assert!(
+            bytes <= MAX_TRACKED_FIELD_BYTES,
+            "序列字节 {bytes} 超过预算 {MAX_TRACKED_FIELD_BYTES}"
+        );
+        assert!(q.len() < 40 && !q.is_empty(), "len={}", q.len());
+    }
+}
+
+#[cfg(test)]
+mod collected_bytes_tests {
+    use super::*;
+
+    /// `collected_values` 也有字节预算（与字段序列对称）：大值收集只按条数封顶
+    /// 仍可涨到几十 MB；裁剪后首值必须钉扎（first() 语义不变）。
+    #[test]
+    fn collected_values_trim_on_byte_budget_and_pin_earliest() {
+        let mut bs = BranchState::new();
+        bs.push_collected(Value::Str("earliest".into()));
+        let big = "x".repeat(8 * 1024);
+        for _ in 0..40 {
+            bs.push_collected(Value::Str(big.clone().into()));
+        }
+
+        assert!(
+            bs.collected_bytes <= MAX_TRACKED_FIELD_BYTES,
+            "collected 字节 {} 超过预算 {}",
+            bs.collected_bytes,
+            MAX_TRACKED_FIELD_BYTES
+        );
+
+        let series = bs.collected_series();
+        assert!(
+            series.len() <= 9,
+            "字节预算应把 40 个 8KB 值裁到个位数，实际 {}",
+            series.len()
+        );
+        assert_eq!(
+            series.first(),
+            Some(&Value::Str("earliest".into())),
+            "被裁掉的首值必须钉扎"
+        );
     }
 }

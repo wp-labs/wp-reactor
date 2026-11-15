@@ -28,9 +28,25 @@ pub struct SharedLimits {
     estimated_memory_bytes: AtomicUsize,
     /// `FailRule` is a rule-wide latch: any shard failing fails the rule.
     failed: AtomicBool,
+    /// 被 `max_instances` 拒收的新 key 数（`on_exceed` 任一策略的拒绝都计）。
+    ///
+    /// 存在的理由：上限生效后是**静默**丢检测（新 flow_id 不再建实例 → 配对失败），
+    /// 没有计数器就只能靠告警量下降间接猜测。导出为
+    /// `rule.instances_rejected_total`。
+    rejected: AtomicU64,
 }
 
 impl SharedLimits {
+    /// 记一次新实例拒收（`max_instances`）。
+    pub fn inc_rejected(&self) {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 累计拒收数（跨分片）。
+    pub fn rejected(&self) -> u64 {
+        self.rejected.load(Ordering::Relaxed)
+    }
+
     /// Create a fresh shared-limits handle (all zeros).
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())

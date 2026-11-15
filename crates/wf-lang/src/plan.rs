@@ -119,6 +119,31 @@ pub struct BindPlan {
 // MatchPlan — temporal matching
 // ---------------------------------------------------------------------------
 
+/// How a collected field value is stored for one alias inside a CEP instance.
+///
+/// 引入缘由（内存）：改造前每个被引用的字段都建一条 1024 条上限的
+/// `VecDeque<Value>` 序列，于是 `s.http_url` 这类**只读最后值**的普通投影、
+/// 以及 `first(b.http_request_body)` 这种**只要首值**的引用，都和真正的
+/// 聚合序列一样占满 1024 槽——实测单实例 59.4 KB，是 2026-11 线上 OOM 的主因。
+/// 按用途分类后，普通投影/首值/末值各只占 1 槽，只有真正需要历史的函数
+/// （`collect_*` / `stddev` / `percentile` / 对字段求值的 `min/max/sum/avg/count`）
+/// 才保留有界序列。
+#[derive(::jumo_derive::Jumo, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[jumo(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
+pub enum FieldMode {
+    /// Only the latest value is ever read (plain projection). One slot, overwritten.
+    Last,
+    /// Only `first(x)` reads it. One slot, written by the earliest event only.
+    First,
+    /// Full bounded history (`collect_set`/`collect_list`/`stddev`/`percentile`,
+    /// or an aggregate that reads the value series).
+    ///
+    /// `Default` 也取 `Series`：漏判模式时宁可多占内存，也不能丢语义
+    /// （`mode_of` 对缺失字段同样回退到这里）。
+    #[default]
+    Series,
+}
+
 /// The match plan: keys, window spec, event steps, close steps, key mapping, and close mode.
 ///
 /// 构造约定（2026-09 P3）：本类型已实现 `Default`（空计划占位）。**新增字段时**
@@ -151,6 +176,13 @@ pub struct MatchPlan {
     pub tracked_bind_aliases: HashSet<String>,
     pub tracked_bind_fields: HashMap<String, HashSet<String>>,
     pub tracked_plain_fields: HashSet<String>,
+    /// Per-alias, per-field storage mode for the collected field history
+    /// (`alias -> field -> mode`). Decides how `wf-cep` stores each collected
+    /// field: full bounded series, first-only, or last-only (see [`FieldMode`]).
+    ///
+    /// 空表 = 全部按 `Series` 处理（与引入本字段前一致），因此既有构造点无需
+    /// 填写即可保持旧语义。
+    pub field_modes: HashMap<String, HashMap<String, FieldMode>>,
     /// Ordering mode of the `on event` block (`Seq` ordered, `Any` unordered).
     pub match_mode: MatchMode,
     /// Ordered sequence constraints (`on event seq { ... }`). When present, event/close steps are empty.

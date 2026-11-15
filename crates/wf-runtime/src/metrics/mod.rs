@@ -163,6 +163,7 @@ pub(crate) struct MetricsSnapshot {
     rule_matches: BTreeMap<String, u64>,
     rule_instances: BTreeMap<String, u64>,
     rule_memory_bytes: BTreeMap<String, u64>,
+    rule_instances_rejected: BTreeMap<String, u64>,
     rule_cursor_gaps: BTreeMap<String, BTreeMap<String, u64>>,
     rule_stats_over_limit: BTreeMap<String, u64>,
     alert_emitted: BTreeMap<String, u64>,
@@ -483,6 +484,8 @@ pub struct RuntimeMetrics {
     /// Gauge of estimated live-instance memory（`limits.max_memory` 会计值），
     /// 跨 shard delta 上报求和（2026-09-04 导出：max_memory 可用实测校准）。
     rule_memory_bytes: BTreeMap<String, AtomicI64>,
+    /// 被 `max_instances`/`max_memory` 拒收的新 key 累计数（delta 累加）。
+    rule_instances_rejected: BTreeMap<String, AtomicI64>,
     rule_cursor_gap_total: BTreeMap<String, BTreeMap<String, AtomicU64>>,
     /// 状态内存 guard 超限拒收新键桶累计（stats 规则, close 时按窗口增量上报）。
     rule_stats_over_limit_total: BTreeMap<String, AtomicU64>,

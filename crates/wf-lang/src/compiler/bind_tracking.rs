@@ -5,11 +5,66 @@
 
 use super::*;
 
+use crate::plan::FieldMode;
+
+/// 字段历史用法位：决定 [`FieldMode`]（合并规则见 [`BindTracking::field_modes`]）。
+const USAGE_FIRST: u8 = 1;
+const USAGE_LAST: u8 = 2;
+const USAGE_SERIES: u8 = 4;
+
 #[derive(Default)]
 pub(crate) struct BindTracking {
     pub aliases: HashSet<String>,
     pub fields: std::collections::HashMap<String, HashSet<String>>,
     pub plain_fields: HashSet<String>,
+    /// alias → field → usage bits（内部；对外经 [`Self::field_modes`] 投影）。
+    usage: std::collections::HashMap<String, std::collections::HashMap<String, u8>>,
+}
+
+impl BindTracking {
+    /// 把按用法累积的位投影为每个字段的存储模式。
+    ///
+    /// 合并规则（宁可多存，不可丢语义）：
+    /// - 任何 `Series` 用法 → `Series`（`collect_*` / `stddev` / `percentile` /
+    ///   对字段求值的 `min/max/sum/avg/count` 都需完整序列）；
+    /// - 同时被 `first()` 与普通读取/`last()` 引用 → `Series`；
+    /// - 仅 `first()` → `First`（只写首个值）；
+    /// - 其余（普通投影 / `last()`）→ `Last`（只保留最新值）。
+    pub(crate) fn field_modes(
+        &self,
+    ) -> std::collections::HashMap<String, std::collections::HashMap<String, FieldMode>> {
+        self.usage
+            .iter()
+            .map(|(alias, fields)| {
+                let modes = fields
+                    .iter()
+                    .map(|(field, bits)| {
+                        let mode = if *bits & USAGE_SERIES != 0 {
+                            FieldMode::Series
+                        } else if *bits & USAGE_FIRST != 0 && *bits & USAGE_LAST != 0 {
+                            FieldMode::Series
+                        } else if *bits & USAGE_FIRST != 0 {
+                            FieldMode::First
+                        } else {
+                            FieldMode::Last
+                        };
+                        (field.clone(), mode)
+                    })
+                    .collect();
+                (alias.clone(), modes)
+            })
+            .collect()
+    }
+
+    fn mark_field(&mut self, alias: &str, field: &str, usage: u8) {
+        let entry = self
+            .usage
+            .entry(alias.to_string())
+            .or_default()
+            .entry(field.to_string())
+            .or_insert(0);
+        *entry |= usage;
+    }
 }
 
 #[cfg(test)]
@@ -50,6 +105,7 @@ pub(crate) fn collect_bind_tracking_aliases(expr: &Expr, aliases: &mut HashSet<S
         aliases: std::mem::take(aliases),
         fields: std::collections::HashMap::new(),
         plain_fields: HashSet::new(),
+        usage: std::collections::HashMap::new(),
     };
     collect_bind_tracking(expr, &mut tracking);
     *aliases = tracking.aliases;
@@ -69,15 +125,48 @@ pub(crate) fn collect_bind_tracking(expr: &Expr, tracking: &mut BindTracking) {
             if qualifier.is_none() && is_stat_selector(name) {
                 return;
             }
-            if qualifier.is_none()
-                && is_series_func(name)
-                && let Some(Expr::Field(
-                    FieldRef::Qualified(alias, field) | FieldRef::Bracketed(alias, field),
-                )) = args.first()
-            {
-                track_bind_field(tracking, alias, field);
+            // 字段用法分类（内存）：决定该字段在实例里存整条序列 / 只存首值 /
+            // 只存最后值（见 `plan::FieldMode`）。`first`/`last` 必须先于
+            // `is_series_func` 判断——后者包含它们。
+            let usage = if qualifier.is_none() && name == "first" {
+                Some(USAGE_FIRST)
+            } else if qualifier.is_none() && name == "last" {
+                Some(USAGE_LAST)
+            } else if qualifier.is_none() && is_series_func(name) {
+                // collect_* / stddev / percentile / 对字段求值的 min·max·sum·avg·count
+                // 都会读完整序列（eval 侧 flatten_bind_series）。
+                Some(USAGE_SERIES)
+            } else {
+                None
+            };
+            let mut first_arg_classified = false;
+            if let Some(usage) = usage {
+                match args.first() {
+                    Some(Expr::Field(
+                        FieldRef::Qualified(alias, field) | FieldRef::Bracketed(alias, field),
+                    )) => {
+                        track_bind_field(tracking, alias, field);
+                        tracking.mark_field(alias, field, usage);
+                        first_arg_classified = true;
+                    }
+                    // 嵌套路径（`first(s.meta.body)`）：按根字段归类，否则会被
+                    // 递归当成普通读取记为 Last（first 语义丢失）。
+                    Some(Expr::Field(FieldRef::Path { alias, segments })) => {
+                        if let Some(PathSegment::Field(root)) = segments.first() {
+                            track_bind_field(tracking, alias, root);
+                            tracking.mark_field(alias, root, usage);
+                            first_arg_classified = true;
+                        }
+                    }
+                    _ => {}
+                }
             }
-            for arg in args {
+            for (idx, arg) in args.iter().enumerate() {
+                if idx == 0 && first_arg_classified {
+                    // 已按函数语义标记，不能再按普通读取记为 Last（否则
+                    // `first(x)` 会退化成 First+Last → Series）。
+                    continue;
+                }
                 collect_bind_tracking(arg, tracking);
             }
         }
@@ -104,12 +193,14 @@ pub(crate) fn collect_bind_tracking(expr: &Expr, tracking: &mut BindTracking) {
         }
         Expr::Field(FieldRef::Qualified(alias, field) | FieldRef::Bracketed(alias, field)) => {
             track_bind_field(tracking, alias, field);
+            tracking.mark_field(alias, field, USAGE_LAST);
         }
         Expr::Field(FieldRef::Path { alias, segments }) => {
             // Track the root object/array field so it reaches the match/close
             // yield context; nested traversal happens at evaluation time.
             if let Some(PathSegment::Field(root)) = segments.first() {
                 track_bind_field(tracking, alias, root);
+                tracking.mark_field(alias, root, USAGE_LAST);
             }
         }
         Expr::Field(FieldRef::Simple(field)) => {
@@ -385,4 +476,100 @@ pub(super) fn compute_trigger_event_needed(
     }
     refs.into_iter()
         .any(|name| name.is_empty() || name.starts_with('_') || !key_names.contains(name.as_str()))
+}
+
+#[cfg(test)]
+mod field_mode_tests {
+    use super::*;
+    use crate::plan::FieldMode;
+
+    fn field(alias: &str, name: &str) -> Expr {
+        Expr::Field(FieldRef::Qualified(alias.to_string(), name.to_string()))
+    }
+
+    fn call(name: &str, arg: Expr) -> Expr {
+        Expr::FuncCall {
+            qualifier: None,
+            name: name.to_string(),
+            args: vec![arg],
+        }
+    }
+
+    fn modes(expr: &Expr) -> std::collections::HashMap<String, FieldMode> {
+        let mut t = BindTracking::default();
+        collect_bind_tracking(expr, &mut t);
+        t.field_modes().remove("a").unwrap_or_default()
+    }
+
+    /// `first(x)` 只要首值 → 单槽（2026-11 内存优化的核心判定）。
+    #[test]
+    fn first_only_maps_to_single_slot() {
+        let m = modes(&call("first", field("a", "body")));
+        assert_eq!(m.get("body"), Some(&FieldMode::First));
+    }
+
+    /// 普通投影只读最后值 → 单槽覆盖。
+    #[test]
+    fn plain_read_maps_to_last() {
+        let m = modes(&field("a", "url"));
+        assert_eq!(m.get("url"), Some(&FieldMode::Last));
+    }
+
+    /// `collect_list` / `stddev` 等需要完整序列。
+    #[test]
+    fn collect_list_keeps_series() {
+        let m = modes(&call("collect_list", field("a", "url")));
+        assert_eq!(m.get("url"), Some(&FieldMode::Series));
+    }
+
+    /// 对字段求值的聚合（eval 读 bind 序列）同样需要完整序列。
+    #[test]
+    fn aggregate_over_field_keeps_series() {
+        for name in ["max", "min", "sum", "avg", "count"] {
+            let m = modes(&call(name, field("a", "v")));
+            assert_eq!(m.get("v"), Some(&FieldMode::Series), "aggregate {name}");
+        }
+    }
+
+    /// `first()` 与普通读取同时出现 → 两端都要，退化为完整序列。
+    #[test]
+    fn first_plus_plain_degrades_to_series() {
+        let m = modes(&Expr::Array(vec![
+            call("first", field("a", "x")),
+            field("a", "x"),
+        ]));
+        assert_eq!(m.get("x"), Some(&FieldMode::Series));
+    }
+
+    /// `last()` 只要最新值 → 单槽覆盖。
+    #[test]
+    fn last_only_maps_to_single_slot() {
+        let m = modes(&call("last", field("a", "y")));
+        assert_eq!(m.get("y"), Some(&FieldMode::Last));
+    }
+
+    /// `first()` 与 `last()` 同时使用 → 两端都要，退化为完整序列。
+    #[test]
+    fn first_plus_last_degrades_to_series() {
+        let m = modes(&Expr::Array(vec![
+            call("first", field("a", "z")),
+            call("last", field("a", "z")),
+        ]));
+        assert_eq!(m.get("z"), Some(&FieldMode::Series));
+    }
+
+    /// 嵌套路径在 `first()` 内按根字段归类（否则会被递归记成 Last）。
+    #[test]
+    fn nested_path_inside_first_uses_root_field() {
+        use crate::ast::PathSegment;
+        let expr = call(
+            "first",
+            Expr::Field(FieldRef::Path {
+                alias: "a".to_string(),
+                segments: vec![PathSegment::Field("meta".to_string())],
+            }),
+        );
+        let m = modes(&expr);
+        assert_eq!(m.get("meta"), Some(&FieldMode::First));
+    }
 }

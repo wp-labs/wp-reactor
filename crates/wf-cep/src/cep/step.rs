@@ -205,6 +205,7 @@ pub(super) fn record_evidence_time(bs: &mut BranchState, event_time_nanos: i64) 
     }
 }
 
+#[allow(dead_code)] // 保留旧签名（测试/兼容），生产走 `_with_modes`
 pub(super) fn collect_event_fields<E: FieldSource>(
     event: &E,
     bs: &mut BranchState,
@@ -212,18 +213,40 @@ pub(super) fn collect_event_fields<E: FieldSource>(
     tracked_plain_fields: &HashSet<String>,
     branch_field: Option<&FieldSelector>,
 ) {
+    collect_event_fields_with_modes(
+        event,
+        bs,
+        tracked_fields,
+        tracked_plain_fields,
+        branch_field,
+        None,
+    )
+}
+
+/// [`collect_event_fields`] 的字段模式版：`modes` = 该别名的
+/// `alias → field → FieldMode`（缺省/未命中 = `Series`，保持旧行为）。
+pub(super) fn collect_event_fields_with_modes<E: FieldSource>(
+    event: &E,
+    bs: &mut BranchState,
+    tracked_fields: Option<&HashSet<String>>,
+    tracked_plain_fields: &HashSet<String>,
+    branch_field: Option<&FieldSelector>,
+    modes: Option<&std::collections::HashMap<String, wf_lang::plan::FieldMode>>,
+) {
     if let Some(fields) = tracked_fields {
         for field_name in fields {
-            push_event_field(event, bs, field_name);
+            push_event_field_with_mode(event, bs, field_name, mode_of(modes, field_name));
         }
+        // 无别名字段（`FieldRef::Simple`）走旧路径：可能被 L3 函数引用
+        // （`first(x)`），保守维持 `Series`。
         for field_name in tracked_plain_fields {
-            push_event_field(event, bs, field_name);
+            push_event_field_with_mode(event, bs, field_name, wf_lang::plan::FieldMode::Series);
         }
         if let Some(field_name) = selected_field_name(branch_field)
             && !fields.contains(field_name)
             && !tracked_plain_fields.contains(field_name)
         {
-            push_event_field(event, bs, field_name);
+            push_event_field_with_mode(event, bs, field_name, mode_of(modes, field_name));
         }
     } else {
         // No tracked set: collect every non-null field. `field_names` covers the
@@ -231,15 +254,35 @@ pub(super) fn collect_event_fields<E: FieldSource>(
         // matches the eager path (batch_to_events drops nulls from the map).
         for field_name in event.field_names() {
             if let Some(value) = event.field_value(field_name) {
-                bs.push_field_value(field_name, value);
+                bs.push_field_value_mode(field_name, value, mode_of(modes, field_name));
             }
         }
     }
 }
 
+fn mode_of(
+    modes: Option<&std::collections::HashMap<String, wf_lang::plan::FieldMode>>,
+    field_name: &str,
+) -> wf_lang::plan::FieldMode {
+    modes
+        .and_then(|m| m.get(field_name))
+        .copied()
+        .unwrap_or(wf_lang::plan::FieldMode::Series)
+}
+
+#[allow(dead_code)]
 fn push_event_field<E: FieldSource>(event: &E, bs: &mut BranchState, field_name: &str) {
+    push_event_field_with_mode(event, bs, field_name, wf_lang::plan::FieldMode::Series);
+}
+
+fn push_event_field_with_mode<E: FieldSource>(
+    event: &E,
+    bs: &mut BranchState,
+    field_name: &str,
+    mode: wf_lang::plan::FieldMode,
+) {
     if let Some(value) = event.field_value(field_name) {
-        bs.push_field_value(field_name, value);
+        bs.push_field_value_mode(field_name, value, mode);
     }
 }
 
@@ -266,7 +309,14 @@ fn selected_field_name(field: Option<&FieldSelector>) -> Option<&str> {
 /// 1025 = 首值 + 最多 1024 个最近样本。Close-step threshold evaluation
 /// (count/sum/min/max/distinct) uses separate accumulators and is not affected by
 /// this cap.
-const MAX_TRACKED_FIELD_VALUES: usize = 1024;
+pub(super) const MAX_TRACKED_FIELD_VALUES: usize = 1024;
+
+/// 每个字段历史序列的**字节**上限（`FieldMode::Series`）。
+///
+/// 条数上限（1024）无法约束大字段：`http_request_body` / `object` 类字段单值
+/// 可达 KB~几十 KB，1024 条就可能是几十 MB/字段/实例。字节预算与条数上限
+/// 同时生效，谁先到谁触发裁剪（至少保留 1 个值）。
+pub(super) const MAX_TRACKED_FIELD_BYTES: usize = 64 * 1024;
 
 /// Push `value` onto `values`, trimming to the most recent
 /// `MAX_TRACKED_FIELD_VALUES` entries.
@@ -282,6 +332,7 @@ const MAX_TRACKED_FIELD_VALUES: usize = 1024;
 /// 8×32KB memmove，占 q15 CPU 的 88%（macOS sample 2026-08-22 实测，q15 10M
 /// EPS 37k 的主因）。
 #[must_use = "被裁减掉的首值必须交给 PinnedFirst 钉扎（warp-fusion#100）"]
+#[allow(dead_code)] // 现由 `push_collected`/`push_capped_field` 内联实现；保留给测试与外部复用
 pub(super) fn push_capped(values: &mut VecDeque<Value>, value: Value) -> Option<Value> {
     values.push_back(value);
     if values.len() > MAX_TRACKED_FIELD_VALUES {
@@ -290,22 +341,41 @@ pub(super) fn push_capped(values: &mut VecDeque<Value>, value: Value) -> Option<
     None
 }
 
+#[allow(dead_code)] // 保留旧签名（测试/兼容），生产走 `_with_modes`
 pub(super) fn collect_alias_event<E: FieldSource>(
     event: &E,
     alias_state: &mut AliasState,
     tracked_fields: Option<&HashSet<String>>,
 ) {
+    collect_alias_event_with_modes(event, alias_state, tracked_fields, None)
+}
+
+/// [`collect_alias_event`] 的字段模式版（见 [`collect_event_fields_with_modes`]）。
+pub(super) fn collect_alias_event_with_modes<E: FieldSource>(
+    event: &E,
+    alias_state: &mut AliasState,
+    tracked_fields: Option<&HashSet<String>>,
+    modes: Option<&std::collections::HashMap<String, wf_lang::plan::FieldMode>>,
+) {
     alias_state.count += 1;
     if let Some(fields) = tracked_fields {
         for field_name in fields {
             if let Some(value) = event.field_value(field_name.as_str()) {
-                alias_state.push_field_value(field_name.as_str(), value);
+                alias_state.push_field_value_mode(
+                    field_name.as_str(),
+                    value,
+                    mode_of(modes, field_name),
+                );
             }
         }
     } else {
         for field_name in event.field_names() {
             if let Some(value) = event.field_value(field_name) {
-                alias_state.push_field_value(field_name, value);
+                alias_state.push_field_value_mode(
+                    field_name,
+                    value,
+                    mode_of(modes, field_name),
+                );
             }
         }
     }

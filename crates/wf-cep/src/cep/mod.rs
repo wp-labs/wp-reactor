@@ -122,6 +122,9 @@ pub struct CepStateMachine {
     /// `Instance::first_hit_wall_nanos`。None = 未注入（单测/测试驱动）→
     /// `@first_match_time` 无值，与 `@emit_time` 未提供时行为一致。
     processing_wall_nanos: Option<i64>,
+    /// 本机被 `max_instances` 拒收的新 key 数（无共享时使用；有共享时计在
+    /// [`SharedLimits`] 上）。
+    rejected: u64,
 }
 
 /// 规则实例状态是否**每事件增长**（`estimated_memory_bytes` 只在 insert/remove
@@ -178,6 +181,7 @@ impl CepStateMachine {
             raw_conv_mode: false,
             expiry_heap: BinaryHeap::new(),
             estimated_memory_bytes: 0,
+            rejected: 0,
             memory_grows_per_event,
             seq_meta,
             processing_wall_nanos: None,
@@ -211,6 +215,7 @@ impl CepStateMachine {
             raw_conv_mode: false,
             expiry_heap: BinaryHeap::new(),
             estimated_memory_bytes: 0,
+            rejected: 0,
             memory_grows_per_event,
             seq_meta,
             processing_wall_nanos: None,
@@ -246,6 +251,7 @@ impl CepStateMachine {
             raw_conv_mode: false,
             expiry_heap: BinaryHeap::new(),
             estimated_memory_bytes: 0,
+            rejected: 0,
             memory_grows_per_event,
             seq_meta,
             processing_wall_nanos: None,
@@ -312,6 +318,31 @@ impl CepStateMachine {
         self.instances.len()
     }
 
+    /// 跨分片累计拒收数（诊断/外部查询用；**不要**用它做分片增量上报——
+    /// 每个 shard 读到的是同一个总量，按增量相加会变成 N 倍）。
+    pub fn instance_rejections(&self) -> u64 {
+        self.shared
+            .as_ref()
+            .map(|s| s.rejected())
+            .unwrap_or(self.rejected)
+    }
+
+    /// 本机（本 shard）累计拒收数 —— 指标按 shard 报增量时用这个，各分片相加恰好等于总量。
+    pub fn local_rejections(&self) -> u64 {
+        self.rejected
+    }
+
+    /// 记一次新实例拒收（`max_instances` / `max_memory` 生效时）。
+    ///
+    /// 本地计数（指标上报）与共享计数（跨分片诊断）**都要**加：只加共享会让
+    /// 每个 shard 都报同一个 delta（N 倍多计）；只加本地则拿不到跨分片总量。
+    pub(crate) fn record_instance_rejection(&mut self) {
+        self.rejected = self.rejected.saturating_add(1);
+        if let Some(shared) = &self.shared {
+            shared.inc_rejected();
+        }
+    }
+
     /// Estimated live-instance memory across all shards of this rule (the
     /// `limits.max_memory` accounting value). Sharded rules report the shared
     /// cross-shard total; unsharded rules the local estimate.
@@ -359,15 +390,14 @@ impl CepStateMachine {
         }
     }
 
-    /// Whether the per-instance memory accounting cache is needed.
+    /// Whether the per-instance memory accounting cache is maintained.
     ///
-    /// `estimated_memory_bytes` is only read when a `max_memory_bytes` limit is
-    /// configured; maintaining it otherwise is pure per-event overhead.
+    /// 2026-11 改造：改为**始终**维护。此前只在配了 `limits.max_memory` 时记账，
+    /// 导致 `rule.memory_bytes` 对绝大多数规则恒为 0 —— 线上 OOM 复盘时
+    /// 「实例状态到底占多少」完全不可观测，只能靠 perf 反推。
+    /// 每事件开销仍受 `plan_memory_grows_per_event` 摊还门控约束。
     fn tracks_memory_bytes(&self) -> bool {
-        self.limits
-            .as_ref()
-            .and_then(|limits| limits.max_memory_bytes)
-            .is_some()
+        true
     }
 
     /// Recompute the exact per-instance memory estimate across all active

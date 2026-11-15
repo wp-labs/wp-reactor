@@ -60,6 +60,7 @@ fn empty_match_plan() -> MatchPlan {
         close_mode: crate::ast::CloseMode::Or,
         tracked_bind_aliases: HashSet::new(),
         tracked_bind_fields: std::collections::HashMap::new(),
+        field_modes: Default::default(),
         tracked_plain_fields: HashSet::new(),
         match_mode: crate::ast::MatchMode::Seq,
         seq: None,
@@ -379,9 +380,11 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
         &yield_plan.fields,
         &rule.lets,
     );
+    let field_modes = bind_tracking.field_modes();
     match_plan.tracked_bind_aliases = bind_tracking.aliases;
     match_plan.tracked_bind_fields = bind_tracking.fields;
     match_plan.tracked_plain_fields = bind_tracking.plain_fields;
+    match_plan.field_modes = field_modes;
     let joins = compile_joins(&rule.joins);
     match_plan.needs_field_history = compute_needs_field_history(
         &match_plan,
@@ -545,9 +548,11 @@ fn compile_pipeline_rule(
             &yield_plan.fields,
             &rule.lets,
         );
+        let field_modes = bind_tracking.field_modes();
         match_plan.tracked_bind_aliases = bind_tracking.aliases;
         match_plan.tracked_bind_fields = bind_tracking.fields;
         match_plan.tracked_plain_fields = bind_tracking.plain_fields;
+        match_plan.field_modes = field_modes;
         let stage_joins = compile_joins(joins);
         match_plan.needs_field_history = compute_needs_field_history(
             &match_plan,

@@ -22,7 +22,7 @@ use super::key::{InstanceKey, ScopeKey, flatten_scope_values};
 use super::seq::{SeqRuntime, consec_broken, scan_negations};
 use super::state::{AliasState, Instance, snapshot_bind_data};
 use super::step::{
-    StepEvaluationInput, StepProgressCapture, collect_alias_event, evaluate_step_with_progress,
+    StepEvaluationInput, StepProgressCapture, collect_alias_event_with_modes, evaluate_step_with_progress,
 };
 use super::types::{
     EngineHashMap, EngineHashSet, FieldSource, MACHINE_ID, MatchedContext, StepData, StepOutcome,
@@ -612,7 +612,10 @@ impl CepStateMachine {
         };
         if !reserved {
             match on_exceed {
-                ExceedAction::Throttle => return Some(StepResult::Accumulate),
+                ExceedAction::Throttle => {
+                    self.record_instance_rejection();
+                    return Some(StepResult::Accumulate);
+                }
                 // P3-B: under shared limits this evicts this shard's LOCAL
                 // oldest instance, not the global oldest across shards (a
                 // cross-shard priority queue is out of scope). The shared
@@ -642,10 +645,12 @@ impl CepStateMachine {
                         None => self.instances.len() < max_inst,
                     };
                     if !re_reserved {
+                        self.record_instance_rejection();
                         return Some(StepResult::Accumulate);
                     }
                 }
                 ExceedAction::FailRule => {
+                    self.record_instance_rejection();
                     fail_rule(&mut self.failed, &self.shared);
                     return Some(StepResult::Accumulate);
                 }
@@ -696,6 +701,9 @@ impl CepStateMachine {
                     if shared_slot_reserved {
                         self.release_shared_instance();
                     }
+                    if is_new {
+                        self.record_instance_rejection();
+                    }
                     return Some(StepResult::Accumulate);
                 }
                 ExceedAction::DropOldest => {
@@ -725,6 +733,9 @@ impl CepStateMachine {
                         if shared_slot_reserved || slot_inherited {
                             self.release_shared_instance();
                         }
+                        if is_new {
+                            self.record_instance_rejection();
+                        }
                         return Some(StepResult::Accumulate);
                     }
                 }
@@ -733,6 +744,9 @@ impl CepStateMachine {
                     // N1: release the un-consumed reservation (see Throttle arm).
                     if shared_slot_reserved {
                         self.release_shared_instance();
+                    }
+                    if is_new {
+                        self.record_instance_rejection();
                     }
                     return Some(StepResult::Accumulate);
                 }
@@ -871,7 +885,7 @@ impl CepStateMachine {
 
         if should_track_bind_alias(plan, alias) {
             let tracked_fields = plan.tracked_bind_fields.get(alias);
-            collect_alias_event(
+            collect_alias_event_with_modes(
                 event,
                 instance
                     .alias_states
@@ -879,6 +893,7 @@ impl CepStateMachine {
                     .entry(alias.to_string())
                     .or_insert_with(AliasState::new),
                 tracked_fields,
+                plan.field_modes.get(alias),
             );
         }
         let mut view = AdvanceView {

@@ -216,6 +216,7 @@ impl RuntimeMetrics {
             rule_matches_total: rule_map_all("rule", "matches_total"),
             rule_instances: rule_map_i64_all("rule", "instances"),
             rule_memory_bytes: rule_map_i64("rule", "memory_bytes"),
+            rule_instances_rejected: rule_map_i64("rule", "instances_rejected_total"),
             rule_cursor_gap_total: gap_map,
             rule_stats_over_limit_total: rule_map("rule", "stats_over_limit_total"),
             alert_emitted_total: rule_map_all("alert", "emitted_total"),
@@ -403,6 +404,13 @@ impl RuntimeMetrics {
     /// 每 shard 报 current−last，内存可增可减、recalibrate 会校正，故也走 delta）。
     pub fn adjust_rule_memory_bytes(&self, rule: &str, delta: i64) {
         if let Some(v) = self.rule_memory_bytes.get(rule) {
+            v.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    /// 累加「被 limits 拒收的新 key」计数（分片规则每 shard 报自身增量）。
+    pub fn adjust_rule_instances_rejected(&self, rule: &str, delta: i64) {
+        if let Some(v) = self.rule_instances_rejected.get(rule) {
             v.fetch_add(delta, Ordering::Relaxed);
         }
     }
@@ -630,6 +638,7 @@ impl RuntimeMetrics {
             rule_matches: self.drain_map(&self.rule_matches_total),
             rule_instances: self.read_gauge_map(&self.rule_instances),
             rule_memory_bytes: self.read_gauge_map(&self.rule_memory_bytes),
+            rule_instances_rejected: self.read_gauge_map(&self.rule_instances_rejected),
             rule_cursor_gaps: self.drain_gap_map(&self.rule_cursor_gap_total),
             rule_stats_over_limit: self.drain_map(&self.rule_stats_over_limit_total),
             alert_emitted: self.drain_map(&self.alert_emitted_total),

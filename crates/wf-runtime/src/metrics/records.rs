@@ -195,6 +195,9 @@ impl MetricsSnapshot {
         for (rule, v) in &self.rule_memory_bytes {
             out.push(metric("rule", "memory_bytes", rule, *v));
         }
+        for (rule, v) in &self.rule_instances_rejected {
+            out.push(metric("rule", "instances_rejected_total", rule, *v));
+        }
         for (rule, windows) in &self.rule_cursor_gaps {
             for (window, v) in windows {
                 out.push(metric_double("rule", "cursor_gap_total", rule, window, *v));

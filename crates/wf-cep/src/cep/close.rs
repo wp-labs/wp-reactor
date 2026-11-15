@@ -4,7 +4,7 @@ use wf_lang::plan::{MatchPlan, StepPlan};
 use super::eval::{eval_expr, eval_expr_ext};
 use super::state::{Instance, StepState, snapshot_bind_data};
 use super::step::{
-    apply_transforms, check_threshold, collect_event_fields, compute_measure, extract_branch_field,
+    apply_transforms, check_threshold, collect_event_fields_with_modes, compute_measure, extract_branch_field,
     record_evidence_time, update_measure,
 };
 use super::types::{
@@ -84,12 +84,13 @@ pub fn accumulate_close_steps<E: FieldSource>(
             // HashMap-insert + Vec push per tracked field on the advance hot
             // path.
             if plan.needs_field_history {
-                collect_event_fields(
+                collect_event_fields_with_modes(
                     event,
                     bs,
                     tracked_fields,
                     &plan.tracked_plain_fields,
                     branch.field.as_ref(),
+                    plan.field_modes.get(alias),
                 );
             }
 
