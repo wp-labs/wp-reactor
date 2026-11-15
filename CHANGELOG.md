@@ -4,6 +4,22 @@ All notable changes to wp-reactor will be documented in this file.
 
 本文件记录面向使用者的变更（行为、DSL、公开 API、配置）；内部实现细节与测试计数不在此展开。段标题 = 版本号 + 发布日期，`-- latest` 仅用于尚未发布的版本。
 
+## [2.7.0] — 2026-11-15
+
+### Added
+
+- **新指标 `rule.instances_rejected_total`**：被 `limits.max_instances` / `limits.max_memory` 拒收的新 key 累计数（按规则维度）。上限生效后是静默丢检测（新 key 不再建实例 → 配对失败），此前没有任何信号可供告警，只能从告警量下降间接猜测。分片规则每个 shard 只上报本地增量，各分片求和即为真实总量。
+
+### Changed
+
+- **`rule.memory_bytes` 恒有值**：此前仅当规则配置了 `limits.max_memory` 才维护每实例内存估算，其余规则该指标为 0，导致内存问题排查时无法从指标侧看到实例状态占用。现改为始终维护（每事件开销仍由既有摊还门控约束）。依赖「未配 limits 时该指标为 0」做判定的告警 / 看板需相应调整。
+- **CEP 实例内存大幅下降（线上 OOM 修复）**：实例内每个被引用字段原建一条 1024 条上限的值序列，包括 `s.http_url` 这类只读末值的普通投影、`first(b.body)` 这类只要首值的引用。现按用途分类存储——普通投影 / `last` 只留 1 个槽，`first` 只留首值 1 个槽，只有 `collect_*` / `stddev` / `percentile` / 对字段求值的 `min·max·sum·avg·count` 才保留有界序列。线上规则实测单实例 59.4 KB，预估降至 8–12 KB 量级。语义不变：裁剪后首值仍被钉扎，`first()` 结果不受影响。
+- **字段序列新增 64 KiB 字节上限**：在原有 1024 条之上再按字节封顶，避免 `collect_list(body)` 这类大值收集只按条数封顶仍涨到几十 MB。预算至少保留 1 个值（不做裁剪丢数据）。L3 收集值（`collected_values`）同步补对称的字节上限。
+
+### Breaking
+
+- **`wf_lang::plan::MatchPlan` 新增公开字段 `field_modes`**（`HashMap<String, HashMap<String, FieldMode>>`，新公开枚举 `wf_lang::plan::FieldMode`）。引擎内部经编译器产出计划，不受影响；直接在代码里构造 `MatchPlan` 字面量的下游（如 `wfgen` 的 datagen / oracle 测试）需补 `field_modes: Default::default()`。空表语义 = 全部按 `FieldMode::Series` 存储，与 2.6.x 行为一致。
+
 ## [2.6.1] — 2026-11-05
 
 ### Changed
