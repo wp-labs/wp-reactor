@@ -337,10 +337,12 @@ fn first_is_stable_for_close_step_output_past_the_cap() {
         Some(&num((BASE_MS + 1999 * 1_000) as f64)),
         "close 步骤 collected_values 末项仍是最新样本"
     );
+    // 2026-11 内存优化：`event_time` 只被 first() 读 → `FieldMode::First` 单槽。
+    // 首值语义不变（首个样本写入后不再覆盖），但不再保留 1024 份历史样本。
     assert_eq!(
         step.field_values.get("event_time").map(|v| v.len()),
-        Some(1025),
-        "close 步骤字段序列 = 首值 + 最近 1024 个"
+        Some(1),
+        "first-only 字段只有单槽（不再保留 1024 份历史）"
     );
     assert_eq!(
         step.field_values.get("event_time").and_then(|v| v.first()),

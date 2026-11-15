@@ -81,6 +81,7 @@ fn simple_plan(keys: Vec<FieldRef>, steps: Vec<wf_lang::plan::StepPlan>) -> Matc
         close_mode: CloseMode::Or,
         tracked_bind_aliases: HashSet::new(),
         tracked_bind_fields: std::collections::HashMap::new(),
+        field_modes: Default::default(),
         tracked_plain_fields: HashSet::new(),
         seq: None,
         match_mode: MatchMode::Seq,
@@ -616,12 +617,13 @@ fn close_output_field_defaults_via_state_machine_roundtrip() {
 // ===========================================================================
 
 #[test]
-fn rule_memory_bytes_tracks_only_when_max_memory_configured() {
+fn rule_memory_bytes_tracks_regardless_of_max_memory() {
     let plan = simple_plan(
         vec![simple_key("sip")],
         vec![step(vec![branch("req", count_ge(1.0))])],
     );
-    // 未配 max_memory → 不记账（0）——避免无谓逐事件开销（tracks_memory_bytes 门）。
+    // 2026-11：改为**始终**记账——未配 max_memory 也要能观测实例内存
+    // （线上 OOM 复盘时 rule.memory_bytes 恒为 0 曾导致完全盲区）。
     let mut no_limit = CepStateMachine::with_limits(
         "r".into(),
         plan.clone(),
@@ -631,7 +633,10 @@ fn rule_memory_bytes_tracks_only_when_max_memory_configured() {
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
     no_limit.advance_at("req", &e, 0);
     assert_eq!(no_limit.instance_count(), 1);
-    assert_eq!(no_limit.rule_memory_bytes(), 0);
+    assert!(
+        no_limit.rule_memory_bytes() > 0,
+        "无 max_memory 时也应记账（否则 rule.memory_bytes 永远是 0）"
+    );
 
     // 配了 max_memory → 实例准入按 base 记账 > 0；未分片 = 本地估算。
     let limits = LimitsPlan {
@@ -652,4 +657,98 @@ fn rule_memory_bytes_tracks_only_when_max_memory_configured() {
     // close 收口释放实例 → 会计随移除归零。
     sm.close(&[str_val("10.0.0.1")], CloseReason::Timeout);
     assert_eq!(sm.rule_memory_bytes(), 0);
+}
+
+// ===========================================================================
+// 2026-11 内存改造：字段存储模式 / 拒收计数（review 补充）
+// ===========================================================================
+
+/// 字段模式契约：`Last` 只留最新、`First` 只留最早、未声明字段保守回退 `Series`。
+#[test]
+fn field_modes_keep_last_first_and_series_distinct() {
+    use super::step::collect_event_fields_with_modes;
+    use wf_lang::plan::FieldMode;
+
+    let tracked: HashSet<String> = ["x", "y", "z"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let modes: std::collections::HashMap<String, FieldMode> = [
+        ("x".to_string(), FieldMode::Last),
+        ("y".to_string(), FieldMode::First),
+    ]
+    .into_iter()
+    .collect();
+
+    let mut bs = BranchState::new();
+    for i in 0..5i64 {
+        let e = event(vec![
+            ("x", Value::Float(i as f64)),
+            ("y", Value::Float(i as f64)),
+            ("z", Value::Float(i as f64)),
+        ]);
+        collect_event_fields_with_modes(
+            &e,
+            &mut bs,
+            Some(&tracked),
+            &HashSet::new(),
+            None,
+            Some(&modes),
+        );
+    }
+
+    let series = bs.field_series();
+    assert_eq!(
+        series.get("x").map(Vec::as_slice),
+        Some(&[Value::Float(4.0)][..]),
+        "Last 模式只保留最新值"
+    );
+    assert_eq!(
+        series.get("y").map(Vec::as_slice),
+        Some(&[Value::Float(0.0)][..]),
+        "First 模式只保留最早值（first() 语义不变）"
+    );
+    assert_eq!(
+        series.get("z").map(Vec::len),
+        Some(5),
+        "未声明模式的字段必须回退 Series（不做行为改变）"
+    );
+}
+
+/// 分片拒收计数：本地计数各分片独立（上报用），共享计数是跨分片总量（诊断用）。
+/// 若上报误用共享总量，各 shard 会各报同一增量 → N 倍（review 修复点）。
+#[test]
+fn rejection_counting_is_per_shard_local_and_shared_total() {
+    use super::limits::SharedLimits;
+
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("req", count_ge(1.0))])],
+    );
+    let mut limits = throttle_limits(100, ExceedAction::Throttle);
+    limits.max_instances = Some(1);
+    let shared = SharedLimits::new();
+    let mut a = CepStateMachine::with_limits_shared(
+        "r".into(),
+        plan.clone(),
+        None,
+        Some(limits.clone()),
+        shared.clone(),
+    );
+    let mut b = CepStateMachine::with_limits_shared("r".into(), plan, None, Some(limits), shared);
+
+    let k1 = event(vec![("sip", str_val("10.0.0.1"))]);
+    let k2 = event(vec![("sip", str_val("10.0.0.2"))]);
+    a.advance_at("req", &k1, 0); // 占用唯一的共享实例槽
+    b.advance_at("req", &k2, 0); // 共享预算已满 → b 被拒
+    a.advance_at("req", &k2, 0); // a 本地也满 → a 被拒
+
+    assert_eq!(a.local_rejections(), 1, "a 本地拒收 1 次");
+    assert_eq!(b.local_rejections(), 1, "b 本地拒收 1 次");
+    assert_eq!(a.instance_rejections(), 2, "共享总量 = 2");
+    assert_eq!(
+        a.local_rejections() + b.local_rejections(),
+        a.instance_rejections(),
+        "各 shard 本地增量之和必须等于共享总量（否则指标 N 倍）"
+    );
 }
