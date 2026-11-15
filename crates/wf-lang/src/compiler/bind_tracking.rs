@@ -40,13 +40,18 @@ impl BindTracking {
                     .iter()
                     .map(|(field, bits)| {
                         let mode = if *bits & USAGE_SERIES != 0 {
+                            // 聚合函数（collect_* / stddev / percentile / 对字段求值的
+                            // min·max·sum·avg·count）需要完整序列。
                             FieldMode::Series
-                        } else if *bits & USAGE_FIRST != 0 && *bits & USAGE_LAST != 0 {
-                            FieldMode::Series
-                        } else if *bits & USAGE_FIRST != 0 {
-                            FieldMode::First
                         } else {
-                            FieldMode::Last
+                            match (*bits & USAGE_FIRST != 0, *bits & USAGE_LAST != 0) {
+                                // first() 与普通读取/ last() 同时引用：单槽满足不了两边。
+                                (true, true) => FieldMode::Series,
+                                // 仅 first()：只写首个值。
+                                (true, false) => FieldMode::First,
+                                // 普通投影 / 仅 last()：只保留最新值。
+                                (false, _) => FieldMode::Last,
+                            }
                         };
                         (field.clone(), mode)
                     })
