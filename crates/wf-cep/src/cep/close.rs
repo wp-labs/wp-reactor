@@ -4,8 +4,8 @@ use wf_lang::plan::{MatchPlan, StepPlan};
 use super::eval::{eval_expr, eval_expr_ext};
 use super::state::{Instance, StepState, snapshot_bind_data};
 use super::step::{
-    apply_transforms, check_threshold, collect_event_fields_with_modes, compute_measure, extract_branch_field,
-    record_evidence_time, update_measure,
+    apply_transforms, check_threshold, collect_event_fields_with_modes, compute_measure,
+    extract_branch_field, record_evidence_time, update_measure,
 };
 use super::types::{
     CloseOutput, CloseReason, EngineHashMap, Event, FieldSource, RollingStats, StepData, Value,

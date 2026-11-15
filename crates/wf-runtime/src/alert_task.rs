@@ -71,7 +71,6 @@ impl AlertBatch {
     }
 
     #[allow(dead_code)]
-    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }

@@ -22,7 +22,8 @@ use super::key::{InstanceKey, ScopeKey, flatten_scope_values};
 use super::seq::{SeqRuntime, consec_broken, scan_negations};
 use super::state::{AliasState, Instance, snapshot_bind_data};
 use super::step::{
-    StepEvaluationInput, StepProgressCapture, collect_alias_event_with_modes, evaluate_step_with_progress,
+    StepEvaluationInput, StepProgressCapture, collect_alias_event_with_modes,
+    evaluate_step_with_progress,
 };
 use super::types::{
     EngineHashMap, EngineHashSet, FieldSource, MACHINE_ID, MatchedContext, StepData, StepOutcome,

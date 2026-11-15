@@ -371,11 +371,7 @@ pub(super) fn collect_alias_event_with_modes<E: FieldSource>(
     } else {
         for field_name in event.field_names() {
             if let Some(value) = event.field_value(field_name) {
-                alias_state.push_field_value_mode(
-                    field_name,
-                    value,
-                    mode_of(modes, field_name),
-                );
+                alias_state.push_field_value_mode(field_name, value, mode_of(modes, field_name));
             }
         }
     }

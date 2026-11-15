@@ -669,10 +669,7 @@ fn field_modes_keep_last_first_and_series_distinct() {
     use super::step::collect_event_fields_with_modes;
     use wf_lang::plan::FieldMode;
 
-    let tracked: HashSet<String> = ["x", "y", "z"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let tracked: HashSet<String> = ["x", "y", "z"].iter().map(|s| s.to_string()).collect();
     let modes: std::collections::HashMap<String, FieldMode> = [
         ("x".to_string(), FieldMode::Last),
         ("y".to_string(), FieldMode::First),

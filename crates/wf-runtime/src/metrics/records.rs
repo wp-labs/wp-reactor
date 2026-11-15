@@ -10,7 +10,6 @@ use super::*;
 
 impl MetricsSnapshot {
     #[allow(clippy::vec_init_then_push)]
-    #[allow(clippy::vec_init_then_push)]
     pub(crate) fn to_records(&self) -> Vec<MetricsRecord> {
         let mut out = Vec::new();
         self.emit_receiver_records(&mut out);
